@@ -227,6 +227,44 @@
                  (ok (probe-file path))))
           (sb-posix:close fd)))))
 
+(deftest rewind-page-reference-reconstructs-only-matching-offers
+    (with-physical-store-directory (root)
+      (let* ((path (merge-pathnames "base/1" root))
+             (output (merge-pathnames "assembled" root))
+             (page-size pg::+blcksz+)
+             (bytes (make-array (+ (* 2 page-size) 3) :element-type '(unsigned-byte 8)
+                                                      :initial-element 7))
+             (page (subseq bytes 0 page-size))
+             (page-hash (pg::physical-store-update-digest #xCBF29CE484222325 page))
+             (pages (make-hash-table))
+             (frames nil)
+             (digest nil))
+        (fill bytes 9 :start page-size)
+        (setf digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)
+              (gethash 0 pages) page-hash
+              (gethash page-size pages) page-hash)
+        (ensure-directories-exist path)
+        (pg::wal-atomic-write-bytes path bytes)
+        (pg::physical-backup-send-file root (list "base/1" (length bytes) digest) 1
+                                       (lambda (frame) (push frame frames)) :pages pages)
+        (setf frames (nreverse frames))
+        (ok (equal '(#\F #\P #\D #\D #\E)
+                   (mapcar (lambda (frame) (code-char (aref frame 0))) frames)))
+        (ok (signals (pg::physical-backup-read-page-reference (second frames) 0 (length bytes) nil)
+                     'error))
+        (ok (signals (pg::physical-backup-read-page-reference (second frames) page-size page-size
+                                                              (constantly page))
+                     'error))
+        (with-open-file (stream output :direction :output :element-type '(unsigned-byte 8))
+          (let ((remaining (rest frames)))
+            (ok (= digest
+                   (pg::physical-backup-receive-file-content
+                    (length bytes) digest (lambda () (pop remaining)) stream "base/1"
+                    (lambda (offset hash)
+                      (assert (and (= offset 0) (= hash page-hash)))
+                      page))))))
+        (ok (equalp bytes (pg::read-bounded-regular-file output (length bytes)))))))
+
 (deftest rewind-offline-archive-fallback-requires-a-missing-local-name
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

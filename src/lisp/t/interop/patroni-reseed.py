@@ -353,6 +353,7 @@ class FormerPrimaryAcceptance(Acceptance):
 
 class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
     label = "rewind-shared-history"
+    replay_pages = False
 
     def capture(self, label):
         path = self.server.root / label
@@ -440,12 +441,41 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
                              for path in (target, self.origin, leased))
         digest = self.result["former_primary"]["retained_origin"]["fork_digest"]
         helper = cancellation.lisp_string(self.helper)
+        replay = ""
+        if self.replay_pages:
+            path = self.server.root / "rewind-page-full-replay"
+            path.mkdir(mode=0o700)
+            replay = " #P" + cancellation.lisp_string(str(path) + "/")
         _, output = self.process("rewind-leased-origin", self.native_arguments() + [
             "--eval", f"(pg::native-patroni-rewind-leased-origin {arguments} "
-                      f"{self.server.port} {helper} {fork} {digest})"])
+                      f"{self.server.port} {helper} {fork} {digest}{replay})"])
         assert b"REWIND-LEASED-ORIGIN PASS" in output
+        if self.replay_pages:
+            assert b"REWIND-PAGE-REUSE PASS" in output
         assert all(preserved_tree(path) == inventory for path, inventory in before.items())
         self.result["checks"].append(self.label)
+
+
+class RewindPageReuseAcceptance(RewindSharedHistoryAcceptance):
+    label = "rewind-page-reuse"
+    replay_pages = True
+
+    def create_rewind_target(self):
+        follow.query(self.server.port, "CREATE TABLE rewind_page_probe(id integer, payload text)")
+        for i in range(32):
+            payload = hashlib.shake_256(str(i).encode()).hexdigest(750)
+            follow.query(self.server.port, f"INSERT INTO rewind_page_probe VALUES({i},'{payload}')")
+        target = super().create_rewind_target()
+        follow.query(self.server.port, "UPDATE rewind_page_probe SET payload='source side' WHERE id=16")
+        return target
+
+    def prove_divergence(self):
+        self.start()
+        follow.query(self.server.port, "UPDATE rewind_page_probe SET payload='target side' WHERE id=0")
+        follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
+        divergent = identity(self.server.port)
+        self.stop()
+        return divergent
 
 
 class RewindInstallAcceptance(RewindSharedHistoryAcceptance):
@@ -983,6 +1013,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
              "rewind-shared-history": RewindSharedHistoryAcceptance,
+               "rewind-page-reuse": RewindPageReuseAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
                "rewind-cli-target-archive": RewindArchiveCliAcceptance,

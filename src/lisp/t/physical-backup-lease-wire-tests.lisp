@@ -90,6 +90,22 @@
                     (backup-lease-wire-replace offered "CAPTURE_REWIND_NATIVE" "REPLAY_REWIND_NATIVE"))
                    'pg::pg-error))))
 
+(deftest rewind-page-wire-checks-alignment-and-ownership
+    (let* ((request (backup-lease-wire-request))
+           (pages '(("base/16384" 0 45) ("base/16384" 8192 123)))
+           (query (pg::pg-client-native-rewind-capture-query request nil pages))
+           (command (pg::parse-replication-command query))
+           (offers (cdr (assoc "page_offers" (pg::logical-replication-command-options command)
+                               :test #'equal))))
+      (ok (= 45 (gethash 0 (gethash "base/16384" offers))))
+      (ok (= 123 (gethash 8192 (gethash "base/16384" offers))))
+      (dolist (bad '(("base/16384" 1 45) ("global/pg_control" 0 45)))
+        (ok (signals (pg::pg-client-native-rewind-capture-query request nil (list bad)) 'error)))
+      (ok (signals (pg::pg-client-native-rewind-capture-query request nil (append pages pages)) 'error))
+      (ok (signals (pg::parse-replication-command
+                    (backup-lease-wire-replace query "CAPTURE_REWIND_NATIVE" "REPLAY_REWIND_NATIVE"))
+                   'pg::pg-error))))
+
 (deftest rewind-origin-discovery-wire-requires-an-admitted-physical-sender
     (let* ((query "IDENTIFY_REWIND_ORIGIN")
            (command (pg::parse-replication-command query))

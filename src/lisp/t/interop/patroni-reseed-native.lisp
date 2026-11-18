@@ -51,7 +51,49 @@
     (assert (probe-file (merge-pathnames changed-file (physical-adoption-owner-directory owner))))
     (assert (not (assoc changed-file reused :test #'equal)))))
 
-(defun native-patroni-rewind-leased-origin (target origin-directory source-directory port helper fork digest)
+(defun native-patroni-rewind-check-pages (owner origin capture manifest replay client request reused-pages offers)
+  (let* ((target (physical-rewind-inspect-primary owner))
+         (database (gethash "postgres" (catalog-databases (getf target :catalog))))
+         (table (gethash "rewind_page_probe" (database-tables database)))
+         (name (format nil "base/~d" (pg-class-relfilenode table)))
+         (entry (assoc name (getf manifest :files) :test #'equal))
+         (fd (physical-backup-open-directory replay))
+         (*pgdata* (physical-adoption-owner-directory owner)))
+    (unwind-protect
+         (progn
+           (assert (some (lambda (page) (equal name (first page))) reused-pages))
+           (assert (equal manifest
+                          (physical-backup-lease-capture-remote
+                           replay client request :directory-fd fd :replay t)))
+           (let ((old (read-bounded-regular-file (merge-pathnames name *pgdata*) (* 1024 1024)))
+                 (baseline (read-bounded-regular-file (merge-pathnames name origin) (* 1024 1024)))
+                 (assembled (read-bounded-regular-file (merge-pathnames name capture) (second entry)))
+                 (full (read-bounded-regular-file (merge-pathnames name replay) (second entry))))
+             (assert (equalp assembled full))
+             (let ((changed
+                     (loop for offset from 0 by +blcksz+
+                           for end = (+ offset +blcksz+)
+                           while (<= end (min (length old) (length full)))
+                           when (mismatch old full :start1 offset :end1 end :start2 offset :end2 end)
+                             collect offset)))
+               (assert (>= (length changed) 2))
+               (assert (notany (lambda (page)
+                                 (and (equal name (first page)) (member (second page) changed)))
+                               reused-pages)))
+             (let ((changed
+                     (loop for offset from 0 by +blcksz+
+                           for end = (+ offset +blcksz+)
+                           while (<= end (min (length old) (length baseline)))
+                           when (mismatch old baseline :start1 offset :end1 end :start2 offset :end2 end)
+                             collect offset)))
+               (assert changed)
+               (assert (notany (lambda (page)
+                                 (and (equal name (first page)) (member (second page) changed)))
+                               offers))))
+           (write-line "REWIND-PAGE-REUSE PASS"))
+      (sb-posix:close fd))))
+
+(defun native-patroni-rewind-leased-origin (target origin-directory source-directory port helper fork digest &optional replay)
   (multiple-value-bind (manifest manifest-digest) (recovery-read-manifest origin-directory)
     (let* ((identity (list (getf manifest :system-id) (getf manifest :timeline)
                            (getf manifest :end) manifest-digest))
@@ -78,10 +120,13 @@
                   (assert (equal identity discovered))
                   (assert (= fork discovered-fork))
                   (assert (= (getf request :timeline) timeline)))
-                (multiple-value-bind (capture record reused)
-                    (physical-rewind-capture-image owner source-directory fd client request)
+                (multiple-value-bind (capture record reused pages offers)
+                    (physical-rewind-capture-image owner source-directory fd client request :fork fork)
                   (declare (ignore record))
                   (native-patroni-rewind-check-reuse owner capture reused)
+                  (when replay
+                    (native-patroni-rewind-check-pages owner origin-directory source-directory
+                                                       capture replay client request pages offers))
                   (format t "~&REWIND-REUSED ~s~%" reused))
                 (call-with-physical-backup-image-directory
                  fd
