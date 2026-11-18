@@ -18,7 +18,7 @@ lifecycle fixture drives clone through rejoin using a supplied leader. Stock
 Patroni monitoring, synchronous candidate selection, recovery configuration,
 and stock post-bootstrap role provisioning also have direct acceptance tests.
 
-Two areas still separate this evidence from closeout:
+The final backend checks cover two areas.
 
 1. Connect native standby feedback to the primary's cleanup decisions.
    Physical slot images can store separate data and catalog transaction
@@ -33,16 +33,22 @@ Two areas still separate this evidence from closeout:
      physical slot cap was checked against C, including WAL removal and
      restart. Catalog horizon advancement was verified through the stock
      Patroni worker and below a compacted receive floor.
-2. State the tested rewind topology and interruption limits in the supported
-   lifecycle contract. The primary archive worker now drains large queues
+2. The supported rewind lifecycle passed after the backend changes.
+   The primary archive worker now drains large queues
    in bounded lock acquisitions and recovers interrupted local cleanup.
    A standby configured for streaming replayed archived WAL across a fork
    and began streaming at the end of the archived child segment. Checkpoint
    notification still has a synchronous scan.
 
-Close the goal against those backend cases and a rerun of the supplied-leader
-lifecycle. Record broader C behavior gaps separately so that the acceptance
-target stays tied to the tested HA workflow.
+The supplied-leader SCRAM lifecycle rerun passed in 331.49 s of wall time
+on the ramdisk.
+Clone took 1.98 s and former-primary construction took 52.71 s. The fixture
+verified physical slot reconnect, a `remote_apply` write, promotion, rewind
+through the dedicated login, read-only rejoin, and a clean standby restart.
+The completed-capture interruption case took 279.08 s. The install,
+follow-configuration and retirement interruption case took 293.36 s.
+All three runs recorded only expected process exits and left no recorded
+process IDs alive.
 
 ## Scope check after WAL namespace proof migration
 
@@ -108,9 +114,9 @@ on the ramdisk, including 2.06 s for clone and 263.09 s for the configured phase
 The existing `rewind-patroni` regression passed in 251.55 s with its fixture's
 missing configuration probe warnings.
 
-Two recovery areas still need work.
+Recovery paths and limits
 
-1. Extend online archive recovery. A native standby configured to stream can
+1. Online archive recovery. A native standby configured to stream can
    restore proved closed WAL with `restore_command` before connecting. It uses
    the selected history and the existing source transition handshake. A pinned
    Patroni standby cold-start test stopped the source, observed a missing first
@@ -176,11 +182,17 @@ Two recovery areas still need work.
    unrelated, symlink, and nonprivate paths. C `xlogrecovery.c` removes its
    fixed scratch files. Native cleanup matches exact `mkdtemp` names under
    `pg_wal`.
-2. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
-   both histories and can find a fork before the immediate parent. The
-   native live evidence covers the immediate-child case. Torn private replay
-   prefixes can also require manual repair. State both limits in the
-   lifecycle contract and qualify any wider support separately.
+2. Native `pg_rewind` supports a stopped, clean former primary and a
+   promoted source from the same system on its immediate child timeline.
+   Rewind verifies a retained native backup origin and the fork, and requires
+   the former primary's WAL to extend past that fork. The fixture uses
+   timelines 1 and 2. In a separate fixture, stock Patroni uses single-user
+   recovery on a dirty target before invoking rewind. C's
+   `findCommonAncestorTimeline` can also find an earlier ancestor.
+   After a tested process interruption, native `pg_rewind --resume` can
+   continue from its journal. Repair checks every surviving file prefix
+   against the sealed source image. A torn or mismatching prefix can require
+   manual repair. The fixtures invoke `--resume` explicitly.
 
 The namespace process test now passes all crash cuts, preserves WAL bytes, and
 continues follow across migration. An active stream from a superseded namespace
