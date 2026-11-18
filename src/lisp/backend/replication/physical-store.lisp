@@ -356,7 +356,7 @@ external modification."
              (fsync-stream stream))))))
     (fsync-directory (physical-store-directory store))))
 
-(defun physical-store-compact (store cursor publish-restartpoint)
+(defun physical-store-compact (store cursor publish-restartpoint &key stage-archive)
   "Publish a durable restartpoint before advancing and cleaning the receive floor.
 
 Recovery callers pin an applied terminal under admission or owned quiescence.
@@ -365,38 +365,49 @@ restartpoint, then publish and read back the complete receive control tuple
 before handing off the local reference and deleting old segments. The callback
 must durably publish data; readback does not prove its fsync. Without immutable
 identity, an unrooted standalone store keeps the earlier behavior. Preserve
-unflushed writes and decoder state. Errors and nonlocal exits fence the store."
-  (with-physical-store (store)
-    (let ((finished nil))
-      (unwind-protect
-           (let ((digest (physical-store-prefix-digest-under-lock store cursor)))
-             (if (and (physical-store-retained-identity store)
-                      (> cursor (physical-store-floor-lsn store)))
-                 (physical-store-seal-and-select store cursor digest publish-restartpoint)
-                 (progn
-                   (when (and (physical-store-retained-root store)
-                              (> cursor (physical-store-floor-lsn store)))
-                     (error "receive compaction requires verified retained identity"))
-                   (funcall publish-restartpoint digest)
-                   (physical-store-test-point :after-restartpoint-publication store)
-                   (physical-store-save-control store (physical-store-flushed-lsn store)
-                                                :digest (physical-store-flushed-digest store)
-                                                :floor-lsn cursor :floor-digest digest)
-                   (sb-sys:without-interrupts
-                     (setf (physical-store-floor-lsn store) cursor
-                           (physical-store-floor-digest store) digest))))
-             (physical-store-test-point :after-floor-publication store)
-             (dolist (file (physical-store-history-segment-entries store))
-               (when (< (second file) (floor cursor +wal-segment-size+))
-                 (delete-file (third file))
-                 (physical-store-test-point :after-obsolete-segment-delete-each store)))
-             (physical-store-test-point :after-obsolete-segment-delete store)
-             (fsync-directory (physical-store-directory store))
-             (setf finished t)
-             cursor)
-        (sb-sys:without-interrupts
-          (physical-store-test-point :before-compaction-cleanup store)
-          (unless finished (setf (physical-store-failed-p store) t)))))))
+unflushed writes and decoder state. Receive proof and publication failures
+fence the store. STAGE-ARCHIVE runs under the store mutex before publication.
+An error signaled by that callback leaves the receive frontier unchanged and
+is reported after releasing the mutex."
+  (multiple-value-bind (result stage-error)
+      (with-physical-store (store)
+        (block publish
+          (let ((finished nil))
+            (unwind-protect
+                 (let ((digest (physical-store-prefix-digest-under-lock store cursor)))
+                   (when stage-archive
+                     (let ((failure (physical-store-stage-compaction-archive-under-lock store cursor stage-archive)))
+                       (when failure
+                         (setf finished t)
+                         (return-from publish (values nil failure)))))
+                   (if (and (physical-store-retained-identity store)
+                            (> cursor (physical-store-floor-lsn store)))
+                       (physical-store-seal-and-select store cursor digest publish-restartpoint)
+                       (progn
+                         (when (and (physical-store-retained-root store)
+                                    (> cursor (physical-store-floor-lsn store)))
+                           (error "receive compaction requires verified retained identity"))
+                         (funcall publish-restartpoint digest)
+                         (physical-store-test-point :after-restartpoint-publication store)
+                         (physical-store-save-control store (physical-store-flushed-lsn store)
+                                                      :digest (physical-store-flushed-digest store)
+                                                      :floor-lsn cursor :floor-digest digest)
+                         (sb-sys:without-interrupts
+                           (setf (physical-store-floor-lsn store) cursor
+                                 (physical-store-floor-digest store) digest))))
+                   (physical-store-test-point :after-floor-publication store)
+                   (dolist (file (physical-store-history-segment-entries store))
+                     (when (< (second file) (floor cursor +wal-segment-size+))
+                       (delete-file (third file))
+                       (physical-store-test-point :after-obsolete-segment-delete-each store)))
+                   (physical-store-test-point :after-obsolete-segment-delete store)
+                   (fsync-directory (physical-store-directory store))
+                   (setf finished t)
+                   cursor)
+              (sb-sys:without-interrupts
+                (physical-store-test-point :before-compaction-cleanup store)
+                (unless finished (setf (physical-store-failed-p store) t)))))))
+    (if stage-error (error stage-error) result)))
 
 (defun physical-store-close (store)
   "Release local ownership without converting unacknowledged writes into flush progress."

@@ -574,7 +574,31 @@
                                            reopened 1 0 fd #'check-directory)))
                           (ok (signals (pg::wal-archive-stage-source
                                         fd name second #'check-directory) 'error))
-                          (ok (equal facts (nth-value 1 (pg::wal-archive-read-source-bytes fd name))))))
+                          (ok (equal facts (nth-value 1 (pg::wal-archive-read-source-bytes fd name)))))
+                        (let ((cursor (* 2 boundary))
+                              (paths (mapcar #'third (pg::physical-store-history-segment-entries reopened)))
+                              (staged nil) (published nil))
+                          (ok (signals
+                               (pg::physical-store-compact
+                                reopened cursor (lambda (digest) (declare (ignore digest)) (setf published t))
+                                :stage-archive (lambda (&rest args) (declare (ignore args)) (error "staging failed")))
+                               'error))
+                          (ok (not published))
+                          (ok (zerop (pg::physical-store-floor-lsn reopened)))
+                          (ok (every #'probe-file paths))
+                          (pg::physical-store-compact
+                           reopened cursor
+                           (lambda (digest)
+                             (declare (ignore digest))
+                             (ok (equal (sort staged #'<) '(0 1)))
+                             (ok (every #'probe-file paths)))
+                           :stage-archive
+                           (lambda (timeline segment bytes)
+                             (pg::wal-archive-stage-source fd (pg::wal-segment-filename segment timeline :timeline)
+                                                           bytes #'check-directory)
+                             (push segment staged)))
+                          (ok (notany #'probe-file paths))
+                          (ok (equalp first (pg::wal-archive-read-source-bytes fd name)))))
                    (sb-posix:close fd)))
             (pg::physical-store-close reopened))))))
 
