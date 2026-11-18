@@ -1,5 +1,10 @@
 # Development TODO
 
+- [ ] Close out the PostgreSQL backend and pinned Patroni comparison using the
+  [scope check](PHYSICAL-HA.md#scope-check-after-native-rewind-page-reuse).
+  Reconcile the acceptance inventory, implement the archive producer, and
+  qualify or document the supported rewind topology and interruption behavior.
+
 - [ ] Bind retained-root deletion to checked archive and host identities before
   permitting deletion after continuation restoration. The fence assumes the
   fixed `PGDATA/pg_physical_retained/` parent. A separate bind-mount alias can

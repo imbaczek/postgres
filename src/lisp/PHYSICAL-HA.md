@@ -3,7 +3,7 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-## Scope check after capture-resume qualification
+## Scope check after native rewind page reuse
 
 Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and
 C-to-Lisp. The mixed-engine tests use logical replication. Native physical
@@ -30,14 +30,48 @@ With no checkpoint hint, stock Patroni checks the source timeline through SQL
 and completes rewind and rejoin. The fixture uses distinct connection settings
 with the same login. Offline configuration queries report `archive_mode` and
 `archive_command`. Server-side WAL archiving remains open.
-C `pg_rewind` uses the target WAL to identify changed pages. Native rewind
-reuses whole matching relation files. C physical WAL and disk interoperability
-are outside the verified behavior.
+C `pg_rewind` maps pages changed on the target and relies on recovery to replay
+subsequent source changes. Native rewind reuses whole matching relation files.
+When discovery proves the fork, it also offers up to 256 candidate pages across
+native relation files. The target WAL scan drops changed pages from the offers.
+The source checks each offered page against the sealed source bytes, and the
+target verifies the entire reconstructed file before installation. The live
+fixture confirms that target-changed pages are absent from the offers and that
+the reconstructed relation matches a full replay byte for byte. Page offers
+require sender and receiver builds that support the extension.
 
-The goal covers backend behavior against the original C implementation and
-pinned Patroni. Coordinated leader election, automatic failover, and blue-green
-orchestration remain separate work. The milestone tests establish the backend
-paths used by those workflows under the tested conditions.
+The native lifecycle now has acceptance for physical bootstrap and streaming,
+standby restart, promotion, and rejoin of a former writer. The synchronous
+durability tests include independent client acknowledgments and cold recovery
+of the credited native replicas while the source stays down. Pinned Patroni
+acceptance covers individual backend calls, replica clone and cancellation, and
+the supplied-leader rejoin sequence. The call inventory below is historical and
+still needs reconciliation against the equivalent C behavior and the tests added
+since that inventory.
+
+The page-reuse fixture took 49.71 s. The partial-capture rehearsal took 256.83 s
+and rejoined after killing both initial capture and the first repair. Strict
+compilation and three focused test heads took 58.23 s. These are milestone
+timings for distinct workloads. They give no before-and-after speed comparison.
+
+Three items remain for backend closeout.
+
+1. Define and exercise the supported bootstrap-through-rejoin contract for
+   stock Patroni 4.1.5. Include generated configuration, utility invocation,
+   connection recovery, and the supported slot and synchronous settings. Keep
+   leadership supplied by the harness.
+2. Add a server-side archive producer and qualify publish, retry and restart
+   behavior against C. Reading archives and reporting settings exercise only
+   the consumer and inspection paths.
+3. Expand native rewind beyond the qualified immediate-child topology, or
+   record that limit in the supported contract. C can find a common ancestor
+   further back in the timeline histories. Also decide how to handle torn local
+   prefixes and qualify the remaining interruption cases in the supported path.
+
+C physical WAL and disk compatibility would require format and replay work
+separate from matching C behavior. The mixed-engine switchovers establish
+logical interoperability. Coordinated leader election, automatic failover,
+and blue-green orchestration remain outside this goal.
 
 ## Physical sender shutdown
 
