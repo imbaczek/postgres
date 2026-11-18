@@ -39,15 +39,48 @@
                (wal-invalid-input "qualified WAL alias belongs to another inode: ~a" new))
           collect (list old new old-stat new-stat))))
 
+(declaim (ftype function wal-encode-archive-segment-proof wal-verify-archive-segment-proof))
+
+(defun wal-namespace-proof-path (segment-path)
+  (merge-pathnames (wal-archive-segment-proof-name (file-namestring segment-path)) segment-path))
+
+(defun wal-namespace-stage-qualified-proof (old new)
+  "Bind an existing closed legacy proof to the qualified name before control switches."
+  (let* ((segment (nth-value 1 (wal-parse-segment-name (pathname-name old) :legacy)))
+         (old-proof (wal-namespace-proof-path old))
+         (new-proof (wal-namespace-proof-path new)))
+    (unless (and (wal-archive-ready-segment-p segment)
+                 (wal-namespace-file-stat old-proof t))
+      (when (wal-namespace-file-stat new-proof t)
+        (error "qualified WAL proof lacks a closed legacy source: ~a" new-proof))
+      (return-from wal-namespace-stage-qualified-proof nil))
+    (let* ((bytes (read-bounded-regular-file old +wal-segment-size+))
+           (system-id (catalog-system-identifier))
+           (proof (read-bounded-regular-file old-proof +wal-archive-segment-proof-size+))
+           (end (wal-verify-archive-segment-proof proof system-id 1 segment :legacy bytes)))
+      (sb-sys:without-interrupts
+        (let ((fd (wal-archive-open-wal-directory)))
+          (unwind-protect
+               (wal-archive-stage-source
+                fd (file-namestring new-proof)
+                (wal-encode-archive-segment-proof system-id 1 segment :timeline end bytes)
+                #'wal-archive-check-wal-directory)
+            (sb-posix:close fd)))))))
+
 (defun wal-namespace-remove-inactive-alias (entry inactive)
   "Recheck both inode identities, and reject any attempt to remove the active name."
   (destructuring-bind (old new expected new-stat) entry
     (declare (ignore new-stat))
-    (unless (equal inactive (ecase *wal-segment-namespace* (:legacy new) (:timeline old)))
-      (error "cannot remove an active WAL namespace alias"))
+    (unless (equal inactive (if (eq *wal-segment-namespace* :legacy) new old))
+      (error "refusing to remove active WAL namespace name"))
     (unless (and (wal-namespace-same-inode-p expected (wal-namespace-file-stat old))
                  (wal-namespace-same-inode-p expected (wal-namespace-file-stat new)))
       (error "WAL namespace alias changed before inactive cleanup"))
+    (let ((proof (wal-namespace-proof-path inactive)))
+      (when (wal-namespace-file-stat proof t)
+        (sb-posix:unlink (namestring proof))))
+    ;; A previous attempt may have unlinked the proof without syncing.
+    (fsync-directory (wal-directory))
     (sb-posix:unlink (namestring inactive))))
 
 (defun wal-reconcile-namespace-at-startup ()
@@ -92,6 +125,8 @@ uncertain publication fences WAL."
                  (unless new-stat (sb-posix:link (namestring old) (namestring new)))
                  (wal-namespace-test-point :after-link)))
              (fsync-directory (wal-directory))
+             (dolist (entry plan)
+               (wal-namespace-stage-qualified-proof (first entry) (second entry)))
              (wal-namespace-test-point :after-links-sync)
              (let ((*wal-segment-namespace* :timeline))
                (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*))
