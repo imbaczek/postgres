@@ -5,18 +5,25 @@ in [TODO.md](TODO.md).
 
 ## Goal closeout check
 
-The goal covers native physical HA and the PostgreSQL backend behavior used
-by pinned Patroni 4.1.5. The test supplies the leader. Election, fencing,
-automatic failover, and blue-green orchestration are future work. Native
-physical WAL and storage use Lisp formats. The Lisp-to-C and C-to-Lisp
-writer switchovers use logical replication.
+### What the milestone demonstrated
 
-Native tests exercise clone, continuous physical follow, restart, promotion,
-rewind, and former-primary rejoin. A separate crash fixture verifies
-synchronous durability from a client acknowledgment ledger. The stock Patroni
-lifecycle fixture drives clone through rejoin using a supplied leader. Stock
-Patroni monitoring, synchronous candidate selection, recovery configuration,
-and stock post-bootstrap role provisioning also have direct acceptance tests.
+| Goal | Evidence and limits |
+| --- | --- |
+| Native physical HA | Native tests exercised clone, continuous follow, standby restart, promotion, rewind, and former-primary rejoin. The archive-to-stream test checked the exact continuation LSN after a timeline fork. Native nodes use Lisp WAL and storage formats. |
+| Synchronous durability | The crash fixture kept a separate client acknowledgment ledger and opened the credited replicas cold while the source stayed down. The supplied-leader Patroni run also exercised writes with `remote_apply`. The evidence covers the tested process crashes and acknowledgment modes. |
+| Patroni backend behavior | Stock Patroni 4.1.5 drove the supplied-leader SCRAM lifecycle and used a dedicated rewind login. Focused runs covered monitoring, synchronous candidate selection, recovery configuration, slot handling, and post-bootstrap role provisioning. The full `pg_stat_replication` view remains absent. Patroni's tested queries use the underlying functions. |
+| Manual writer switchovers | Lisp-to-Lisp, Lisp-to-C, and C-to-Lisp passed. The mixed-engine switchovers use logical replication. |
+| Coordination | The fixtures supply the leader. DCS integration, election, fencing, automatic failover, and blue-green orchestration remain follow-up work. |
+
+The four physical regression shards covered all 3,226 registered tests. The
+original test revision reported 14 failures. Each passed in a focused rerun
+after test corrections, with the last two cold-recovery checks passing in
+56.36 s. The longest shard took 11,128.47 s. The shard runs and focused
+reruns used ramdisk storage. Reseed cases dominated the long gaps in the
+reports, and each cold crash fixture also launched a fresh Lisp image. There
+is no comparable before-and-after measurement for the full suite.
+
+### Scope and acceptance details
 
 The final backend checks cover two areas.
 
