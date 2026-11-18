@@ -26,8 +26,9 @@ Three areas still separate this evidence from closeout:
    The standby sends data feedback with or without a named physical slot.
    Ordinary VACUUM and index builds use that horizon, and SQL reports the
    slot's value as `xmin`. A new forced XID rollover waits for older feedback
-   horizons. Catalog feedback and legacy rollover recovery still need
-   acceptance, as do Patroni's logical slot readiness and slot copy path.
+   horizons. Cold startup rejects horizons it cannot verify across a
+   checkpoint. Catalog feedback and Patroni's logical slot readiness and
+   slot copy path still need acceptance.
 2. Exercise password-backed bootstrap and post-bootstrap role provisioning
    through stock Patroni.
 3. Qualify archive recovery with a configured streaming source across a
@@ -5193,13 +5194,17 @@ Cold primary startup also checks restored slot horizons after WAL redo and
 before admitting clients. A replayed reset establishes the CLOG boundary,
 and a next XID past the start of an epoch proves that epoch has begun. An
 old checkpoint taken exactly at the first XID of an epoch can hide the reset
-record. In that case startup can reject feedback from earlier epochs but
-cannot distinguish an already-reset previous epoch from one waiting to wrap.
-The preceding epoch's pin still defers a fresh reset.
+record. If the checkpoint shows an old XID still active, it predates the reset.
+Without such evidence, startup refuses to admit clients with a preceding-epoch
+pin. This also refuses a clean restart if an uncompleted rollover was
+checkpointed at the boundary with no old XID active.
 
 The live CLOG fail-stop regression passed in 23.73 s on the ramdisk, including
 a crash after durable reset WAL and before CLOG replacement. Focused Rove
 tests separately covered the replayed boundary and startup's slot checks.
+The expanded regression passed in 27.81 s on the ramdisk. It verified cold
+startup refusal with an old catalog horizon and a checkpoint at the boundary,
+both with and without a completed reset before the checkpoint.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
