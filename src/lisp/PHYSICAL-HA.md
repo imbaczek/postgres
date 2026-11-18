@@ -26,9 +26,11 @@ Two areas still separate this evidence from closeout:
    The standby sends data feedback with or without a named physical slot.
    Ordinary VACUUM and index builds use that horizon, and SQL reports the
    slot's value as `xmin`. A new forced XID rollover waits for older feedback
-   horizons. Cold startup rejects horizons it cannot verify across a
-   checkpoint. Catalog feedback and Patroni's logical slot readiness and
-   slot copy path still need acceptance.
+     horizons. Cold startup rejects horizons it cannot verify across a
+     checkpoint. Stock Patroni copies logical slots, checks readiness, and
+     advances the standby's confirmed position. A consumer continued across
+     promotion and resumed after the promoted primary restarted. Finite WAL
+     caps and independent catalog horizon advancement still need qualification.
 2. Qualify archive recovery with a configured streaming source across a
    timeline fork, and settle archive backlog and cleanup behavior. State the
    tested rewind topology and interruption limits in the supported lifecycle
@@ -5149,8 +5151,8 @@ physical image, including catalog and WAL credential data. The SQL file grants
 keep their limited file scope. Lease operations still require the exact lease
 request and token. The fixture supplies the leader and runs no coordinator.
 
-Patroni-managed logical-slot synchronization remains open, including catalog
-feedback, slot readiness and the slot-copy path.
+Patroni-managed logical-slot copy, readiness, advancement, and promotion
+handoff have supplied-leader acceptance with a moving logical consumer.
 
 The C fixture `t/interop/hot-standby-feedback-reference.py` takes a C binary
 directory and two ports. Run it with the pinned Patroni Python environment.
@@ -5162,8 +5164,39 @@ clears only `catalog_xmin`.
 
 C computes the two horizons in `GetReplicationHorizons` and applies them in
 `PhysicalReplicationSlotNewXmin`. Patroni uses the retained catalog horizon
-to assess slot readiness. Native SQL reports a physical slot's data `xmin`
-and returns NULL for `catalog_xmin`. Patroni's slot-copy path remains open.
+to assess slot readiness. Native SQL reports both horizons. The native standby
+includes a usable logical slot's catalog pin when applied replay covers the
+slot's positions. The live Patroni follow fixture supplies a replay-covered
+slot entry through the control REPL and checks that the upstream physical slot
+publishes and clears its catalog horizon independently of the data horizon.
+This verifies the feedback transport. The stock copy query can read the
+exact durable state for a registered logical slot on the primary. The
+one-argument `pg_read_binary_file` accepts this path for superusers and
+logins with native rewind authority. The ordinary rewind file grants alone
+leave the slot file private. The Patroni follow fixture checked the copy
+query, byte equality with the persisted image, and both permission cases on
+the ramdisk in 75.98 s, including the rest of the follow fixture.
+
+Streaming startup defers slot files that are ahead of replay. It verifies
+their source identity, logical policy, transaction epoch, and retained WAL
+anchors before publishing them. A slot created before the standby's base
+qualifies once its restart has advanced into retained WAL and the replayed
+logical ON interval matches its recorded origin. Promotion binds the exact
+slot files to the frozen fork and retained parent WAL before publishing child
+control. Checkpoints preserve the evidence reference for cold startup.
+
+`t/interop/patroni-follow.py --logical-slot-copy` exercises stock Patroni
+4.1.5 and psycopg2 with a supplied leader. The fixture begins with a lagged
+standby and an acknowledgment inside a pgoutput commit record. It verifies
+standby catch-up, readiness, and subsequent advancement by Patroni's worker.
+After promotion the consumer skips the acknowledged transaction, reads a
+parent transaction and a child transaction, and resumes after a clean
+restart. `--logical-slot-before-base` verifies the same sequence for a slot
+created before the standby base. The latest pre-base run used a dedicated
+`NATIVE_REWIND` login under local trust and took 38.90 s on the ramdisk. The
+earlier post-base run took 23.07 s. Ordinary follow and promotion took 80.45 s.
+The psycopg3 fallback, finite WAL caps, and independent catalog horizon
+advancement remain open.
 
 Six focused physical-slot tests passed in 36 ms of Rove execution, covering
 image round trips, checksum rejection, file dispatch, and startup. The full
