@@ -1722,8 +1722,8 @@ Capture the floor and its timeline together before running the restore shell."
                 (physical-restore-cleanup-stages-at-startup fd))
            (sb-posix:close fd)))))))
 
-(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace &optional partial)
-  "Fetch one proved extent through a private directory pinned under pg_wal."
+(defun call-with-physical-follow-restore-stage (runtime function)
+  "Pass a pinned private restore directory and its checks to FUNCTION."
   (let ((parent nil) (fd nil) (name nil) (facts nil))
     (unwind-protect
          (progn
@@ -1749,15 +1749,50 @@ Capture the floor and its timeline together before running the restore shell."
                       (wal-archive-check-private-child parent name fd)))
              (physical-follow-authorize-receiver runtime)
              (check)
-             (wal-restore-proved-segment command fd system-id timeline segment namespace
-                                         :working-directory *pgdata* :check #'check :partial partial
-                                         :cancel-check #'cancel-check
-                                         :restart-file (physical-follow-archive-restart-file runtime namespace))))
+             (funcall function fd #'check #'cancel-check)))
       (unwind-protect
            (when facts
              (physical-backup-remove-stage-tree parent name :mount (ninth facts) :expected facts))
         (when fd (sb-posix:close fd))
         (when parent (sb-posix:close parent))))))
+
+(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace &optional partial)
+  "Fetch one proved extent through a private directory pinned under pg_wal."
+  (call-with-physical-follow-restore-stage
+   runtime
+   (lambda (fd check cancel-check)
+     (wal-restore-proved-segment command fd system-id timeline segment namespace
+                                 :working-directory *pgdata* :check check :partial partial
+                                 :cancel-check cancel-check
+                                 :restart-file (physical-follow-archive-restart-file runtime namespace)))))
+
+(defun physical-follow-fetch-archive-history (runtime command timeline)
+  "Fetch bounded history bytes without publishing them or choosing a branch."
+  (call-with-physical-follow-restore-stage
+   runtime
+   (lambda (fd check cancel-check)
+     ;; C disables archive cleanup when probing history.
+     (wal-restore-archive-file command (timeline-history-filename timeline) fd 0 +timeline-history-max-bytes+
+                               *pgdata* check cancel-check "000000000000000000000000.wal"))))
+
+(defun physical-follow-find-archive-history (runtime command local-history cursor)
+  "Return the newest consecutive archive history if it extends durable receipt.
+Selection still requires WAL transition evidence and durable publication."
+  (timeline-check-lineage local-history)
+  (let ((parent (timeline-history-entry-timeline (first local-history)))
+        (latest nil) (latest-bytes nil))
+    (loop for timeline from (1+ parent) to #xffffffff
+          for bytes = (physical-follow-fetch-archive-history runtime command timeline)
+          while bytes
+          do (setf latest timeline latest-bytes bytes))
+    (when latest
+      (let* ((text (bytes->string latest-bytes))
+             (history (timeline-check-lineage (timeline-parse-history latest text)))
+             (ancestor (find parent history :key #'timeline-history-entry-timeline)))
+        (when (and (physical-store-history-extends-p local-history history)
+                   ancestor (timeline-history-entry-end ancestor)
+                   (<= cursor (timeline-history-entry-end ancestor)))
+          (values history text))))))
 
 (defun physical-follow-restore-next (runtime command cursor)
   (let* ((timeline (physical-follow-runtime-receive-timeline runtime))

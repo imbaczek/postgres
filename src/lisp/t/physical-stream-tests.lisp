@@ -912,6 +912,45 @@
                                                       :restart-file "%r"))))
           (pg::physical-store-close store)))))
 
+(deftest archive-history-discovery-checks-ancestry-and-durable-cursor
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (store (pg::physical-store-open root 123 1 :create t))
+             (pg::*physical-receive-store* store)
+             (pg::*physical-recovery-state* (list :system-id 123 :timeline 1 :end 0))
+             (pg::*physical-recovery-failed-p* nil)
+             (pg::*shutdown* pg::+no-shutdown+)
+             (runtime (pg::make-physical-follow-runtime))
+             (archive (merge-pathnames "archive/" root))
+             (local (pg::timeline-parse-history 1 ""))
+             (command (concatenate 'string "test \"%r\" = 000000000000000000000000.wal && "
+                                   "test -f \"archive/%f\" && cp -- \"archive/%f\" \"%p\"")))
+        (unwind-protect
+             (progn
+               (pg::wal-ensure-directory-durable (pg::wal-directory))
+               (pg::wal-ensure-directory-durable archive)
+               (flet ((publish (timeline text)
+                        (pg::wal-atomic-write-bytes
+                         (merge-pathnames (pg::timeline-history-filename timeline) archive)
+                         (pg::string->bytes text)))
+                      (discover (cursor)
+                        (let ((history (pg::physical-follow-find-archive-history runtime command local cursor)))
+                          (when history (pg::timeline-history-entry-timeline (first history))))))
+                 (ok (null (discover 32)))
+                 (publish 2 (format nil "1 0/20 first fork~%"))
+                 (publish 4 (format nil "1 0/20 first fork~%2 0/80 later fork~%"))
+                 (ok (eql 2 (discover 32)))
+                 (ok (null (discover 33)))
+                 (delete-file (merge-pathnames (pg::timeline-history-filename 4) archive))
+                 (publish 3 (format nil "1 0/10 divergent fork~%"))
+                 (ok (null (discover 32)))
+                 (publish 4 (format nil "1 0/20 first fork~%2 0/80 later fork~%"))
+                 (ok (eql 4 (discover 32)))
+                 (publish 3 "")
+                 (ok (eql 4 (discover 32))))
+               (ok (null (pg::directory-entry-names (pg::wal-directory)))))
+          (pg::physical-store-close store)))))
+
 (deftest native-receiver-restores-partial-only-at-bound-fork
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)

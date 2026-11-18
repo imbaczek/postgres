@@ -189,6 +189,8 @@ before applying EOR. This check grants neither recovery completion nor writer ad
 (defun timeline-history-path (timeline directory)
   (pgdata-resolve-path (concatenate 'string "pg_wal/" (timeline-history-filename timeline)) directory))
 
+(defconstant +timeline-history-max-bytes+ (* 16 1024 1024))
+
 (defun timeline-encode-history (child parent switchpoint reason parent-bytes)
   "Copy parent bytes and append C writeTimeLineHistory's exact split-line layout.
 Native ancestry requires the parent history and a forward fork; no role is changed."
@@ -212,7 +214,7 @@ Native ancestry requires the parent history and a forward fork; no role is chang
     (let ((bytes (concatenate '(vector (unsigned-byte 8))
                               (or parent-bytes #())
                               (if parent-bytes #(10) #()) line)))
-      (unless (<= (length bytes) (* 16 1024 1024))
+      (unless (<= (length bytes) +timeline-history-max-bytes+)
         (error "timeline history exceeds readable size"))
       bytes)))
 
@@ -227,7 +229,7 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (let* ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
          (length (sb-posix:stat-size stat)))
     (unless (and (= sb-posix:s-ifreg (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
-                 (<= 0 length (* 16 1024 1024)))
+                 (<= 0 length +timeline-history-max-bytes+))
       (ereport "58030" "invalid or oversized timeline history file"))
     (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
       (unless (= length (read-sequence bytes stream))
