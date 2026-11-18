@@ -13,13 +13,16 @@ Pinned Patroni 4.1.5 has exercised real writer probes, follow and promote
 methods, and scheduled offline recovery of a dirty former primary with a
 leader supplied by the test. The recovered primary was rewound and rejoined as
 a standby. Native `pg_rewind --resume` has recovered from process crashes
-before the first capture, after a complete capture, and during install, follow
-configuration, and retirement.
+before the first capture, during receipt and repair of a READY image, and during
+install, follow configuration, and retirement.
 
-A transfer interrupted after the source records READY can still leave an
-incomplete target image. Resuming that case requires the source to retain and
-serve the exact image. Other remaining checks include retrieving missing target
-WAL from an archive and covering the remaining stock Patroni rewind queries.
+The source retains and replays the exact READY image. The target checks every
+existing file prefix against a verified replay before appending missing bytes.
+The crash rehearsal killed both the initial receive and the first repair. A
+killed repair can leave a private replay workspace. Recovery requires any
+surviving prefix to match the image, so a torn write can require manual repair.
+Remaining work includes retrieving missing target WAL from an archive and
+covering the remaining stock Patroni rewind queries.
 C `pg_rewind` uses the target WAL to identify changed pages. Native rewind
 reuses whole matching relation files. C physical WAL and disk interoperability
 are outside the verified behavior.

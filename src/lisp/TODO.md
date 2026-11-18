@@ -940,12 +940,13 @@
    Patroni test arms divergence checking on the running primary and schedules
    offline recovery after a crash with a leader present, then rewinds and
    rejoins. A copied recovery base drops the source's local qualification.
-   Native `pg_rewind --resume` passes process crashes before the first capture,
-   after a complete capture, and during journaled install, follow configuration,
-   and retirement. Resuming a partial capture from a READY source and retrieving
-   missing target WAL from an archive remain open. C pg_rewind builds a
-   changed-page map from target WAL. Native rewind reuses whole matching
-   relation files.
+   Native `pg_rewind --resume` passes process crashes before capture, during
+   receipt and repair of a READY image, and during journaled install, follow
+   configuration, and retirement. The interrupted-receive test retains the
+   original stage and file inodes across both kills. A killed repair can leave
+   a private replay workspace. Missing target WAL still needs archive
+   retrieval. C pg_rewind builds a changed-page map from target WAL. Native
+   rewind reuses whole matching relation files.
   Coordination stays outside this backend work.
 
 - [x] Keep ready native physical senders through the primary shutdown checkpoint.
