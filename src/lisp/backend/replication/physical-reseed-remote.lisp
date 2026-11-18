@@ -234,6 +234,8 @@ Bind capture to the accepted source observed during discovery."
      :helper helper)))
 
 (defun physical-rewind-replay-into-stage (owner record client fd scratch-fd)
+  ;; Verify the replayed image, source lease, and rewind origin before changing
+  ;; the stage. Check every existing prefix before beginning the append pass.
   (call-with-physical-backup-image-directory
    scratch-fd
    (lambda (scratch)
@@ -267,6 +269,8 @@ Bind capture to the accepted source observed during discovery."
          (name (car (last (pathname-directory scratch))))
          (parent-fd (physical-backup-open-directory parent))
          (created nil))
+    ;; Cleanup runs on ordinary unwinding. A killed process can leave the
+    ;; scratch tree behind, so the next attempt uses a fresh directory.
     (unwind-protect
          (progn
            (sb-sys:without-interrupts

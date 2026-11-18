@@ -169,6 +169,8 @@
              (decf remaining count))
     (physical-rewind-check-file-observation source-fd source-parent source-name sealed)
     (physical-rewind-check-file-observation target-fd parent name partial)
+    ;; Extend the matched prefix through the original inode. Recheck that
+    ;; identity after syncing.
     (when (and append (< length size))
       (unless (file-position output length) (error "cannot seek to rewind receive file end"))
       (loop with remaining = (- size length)
