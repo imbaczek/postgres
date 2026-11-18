@@ -540,6 +540,10 @@ class RewindCliAcceptance(RewindInstallAcceptance):
 class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
     label = "rewind-cli-capture-resume"
     capture_hook = "native-patroni-rewind-crash-after-capture"
+    captured = True
+
+    def retained_rewind_stages(self):
+        return list(self.server.data.parent.glob(".pg-native-backups-*/rewind.*"))
 
     def execute_rewind(self, target, conninfo):
         env = dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper)
@@ -550,15 +554,34 @@ class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
             timeout=240, env=env, expected=-signal.SIGKILL)
         assert (target / "physical-reseed.attempt").is_file()
         assert not (target / "physical-reseed.install").exists()
+        retained = self.retained_rewind_stages()
+        if self.captured:
+            stage, = retained
+            assert stat.S_IMODE(stage.stat().st_mode) == 0o700
+            seal = stage / "rewind.seal"
+            assert stat.S_IMODE(seal.stat().st_mode) == 0o600
+            stage_inode = stage.stat().st_ino
+            seal_inode = seal.stat().st_ino
+            self.stop()
+            orphan = stage.parent / "rewind.orphan_probe"
+            orphan.mkdir(mode=0o700)
+            self.start()
+            assert self.retained_rewind_stages() == retained
+            assert not orphan.exists()
+            assert stage.stat().st_ino == stage_inode and seal.stat().st_ino == seal_inode
+        else:
+            assert not retained
         _, resumed = self.process("rewind-capture-resume", [
             str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target), "--resume"],
             timeout=900, env=env)
+        assert not self.retained_rewind_stages()
         return resumed
 
 
 class RewindFirstCaptureCliAcceptance(RewindCaptureResumeCliAcceptance):
     label = "rewind-cli-first-capture"
     capture_hook = "native-patroni-rewind-crash-before-capture"
+    captured = False
 
 
 class RewindResumeCliAcceptance(RewindCliAcceptance):
