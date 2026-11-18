@@ -16,6 +16,19 @@
         (setf (aref proof 0) (logxor (aref proof 0) 1))
         (rove:ok (null (scram-verify-client-proof stored server message proof))))))
 
+(rove:deftest role-scram-verifiers-use-random-salt-and-postgresql-password-normalization
+    (let* ((password (format nil "I~cX" (code-char #xad)))
+           (verifier (scram-build-role-verifier password))
+           (second-verifier (scram-build-role-verifier password)))
+      (destructuring-bind (salt iterations stored server) verifier
+        (rove:ok (not (equalp salt (first second-verifier))))
+        (multiple-value-bind (expected-stored expected-server)
+            (scram-derive-keys (string->bytes "IX") salt iterations)
+          (rove:ok (equalp stored expected-stored))
+          (rove:ok (equalp server expected-server)))))
+  (rove:ok (null (scram-build-role-verifier "")))
+  (rove:ok (rove:signals (scram-build-role-verifier (string (code-char 0))) 'pg-error)))
+
 (rove:deftest scram-wire-rejects-invalid-input
     (rove:ok (null (scram-decode-proof (make-string 44 :initial-element (code-char 233)))))
   (multiple-value-bind (bare nonce binding) (scram-parse-client-first "y,,n=,r=test")

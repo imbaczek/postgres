@@ -27,19 +27,95 @@
         (error "could not encode SCRAM bytes")))
     (bytes->string output :end size)))
 
+(defun scram-decode64 (text size)
+  "Decode a canonically padded base64 field of an expected size."
+  (let ((encoded-size (* 4 (ceiling size 3))))
+    (when (and (= encoded-size (length text))
+               (every (lambda (character) (< (char-code character) 128)) text))
+      (ensure-scram-crypto)
+      (let ((input (string->bytes text))
+            (output (make-array (* 3 (ceiling size 3)) :element-type '(unsigned-byte 8))))
+        (sb-sys:with-pinned-objects (input output)
+          (when (= (length output)
+                   (scram-crypto-decode64
+                    (sb-sys:vector-sap output) (sb-sys:vector-sap input) encoded-size))
+            (let ((decoded (subseq output 0 size)))
+              (when (string= text (scram-encode64 decoded)) decoded))))))))
+
 (defun scram-decode-proof (text)
-  (unless (= 44 (length text))
-    (return-from scram-decode-proof nil))
-  (ensure-scram-crypto)
-  (let ((input (string->bytes text))
-        (output (make-array 33 :element-type '(unsigned-byte 8))))
-    (unless (= 44 (length input))
-      (return-from scram-decode-proof nil))
-    (sb-sys:with-pinned-objects (input output)
-      (when (= 33 (scram-crypto-decode64
-                   (sb-sys:vector-sap output) (sb-sys:vector-sap input) (length input)))
-        (let ((proof (subseq output 0 +scram-key-bytes+)))
-          (when (string= text (scram-encode64 proof)) proof))))))
+  (scram-decode64 text +scram-key-bytes+))
+
+(defvar *scram-libpq-loaded-p* nil)
+
+(sb-alien:define-alien-routine ("PQconnectStart" scram-pq-connect-start) sb-alien:system-area-pointer
+  (connection-options sb-alien:c-string))
+
+(sb-alien:define-alien-routine ("PQencryptPasswordConn" scram-pq-encrypt-password) sb-alien:system-area-pointer
+  (connection sb-alien:system-area-pointer)
+  (password sb-alien:system-area-pointer)
+  (user sb-alien:c-string)
+  (algorithm sb-alien:c-string))
+
+(sb-alien:define-alien-routine ("PQfinish" scram-pq-finish) sb-alien:void
+  (connection sb-alien:system-area-pointer))
+
+(sb-alien:define-alien-routine ("PQfreemem" scram-pq-free) sb-alien:void
+  (pointer sb-alien:system-area-pointer))
+
+(defun ensure-scram-libpq ()
+  (sb-thread:with-mutex (*scram-crypto-lock*)
+    (unless *scram-libpq-loaded-p*
+      (sb-alien:load-shared-object "libpq.so.5")
+      (setf *scram-libpq-loaded-p* t))))
+
+(defun scram-decode-libpq-verifier (text)
+  (let ((fields (uiop:split-string text :separator "$:")))
+    (when (= 5 (length fields))
+      (destructuring-bind (method rounds salt stored server) fields
+        (when (and (string= method "SCRAM-SHA-256")
+                   (<= 1 (length rounds) 10) (every #'digit-char-p rounds))
+          (let ((iterations (parse-integer rounds))
+                (salt-bytes (scram-decode64 salt 16))
+                (stored-key (scram-decode-proof stored))
+                (server-key (scram-decode-proof server)))
+            (when (and (<= 1 iterations #x7fffffff) salt-bytes stored-key server-key)
+              (list salt-bytes iterations stored-key server-key))))))))
+
+(defun scram-read-libpq-verifier (pointer)
+  (let ((text (make-string 256)))
+    (unwind-protect
+         (loop for index below (length text)
+               for byte = (sb-sys:sap-ref-8 pointer index)
+               when (zerop byte)
+                 do (return (scram-decode-libpq-verifier (subseq text 0 index)))
+               do (setf (char text index) (code-char byte)))
+      (fill text #\Space))))
+
+(defun scram-build-role-verifier (password)
+  "Use libpq's PostgreSQL password normalization and random salt without connecting."
+  (when (zerop (length password))
+    (return-from scram-build-role-verifier nil))
+  (when (find (code-char 0) password)
+    (ereport "22023" "role password contains a zero byte"))
+  (ensure-scram-libpq)
+  (let ((bytes (sb-ext:string-to-octets password :external-format :utf-8 :null-terminate t))
+        (connection (sb-sys:int-sap 0))
+        (secret (sb-sys:int-sap 0)))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             ;; An unknown connection option gives libpq a handle without opening a socket.
+             (setf connection (scram-pq-connect-start "pg_lisp_offline=true"))
+             (unless (zerop (sb-sys:sap-int connection))
+               (sb-sys:with-pinned-objects (bytes)
+                 (setf secret (scram-pq-encrypt-password connection (sb-sys:vector-sap bytes)
+                                                         "" "scram-sha-256"))))
+             (or (and (not (zerop (sb-sys:sap-int secret)))
+                      (scram-read-libpq-verifier secret))
+                 (error "could not generate role SCRAM verifier")))
+        (fill bytes 0)
+        (unless (zerop (sb-sys:sap-int secret)) (scram-pq-free secret))
+        (unless (zerop (sb-sys:sap-int connection)) (scram-pq-finish connection))))))
 
 (defun scram-random-nonce ()
   (ensure-scram-crypto)
