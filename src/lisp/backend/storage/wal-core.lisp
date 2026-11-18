@@ -4160,9 +4160,16 @@ release their claims to the retained WAL."
 (defun wal-archive-partial-item-p (item)
   (and (consp item) (eq (car item) :partial)))
 
+(declaim (ftype function wal-archive-segment-proof-name wal-archive-primary-proof-matches-p))
+
+(defun wal-archive-proof-item-p (item)
+  (and (consp item) (eq (car item) :proof)))
+
 (defun wal-archive-item-name (item)
   "Name a selected history, partial, or current timeline segment."
   (cond ((wal-archive-partial-item-p item) (second item))
+        ((wal-archive-proof-item-p item)
+         (wal-archive-segment-proof-name (wal-archive-item-name (cdr item))))
         ((consp item) (timeline-history-filename (cdr item)))
         (t (wal-segment-filename item *wal-insert-timeline* *wal-segment-namespace*))))
 
@@ -4172,6 +4179,8 @@ Apply the durable, closed segment checks to WAL segments."
   (cond ((wal-archive-partial-item-p item)
          (and (wal-archive-primary-ready-p)
               (member item (wal-archive-partial-items) :test #'equal)))
+        ((wal-archive-proof-item-p item)
+         (and (wal-archive-primary-ready-p) (wal-archive-ready-segment-p (cdr item))))
         ((consp item)
          (and (wal-archive-primary-ready-p)
               (member item (wal-archive-history-items) :test #'equal)))
@@ -4418,12 +4427,19 @@ When SYNC is true, sync the receipt and directory. Recheck both named files."
                       (equal source (wal-archive-check-source wal-fd name source-fd)))))))
       (if stream (close stream) (sb-posix:close fd)))))
 
+(declaim (ftype function wal-archive-staged-segment-done-p))
+
+(defun wal-archive-proof-present-p (wal-fd name)
+  (wal-namespace-file-stat
+   (merge-pathnames name (physical-image-fd-path wal-fd)) t))
+
 (defun wal-archive-recycle-segment (segment)
   "Under the WAL lock, unlink a segment only after its completion receipt matches.
 Keep the descriptors open through unlink and sync the WAL directory."
   (when (wal-archive-ready-segment-p segment)
-    (let ((name (file-namestring (wal-segment-path segment)))
-          (wal-fd nil) (status-fd nil) (source-fd nil))
+    (let* ((name (file-namestring (wal-segment-path segment)))
+           (proof-name (wal-archive-segment-proof-name name))
+           (proof-fd nil) (proof-facts nil) (wal-fd nil) (status-fd nil) (source-fd nil))
       (unwind-protect
            (when (and (handler-case
                           (progn
@@ -4432,19 +4448,39 @@ Keep the descriptors open through unlink and sync the WAL directory."
                                   source-fd (wal-archive-open-source wal-fd name))
                             (wal-archive-check-wal-directory wal-fd)
                             (wal-archive-check-status-directory wal-fd status-fd)
-                            (when (wal-archive-done-matches-p wal-fd status-fd name source-fd)
-                              (wal-archive-check-wal-directory wal-fd)
-                              (wal-archive-check-status-directory wal-fd status-fd)
-                              t))
+                            (when (wal-archive-proof-present-p wal-fd proof-name)
+                              (setf proof-fd (wal-archive-open-source wal-fd proof-name)
+                                    proof-facts (wal-archive-check-source wal-fd proof-name proof-fd)))
+                            (let ((facts (wal-archive-check-source wal-fd name source-fd)))
+                              (when (and (or (not proof-fd)
+                                             (and (wal-archive-done-matches-p wal-fd status-fd proof-name proof-fd)
+                                                  (wal-archive-primary-proof-matches-p
+                                                   wal-fd status-fd segment proof-facts)))
+                                         (wal-archive-done-matches-p wal-fd status-fd name source-fd)
+                                         (equal facts (wal-archive-check-source wal-fd name source-fd))
+                                         (or (not proof-fd)
+                                             (equal proof-facts
+                                                    (wal-archive-check-source wal-fd proof-name proof-fd))))
+                                (wal-archive-check-wal-directory wal-fd)
+                                (wal-archive-check-status-directory wal-fd status-fd)
+                                t)))
                         (error () nil))
                       (zerop (port-unlinkat wal-fd name 0)))
+             (when (and proof-fd
+                        (not (handler-case
+                                 (and (equal proof-facts (wal-archive-check-source wal-fd proof-name proof-fd))
+                                      (zerop (port-unlinkat wal-fd proof-name 0)))
+                               (error () nil))))
+               (warn "could not remove retired archive proof: ~a" proof-name))
              (sb-posix:fsync wal-fd)
              t)
         (unwind-protect
-             (when source-fd (sb-posix:close source-fd))
+             (when proof-fd (sb-posix:close proof-fd))
           (unwind-protect
-               (when status-fd (sb-posix:close status-fd))
-            (when wal-fd (sb-posix:close wal-fd))))))))
+               (when source-fd (sb-posix:close source-fd))
+            (unwind-protect
+                 (when status-fd (sb-posix:close status-fd))
+              (when wal-fd (sb-posix:close wal-fd)))))))))
 
 (defun wal-archive-publish-done (status-fd name facts)
   "Write and sync the completion file, rename it, then sync the status directory."
@@ -4552,11 +4588,15 @@ under the lock, and publish completion only after success."
                       (unless (and (wal-archive-item-ready-p item)
                                    (wal-archive-partial-matches-p wal-fd item facts))
                         (return-from wal-archive-attempt nil)))
+                     ((wal-archive-proof-item-p item)
+                      (unless (and (wal-archive-item-ready-p item)
+                                   (wal-archive-primary-proof-matches-p wal-fd status-fd (cdr item) facts))
+                        (return-from wal-archive-attempt nil)))
                      ((consp item)
                       (unless (member item (wal-archive-history-items name facts) :test #'equal)
                         (return-from wal-archive-attempt nil)))))
              ;; Reuse the standby receipt only for identical committed history.
-             (let ((staged (when (and (consp item) (not (wal-archive-partial-item-p item)))
+             (let ((staged (when (and (consp item) (not (or (wal-archive-partial-item-p item) (wal-archive-proof-item-p item))))
                              (wal-archive-staged-history-state wal-fd name facts))))
                (when (and (eq staged :pending) (startup-standby-wal-archive-enabled-p))
                  (return-from wal-archive-attempt (values nil :staged-pending)))
@@ -4568,6 +4608,8 @@ under the lock, and publish completion only after success."
                                 (wal-archive-item-ready-p item)
                                 (or (not (wal-archive-partial-item-p item))
                                     (wal-archive-partial-matches-p wal-fd item facts))
+                                (or (not (wal-archive-proof-item-p item))
+                                    (wal-archive-primary-proof-matches-p wal-fd status-fd (cdr item) facts))
                                 (equal facts (wal-archive-check-source wal-fd name source-fd)))
                      (error "WAL archive source changed during command: ~a" name))
                    (wal-archive-check-wal-directory wal-fd)
@@ -4584,6 +4626,23 @@ under the lock, and publish completion only after success."
   (concatenate 'string name ".proof"))
 
 (declaim (ftype function wal-encode-archive-segment-proof wal-archive-stage-source))
+
+(declaim (ftype function wal-verify-archive-segment-proof))
+
+(defun wal-archive-primary-proof-matches-p (wal-fd status-fd segment proof-facts)
+  (let* ((name (wal-archive-item-name segment))
+         (proof-name (wal-archive-segment-proof-name name))
+         (source-fd (wal-archive-open-source wal-fd name)))
+    (unwind-protect
+         (when (wal-archive-done-matches-p wal-fd status-fd name source-fd)
+           (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd name)
+             (multiple-value-bind (proof read-facts) (wal-archive-read-source-bytes wal-fd proof-name)
+               (and (equal facts (wal-archive-check-source wal-fd name source-fd))
+                    (or (null proof-facts) (equal proof-facts read-facts))
+                    (wal-verify-archive-segment-proof proof (catalog-system-identifier)
+                                                      *wal-insert-timeline* segment *wal-segment-namespace*
+                                                      bytes)))))
+      (sb-posix:close source-fd))))
 
 (defun wal-record-primary-archive-rotation (segment end)
   "Persist the writer's end before the first record enters the next segment."
@@ -4694,26 +4753,32 @@ Exclude the open output segment and sync the status directory."
 (defun wal-archive-item-pending-p (wal-fd status-fd item)
   "Check for a matching receipt and create a ready marker for pending work.
 Skip an optional partial when it cannot be checked or does not match."
-  (let ((partial (wal-archive-partial-item-p item)))
+  (let ((partial (wal-archive-partial-item-p item))
+        (proof (wal-archive-proof-item-p item)))
     (flet ((pending ()
              (let* ((name (wal-archive-item-name item))
                     (fd (wal-archive-open-source wal-fd name)))
                (unwind-protect
                     (and (not (wal-archive-done-matches-p wal-fd status-fd name fd :sync nil))
                          (or (not partial) (wal-archive-partial-matches-p wal-fd item))
+                         (or (not proof) (wal-archive-primary-proof-matches-p wal-fd status-fd (cdr item) nil))
                          (progn (wal-archive-create-ready status-fd item) t))
                  (sb-posix:close fd)))))
-      (if partial (handler-case (pending) (error () nil)) (pending)))))
+      (if (or partial proof) (handler-case (pending) (error () nil)) (pending)))))
 
-(defun wal-archive-pending-item-under-lock ()
+(defun wal-archive-pending-item-under-lock (&optional skip-proofs)
   "Find pending history or a completed segment under the WAL lock.
 Ensure its ready marker is durable and return the item and storage epoch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (wal-archive-primary-ready-p)
-    (let ((items (append (wal-archive-history-items)
-                         (wal-archive-partial-items)
-                         (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments))))
-          (wal-fd nil) (status-fd nil))
+    (let* ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments)))
+           (items (append (wal-archive-history-items)
+                          (wal-archive-partial-items)
+                          (loop for segment in segments
+                                collect segment
+                                unless (member segment skip-proofs :test #'eql)
+                                  collect (cons :proof segment))))
+           (wal-fd nil) (status-fd nil))
       (when items
         (wal-ensure-directory-durable (merge-pathnames "archive_status/" (wal-directory)))
         (sb-sys:without-interrupts
@@ -4767,6 +4832,27 @@ Ensure its ready marker is durable and return the item and storage epoch."
 
 (declaim (ftype function physical-recovery-archive-receive-step))
 
+(defun wal-archiver-step-primary (template)
+  (let ((failed-proofs nil))
+    (loop
+      (multiple-value-bind (item epoch)
+          (sb-thread:with-mutex (*wal-lock*)
+            (wal-archive-pending-item-under-lock failed-proofs))
+        (unless item (return nil))
+        (if (wal-archive-proof-item-p item)
+            (progn
+              (handler-case
+                  (if (wal-archive-attempt item template :epoch epoch)
+                      (return t)
+                      (warn "archive_command failed for WAL proof ~a; will retry" (cdr item)))
+                (error (condition)
+                  (warn "could not archive WAL proof ~a: ~a" (cdr item) condition)))
+              (push (cdr item) failed-proofs))
+            (multiple-value-bind (archived status) (wal-archive-attempt item template :epoch epoch)
+              (unless (or archived (eq status :staged-pending))
+                (warn "archive_command failed for WAL item ~a; will retry" item))
+              (return archived)))))))
+
 (defun wal-archiver-step ()
   (let ((template (startup-archive-command)))
     (when (and template (plusp (length template)))
@@ -4778,14 +4864,7 @@ Ensure its ready marker is durable and return the item and storage epoch."
                    (error (condition)
                      (warn "staged WAL archiver will retry: ~a" condition)
                      nil)))
-            (multiple-value-bind (item epoch)
-                (sb-thread:with-mutex (*wal-lock*)
-                  (wal-archive-pending-item-under-lock))
-              (when item
-                (multiple-value-bind (archived status) (wal-archive-attempt item template :epoch epoch)
-                  (unless (or archived (eq status :staged-pending))
-                    (warn "archive_command failed for WAL item ~a; will retry" item))
-                  archived))))))))
+            (wal-archiver-step-primary template))))))
 
 (defun wal-archiver-try-step ()
   (handler-case (wal-archiver-step)

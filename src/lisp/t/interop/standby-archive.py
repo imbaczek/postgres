@@ -38,16 +38,20 @@ def exercise(root, source_port, target_port):
     source_data, target_data = root / "source", root / "replica"
     source_socket = root / "source.sock"
     archive = root / "archive"
+    primary_archive = root / "primary-archive"
     allow = root / "allow-archive"
     allow_proofs = root / "allow-archive-proofs"
     attempts = root / "archive-attempts"
     archive.mkdir()
+    primary_archive.mkdir()
+    primary_command = f'cp -- "%p" {shlex.quote(str(primary_archive))}/"%f"'
     pg_wal = target_data / "pg_wal"
     queue = pg_wal / "standby_archive"
     node = None
     with (root / "source.log").open("w") as log:
         source = subprocess.Popen(
             [str(follow.BASE / "pg-lisp.sh"), "-D", str(source_data), "-p", str(source_port),
+             "-c", "archive_mode=on", "-c", f"archive_command={primary_command}",
              "--control-socket", str(source_socket)], stdout=log, stderr=log)
         try:
             follow.wait_for(lambda: follow.query(source_port, "SELECT 1") == [(1,)])
@@ -98,6 +102,15 @@ def exercise(root, source_port, target_port):
                     (source_data / "pg_wal" / f"{index:016X}.wal").read_bytes()).digest()
                 for index, name in enumerate((first, second))
             }
+            for index, name in enumerate((first, second)):
+                raw_name = f"{index:016X}.wal"
+                receipt = source_data / "pg_wal/archive_status" / (raw_name + ".proof.done")
+                follow.wait_for(receipt.is_file)
+                raw = (primary_archive / raw_name).read_bytes()
+                assert hashlib.sha256(raw).digest() == expected[name]
+                proof = (primary_archive / (raw_name + ".proof")).read_bytes()
+                assert len(proof) == 52 and proof[:4] == b"PWAP"
+                assert int.from_bytes(proof[32:40], "little") == index * 16 * 1024 * 1024 + len(raw)
             source.send_signal(signal.SIGINT)
             assert source.wait(timeout=45) == 0
             queue.chmod(0o700)

@@ -67,6 +67,58 @@
                   (ok warned))
              (when pg::*wal-output-stream* (close pg::*wal-output-stream*))))))))
 
+(deftest primary-archive-publishes-and-recycles-rotation-proof
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-ready* t)
+              (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
+              (pg::*wal-insert-timeline* 1)
+              (pg::*wal-segment-namespace* :legacy)
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (segment (pg::wal-segment-path 0))
+              (name (file-namestring segment))
+              (proof-name (pg::wal-archive-segment-proof-name name))
+              (proof (merge-pathnames proof-name (pg::wal-directory)))
+              (destination (merge-pathnames proof-name pg::*pgdata*))
+              (bytes (sample-physical-record)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on"
+               (getf (gethash "archive_command" settings) :value) "cp -- \"%p\" \"%f\"")
+         (pg::wal-atomic-write-bytes segment bytes)
+         (pg::wal-record-primary-archive-rotation 0 (length bytes))
+         (ok (pg::wal-archiver-step))
+         (ok (not (probe-file destination)))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (not (pg::wal-archive-recycle-segment 0))))
+         (handler-bind ((warning #'muffle-warning))
+           (ok (pg::wal-archiver-step-primary
+                "case \"%f\" in *.proof) exit 1;; esac; cp -- \"%p\" \"%f\"")))
+         (ok (probe-file (merge-pathnames "0000000000000001.wal" pg::*pgdata*)))
+         (ok (not (probe-file destination)))
+         (let ((receipt (merge-pathnames (concatenate 'string "archive_status/" proof-name ".done")
+                                         (pg::wal-directory))))
+           (sb-posix:mkdir (namestring receipt) #o700)
+           (handler-bind ((warning #'muffle-warning))
+             (ok (pg::wal-archiver-step)))
+           (ok (probe-file (merge-pathnames "0000000000000002.wal" pg::*pgdata*)))
+           (sb-posix:rmdir (namestring receipt)))
+         (ok (pg::wal-archiver-step-primary
+              "case \"%f\" in *.proof) cp -- \"%p\" \"%f\";; *) exit 1;; esac"))
+         (ok (= (length bytes)
+                (pg::wal-verify-archive-segment-proof
+                 (pg::read-bounded-regular-file destination pg::+wal-archive-segment-proof-size+)
+                 (pg::catalog-system-identifier) 1 0 :legacy bytes)))
+         (pg::wal-atomic-write-bytes
+          segment (pg::wal-encode-record pg::+wal-record-maintenance+ 0 0 (empty-octets)))
+         (ok (pg::wal-archive-attempt 0 "cp -- \"%p\" \"%f\""))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (not (pg::wal-archive-recycle-segment 0))))
+         (pg::wal-atomic-write-bytes segment bytes)
+         (ok (pg::wal-archive-attempt 0 "cp -- \"%p\" \"%f\""))
+         (sb-thread:with-mutex (pg::*wal-lock*)
+           (ok (pg::wal-archive-recycle-segment 0)))
+         (ok (not (probe-file segment)))
+         (ok (not (probe-file proof)))))))
+
 (deftest primary-archive-ready-follows-control-and-fences-recycling
     (call-with-physical-source-fixture
      (lambda ()
