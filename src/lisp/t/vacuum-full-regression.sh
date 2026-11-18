@@ -248,6 +248,37 @@ EOF
 grep -q '(1)' "$TMP/horizon-tuple-count.out" \
     || fail "FULL did not retain the recently-dead version protected by its snapshot"
 
+# Inject the horizon that a standby would report before the deleting XID.
+run -c 'create table full_feedback (id int)' >/dev/null
+run -c 'insert into full_feedback values (1)' >/dev/null
+run -c "select * from pg_create_physical_replication_slot('full_feedback')" >/dev/null
+control <<'EOF' > "$TMP/feedback-slot.out"
+(let ((xmin (next-full-xid)))
+  (sb-thread:with-mutex (*wal-lock*)
+    (setf (physical-slot-horizons (gethash "full_feedback" *wal-replication-slots*))
+          (list xmin nil)))
+  :feedback-installed)
+(quit)
+EOF
+grep -qi ':feedback-installed' "$TMP/feedback-slot.out" \
+    || fail "could not set the physical slot horizon"
+run -c 'delete from full_feedback where id = 1' >/dev/null
+run -c 'vacuum full_feedback' >/dev/null
+run -c 'create index full_feedback_idx on full_feedback (id)' >/dev/null
+run -c 'vacuum full full_feedback' >/dev/null
+control <<'EOF' > "$TMP/feedback-index.out"
+(let* ((db (gethash "postgres" (catalog-databases *catalog*)))
+       (idx (gethash "full_feedback_idx" (database-indexes db)))
+       (key (encode-index-key (list 1) (list :int4))))
+  (list (length (btree-search (pg-index-relfilenode idx) key))))
+(quit)
+EOF
+grep -q '(1)' "$TMP/feedback-index.out" \
+    || fail "vacuum or index rebuild discarded the slot-protected version"
+[ "$(row_count 'select id from full_feedback')" = 0 ] \
+    || fail "feedback made a deleted row visible to a new snapshot"
+run -c "select pg_drop_replication_slot('full_feedback')" >/dev/null
+
 # Pause FULL after it captures its initial heap/index set but before it obtains
 # the relation gates. CREATE INDEX can publish during this window, so FULL must
 # detect the changed set, retry, and rebuild the new index against compacted TIDs.

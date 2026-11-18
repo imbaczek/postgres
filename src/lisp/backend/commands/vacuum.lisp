@@ -5,6 +5,19 @@
 (defun current-table-index-relfilenodes (table)
   (mapcar #'pg-index-relfilenode (table-indexes table)))
 
+(defun vacuum-data-oldest-xmin (&optional exclude-snapshot)
+  "Return the data removal horizon from local snapshots, transactions, and physical slots.
+Exclude EXCLUDE-SNAPSHOT from the local horizon. Lost slots and slots without
+a data horizon do not hold back cleanup."
+  (let ((oldest (oldest-xmin exclude-snapshot)))
+    (sb-thread:with-mutex (*wal-lock*)
+      (loop for slot being the hash-values of *wal-replication-slots*
+            when (and (wal-physical-slot-p slot)
+                      (not (eq :lost (wal-replication-slot-wal-status slot))))
+              do (let ((xmin (first (physical-slot-horizons slot))))
+                   (when xmin (setf oldest (min oldest xmin))))))
+    oldest))
+
 (defun vacuum-compute-freeze-cutoff
     (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)
   "Choose the freeze cutoff from the caller's horizon and age policy.
@@ -70,7 +83,7 @@ requested relations and an ownership callback, published atomically with gates."
             ;; C's PROC_IN_VACUUM flag keeps the vacuum statement's own
             ;; registered snapshot from holding back its removal horizon.
             (oldest-xmin (or forced-oldest-xmin
-                             (oldest-xmin *current-snapshot*)))
+                             (vacuum-data-oldest-xmin *current-snapshot*)))
             (old-relfrozenxid (or (pg-class-relfrozenxid table)
                                   +first-normal-xid+))
             (freeze-cutoff
@@ -118,7 +131,7 @@ to the TOAST pass independently of the main relation."
                    (ereport "55000" "TOAST relation changed while waiting for lock"))))
         (with-relation-maintenance-locks ((list parent-node heap-node index-node))
           (with-write-lock (verify-ownership))
-          (let* ((oldest-xmin (or forced-oldest-xmin (oldest-xmin *current-snapshot*)))
+          (let* ((oldest-xmin (or forced-oldest-xmin (vacuum-data-oldest-xmin *current-snapshot*)))
                  (old-xid (or (pg-toast-relfrozenxid toast) +first-normal-xid+))
                  (cutoff (vacuum-compute-freeze-cutoff
                           old-xid oldest-xmin (next-full-xid)
@@ -356,7 +369,8 @@ implementation's replacement metadata transition atomic as well."
     (values)))
 
 (defun vacuum-full-table (table)
-  "Rewrite TABLE and all its indexes under exclusive relation build gates."
+  "Rewrite TABLE and all its indexes under exclusive relation build gates.
+Use one data removal horizon for the heap rewrite and index builds."
   (let ((db (with-write-lock
               (ensure-current-table table)
               (current-database))))
@@ -367,7 +381,7 @@ implementation's replacement metadata transition atomic as well."
               ;; Keep FULL's original registered snapshot in the removal
               ;; horizon. PostgreSQL does not set PROC_IN_VACUUM for FULL,
               ;; since index expressions may consult other relations.
-              (oldest-xmin (oldest-xmin))
+              (oldest-xmin (vacuum-data-oldest-xmin))
               (freeze-cutoff
                 (vacuum-full-freeze-cutoff table oldest-xmin (next-full-xid)))
               (new-table (copy-pg-class table))
@@ -408,7 +422,7 @@ implementation's replacement metadata transition atomic as well."
                    for was-valid = (pg-index-valid-p old-index)
                    do (btree-init (pg-index-relfilenode new-index))
                       (build-index-entries
-                       new-index new-table
+                       new-index new-table :removal-horizon oldest-xmin
                        :unique (and was-valid
                                     (pg-index-unique-p old-index))
                        :name (pg-index-name old-index))

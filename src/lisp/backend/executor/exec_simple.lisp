@@ -861,8 +861,9 @@ read lease to protect the index lookup."
       (funcall function)
       (call-with-btree-relation-read-lock relfilenode function)))
 
-(defun build-index-entries (idx table &key unique name)
-  "Populate IDX from every heap version that an active snapshot may need.
+(defun build-index-entries (idx table &key unique name (removal-horizon (vacuum-data-oldest-xmin)))
+  "Populate IDX with heap versions retained by REMOVAL-HORIZON.
+The default horizon includes local activity and physical slots.
 
 UNIQUE checks only tuples visible to the fresh statement snapshot.  The caller
 holds the table DDL gate, which has drained other writers and maintenance
@@ -870,8 +871,7 @@ before this removal horizon is captured."
   (let* ((heap-relfilenode (pg-class-relfilenode table))
          (index-relfilenode (pg-index-relfilenode idx))
          (columns (pg-class-columns table))
-         (snapshot *current-snapshot*)
-         (removal-horizon (oldest-xmin)))
+         (snapshot *current-snapshot*))
     (loop for block below (buf-nblocks heap-relfilenode)
           for page = (buf-read heap-relfilenode block)
           when page

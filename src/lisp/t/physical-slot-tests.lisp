@@ -355,6 +355,28 @@
       (setf (pg::wal-replication-slot-kind slot) :unknown)
       (ok (signals (pg::wal-encode-replication-slot slot) 'error))))
 
+(deftest physical-slot-data-horizon-bounds-vacuum
+    (let* ((pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*next-xid* 100)
+           (pg::*active-xids* nil)
+           (first (physical-slot-test-object :name "first"))
+           (second (physical-slot-test-object :name "second"))
+           (lost (physical-slot-test-object :name "lost")))
+      (setf (gethash "first" pg::*wal-replication-slots*) first
+            (gethash "second" pg::*wal-replication-slots*) second
+            (gethash "lost" pg::*wal-replication-slots*) lost
+            (pg::wal-replication-slot-wal-status lost) :lost
+            (pg::physical-slot-horizons first) '(39 12)
+            (pg::physical-slot-horizons second) '(41 nil)
+            (pg::physical-slot-horizons lost) '(21 nil))
+      (ok (= 39 (pg::vacuum-data-oldest-xmin)))
+      (let ((pg::*active-xids* '(30)))
+        (ok (= 30 (pg::vacuum-data-oldest-xmin))))
+      (setf (pg::physical-slot-horizons first) '(nil 12))
+      (ok (= 41 (pg::vacuum-data-oldest-xmin)))
+      (remhash "second" pg::*wal-replication-slots*)
+      (ok (= 100 (pg::vacuum-data-oldest-xmin)))))
+
 (deftest physical-standby-feedback-persists-only-for-current-owner
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
