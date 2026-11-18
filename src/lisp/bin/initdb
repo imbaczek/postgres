@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Initialize a fresh native PostgreSQL data directory offline."""
+
+import argparse
+import ctypes
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+
+def check_target(target):
+    """Return the identity of an existing empty directory, or None."""
+    try:
+        status = target.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
+        raise ValueError("data directory must be an owned directory")
+    if any(target.iterdir()):
+        raise ValueError("data directory is not empty")
+    return status.st_dev, status.st_ino
+
+
+def publish(stage, target, identity):
+    if check_target(target) != identity:
+        raise ValueError("data directory changed during initialization")
+    if identity is not None:
+        # A directory rename can replace only an empty directory.
+        os.replace(stage, target)
+        return
+    rename = ctypes.CDLL(None, use_errno=True).renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    if rename(AT_FDCWD, os.fsencode(stage), AT_FDCWD, os.fsencode(target), RENAME_NOREPLACE) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target)
+
+
+def initialize(target):
+    target = target.absolute()
+    identity = check_target(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".pg-lisp-initdb-", dir=target.parent))
+    launcher = Path(__file__).resolve().parents[1] / "pg-lisp.sh"
+    try:
+        subprocess.run([launcher, "--initdb-native", "-D", stage], stdin=subprocess.DEVNULL, check=True)
+        publish(stage, target, identity)
+        # WAL initialization already synced the staging directory's ancestors.
+        fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", nargs="?", type=Path)
+    parser.add_argument("-D", "--pgdata", type=Path)
+    parser.add_argument("-U", "--username", choices=["postgres"], default="postgres")
+    parser.add_argument("-E", "--encoding", choices=["UTF8"], default="UTF8")
+    parser.add_argument("--locale", choices=["C", "POSIX"], default="C")
+    parser.add_argument("--no-locale", action="store_true")
+    parser.add_argument("-A", "--auth", choices=["trust"], default="trust")
+    parser.add_argument("--auth-host", choices=["trust"])
+    parser.add_argument("--auth-local", choices=["trust"])
+    args = parser.parse_args()
+    if args.directory is not None and args.pgdata is not None:
+        parser.error("specify the data directory once")
+    target = args.directory or args.pgdata or os.environ.get("PGDATA")
+    if not target:
+        parser.error("a data directory is required")
+    os.umask(0o077)
+    initialize(Path(target))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"initdb: {error}", file=sys.stderr)
+        sys.exit(1)

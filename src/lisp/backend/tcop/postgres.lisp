@@ -1027,12 +1027,50 @@ throughout replay and shutdown."
          (prepare-primary-shutdown)))))
   (sb-ext:exit :code 0))
 
+(defun native-initdb-check-stage (directory allowed)
+  "Reject any unexpected entry, including hidden files and dangling symlinks."
+  (unless (and (probe-file directory)
+               (equal (directory-entry-names directory :maximum-entries (length allowed)) allowed))
+    (error "native initialization requires an empty private staging directory")))
+
+(defun run-native-initdb (arguments)
+  "Build a clean primary in a fresh staging directory without starting listeners."
+  (unless (and (= (length arguments) 2) (equal (first arguments) "-D"))
+    (error "native initialization requires -D STAGE"))
+  (let ((directory (directory-pathname (second arguments))))
+    (native-initdb-check-stage directory nil)
+    (multiple-value-bind (host port pgdata control-port control-socket swank-port swank-bind-address
+                          temp-file-limit sort-arena-limit max-slot-wal-keep-bytes settings native overrides)
+        (parse-args arguments)
+      (declare (ignore pgdata control-port control-socket swank-port swank-bind-address
+                       temp-file-limit sort-arena-limit max-slot-wal-keep-bytes))
+      (let ((*shutdown-finalizing-p* t))
+        (call-with-physical-reseed-offline-startup
+         directory
+         (lambda ()
+           (authentication-preflight-startup settings)
+           (startup-install-initial-settings settings native overrides)
+           (startup-install-resource-capacity settings)
+           (postmaster-own-data-directory host port :startup-before-pid
+                                          (lambda () (native-initdb-check-stage directory '(".pg_lisp.lock"))))
+           (startup-complete-authentication)
+           (initialize-primary-storage)
+           (prepare-primary-shutdown)
+           (with-open-file (stream (merge-pathnames "postgresql.conf" directory)
+                                   :direction :output :if-exists :error)
+             (write-line "# Native pg-lisp configuration." stream)
+             (fsync-stream stream))
+           (fsync-directory directory))))))
+  (sb-ext:exit :code 0))
+
 (defun main ()
   ;; Preflight policy before ownership, then initialize it after owning PGDATA.
   ;; Install resource limits before recovery, and check or report them before listen.
   (let ((arguments (cdr sb-ext:*posix-argv*)))
     (when (equal (first arguments) "--single")
       (run-offline-primary-recovery (rest arguments)))
+    (when (equal (first arguments) "--initdb-native")
+      (run-native-initdb (rest arguments)))
     (startup-handle-meta-request arguments))
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes

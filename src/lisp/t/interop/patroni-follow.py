@@ -66,7 +66,7 @@ def control(process, path, form):
     return result.stdout
 
 
-def configuration(data, port, root):
+def configuration(data, port, root, major_version=None):
     # Keep Patroni's real process path; the wrapper only adds a private debug
     # socket and forwards every standard argument unchanged to the native server.
     executable = root / 'postgres'
@@ -77,7 +77,8 @@ def configuration(data, port, root):
                           + ' "$@" --control-socket '
                           + shlex.quote(str(root / 'target.sock')) + '\n')
     executable.chmod(0o700)
-    major_version = int((data / 'PG_VERSION').read_text().strip()) * 10000
+    if major_version is None:
+        major_version = int((data / 'PG_VERSION').read_text().strip()) * 10000
     parameters = {name: option[0] for name, option in ConfigHandler.CMDLINE_OPTIONS.items()
                   if option[0] is not None and option[2] <= major_version}
     return dict(
