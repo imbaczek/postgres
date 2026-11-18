@@ -60,10 +60,10 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Cover ancestor
-   history and partial segments from the old timeline after promotion, add
-   standby `archive_mode=always`, and use an archive produced by the worker
-   for stopped-target restore.
+2. Complete the server-side archive comparison against C. Cover partial
+   segments from the old timeline after promotion, add standby
+   `archive_mode=always`, and use an archive produced by the worker for
+   stopped-target restore.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -178,6 +178,16 @@ promoted it, and compared the archived `00000002.history` with both the PGDATA
 file and the live `TIMELINE_HISTORY` response. The live run took 28.05 s.
 Strict compilation and six focused test heads took 74.68 s, including 58.98 s
 to load the test system.
+
+After the current history, the worker archives locally retained ancestor
+histories from newest to oldest before processing WAL segments. Each ancestor
+must match both the committed lineage and the exact byte prefix copied into
+the current history. The worker reads through a held WAL directory, skips
+missing or unusable optional ancestors, and checks the parsed file's identity
+against the held archive source before invoking the command. A three-timeline
+fixture checks ordering and excludes a sibling, a hard link, a missing history,
+and changed ancestor bytes. Strict compilation and six focused heads took
+63.55 s. The live single-promotion Patroni regression took 27.38 s.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
