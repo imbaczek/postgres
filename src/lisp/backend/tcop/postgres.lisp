@@ -219,8 +219,7 @@ Capture the replication source identity for later sender registration."
             (ereport-fatal "57P03" "the database system is shutting down"))
           (let* ((params (parse-startup-params body))
                  (replication (startup-replication-parameters-mode params))
-                 (app (or (startup-last-parameter params "application_name") ""))
-                 (peer (sb-bsd-sockets:socket-peername (backend-socket *backend*))))
+                 (app (or (startup-last-parameter params "application_name") "")))
             (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
               (setf (backend-startup-user *backend*) user
                     (backend-database *backend*) dbname
@@ -231,10 +230,11 @@ Capture the replication source identity for later sender registration."
               (when (and (recovery-in-progress-p) (not (startup-configuration-hot-standby configuration)))
                 (ereport-fatal "57P03" "the database system is not accepting connections"
                                :detail "Hot standby mode is disabled."))
-              (unless (eq :scram (authorize-and-admit-startup-backend
-                                  *backend* configuration user dbname peer))
-                (return-from process-startup (finish-startup stream params dbname)))
-              (values configuration params user dbname peer)))))
+              (let ((peer (sb-bsd-sockets:socket-peername (backend-socket *backend*))))
+                (unless (eq :scram (authorize-and-admit-startup-backend
+                                    *backend* configuration user dbname peer))
+                  (return-from process-startup (finish-startup stream params dbname)))
+                (values configuration params user dbname peer))))))
     (handler-case
         (authenticate-role-scram stream user)
       (sb-ext:timeout ()
