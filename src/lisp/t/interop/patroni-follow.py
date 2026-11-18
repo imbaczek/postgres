@@ -18,6 +18,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -25,6 +26,17 @@ from types import SimpleNamespace
 import psycopg2
 from psycopg2.extras import LogicalReplicationConnection
 import psutil
+
+if os.environ.get('PATRONI_TEST_PSYCOPG3') == '1':
+    # Keep psycopg2 for the fixture's replication client while exercising
+    # Patroni's real import fallback for its own SQL connections.
+    sys.modules['psycopg2'] = None
+    try:
+        from patroni import psycopg as patroni_sql
+    finally:
+        sys.modules['psycopg2'] = psycopg2
+    assert patroni_sql.Error.__module__ == 'psycopg'
+
 from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
 from patroni.async_executor import CriticalTask

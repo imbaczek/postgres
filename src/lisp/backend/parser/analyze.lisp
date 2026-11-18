@@ -929,11 +929,30 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required)))
     ((string= name "pg_drop_replication_slot") '((nil :name :required)))))
 
-(defun analyze-catalog-call-inputs (arguments table)
+(defvar *query-parameter-types* nil)
+
+(declaim (ftype function query-parameter-slot))
+
+(defun infer-query-parameter-type (raw type)
+  "Assign TYPE to an unspecified parameter in a typed expression position."
+  (when (and type (eq (first raw) :parameter)
+             (null (query-parameter-slot (second raw) *query-parameter-types*)))
+    (setf (aref *query-parameter-types* (1- (second raw))) type)))
+
+(defun catalog-call-argument-index (raw position signature)
+  (if (eq (first raw) :named-arg)
+      (position (second raw) signature :key #'first :test #'equal)
+      position))
+
+(defun analyze-catalog-call-inputs (arguments table &optional signature)
   "Analyze catalog call arguments in caller order before binding their names."
-  (let ((analyzed (mapcar (lambda (raw)
-                            (analyze-expr (if (eq (first raw) :named-arg) (third raw) raw) table))
-                          arguments))
+  (let ((analyzed (loop for raw in arguments for position from 0
+                        for named = (eq (first raw) :named-arg)
+                        for input = (if named (third raw) raw)
+                        for index = (catalog-call-argument-index raw position signature)
+                        do (when index
+                             (infer-query-parameter-type input (second (nth index signature))))
+                        collect (analyze-expr input table)))
         (names nil))
     (dolist (raw arguments)
       (let ((name (and (eq (first raw) :named-arg) (second raw))))
@@ -944,17 +963,15 @@ then argument types. Only ambiguity and type failures carry the cast hint."
         (when name (push name names))))
     (values analyzed names)))
 
-(defun analyze-replication-slot-arguments (name arguments table variadic)
+(defun analyze-replication-slot-arguments (name arguments table variadic &optional (signature (replication-slot-function-signature name)))
   "Bind supported replication slot arguments and defaults to the catalog signature."
-  (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table)
-    (let* ((signature (replication-slot-function-signature name))
-           (assigned (make-array (length signature) :initial-element nil))
+  (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table signature)
+    (let* ((assigned (make-array (length signature) :initial-element nil))
            (slots (make-array (length signature) :initial-element nil))
-           (position 0) (bindings nil))
+           (bindings nil))
       (loop for raw in arguments for expression in analyzed
-            for named = (eq (first raw) :named-arg)
-            for index = (if named (position (second raw) signature :key #'first :test #'equal)
-                            (prog1 position (incf position)))
+            for position from 0
+            for index = (catalog-call-argument-index raw position signature)
             for type = (and index (< index (length signature)) (second (nth index signature)))
             do (unless (and type (not (aref assigned index))
                             (or (in-unknown-constant-p expression)
@@ -3318,7 +3335,12 @@ candidate selection."
 
 (defun analyze-any-expression (expression scope)
   (let* ((left (analyze-expr (third expression) scope))
-         (array (analyze-scalar-array-argument (fourth expression) scope))
+         (raw (fourth expression))
+         (array (progn
+                  (infer-query-parameter-type
+                   raw (sql-array-type (if (eq (expr-type left) :varchar)
+                                           :text (expr-type left))))
+                  (analyze-scalar-array-argument raw scope)))
          (element (or (sql-array-element-type (expr-type array))
                       (and (eq (expr-type array) :int2vector) :int2))))
     (when (and (in-unknown-constant-p array) (eq (second array) +null+))
@@ -3341,8 +3363,6 @@ candidate selection."
       (list (first expression) (second expression) (first operands) array
             :element-source element :element-target (expr-type (second operands))
             :type :bool :typmod -1))))
-
-(defvar *query-parameter-types* nil)
 
 (defvar *query-parameter-values* nil)
 
@@ -3385,12 +3405,15 @@ candidate selection."
                :table-oid (pg-class-oid table)
                :attnum (pg-column-attnum col)))))))
 
+(defun report-unresolved-query-parameter (index)
+  (ereport "42P18" "could not determine data type of parameter $~a" index))
+
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
   (case (first expr)
     (:parameter
      (let ((type (query-parameter-slot (second expr) *query-parameter-types*)))
-       (unless type (ereport "42P18" "could not determine data type of parameter $~a" (second expr)))
+       (unless type (report-unresolved-query-parameter (second expr)))
        (list :parameter (second expr) :type type :typmod -1)))
     (:sublink (analyze-sublink expr table))
     (:window (analyze-window-call expr table))

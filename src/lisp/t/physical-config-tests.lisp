@@ -1300,6 +1300,31 @@
       (ok (equal "port ÄΣ" (pg::eval-func "lower" '("PORT ÄΣ"))))
       (ok (eq pg::+null+ (pg::eval-func "lower" (list pg::+null+))))))
 
+(deftest scalar-array-comparison-infers-an-unspecified-parameter
+    (dolist (operator '(:any :all))
+      (let ((pg::*query-parameter-types* (vector nil)))
+        (pg::analyze-expr (list operator "=" '(:const 1) '(:parameter 1)) nil)
+        (ok (equalp #(:int4-array) pg::*query-parameter-types*))))
+  (let ((pg::*query-parameter-types* (vector :int8-array)))
+    (pg::analyze-expr '(:any "=" (:const 1) (:parameter 1)) nil)
+    (ok (equalp #(:int8-array) pg::*query-parameter-types*)))
+  (let* ((pg::*query-parameter-types* (vector nil))
+         (statement (first (pg::parse-statements "SELECT 'x'::varchar = ANY($1)")))
+         (target (first (getf statement :targets))))
+    (pg::analyze-expr (getf target :expr) nil)
+    (ok (equalp #(:text-array) pg::*query-parameter-types*))))
+
+(deftest replication-slot-functions-infer-unspecified-parameters
+    (let ((pg::*query-parameter-types* (vector nil nil)))
+      (pg::analyze-replication-slot-arguments "pg_replication_slot_advance"
+                                              '((:parameter 1) (:parameter 2)) nil nil)
+      (ok (equalp #(:name :pg-lsn) pg::*query-parameter-types*)))
+  (let ((pg::*query-parameter-types* (vector nil nil)))
+    (pg::analyze-replication-slot-arguments "pg_replication_slot_advance"
+                                            '((:named-arg "upto_lsn" (:parameter 1))
+                                              (:named-arg "slot_name" (:parameter 2))) nil nil)
+    (ok (equalp #(:pg-lsn :name) pg::*query-parameter-types*))))
+
 (deftest scalar-array-all-matches-c-empty-and-null-identities
     (flet ((value (sql)
              (let* ((ast (first (pg::parse-statements sql)))
