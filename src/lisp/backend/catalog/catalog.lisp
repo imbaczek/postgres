@@ -86,10 +86,19 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   (format nil "~36r-~X"
           (get-universal-time) (random (ash 1 128))))
 
+(defstruct (pg-role (:print-function print-pg-role))
+  oid name login-p superuser-p replication-p verifier function-grants native-rewind-p)
+
+(defun print-pg-role (role stream depth)
+  (declare (ignore depth))
+  (print-unreadable-object (role stream :type t)
+    (format stream "~s" (pg-role-name role))))
+
 (defstruct catalog
   (cluster-identity (new-catalog-cluster-identity))
   (next-oid +first-normal-object-id+)
-  (databases (make-hash-table :test #'equal)))
+  (databases (make-hash-table :test #'equal))
+  (roles (make-hash-table :test #'equal)))
 
 (defvar *catalog* nil)
 
@@ -353,11 +362,157 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
           (setf (gethash entry (database-applied-logical-event-ids db)) 0)))
     db))
 
+(defun catalog-role-change (name existing options create-p &key oid bootstrap-verifier)
+  "Build a role change without modifying the committed role or catalog."
+  (when (and create-p existing)
+    (ereport "42710" "role ~s already exists" name))
+  (unless (or create-p existing)
+    (ereport "42704" "role ~s does not exist" name))
+  (when (or (not (<= 1 (length (string->bytes name)) 63))
+            (find-if (lambda (character)
+                       (member (char-code character) '(0 10 13))) name))
+    (ereport "42602" "invalid role name"))
+  (when (and create-p (or (uiop:string-prefix-p "pg_" name)
+                          (member name '("public" "none") :test #'string=)))
+    (ereport "42939" "role name ~s is reserved" name))
+  (when (and (string= name "postgres") (equal (assoc :superuser options) '(:superuser)))
+    (ereport "0A000" "the bootstrap postgres role must remain a superuser"))
+  (when (and (string= name "postgres") (equal (assoc :login options) '(:login)))
+    (ereport "0A000" "the bootstrap postgres role must retain LOGIN"))
+  (let ((candidate (if existing (copy-pg-role existing) (make-pg-role :name name :oid oid))))
+    (when bootstrap-verifier
+      (setf (pg-role-verifier candidate) bootstrap-verifier))
+    (loop for (attribute . value) in options
+          do (ecase attribute
+               (:login (setf (pg-role-login-p candidate) value))
+               (:superuser (setf (pg-role-superuser-p candidate) value))
+               (:replication (setf (pg-role-replication-p candidate) value))
+               (:native-rewind (setf (pg-role-native-rewind-p candidate) value))
+               (:grant-function (pushnew value (pg-role-function-grants candidate)))
+               (:password (setf (pg-role-verifier candidate)
+                                (and value (scram-build-role-verifier value))))))
+    candidate))
+
+(defun catalog-prepare-role-changes (catalog changes)
+  "Return a replacement role table after checking the committed inputs to CHANGES.
+Each change holds the name, original committed role object (or NIL), and its
+replacement. The caller holds the catalog writer lock through publication."
+  (let ((previous (catalog-roles catalog))
+        (next (make-hash-table :test #'equal)))
+    (maphash (lambda (name role) (setf (gethash name next) role)) previous)
+    (dolist (change changes next)
+      (destructuring-bind (name expected replacement) change
+        (unless (eq expected (gethash name previous))
+          (ereport "40001" "role ~s changed concurrently" name))
+        (setf (gethash name next) replacement)))))
+
+(defun catalog-bootstrap-role ()
+  (make-pg-role :oid 10 :name "postgres" :login-p t :superuser-p t :replication-p t))
+
+(defun stage-catalog-role-change (backend ast)
+  "Prepare a role change visible only inside BACKEND's transaction."
+  (let* ((name (getf ast :name))
+         (options (getf ast :options))
+         (create-p (eq (getf ast :type) :create-role)))
+    (with-write-catalog-locks
+      (let ((actor (gethash (backend-startup-user backend) (catalog-roles *catalog*))))
+        (when (and actor (not (pg-role-superuser-p actor)))
+          (ereport "42501" "permission denied to change roles")))
+      (let* ((pending (assoc name (backend-role-changes backend) :test #'string=))
+             (committed (gethash name (catalog-roles *catalog*)))
+             (bootstrap-p (and (null pending) (null committed) (string= name "postgres")))
+             (existing (cond (pending (third pending))
+                             (bootstrap-p (catalog-bootstrap-role))
+                             (t committed)))
+             (verifier (when (and bootstrap-p (not create-p) (not (assoc :password options))
+                                  (authentication-entry-exists-p
+                                   (pgdata-path "global/pg_bootstrap_scram")))
+                         (read-bootstrap-scram-verifier)))
+             (candidate (catalog-role-change name existing options create-p
+                                             :oid (unless existing (allocate-oid))
+                                             :bootstrap-verifier verifier)))
+        (if pending
+            (setf (third pending) candidate)
+            (push (list name committed candidate) (backend-role-changes backend))))))
+  (values))
+
+(defun commit-catalog-role-changes (backend)
+  "Publish a role-only transaction with the catalog's durable WAL terminal."
+  (when (or (backend-xid backend) (backend-final-ddl-committed-p backend))
+    (ereport "0A000" "role changes cannot share a transaction with data or other catalog changes"))
+  (with-write-catalog-locks
+    (let ((actor (gethash (backend-startup-user backend) (catalog-roles *catalog*))))
+      (when (and actor (not (pg-role-superuser-p actor)))
+        (ereport "42501" "permission denied to change roles")))
+    (let* ((live *catalog*)
+           (next (catalog-prepare-role-changes live (backend-role-changes backend)))
+           (*catalog* (copy-catalog live)))
+      (setf (catalog-roles *catalog*) next)
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (save-catalog :final-ddl-p t)
+          (when (backend-final-ddl-committed-p backend)
+            (setf (catalog-roles live) next)))))))
+
+(defun catalog-role-to-sexp (role)
+  (list (pg-role-oid role) (pg-role-name role) (pg-role-login-p role)
+        (pg-role-superuser-p role) (pg-role-replication-p role) (pg-role-verifier role)
+        (pg-role-function-grants role) (pg-role-native-rewind-p role)))
+
+(defun catalog-role-verifier-from-sexp (encoded)
+  (when encoded
+    (unless (and (typep encoded '(cons vector (cons integer (cons vector (cons vector null)))))
+                 (<= 1 (second encoded) #x7fffffff)
+                 (loop for bytes in (list (first encoded) (third encoded) (fourth encoded))
+                       for size in '(16 32 32)
+                       always (and (= (length bytes) size)
+                                   (every (lambda (byte) (typep byte '(unsigned-byte 8))) bytes))))
+      (error "invalid role verifier in catalog image"))
+    (flet ((octets (bytes)
+             (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+      (list (octets (first encoded)) (second encoded)
+            (octets (third encoded)) (octets (fourth encoded))))))
+
+(defparameter *rewind-function-grant-signatures*
+  '((:ls-dir "pg_ls_dir" "text" "boolean" "boolean")
+    (:stat-file "pg_stat_file" "text" "boolean")
+    (:read-binary-file "pg_read_binary_file" "text")
+    (:read-binary-file-range "pg_read_binary_file" "text" "bigint" "bigint" "boolean")))
+
+(defun catalog-role-from-sexp (encoded)
+  (unless (typep encoded '(cons (unsigned-byte 32)
+                           (cons string (cons boolean (cons boolean (cons boolean
+                                                                     (cons t (or null (cons list (or null (cons boolean null)))))))))))
+    (error "invalid role in catalog image"))
+  (destructuring-bind (oid name login-p superuser-p replication-p verifier &optional grants native-rewind-p) encoded
+    (unless (and (<= 1 (length (string->bytes name)) 63) (not (find (code-char 0) name))
+                 (if (string= name "postgres") (= oid 10) (>= oid +first-normal-object-id+)))
+      (error "invalid role identity in catalog image"))
+    (unless (and (list-length grants)
+                 (every (lambda (grant) (assoc grant *rewind-function-grant-signatures*)) grants))
+      (error "invalid role function grants in catalog image"))
+    (make-pg-role :oid oid :name name :login-p login-p :superuser-p superuser-p
+                  :replication-p replication-p :verifier (catalog-role-verifier-from-sexp verifier)
+                  :function-grants (copy-list grants) :native-rewind-p native-rewind-p)))
+
+(defun catalog-decode-roles (entries)
+  (let ((roles (make-hash-table :test #'equal))
+        (oids (make-hash-table :test #'eql)))
+    (dolist (entry entries roles)
+      (let ((role (catalog-role-from-sexp entry)))
+        (when (or (gethash (pg-role-name role) roles) (gethash (pg-role-oid role) oids))
+          (error "duplicate role identity in catalog image"))
+        (setf (gethash (pg-role-name role) roles) role
+              (gethash (pg-role-oid role) oids) t)))))
+
 (defun catalog-to-sexp (cat)
   `(:cluster-identity ,(catalog-cluster-identity cat)
     :next-oid ,(catalog-next-oid cat)
     :databases ,(loop for db being the hash-values of (catalog-databases cat)
-                      collect (database-to-sexp db))))
+                      collect (database-to-sexp db))
+    ,@(when (plusp (hash-table-count (catalog-roles cat)))
+        (list :roles (loop for role being the hash-values of (catalog-roles cat)
+                           collect (catalog-role-to-sexp role))))))
 
 (defun catalog-from-sexp (s)
   (unless (getf s :cluster-identity)
@@ -365,7 +520,8 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
   (let ((cat (make-catalog :cluster-identity
                            (or (getf s :cluster-identity)
                                (new-catalog-cluster-identity))
-                           :next-oid (getf s :next-oid))))
+                           :next-oid (getf s :next-oid)
+                           :roles (catalog-decode-roles (getf s :roles)))))
     (dolist (ds (getf s :databases))
       (let ((db (database-from-sexp ds)))
         (setf (gethash (database-name db) (catalog-databases cat)) db)))
@@ -393,6 +549,7 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
                        (pgdata-path "global/pg_catalog.tmp")
                        (pgdata-path "global/")
                        :element-type '(unsigned-byte 8)
+                       :mode #o600
                        :rename-function (or *catalog-rename-function*
                                             #'sb-posix:rename))
     ;; Atomic rename keeps the old catalog present until the new image is

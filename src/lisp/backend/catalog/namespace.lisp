@@ -14,6 +14,10 @@
 (defparameter +physical-slot-advance-result-fields+
   '(("slot_name" :name) ("end_lsn" :pg-lsn)))
 
+(defparameter +rewind-stat-file-result-fields+
+  '(("size" :int8) ("access" :timestamptz) ("modification" :timestamptz)
+    ("change" :timestamptz) ("creation" :timestamptz) ("isdir" :bool)))
+
 (defparameter +control-checkpoint-result-fields+
   '(("checkpoint_lsn" :pg-lsn) ("redo_lsn" :pg-lsn) ("redo_wal_file" :text)
     ("timeline_id" :int4) ("prev_timeline_id" :int4)
@@ -225,9 +229,28 @@
 
 (defconstant +bootstrap-role-oid+ 10)
 
+(defun sql-visible-roles ()
+  (let ((roles (and *catalog* (catalog-roles *catalog*)))
+        (changes (and *backend* (backend-role-changes *backend*))))
+    (append (mapcar #'third changes)
+            (when roles
+              (loop for role being the hash-values of roles
+                    unless (assoc (pg-role-name role) changes :test #'string=)
+                      collect role))
+            (unless (or (and roles (gethash "postgres" roles))
+                        (assoc "postgres" changes :test #'string=))
+              (list (catalog-bootstrap-role))))))
+
+(defun sql-roles-rows ()
+  (loop for role in (sql-visible-roles)
+        collect (vector (pg-role-name role) (pg-role-superuser-p role)
+                        (pg-role-login-p role) (pg-role-replication-p role)
+                        (pg-role-oid role))))
+
 (defun sql-authid-rows ()
-  "Expose the SQL identity of the bootstrap role in catalog column order."
-  (list (vector +bootstrap-role-oid+ (current-user-name))))
+  "Return role identities without exposing password verifiers."
+  (loop for role in (sql-visible-roles)
+        collect (vector (pg-role-oid role) (pg-role-name role))))
 
 (defparameter +activity-result-fields+
   '(("pid" :int4) ("usesysid" :oid) ("application_name" :text)
@@ -265,8 +288,12 @@ A provisional connection has no SQL role until startup admission succeeds."
      (loop for backend being the hash-values of *backend-registry*
            when (or (eq pid +null+) (= pid (backend-pid backend)))
              collect (vector (backend-pid backend)
-                             (if (gethash backend *backend-admission-classes*)
-                                 +bootstrap-role-oid+ +null+)
+                             (or (when (gethash backend *backend-admission-classes*)
+                                   (let* ((user (backend-startup-user backend))
+                                          (role (and *catalog* (gethash user (catalog-roles *catalog*)))))
+                                     (cond (role (pg-role-oid role))
+                                           ((string= user "postgres") +bootstrap-role-oid+))))
+                                 +null+)
                              (copy-seq (or (backend-application-name backend) ""))
                              (or (gethash backend *backend-client-addresses*) +null+))))))
 
@@ -509,6 +536,9 @@ synchronous_commit. Reject unsupported parameters and other local settings."
          :rows 'startup-settings-rows :fields +sql-settings-fields+)
    (list :oid 1260 :name "pg_authid" :kind #\r :rows 'sql-authid-rows
          :fields '(("oid" :oid t 1) ("rolname" :name t 2)))
+   (list :oid 12110 :name "pg_roles" :kind #\v :rows 'sql-roles-rows
+         :fields '(("rolname" :name t 1) ("rolsuper" :bool t 2)
+                   ("rolcanlogin" :bool t 6) ("rolreplication" :bool t 7) ("oid" :oid t 13)))
    (list :oid 1262 :name "pg_database" :kind #\r :rows 'sql-database-rows
          :fields '(("oid" :oid t 1) ("datname" :name t 2)))
    (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
@@ -889,4 +919,5 @@ Capture policy and keep size once for every row in the snapshot."
 (defun current-schema-name ()
   (or (first (explicit-sql-search-path)) +null+))
 
-(defun current-user-name () "postgres")
+(defun current-user-name ()
+  (if *backend* (backend-startup-user *backend*) "postgres"))

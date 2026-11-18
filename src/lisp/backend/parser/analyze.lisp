@@ -1608,9 +1608,31 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
         (with-write-lock (check-relation))))
   name)
 
+(defun coerce-rewind-function-arguments (name arguments types)
+  (unless (and types (= (length arguments) (length types))
+               (every (lambda (argument type)
+                        (or (in-unknown-constant-p argument)
+                            (sql-implicit-coercion-p (expr-type argument) type)))
+                      arguments types))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (mapcar #'coerce-common-expression arguments types))
+
 (defun analyze-utility-function-call (name args)
   "Analyze the supported utility calls or report an unresolved function."
   (cond
+    ((string= name "pg_read_binary_file")
+     (let ((types (case (length args) (1 '(:text)) (4 '(:text :int8 :int8 :bool)))))
+       (list :func name (coerce-rewind-function-arguments name args types) :type :bytea :typmod -1)))
+    ((string= name "pg_stat_file")
+     (list :func name (coerce-rewind-function-arguments name args '(:text :bool))
+           :type :record :typmod -1 :fields +rewind-stat-file-result-fields+))
+    ((string= name "pg_ls_dir")
+     (unless (and *select-set-functions-allowed-p*
+                  (not (and (boundp '*inside-aggregate-input-p*) *inside-aggregate-input-p*))
+                  (not (some #'analyzed-expression-contains-set-p args)))
+       (ereport "0A000" "set-returning functions are not allowed in this context"))
+     (list :set-func name (coerce-rewind-function-arguments name args '(:text :bool :bool))
+           :type :text :typmod -1))
     ((string= name "set_config")
      (unless (and (= (length args) 3)
                   (eq (expr-type (first args)) :text)
@@ -3520,7 +3542,8 @@ candidate selection."
   (unless (eq (first raw) :func)
     (ereport "42809" "expression is not a supported composite type"))
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
-    (cond ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
+    (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
+          ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
           ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
           ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
@@ -4584,6 +4607,8 @@ the full 64-bit ID as a signed value."
 
 (defun eval-func (name args)
   (cond
+    ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
+    ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
     ((string= name "width_bucket") (sql-width-bucket args))
     ((and (member name '("nextval" "currval" "setval") :test #'string=)

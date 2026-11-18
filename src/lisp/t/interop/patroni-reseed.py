@@ -1158,6 +1158,39 @@ class RewindPatroniCheckpointAcceptance(RewindPatroniAcceptance):
         assert gate.call_args.args[0]["application_name"] == "rewind_checkpoint_probe"
 
 
+class RewindPatroniScramAcceptance(PatroniLifecycleAcceptance):
+    label = "patroni-lifecycle-scram"
+    rewind_user = "rewind_lifecycle"
+    rewind_password = "rewind-lifecycle-fixture"
+
+    def checkpoint_hint(self, config):
+        # The promoted source stays available to the normal fixture probes.
+        # Only the dedicated rewind account must use SCRAM.
+        source = self.server.port
+        follow.query(source, f"CREATE ROLE {self.rewind_user} LOGIN NATIVE_REWIND PASSWORD '{self.rewind_password}'")
+        for signature in ("pg_ls_dir(text, boolean, boolean)", "pg_stat_file(text, boolean)",
+                          "pg_read_binary_file(text)", "pg_read_binary_file(text, bigint, bigint, boolean)"):
+            follow.query(source, f"GRANT EXECUTE ON FUNCTION pg_catalog.{signature} TO {self.rewind_user}")
+        hba = self.server.data / "pg_hba.conf"
+        hba.write_text(f"host all {self.rewind_user} 127.0.0.1/32 scram-sha-256\n"
+                       f"host replication {self.rewind_user} 127.0.0.1/32 scram-sha-256\n"
+                       + hba.read_text())
+        assert follow.query(source, "SELECT pg_reload_conf()") == [(True,)]
+        config["authentication"]["rewind"] = {"username": self.rewind_user,
+                                                "password": self.rewind_password}
+        return {}
+
+    def execute_patroni_rewind(self, rewind, leader):
+        credentials = rewind._conn_kwargs(leader, {"username": self.rewind_user,
+                                                   "password": self.rewind_password})
+        assert rewind.check_leader_has_run_checkpoint(credentials) is None
+        with patch.object(rewind, "check_leader_has_run_checkpoint",
+                          wraps=rewind.check_leader_has_run_checkpoint) as gate:
+            rewind.execute(leader)
+        gate.assert_called_once()
+        assert gate.call_args.args[0]["user"] == self.rewind_user
+
+
 class RewindDirtyPatroniAcceptance(RewindPatroniAcceptance):
     label = "rewind-patroni-dirty"
     segment_size = 16 * 1024 * 1024
@@ -1342,6 +1375,7 @@ def main():
              "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
                  "patroni-lifecycle": PatroniLifecycleAcceptance,
+                   "patroni-lifecycle-scram": RewindPatroniScramAcceptance,
                "rewind-patroni-checkpoint-query": RewindPatroniCheckpointAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}

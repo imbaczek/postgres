@@ -165,7 +165,9 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
   (if (eq :scram (authentication-authorize (startup-configuration-authentication configuration)
                                            user database peer (backend-replication-mode backend)))
       :scram
-      (admit-startup-backend-with-configuration backend configuration peer)))
+      (progn
+        (authentication-check-role-admission user (backend-replication-mode backend))
+        (admit-startup-backend-with-configuration backend configuration peer))))
 
 (defun finish-startup (stream params dbname)
   "Send startup parameters for an admitted backend."
@@ -174,7 +176,7 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
   (with-catalog-lock
     (unless (or (eq (backend-replication-mode *backend*) :physical)
                 (gethash dbname (catalog-databases *catalog*)))
-      (when (recovery-in-progress-p)
+      (when (or (recovery-in-progress-p) (rewind-restricted-sql-session-p))
         (ereport-fatal "3D000" "database ~s does not exist" dbname))
       (get-database dbname)
       (save-catalog)))
@@ -188,8 +190,10 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
   (send-parameter-status stream "integer_datetimes" "on")
   (send-parameter-status stream "standard_conforming_strings" "on")
   (send-parameter-status stream "IntervalStyle" "postgres")
-  (send-parameter-status stream "is_superuser" "on")
-  (send-parameter-status stream "session_authorization" (current-user-name))
+  (let ((user (backend-startup-user *backend*)))
+    (let ((role (authentication-committed-role user)))
+      (send-parameter-status stream "is_superuser" (if (or (null role) (pg-role-superuser-p role)) "on" "off"))
+      (send-parameter-status stream "session_authorization" (if role user (current-user-name)))))
   (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
   (send-parameter-status stream "default_transaction_read_only" "off")
   (report-hot-standby-status stream t)
@@ -218,7 +222,8 @@ Capture the replication source identity for later sender registration."
                  (app (or (startup-last-parameter params "application_name") ""))
                  (peer (sb-bsd-sockets:socket-peername (backend-socket *backend*))))
             (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
-              (setf (backend-database *backend*) dbname
+              (setf (backend-startup-user *backend*) user
+                    (backend-database *backend*) dbname
                     (backend-application-name *backend*) app
                     (backend-replication-mode *backend*) replication
                     (backend-replication-source-id *backend*)
@@ -231,12 +236,13 @@ Capture the replication source identity for later sender registration."
                 (return-from process-startup (finish-startup stream params dbname)))
               (values configuration params user dbname peer)))))
     (handler-case
-        (authenticate-bootstrap-scram stream user)
+        (authenticate-role-scram stream user)
       (sb-ext:timeout ()
         (ereport-fatal "57014" "canceling authentication due to timeout")))
     (with-live-operation
       (unless (and (conns-allowed-p) (eq configuration (startup-require-configuration)))
         (ereport-fatal "57P03" "startup configuration changed; retry the connection"))
+      (authentication-check-role-admission user (backend-replication-mode *backend*))
       (admit-startup-backend-with-configuration *backend* configuration peer)
       (finish-startup stream params dbname))))
 
@@ -616,6 +622,10 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
 
 (defun %dispatch-frontend-frame (stream type-byte length-bytes payload)
   "Admit a raw frame before protocol validation and message construction."
+  (when (and (eq (backend-replication-mode *backend*) :physical)
+             (not (string= (backend-startup-user *backend*) "postgres"))
+             (not (member (code-char type-byte) '(#\Q #\X))))
+    (ereport-fatal "08P01" "physical replication requires simple-query protocol"))
   (cond
     ((and *extended-query-state*
           (extended-query-state-ignore-until-sync *extended-query-state*)

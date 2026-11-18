@@ -1177,6 +1177,65 @@
         (ok (equal "" (pg::sql-setting-value "pg_stat_statements.track_utility")))
         (ok (intake-fails-p (lambda () (run-sql "SET log_statement TO all")))))))
 
+(deftest role-options-for-patroni-bootstrap-parse-at-both-entry-points
+    (let* ((create "CREATE ROLE \"Replica Login\" WITH REPLICATION LOGIN PASSWORD 'test''password'")
+           (alter "ALTER ROLE postgres WITH NOSUPERUSER NOLOGIN PASSWORD NULL")
+           (create-ast '(:type :create-role :name "Replica Login"
+                         :options ((:replication . t) (:login . t) (:password . "test'password"))))
+           (alter-ast '(:type :alter-role :name "postgres"
+                        :options ((:superuser) (:login) (:password)))))
+      (ok (equal (list create-ast alter-ast)
+                 (pg::parse-statements (format nil "~a; ~a" create alter))))
+      (ok (equal (list alter-ast create-ast)
+                 (getf (pg::compile-do-source (format nil "BEGIN ~a; ~a; END;" alter create))
+                       :statements)))
+      (ok (intake-fails-p (lambda () (pg::parse-statements "ALTER ROLE postgres LOGIN NOLOGIN"))))
+      (ok (intake-fails-p (lambda () (pg::parse-statements "CREATE ROLE new_role BYPASSRLS"))))))
+
+(deftest role-verifiers-roundtrip-in-the-physical-catalog-image
+    (let* ((catalog (pg::make-catalog))
+           (verifier (list (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1)
+                           4096
+                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
+                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
+           (role (pg::make-pg-role :oid pg::+first-normal-object-id+ :name "streamer"
+                                   :login-p t :replication-p t :verifier verifier
+                                   :native-rewind-p t :function-grants '(:read-binary-file :stat-file))))
+      (ok (zerop (hash-table-count (pg::catalog-roles
+                                    (pg::catalog-from-sexp (pg::catalog-to-sexp catalog))))))
+      (setf (gethash "streamer" (pg::catalog-roles catalog)) role)
+      (let* ((pg::*catalog* catalog)
+             (*read-eval* nil)
+             (image (read-from-string (pg::bytes->string (pg::catalog-image-bytes))))
+             (restored (gethash "streamer" (pg::catalog-roles (pg::catalog-from-sexp image)))))
+        (ok (equalp (pg::catalog-role-to-sexp role) (pg::catalog-role-to-sexp restored)))
+        (ok (typep (first (pg::pg-role-verifier restored)) '(simple-array (unsigned-byte 8) (16))))
+        (ok (pg::pg-role-native-rewind-p restored))
+        (ok (eq :read-binary-file (first (pg::pg-role-function-grants restored))))
+        (let ((bad (copy-tree image)))
+          (setf (seventh (first (getf bad :roles))) '(:unsupported))
+          (ok (intake-fails-p (lambda () (pg::catalog-from-sexp bad)))))
+        (push (first (getf image :roles)) (getf image :roles))
+        (ok (intake-fails-p (lambda () (pg::catalog-from-sexp image)))))))
+
+(deftest role-replacement-preserves-committed-state-until-publication
+    (let* ((catalog (pg::make-catalog))
+           (role (pg::catalog-role-change "replica" nil '((:login . t) (:password . "fixture"))
+                                          t :oid pg::+first-normal-object-id+))
+           (staged (pg::catalog-prepare-role-changes catalog (list (list "replica" nil role)))))
+      (ok (null (gethash "replica" (pg::catalog-roles catalog))))
+      (ok (eq role (gethash "replica" staged)))
+      (setf (pg::catalog-roles catalog) staged)
+      (let ((candidate (pg::catalog-role-change "replica" role '((:replication . t)) nil))
+            (cleared (pg::catalog-role-change "replica" role '((:password)) nil)))
+        (ok (eq (pg::pg-role-verifier role) (pg::pg-role-verifier candidate)))
+        (ok (null (pg::pg-role-verifier cleared)))
+        (ok (pg::pg-role-replication-p candidate))
+        (ok (not (pg::pg-role-replication-p role)))
+        (ok (intake-fails-p
+             (lambda ()
+               (pg::catalog-prepare-role-changes catalog (list (list "replica" nil candidate)))))))))
+
 (cl-spec:defproperty session-options-roundtrip-backslash-escaped-tokens
     ((bits (range integer 0 4611686018427387903)) (size (range integer 1 40)))
   (:about pg::split-session-options)

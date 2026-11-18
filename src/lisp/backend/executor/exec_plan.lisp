@@ -1645,6 +1645,8 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
              (lambda ()
                (if pending (progn (setf pending nil) (values value t))
                    (values nil nil)))))
+          ((string= (second call) "pg_ls_dir")
+           (apply #'make-rewind-directory-result-iterator arguments))
           ((string= (second call) "pg_stat_get_wal_senders")
            (make-wal-sender-result-iterator))
           ((string= (second call) "pg_stat_get_activity")

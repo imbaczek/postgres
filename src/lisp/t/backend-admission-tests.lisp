@@ -84,6 +84,66 @@
                        (ok (eq next (pg::startup-capture-configuration))))
                   (setf (symbol-function 'pg::authentication-authorize) authorize))))))))))
 
+(deftest stored-role-flags-govern-startup-admission
+    (let* ((pg::*catalog* (pg::make-catalog))
+           (roles (pg::catalog-roles pg::*catalog*)))
+      (flet ((state (user mode)
+               (handler-case (progn (pg::authentication-check-role-admission user mode) nil)
+                 (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))
+        (ok (null (state "postgres" :physical)))
+        (ok (equal "28000" (state "unknown" :physical)))
+        (ok (equal "28000" (state "unknown" nil)))
+        (setf (gethash "follower" roles)
+              (pg::make-pg-role :name "follower" :login-p t :replication-p t))
+        (ok (null (state "follower" :physical)))
+        (ok (equal "42501" (state "follower" nil)))
+        (setf (pg::pg-role-replication-p (gethash "follower" roles)) nil)
+        (ok (equal "42501" (state "follower" :physical)))
+        (setf (pg::pg-role-login-p (gethash "follower" roles)) nil)
+        (ok (equal "28000" (state "follower" :physical))))))
+
+(deftest rewind-file-grants-distinguish-whole-file-and-range-signatures
+    (let ((pg::*catalog* (pg::make-catalog))
+          (pg::*backend* (pg::make-backend :startup-user "rewind")))
+      (setf (gethash "rewind" (pg::catalog-roles pg::*catalog*))
+            (pg::make-pg-role :name "rewind" :function-grants '(:read-binary-file)))
+      (ok (null (pg::require-rewind-function-grant :read-binary-file)))
+      (ok (signals (pg::require-rewind-function-grant :read-binary-file-range) 'pg::pg-error))
+      (ok (pg::rewind-readable-file-p "base/10001"))
+      (ok (not (pg::rewind-readable-file-p "base/../global/pg_catalog.dat")))
+      (ok (not (pg::rewind-readable-file-p "pg_wal/0000000000000000.wal")))))
+
+(deftest rewind-grants-do-not-authorize-general-physical-replication
+    (let* ((pg::*catalog* (pg::make-catalog))
+           (backend (pg::make-backend :startup-user "rewind" :replication-mode :physical))
+           (role (pg::make-pg-role :name "rewind" :login-p t
+                                   :function-grants '(:ls-dir :stat-file :read-binary-file))))
+      (setf (gethash "rewind" (pg::catalog-roles pg::*catalog*)) role)
+      (ok (signals (pg::authentication-check-role-admission "rewind" :physical) 'pg::pg-error))
+      (push :read-binary-file-range (pg::pg-role-function-grants role))
+      (ok (signals (pg::authentication-check-role-admission "rewind" :physical) 'pg::pg-error))
+      (setf (pg::pg-role-native-rewind-p role) t)
+      (ok (null (pg::authentication-check-role-admission "rewind" :physical)))
+      (ok (null (pg::require-physical-replication-command-privilege backend :physical-lease-capture-rewind)))
+      (dolist (command '(:physical-start :physical-backup :physical-lease-capture :create-physical :drop))
+        (ok (signals (pg::require-physical-replication-command-privilege backend command) 'pg::pg-error)))))
+
+(deftest rewind-sql-scope-rejects-delegated-execution
+    (let ((pg::*catalog* (pg::make-catalog))
+          (pg::*backend* (pg::make-backend :startup-user "rewind")))
+      (setf (gethash "rewind" (pg::catalog-roles pg::*catalog*))
+            (pg::make-pg-role :name "rewind" :function-grants '(:read-binary-file)))
+      (flet ((authorize (sql) (pg::check-rewind-sql-statements (pg::parse-statements sql))))
+        (ok (null (authorize "SELECT pg_catalog.pg_read_binary_file($1)")))
+        (ok (null (authorize "SELECT * FROM pg_catalog.pg_roles")))
+        (dolist (sql '("SELECT 1; DO $$BEGIN NULL; END$$"
+                       "SELECT (SELECT pg_reload_conf())"
+                       "SELECT pg_read_binary_file(current_setting('data_directory'))"
+                       "SELECT pg_read_binary_file('PG_VERSION') FROM pg_catalog.pg_authid"
+                       "SELECT * FROM pg_roles"
+                       "SELECT * FROM pg_catalog.pg_roles UNION SELECT * FROM pg_roles"))
+          (ok (signals (authorize sql) 'pg::pg-error) sql)))))
+
 (deftest zero-senders-rejects-both-replication-modes-without-consuming-sql
     (call-with-backend-admission-fixture
      (lambda ()

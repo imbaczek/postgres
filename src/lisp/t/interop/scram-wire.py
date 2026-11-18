@@ -13,11 +13,11 @@ OwnedLisp = runpy.run_path(str(Path(__file__).parents[1] / 'command-complete.py'
 LISP = Path(__file__).resolve().parents[2]
 
 
-def query(server, password):
+def query(server, password, statement='SELECT 42'):
     dsn = (f'host=127.0.0.1 port={server.port} user=postgres dbname=postgres '
            'sslmode=disable connect_timeout=3')
     return subprocess.run(
-        ['psql', '-XAwqt', '-d', dsn, '-c', 'SELECT 42'],
+        ['psql', '-XAwqt', '-d', dsn, '-c', statement],
         env={**os.environ, 'PGPASSWORD': password, 'LC_ALL': 'C'},
         capture_output=True, text=True, timeout=15)
 
@@ -56,7 +56,7 @@ def check_authentication_timeout(server):
     assert query(server, 'wire-fixture').returncode == 0
 
 
-def start_and_check_login(server):
+def start_and_check_login(server, password='wire-fixture'):
     with (server.root / 'server.log').open('ab') as log:
         server.process = subprocess.Popen(
             [str(LISP / 'pg-lisp.sh'), '-D', str(server.data), '-p', str(server.port)],
@@ -64,7 +64,7 @@ def start_and_check_login(server):
     deadline = time.monotonic() + 45
     while True:
         assert server.process.poll() is None, server.root
-        good = query(server, 'wire-fixture')
+        good = query(server, password)
         if good.returncode == 0:
             assert good.stdout.strip() == '42', good
             return
@@ -72,19 +72,21 @@ def start_and_check_login(server):
         time.sleep(0.1)
 
 
-def check_backup_login(source):
+def check_backup_login(source, password='wire-fixture'):
     clone = OwnedLisp()
     try:
         dsn = f'host=127.0.0.1 port={source.port} user=postgres sslmode=disable'
         result = subprocess.run(
             [str(LISP / 'bin/pg_basebackup'), '-D', str(clone.data), '-X', 'stream', '-d', dsn],
-            env={**os.environ, 'PGPASSWORD': 'wire-fixture'},
+            env={**os.environ, 'PGPASSWORD': password},
             capture_output=True, text=True, timeout=60)
         assert result.returncode == 0, result.stderr
         relative = Path('global/pg_bootstrap_scram')
         assert (clone.data / relative).stat().st_mode & 0o777 == 0o600
         assert (clone.data / relative).read_bytes() == (source.data / relative).read_bytes()
-        start_and_check_login(clone)
+        for node in (source, clone):
+            assert (node.data / 'global/pg_catalog.dat').stat().st_mode & 0o777 == 0o600
+        start_and_check_login(clone, password)
         bad = query(clone, 'wrong-fixture-password')
         assert bad.returncode != 0 and 'password authentication failed' in bad.stderr, bad
         print('scram-wire: authenticated native base backup retains the private verifier PASS')
@@ -112,8 +114,45 @@ def main():
             check_empty_initial_response(server)
             if attempt == 0:
                 check_authentication_timeout(server)
-                check_backup_login(server)
+            else:
+                rolled_back = query(server, 'wire-fixture',
+                                    "BEGIN; ALTER ROLE postgres PASSWORD 'unused-fixture'; ROLLBACK")
+                assert rolled_back.returncode == 0, rolled_back.stderr
+                failed = query(server, 'wire-fixture',
+                               "ALTER ROLE postgres PASSWORD 'unused-fixture'; SELECT 1/0")
+                assert failed.returncode != 0 and 'division by zero' in failed.stderr, failed
+                changed = query(server, 'wire-fixture', "ALTER ROLE postgres PASSWORD 'rotated-fixture'")
+                assert changed.returncode == 0, changed.stderr
+                assert query(server, 'wire-fixture').returncode != 0
+                assert query(server, 'rotated-fixture').returncode == 0
             server.stop()
+        start_and_check_login(server, 'rotated-fixture')
+        assert query(server, 'wire-fixture').returncode != 0
+        version = query(server, 'rotated-fixture',
+                        "SELECT pg_catalog.pg_read_binary_file('PG_VERSION')")
+        assert version.returncode == 0 and version.stdout.strip().startswith('\\x'), version
+        prefix = query(server, 'rotated-fixture',
+                       "SELECT octet_length(pg_read_binary_file('PG_VERSION', 0, 1, false))")
+        assert prefix.returncode == 0 and prefix.stdout.strip() == '1', prefix
+        root = query(server, 'rotated-fixture',
+                     "SELECT pg_ls_dir('.', false, true) AS entry ORDER BY entry")
+        assert root.returncode == 0 and root.stdout.splitlines() == ['.', '..', 'PG_VERSION', 'base', 'global', 'pg_xact'], root
+        global_dir = query(server, 'rotated-fixture',
+                           "SELECT * FROM pg_catalog.pg_ls_dir('global', false, false)")
+        assert global_dir.returncode == 0 and global_dir.stdout.strip() == 'pg_control', global_dir
+        metadata = query(server, 'rotated-fixture',
+                         "SELECT size, isdir FROM pg_catalog.pg_stat_file('PG_VERSION', false)")
+        assert metadata.returncode == 0 and metadata.stdout.strip() == f"{(server.data / 'PG_VERSION').stat().st_size}|f", metadata
+        directory = query(server, 'rotated-fixture',
+                          "SELECT (pg_stat_file('base', false)).isdir")
+        assert directory.returncode == 0 and directory.stdout.strip() == 't', directory
+        private_dir = query(server, 'rotated-fixture', "SELECT pg_ls_dir('pg_wal', false, false)")
+        assert private_dir.returncode != 0 and 'outside the rewind read scope' in private_dir.stderr, private_dir
+        for path in ('../pwfile', 'global/pg_bootstrap_scram', 'global/pg_catalog.dat'):
+            denied = query(server, 'rotated-fixture', f"SELECT pg_read_binary_file('{path}')")
+            assert denied.returncode != 0 and 'outside the rewind read scope' in denied.stderr, denied
+        check_backup_login(server, 'rotated-fixture')
+        print('scram-wire: rollback and committed password rotation survive restart and clone PASS')
         print('scram-wire: initdb credentials, restart and startup frame validation PASS')
     finally:
         server.stop()

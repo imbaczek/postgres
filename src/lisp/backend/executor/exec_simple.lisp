@@ -822,6 +822,9 @@ Do not perform wire I/O while restoring transaction state."
      (if (backend-transaction-read-only-p) "on" "off"))
     ((string= name "in_hot_standby") (if (recovery-in-progress-p) "on" "off"))
     ((string= name "default_transaction_read_only") "off")
+    ((string= name "wal_segment_size") (startup-format-unit +wal-segment-size+ :bytes))
+    ((string= name "data_directory_mode")
+     (format nil "~4,'0o" (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring *pgdata*))))))
     ((string= name "server_version") *server-version*)
     ((string= name "server_version_num") (princ-to-string *server-version-num*))
     ((string= name "search_path") (session-search-path))
@@ -1581,6 +1584,19 @@ Release these locks before waiting for commit or sending replies."
 
 (defvar *inline-do-found-p* nil)
 
+(defun exec-role-change (stream ast)
+  (when (backend-transaction-read-only-p)
+    (ereport "25006" "cannot change roles in a read-only transaction"))
+  (unless (string= (backend-startup-user *backend*) "postgres")
+    (ereport "42501" "permission denied to change roles"))
+  (when (or (backend-xid *backend*) (backend-final-ddl-committed-p *backend*))
+    (ereport "0A000" "role changes cannot share a transaction with data or other catalog changes"))
+  (stage-catalog-role-change *backend* ast)
+  (send-command-complete stream (ecase (getf ast :type)
+                                  (:create-role "CREATE ROLE")
+                                  (:alter-role "ALTER ROLE")
+                                  (:grant-role-function "GRANT"))))
+
 (defun execute-do-statement (stream ast)
   "Run an inline statement without starting or ending a transaction.
 SQL children register a statement snapshot and advance the command ID; cleanup
@@ -1606,6 +1622,7 @@ restores the caller's snapshot. Blocks and NULL need no snapshot of their own."
                (if (eq (getf ast :type) :perform) (getf ast :query) ast))
               (case (getf ast :type)
                 (:perform (setf *inline-do-found-p* (exec-perform (getf ast :query))))
+                ((:create-role :alter-role :grant-role-function) (exec-role-change stream ast))
                 (:set (exec-set stream ast))
                 (:reset (exec-reset stream ast))
                 (t (ereport "0A000" "unsupported inline statement"))))
@@ -1641,6 +1658,8 @@ without a change; each actual publication captures its own schema precondition."
                          :create-index :drop-index :alter-index :alter-table
                          :apply-sequence-state :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
+    (when (and (catalog-change-p ast) (backend-role-changes *backend*))
+      (ereport "0A000" "role changes cannot share a transaction with other catalog changes"))
     (when (and (catalog-change-p ast) (backend-explicit *backend*))
       (ereport "0A000"
                "catalog changes are not supported inside an explicit transaction block"))
@@ -1652,6 +1671,7 @@ without a change; each actual publication captures its own schema precondition."
                    (case (getf ast :type)
                      (:select (exec-select stream ast))
                      (:do (exec-do stream ast))
+                     ((:create-role :alter-role :grant-role-function) (exec-role-change stream ast))
                      (:copy-to (setf copy-row-count (exec-copy-to stream ast)))
                      (:explain (exec-explain stream ast))
                      (:analyze (exec-analyze stream ast))
@@ -1754,7 +1774,8 @@ retires the transaction without undoing the catalog."
 Transaction options and session characteristics are excluded."
   (and (rest statements)
        (every (lambda (statement)
-                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show :do))
+                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show :do
+                                                      :create-role :alter-role :grant-role-function))
                      (not (getf statement :transaction-options-p))
                      (not (getf statement :session-characteristics-p))))
               statements)))
@@ -1810,6 +1831,7 @@ Advance the command ID after each successful non-transaction statement."
 Protect setup, commit completion and abort cleanup from interrupts; statement
 execution and final network output remain interruptible. The last command tag
 is sent only after commit."
+  (check-rewind-sql-statements statements)
   (when *extended-simple-multi-p*
     (return-from execute-simple-query-statements
       (execute-query-statements stream statements t)))

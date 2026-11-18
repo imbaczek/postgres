@@ -1073,11 +1073,27 @@ The caller releases the slot before sending shutdown completion."
          (end (or (position 0 query-payload) (length query-payload))))
     (bytes->string query-payload :start 0 :end end)))
 
+(defun require-physical-replication-command-privilege (backend command-type)
+  (when (eq (backend-replication-mode backend) :physical)
+    (let* ((user (backend-startup-user backend))
+           (role (authentication-committed-role user)))
+      (unless (or (if role (pg-role-replication-p role) (string= user "postgres"))
+                  (and (role-can-rewind-native-p role)
+                       (member command-type
+                               '(:identify :timeline-history :show :physical-identify-rewind-origin
+                                 :physical-lease-capture-rewind :physical-lease-replay-rewind
+                                 :physical-lease-prove-rewind :physical-lease-status
+                                 :physical-lease-prepare-follow :physical-lease-cancel-follow
+                                 :physical-lease-handoff :physical-lease-abort
+                                 :physical-lease-cleanup-selected))))
+        (ereport "42501" "command is outside the native rewind replication scope")))))
+
 (defun validate-replication-command-context (command)
   "Enforce transaction and recovery restrictions before touching replication state."
   (when (eq (backend-state *backend*) :aborted)
     (ereport "25P02"
              "current transaction is aborted, commands ignored until end of transaction block"))
+  (require-physical-replication-command-privilege *backend* (logical-replication-command-type command))
   (check-recovery-available)
   (when (and (eq (backend-replication-mode *backend*) :physical)
              (member (logical-replication-command-type command) '(:create :start)))
@@ -1141,8 +1157,11 @@ The caller releases the slot before sending shutdown completion."
              (with-live-operation (identify-replication-system stream)))
             (:show
              (with-live-operation
-               (exec-show stream (list :name (cdr (assoc "name" (logical-replication-command-options command)
-                                                         :test #'string=))))
+               (let ((name (cdr (assoc "name" (logical-replication-command-options command) :test #'string=))))
+                 (when (and (not (string= (backend-startup-user *backend*) "postgres"))
+                            (not (member name '("wal_segment_size" "data_directory_mode") :test #'string-equal)))
+                   (ereport "42501" "setting is outside the replication SQL scope"))
+                 (exec-show stream (list :name name)))
                (send-ready-for-query stream (transaction-status-char))))
             (:timeline-history
              (with-live-operation

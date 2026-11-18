@@ -8,6 +8,7 @@
   (pid 0)
   (cancel-key nil)
   (database "postgres")
+  (startup-user "postgres")
   (replication-mode nil)
   ;; Capture during admitted startup; registration checks this same source identity.
   (replication-source-id nil)
@@ -27,6 +28,7 @@
   (transaction-schema-read-lock-held-p nil)
   (first-snapshot-set nil)
   (dirty-relations '())
+  (role-changes nil)
   ;; Per-transaction durable boundaries; reset detaches this context.
   (wal-obligation nil)
   (logical-changes '())
@@ -2505,6 +2507,7 @@ so no interrupt can discard the owner of a virtual ID or its relation locks."
           (backend-snapshot b) nil
           (backend-first-snapshot-set b) nil
           (backend-dirty-relations b) '()
+          (backend-role-changes b) nil
           (backend-wal-obligation b) nil
           (backend-logical-changes b) '()
           (backend-logical-change-bytes b) 0)
@@ -2685,10 +2688,27 @@ Run outside publication locks, clean up the transaction, then handle the outcome
 ;; consumption and wait: after an irreversible commit, errors or nonlocal
 ;; exits suppress frontend output and still perform committed cleanup.
 
+(defun commit-role-only-transaction (backend)
+  (prepare-backend-final-ddl backend)
+  (let ((context (backend-wal-obligation backend))
+        (complete nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (multiple-value-prog1
+               (sb-sys:allow-with-interrupts
+                 (sb-sys:with-local-interrupts
+                   (commit-catalog-role-changes backend)
+                   (commit-final-ddl-without-xid backend)))
+             (setf complete t))
+        (when (and (not complete) (transaction-wal-obligation-final-ddl-p context))
+          (finish-failed-final-ddl backend))))))
+
 (defun commit-transaction ()
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
   (let ((b *backend*))
+    (when (backend-role-changes b)
+      (return-from commit-transaction (commit-role-only-transaction b)))
     (if (backend-xid b)
         (let ((changes
                 (when *wal-ready*

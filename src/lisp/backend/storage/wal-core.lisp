@@ -2956,7 +2956,7 @@ src/backend/access/transam/xlogreader.c."
 
 (defun wal-apply-catalog-image (deletes catalog-bytes)
   (wal-atomic-write-bytes (merge-pathnames "global/pg_catalog.dat" *pgdata*)
-                          catalog-bytes)
+                          catalog-bytes :mode #o600)
   (dolist (relfilenode deletes)
     (smgr-forget relfilenode :delete t))
   (when deletes (fsync-directory (merge-pathnames "base/" *pgdata*))))
@@ -3308,12 +3308,12 @@ the checkpoint, or NIL when no reset was replayed."
       (wal-install-recovered-logical-policy logical-status incarnation))
     reset-boundary))
 
-(defun wal-atomic-write-bytes (path bytes)
+(defun wal-atomic-write-bytes (path bytes &key mode)
   (with-atomic-output (stream
                        path
                        (make-pathname :type "tmp" :defaults path)
                        (make-pathname :name nil :type nil :defaults path)
-                       :element-type '(unsigned-byte 8))
+                       :element-type '(unsigned-byte 8) :mode mode)
     (write-sequence bytes stream)))
 
 (defun wal-slot-retention-mode (policy)

@@ -158,6 +158,15 @@ def exercise(log):
     SPARE.close()
     SPARE = None
     wait_sessions(1)
+    denied([("user", "alice")])
+    denied([("user", "repl"), ("replication", "true")])
+    with HELD.cursor() as cursor:
+        cursor.execute("CREATE ROLE alice LOGIN")
+        cursor.execute("GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO alice")
+        cursor.execute("CREATE ROLE repl LOGIN REPLICATION")
+    psycopg2.connect(host="127.0.0.1", port=PORT, user="postgres",
+                     dbname="alice", connect_timeout=2).close()
+    wait_sessions(1)
     for params in ([('user', 'alice')], [('user', 'alice'), ('database', '')],
                    [('user', 'repl'), ('replication', 'true')],
                    [('user', 'postgres'), ('database', 'postgres'), ('replication', 'database')]):

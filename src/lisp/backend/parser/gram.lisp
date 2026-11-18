@@ -184,13 +184,37 @@ Range and negative checks occur when the LIMIT executes."
     (expect-kw p "end")
     (list :type :do-block :statements statements)))
 
+(defun parse-rewind-function-grant (p)
+  (expect-kw p "execute")
+  (expect-kw p "on")
+  (expect-kw p "function")
+  (unless (string= (pident p) "pg_catalog")
+    (ereport "0A000" "only pg_catalog rewind function grants are supported"))
+  (expect-punct p #\.)
+  (let* ((function (pident p))
+         (types (with-parens (p)
+                  (loop collect (pident p) while (match-punct p #\,))))
+         (grant (car (rassoc (cons function types) *rewind-function-grant-signatures* :test #'equal))))
+    (unless grant
+      (ereport "42883" "unsupported rewind function signature"))
+    (expect-kw p "to")
+    (list :type :grant-role-function :name (pident p)
+          :options (list (cons :grant-function grant)))))
+
 (defun parse-do-procedural-statement (p)
   (cond
+    ((match-kw p "grant") (parse-rewind-function-grant p))
     ((at-eof-p p) (syntax-error p "expected END"))
     ((kw-p p "begin") (parse-do-block p))
     ((match-kw p "if") (parse-do-if-found p))
     ((match-kw p "null") (list :type :do-null))
     ((match-kw p "perform") (list :type :perform :query (parse-select p)))
+    ((match-kw p "create")
+     (expect-kw p "role")
+     (parse-role-options p :create-role))
+    ((match-kw p "alter")
+     (expect-kw p "role")
+     (parse-role-options p :alter-role))
     ((match-kw p "set") (parse-set p))
     ((match-kw p "reset") (parse-reset p))
     (t (ereport "0A000" "unsupported statement in inline PL/pgSQL block: ~a" (pval p)))))
@@ -205,6 +229,7 @@ Range and negative checks occur when the LIMIT executes."
 
 (defun parse-statement (p)
   (cond
+    ((match-kw p "grant") (parse-rewind-function-grant p))
     ((match-kw p "explain") (parse-explain p))
     ((match-kw p "do") (parse-do p))
     ((kw-p p "with") (parse-with-select p))
@@ -643,8 +668,36 @@ Range and negative checks occur when the LIMIT executes."
 
 ;;; ---- CREATE / DROP / ALTER ----
 
+(defun parse-role-options (p type)
+  "Parse the role attributes used by Patroni. An absent option leaves ALTER unchanged."
+  (let ((name (pident p))
+        (options nil))
+    (match-kw p "with")
+    (loop until (or (at-eof-p p) (punct-p p #\;))
+          do (multiple-value-bind (attribute value)
+                 (cond
+                   ((match-kw p "native_rewind") (values :native-rewind t))
+                   ((match-kw p "nonative_rewind") (values :native-rewind nil))
+                   ((match-kw p "login") (values :login t))
+                   ((match-kw p "nologin") (values :login nil))
+                   ((match-kw p "superuser") (values :superuser t))
+                   ((match-kw p "nosuperuser") (values :superuser nil))
+                   ((match-kw p "replication") (values :replication t))
+                   ((match-kw p "noreplication") (values :replication nil))
+                   ((match-kw p "password")
+                    (values :password
+                            (cond ((match-kw p "null") nil)
+                                  ((eq (pkind p) :string) (parse-string-literal p))
+                                  (t (syntax-error p "expected a role password string or NULL")))))
+                   (t (ereport "0A000" "unsupported role option")))
+               (when (assoc attribute options)
+                 (syntax-error p "conflicting or redundant role options"))
+               (push (cons attribute value) options)))
+    (list :type type :name name :options (nreverse options))))
+
 (defun parse-create (p)
   (cond
+    ((match-kw p "role") (parse-role-options p :create-role))
     ((match-kw p "sequence") (parse-create-sequence p))
     ((match-kw p "publication") (parse-create-publication p))
     ((match-kw p "table") (parse-create-table p))
@@ -1103,6 +1156,7 @@ Range and negative checks occur when the LIMIT executes."
 
 (defun parse-alter (p)
   (cond
+    ((match-kw p "role") (parse-role-options p :alter-role))
     ((match-kw p "publication")
      (parse-alter-publication p))
     ((match-kw p "sequence")

@@ -466,6 +466,10 @@ derivation is needed. The source control remains unchanged."
           (list "global/pg_wal_control" (length actual)
                 (physical-store-update-digest #xCBF29CE484222325 actual)))))))
 
+(defun physical-backup-private-file-p (name)
+  (or (bootstrap-scram-path-p name)
+      (equal name "global/pg_catalog.dat")))
+
 (defun physical-bootstrap-copy-file (relative target &key limit)
   "Copy and fsync a stable source file or exact prefix, returning its length and checksum.
 Each read writes and hashes the same bytes.  A requested prefix must be complete."
@@ -495,7 +499,8 @@ Each read writes and hashes the same bytes.  A requested prefix must be complete
     (with-open-file (input source :element-type '(unsigned-byte 8))
       (with-atomic-output
           (output destination (make-pathname :type "tmp" :defaults destination)
-                  parent :element-type '(unsigned-byte 8))
+                  parent :element-type '(unsigned-byte 8)
+                  :mode (when (physical-backup-private-file-p relative) #o600))
         (loop for count = (read-sequence buffer input
                                          :end (if limit (min (length buffer) (- limit length))
                                                   (length buffer)))
@@ -698,6 +703,121 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
   (and (stringp name) (uiop:string-prefix-p "base/" name)
        (recovery-manifest-path-p name)))
 
+(defun rewind-readable-file-p (name)
+  ;; Catalog, WAL and configuration files can contain credentials. Native
+  ;; rewind transfers its sealed image over the physical replication path.
+  (or (member name '("PG_VERSION" "global/pg_control" "pg_xact") :test #'equal)
+      (physical-backup-reuse-path-p name)))
+
+(defun require-rewind-function-grant (function)
+  (let* ((user (backend-startup-user *backend*))
+         (role (authentication-committed-role user)))
+    (unless (if role
+                (or (pg-role-superuser-p role) (member function (pg-role-function-grants role)))
+                (string= user "postgres"))
+      (ereport "42501" "permission denied for rewind file function"))))
+
+(defun call-with-rewind-file-image (function)
+  (let ((fd nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (setf fd (sb-posix:open
+                       (string-right-trim "/" (namestring *pgdata*))
+                       (logior sb-posix:o-rdonly sb-posix:o-directory
+                               sb-posix:o-nofollow +postmaster-o-cloexec+)))
+             (sb-sys:with-local-interrupts
+               (call-with-physical-image-directory fd function :primary)))
+        (when fd (sb-posix:close fd))))))
+
+(defun rewind-readable-directory-p (name)
+  (member name '("." "base" "global") :test #'equal))
+
+(defun rewind-image-directory-fd (name)
+  (if (string= name ".")
+      (physical-image-context-root-fd *physical-image-context*)
+      (cdr (assoc name (physical-image-context-children *physical-image-context*) :test #'equal))))
+
+(defun sql-rewind-stat-file (name missing-ok)
+  (require-rewind-function-grant :stat-file)
+  (when (or (eq name +null+) (eq missing-ok +null+)) (return-from sql-rewind-stat-file +null+))
+  (unless (or (rewind-readable-directory-p name) (rewind-readable-file-p name))
+    (ereport "42501" "file is outside the rewind read scope"))
+  (let ((stat
+          (call-with-rewind-file-image
+           (lambda (directory)
+             (if (rewind-readable-directory-p name)
+                 (sb-posix:fstat (rewind-image-directory-fd name))
+                 (with-physical-image-input (stream (merge-pathnames name directory)
+                                                    :element-type '(unsigned-byte 8)
+                                                    :if-does-not-exist nil)
+                   (when stream (sb-posix:fstat (sb-sys:fd-stream-fd stream)))))))))
+    (unless stat
+      (if (eq missing-ok t) (return-from sql-rewind-stat-file +null+)
+          (ereport "58P01" "rewind source file does not exist")))
+    (flet ((timestamp (seconds) (* (- seconds 946684800) 1000000)))
+      (make-sql-record :fields +rewind-stat-file-result-fields+
+                       :values (vector (sb-posix:stat-size stat)
+                                       (timestamp (sb-posix:stat-atime stat))
+                                       (timestamp (sb-posix:stat-mtime stat))
+                                       (timestamp (sb-posix:stat-ctime stat))
+                                       +null+
+                                       (not (null (sb-posix:s-isdir (sb-posix:stat-mode stat)))))))))
+
+(defun make-rewind-directory-result-iterator (name missing-ok include-dot-dirs)
+  (require-rewind-function-grant :ls-dir)
+  (when (member +null+ (list name missing-ok include-dot-dirs))
+    (return-from make-rewind-directory-result-iterator (lambda () (values nil nil))))
+  (unless (rewind-readable-directory-p name)
+    (ereport "42501" "directory is outside the rewind read scope"))
+  (let ((entries
+          (call-with-rewind-file-image
+           (lambda (root)
+             (declare (ignore root))
+             (let* ((root-p (string= name "."))
+                    (path (physical-image-fd-path (rewind-image-directory-fd name)))
+                    (names (directory-entry-names path :follow-symlinks t
+                                                       :maximum-entries 100000
+                                                       :maximum-name-bytes (* 16 1024 1024))))
+               (nconc (when (eq include-dot-dirs t) (list "." ".."))
+                      (remove-if-not
+                       (lambda (leaf)
+                         (if root-p
+                             (or (rewind-readable-directory-p leaf) (rewind-readable-file-p leaf))
+                             (rewind-readable-file-p (concatenate 'string name "/" leaf))))
+                       names)))))))
+    (lambda ()
+      (when entries
+        (values (pop entries) t)))))
+
+(defun sql-rewind-read-binary-file (name &optional (offset 0 ranged-p) length missing-ok)
+  (require-rewind-function-grant (if ranged-p :read-binary-file-range :read-binary-file))
+  (when (member +null+ (list name offset length missing-ok))
+    (return-from sql-rewind-read-binary-file +null+))
+  (unless (rewind-readable-file-p name)
+    (ereport "42501" "file is outside the rewind read scope"))
+  (when (and ranged-p (minusp length))
+    (ereport "22023" "requested length cannot be negative"))
+  (call-with-rewind-file-image
+   (lambda (directory)
+     (with-physical-image-input (stream (merge-pathnames name directory)
+                                        :element-type '(unsigned-byte 8) :if-does-not-exist nil)
+       (unless stream
+         (if missing-ok (return-from sql-rewind-read-binary-file +null+)
+             (ereport "58P01" "rewind source file does not exist")))
+       (let* ((size (sb-posix:stat-size (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
+              (start (if (minusp offset) (+ size offset) offset))
+              (count (min (or length size) (max 0 (- size start)))))
+         (when (minusp start)
+           (ereport "22023" "requested offset precedes the start of the file"))
+         (when (> count (* 16 1024 1024))
+           (ereport "54000" "rewind file read exceeds the 16 MiB limit"))
+         (let ((result (make-array count :element-type '(unsigned-byte 8))))
+           (unless (or (zerop count) (file-position stream start))
+             (ereport "58030" "could not seek rewind source file"))
+           (let ((read (read-sequence result stream)))
+             (if (= read count) result (subseq result 0 read)))))))))
+
 (defun physical-backup-file-header-image (entry tag)
   (destructuring-bind (name size digest) entry
     (let ((path (string->bytes name))
@@ -889,7 +1009,7 @@ bytes against the sealed file digest. The caller checks the header and owns outp
 ;; Descriptor-scoped receipt creates relative to held directories; the legacy
 ;; path retains its existing pathname-based file creation and sync behavior.
 
-(defun call-with-private-bootstrap-verifier-output (path function)
+(defun call-with-private-backup-file-output (path function)
   (sb-sys:without-interrupts
     (let ((fd nil) (stream nil))
       (unwind-protect
@@ -932,8 +1052,8 @@ bytes against the sealed file digest. The caller checks the header and owns outp
                              (multiple-value-prog1
                                  (physical-backup-receive-file-content size expected-digest next output)
                                (fsync-stream output))))
-                      (prog1 (if (bootstrap-scram-path-p name)
-                                 (call-with-private-bootstrap-verifier-output path #'receive)
+                      (prog1 (if (physical-backup-private-file-p name)
+                                 (call-with-private-backup-file-output path #'receive)
                                  (with-open-file (output path :direction :output :if-exists :error
                                                               :if-does-not-exist :create :element-type '(unsigned-byte 8))
                                    (receive output)))
