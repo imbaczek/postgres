@@ -155,80 +155,90 @@ Like C ReportChangedGUCOptions, recovery can only change from on to off."
                          (remhash *backend* *hot-standby-reported-backends*))))))
     (when report (send-parameter-status stream "in_hot_standby" (if standby "on" "off")))))
 
-(defun authorize-and-admit-startup-backend (backend configuration user database peer)
-  "Authorize and reserve quota using one captured configuration root."
-  (authentication-authorize (startup-configuration-authentication configuration)
-                            user database peer (backend-replication-mode backend))
+(defun admit-startup-backend-with-configuration (backend configuration peer)
   (postmaster-admit-startup-backend
    backend (startup-configuration-max-connections configuration)
-   (startup-configuration-max-senders configuration)
-   peer))
+   (startup-configuration-max-senders configuration) peer))
+
+(defun authorize-and-admit-startup-backend (backend configuration user database peer)
+  "Admit a trusted startup or return :SCRAM before claiming any quota."
+  (if (eq :scram (authentication-authorize (startup-configuration-authentication configuration)
+                                           user database peer (backend-replication-mode backend)))
+      :scram
+      (admit-startup-backend-with-configuration backend configuration peer)))
+
+(defun finish-startup (stream params dbname)
+  "Send startup parameters for an admitted backend."
+  (send-auth-ok stream)
+  (session-apply-startup-options params)
+  (with-catalog-lock
+    (unless (or (eq (backend-replication-mode *backend*) :physical)
+                (gethash dbname (catalog-databases *catalog*)))
+      (when (recovery-in-progress-p)
+        (ereport-fatal "3D000" "database ~s does not exist" dbname))
+      (get-database dbname)
+      (save-catalog)))
+  (send-parameter-status stream "server_version" *server-version*)
+  (session-report-parameter stream "search_path" (session-search-path))
+  (send-parameter-status stream "server_version_num" (princ-to-string *server-version-num*))
+  (send-parameter-status stream "server_encoding" "UTF8")
+  (send-parameter-status stream "client_encoding" "UTF8")
+  (session-report-parameter stream "DateStyle" (session-extra-setting-value "datestyle"))
+  (session-report-parameter stream "TimeZone" (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
+  (send-parameter-status stream "integer_datetimes" "on")
+  (send-parameter-status stream "standard_conforming_strings" "on")
+  (send-parameter-status stream "IntervalStyle" "postgres")
+  (send-parameter-status stream "is_superuser" "on")
+  (send-parameter-status stream "session_authorization" (current-user-name))
+  (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
+  (send-parameter-status stream "default_transaction_read_only" "off")
+  (report-hot-standby-status stream t)
+  (let ((key (random-cancel-key)))
+    (setf (backend-cancel-key *backend*) key)
+    (send-backend-key-data stream (backend-pid *backend*) key))
+  (send-ready-for-query stream #\I))
 
 (defun process-startup (stream body)
-  "Parse startup mode, check availability and authenticate before reserving quota.
-Capture one root under admission for hot standby, authentication and quota limits.
-Capture a replication connection's source identity under admission so later
-sender registration can reject a source change during the intervening gap.
-When hot_standby is off, reject every startup mode during recovery before authentication.
-Use the socket peer and final startup identities for HBA before reserving quota.
-SQL role authorization remains separate and currently uses the postgres role."
-  (with-live-operation
-    (let* ((configuration (startup-require-configuration))
-           (code (bytes-to-u32 body 0))
-           (major (ash code -16)))
-      (unless (= major 3)
-        (ereport "0A000"
-                 (format nil "unsupported frontend protocol ~a.~a"
-                         major (logand code #xFFFF))))
-      ;; Reject new clients once a shutdown is underway, before authentication,
-      ;; exactly as PostgreSQL's canAcceptConnections() does.
-      (unless (conns-allowed-p)
-        (ereport-fatal "57P03" "the database system is shutting down"))
-      (let* ((params (parse-startup-params body))
-             (replication (startup-replication-parameters-mode params))
-             (app (or (startup-last-parameter params "application_name") "")))
-        (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
-          (setf (backend-database *backend*) dbname)
-          (setf (backend-application-name *backend*) app)
-          (setf (backend-replication-mode *backend*) replication
-                (backend-replication-source-id *backend*)
-                (when replication (nth-value 0 (sync-replication-configuration-state))))
-          (when (and (recovery-in-progress-p) (not (startup-configuration-hot-standby configuration)))
-            (ereport-fatal "57P03" "the database system is not accepting connections"
-                           :detail "Hot standby mode is disabled."))
-          (authorize-and-admit-startup-backend
-           *backend* configuration user dbname
-           (sb-bsd-sockets:socket-peername (backend-socket *backend*)))
-          (send-auth-ok stream)
-          (session-apply-startup-options params)
-          (with-catalog-lock
-            (unless (or (eq (backend-replication-mode *backend*) :physical)
-                        (gethash dbname (catalog-databases *catalog*)))
-              (when (recovery-in-progress-p)
-                (ereport-fatal "3D000" "database ~s does not exist" dbname))
-              (get-database dbname)
-              (save-catalog)))
-          (send-parameter-status stream "server_version" *server-version*)
-          (session-report-parameter stream "search_path" (session-search-path))
-          (send-parameter-status stream "server_version_num"
-                                 (princ-to-string *server-version-num*))
-          (send-parameter-status stream "server_encoding" "UTF8")
-          (send-parameter-status stream "client_encoding" "UTF8")
-          (session-report-parameter stream "DateStyle" (session-extra-setting-value "datestyle"))
-          (session-report-parameter stream "TimeZone"
-                                    (or (gethash "timezone" (backend-settings *backend*)) "UTC"))
-          (send-parameter-status stream "integer_datetimes" "on")
-          (send-parameter-status stream "standard_conforming_strings" "on")
-          (send-parameter-status stream "IntervalStyle" "postgres")
-          (send-parameter-status stream "is_superuser" "on")
-          (send-parameter-status stream "session_authorization" (current-user-name))
-          (session-report-parameter stream "application_name" (sql-setting-value "application_name"))
-          (send-parameter-status stream "default_transaction_read_only" "off")
-          (report-hot-standby-status stream t)
-          (let ((key (random-cancel-key)))
-            (setf (backend-cancel-key *backend*) key)
-            (send-backend-key-data stream (backend-pid *backend*) key))
-          (send-ready-for-query stream #\I))))))
+  "Check startup and select HBA under admission.
+Trust reserves quota immediately. SCRAM releases admission for the network
+exchange, then rechecks the configuration before reserving quota.
+Capture the replication source identity for later sender registration."
+  (multiple-value-bind (configuration params user dbname peer)
+      (with-live-operation
+        (let* ((configuration (startup-require-configuration))
+               (code (bytes-to-u32 body 0))
+               (major (ash code -16)))
+          (unless (= major 3)
+            (ereport "0A000"
+                     (format nil "unsupported frontend protocol ~a.~a" major (logand code #xFFFF))))
+          (unless (conns-allowed-p)
+            (ereport-fatal "57P03" "the database system is shutting down"))
+          (let* ((params (parse-startup-params body))
+                 (replication (startup-replication-parameters-mode params))
+                 (app (or (startup-last-parameter params "application_name") ""))
+                 (peer (sb-bsd-sockets:socket-peername (backend-socket *backend*))))
+            (multiple-value-bind (user dbname) (authentication-startup-identities params replication)
+              (setf (backend-database *backend*) dbname
+                    (backend-application-name *backend*) app
+                    (backend-replication-mode *backend*) replication
+                    (backend-replication-source-id *backend*)
+                    (when replication (nth-value 0 (sync-replication-configuration-state))))
+              (when (and (recovery-in-progress-p) (not (startup-configuration-hot-standby configuration)))
+                (ereport-fatal "57P03" "the database system is not accepting connections"
+                               :detail "Hot standby mode is disabled."))
+              (unless (eq :scram (authorize-and-admit-startup-backend
+                                  *backend* configuration user dbname peer))
+                (return-from process-startup (finish-startup stream params dbname)))
+              (values configuration params user dbname peer)))))
+    (handler-case
+        (authenticate-bootstrap-scram stream user)
+      (sb-ext:timeout ()
+        (ereport-fatal "57014" "canceling authentication due to timeout")))
+    (with-live-operation
+      (unless (and (conns-allowed-p) (eq configuration (startup-require-configuration)))
+        (ereport-fatal "57P03" "startup configuration changed; retry the connection"))
+      (admit-startup-backend-with-configuration *backend* configuration peer)
+      (finish-startup stream params dbname))))
 
 ;;; ---- query dispatch ----
 

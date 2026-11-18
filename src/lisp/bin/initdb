@@ -2,6 +2,7 @@
 """Initialize a fresh native PostgreSQL data directory offline."""
 
 import argparse
+import base64
 import ctypes
 import os
 from pathlib import Path
@@ -43,7 +44,58 @@ def publish(stage, target, identity):
         raise OSError(error, os.strerror(error), target)
 
 
-def initialize(target):
+def scram_verifier(password):
+    """Use libpq to build the offline verifier without connecting."""
+    pq = ctypes.CDLL("libpq.so.5")
+    pq.PQconnectStart.argtypes = [ctypes.c_char_p]
+    pq.PQconnectStart.restype = ctypes.c_void_p
+    pq.PQencryptPasswordConn.argtypes = [ctypes.c_void_p] + [ctypes.c_char_p] * 3
+    pq.PQencryptPasswordConn.restype = ctypes.c_void_p
+    pq.PQfreemem.argtypes = [ctypes.c_void_p]
+    pq.PQfreemem.restype = None
+    pq.PQfinish.argtypes = [ctypes.c_void_p]
+    pq.PQfinish.restype = None
+    # libpq needs a handle for its iteration setting. An invalid connection
+    # option makes it return a handle without opening a socket.
+    connection = pq.PQconnectStart(b"pg_lisp_offline=true")
+    if not connection:
+        raise ValueError("could not initialize SCRAM verifier generation")
+    try:
+        secret = pq.PQencryptPasswordConn(connection, password, b"postgres", b"scram-sha-256")
+        if not secret:
+            raise ValueError("could not generate SCRAM verifier")
+        try:
+            method, salt_spec, keys = ctypes.string_at(secret).split(b"$")
+            iterations, salt = salt_spec.split(b":")
+            stored, server = keys.split(b":")
+            decoded = [base64.b64decode(field, validate=True) for field in (salt, stored, server)]
+            if method != b"SCRAM-SHA-256" or [len(field) for field in decoded] != [16, 32, 32]:
+                raise ValueError("unexpected SCRAM verifier format")
+            return " ".join(["PGSCRAM1", iterations.decode("ascii"), *(field.hex() for field in decoded)]) + "\n"
+        finally:
+            pq.PQfreemem(secret)
+    finally:
+        pq.PQfinish(connection)
+
+
+def write_synced(path, text):
+    """Write and sync an ASCII file before publishing the directory."""
+    with path.open("w", encoding="ascii") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def sync_directory(path):
+    """Make the directory's updated entries durable."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def initialize(target, password_file, host_auth, local_auth):
     target = target.absolute()
     identity = check_target(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -51,13 +103,25 @@ def initialize(target):
     launcher = Path(__file__).resolve().parents[1] / "pg-lisp.sh"
     try:
         subprocess.run([launcher, "--initdb-native", "-D", stage], stdin=subprocess.DEVNULL, check=True)
+        if password_file is not None:
+            with password_file.open("rb") as stream:
+                line = stream.readline(10003)
+            if len(line) == 10003 and not line.endswith(b"\n"):
+                raise ValueError("bootstrap password line is too long")
+            password = line.rstrip(b"\r\n")
+            if not password or len(password) > 10000 or b"\0" in password:
+                raise ValueError("invalid bootstrap password")
+            write_synced(stage / "global/pg_bootstrap_scram", scram_verifier(password))
+            sync_directory(stage / "global")
+        if "scram-sha-256" in (host_auth, local_auth):
+            lines = [f"local {database} all {local_auth}" for database in ("all", "replication")]
+            lines.extend(f"host {database} all {address} {host_auth}"
+                         for address in ("127.0.0.1/32", "::1/128")
+                         for database in ("all", "replication"))
+            write_synced(stage / "pg_hba.conf", "\n".join(lines) + "\n")
+            sync_directory(stage)
         publish(stage, target, identity)
-        # WAL initialization already synced the staging directory's ancestors.
-        fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        sync_directory(target.parent)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -71,17 +135,22 @@ def main():
     parser.add_argument("-E", "--encoding", choices=["UTF8"], default="UTF8")
     parser.add_argument("--locale", choices=["C", "POSIX"], default="C")
     parser.add_argument("--no-locale", action="store_true")
-    parser.add_argument("-A", "--auth", choices=["trust"], default="trust")
-    parser.add_argument("--auth-host", choices=["trust"])
-    parser.add_argument("--auth-local", choices=["trust"])
+    methods = ["trust", "scram-sha-256"]
+    parser.add_argument("-A", "--auth", choices=methods, default="trust")
+    parser.add_argument("--auth-host", choices=methods)
+    parser.add_argument("--auth-local", choices=methods)
+    parser.add_argument("--pwfile", type=Path)
     args = parser.parse_args()
     if args.directory is not None and args.pgdata is not None:
         parser.error("specify the data directory once")
     target = args.directory or args.pgdata or os.environ.get("PGDATA")
     if not target:
         parser.error("a data directory is required")
+    host_auth, local_auth = args.auth_host or args.auth, args.auth_local or args.auth
+    if "scram-sha-256" in (host_auth, local_auth) and args.pwfile is None:
+        parser.error("SCRAM authentication requires --pwfile")
     os.umask(0o077)
-    initialize(Path(target))
+    initialize(Path(target), args.pwfile, host_auth, local_auth)
 
 
 if __name__ == "__main__":

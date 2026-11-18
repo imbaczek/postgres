@@ -319,12 +319,15 @@ A missing database defaults to the user; physical replication has no database."
           (error "could not format numeric client address")))))
 
 (defun authentication-authorize (policy user database peer replication)
-  "Apply the installed first-match HBA policy to the numeric peer and startup names.
-Trust admits the connection; reject and no match signal distinct fatal errors."
+  "Select the first matching HBA rule for the peer and startup identities.
+Return T for trust or :SCRAM for a password exchange. A reject or missing
+rule signals a fatal error."
   (unless policy (ereport-fatal "28000" "authentication policy is not initialized"))
   (let ((method (hba-match-rules (authentication-policy-rules policy) user database peer
                                  :replication replication)))
-    (when (eq method :trust) (return-from authentication-authorize t))
+    (case method
+      (:trust (return-from authentication-authorize t))
+      (:scram (return-from authentication-authorize :scram)))
     (let ((host (authentication-peer-text peer)))
       (ecase method
         (:reject
@@ -339,3 +342,52 @@ Trust admits the connection; reject and no match signal distinct fatal errors."
                             host user)
              (ereport-fatal "28000" "no pg_hba.conf entry for host \"~a\", user \"~a\", database \"~a\", no encryption"
                             host user database)))))))
+
+(defun bootstrap-scram-hex (text size)
+  (unless (= (length text) (* 2 size))
+    (error "invalid bootstrap SCRAM verifier"))
+  (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (index size bytes)
+      (let* ((offset (* 2 index))
+             (high (digit-char-p (char text offset) 16))
+             (low (digit-char-p (char text (1+ offset)) 16)))
+        (unless (and high low) (error "invalid bootstrap SCRAM verifier"))
+        (setf (aref bytes index) (+ (* 16 high) low))))))
+
+(defun read-bootstrap-scram-verifier ()
+  "Load salt, iterations and keys from the private offline bootstrap verifier."
+  (let ((fd (sb-posix:open (namestring (pgdata-path "global/pg_bootstrap_scram"))
+                           (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                   sb-posix:o-nonblock +postmaster-o-cloexec+)))
+        (stream nil))
+    (unwind-protect
+         (let* ((stat (sb-posix:fstat fd))
+                (mode (sb-posix:stat-mode stat))
+                (buffer (make-string 256)))
+           (unless (and (sb-posix:s-isreg mode) (zerop (logand mode #o077))
+                        (= (sb-posix:stat-uid stat) (sb-posix:geteuid)))
+             (error "invalid bootstrap SCRAM verifier file"))
+           (setf stream (sb-sys:make-fd-stream fd :input t :element-type 'character
+                                                  :external-format :latin-1))
+           (let ((count (read-sequence buffer stream)))
+             (unless (and (< 1 count (length buffer))
+                          (char= (char buffer (1- count)) #\Newline))
+               (error "invalid bootstrap SCRAM verifier file"))
+             (destructuring-bind (tag rounds salt stored server)
+                 (uiop:split-string (subseq buffer 0 (1- count)) :separator " ")
+               (unless (string= tag "PGSCRAM1") (error "invalid bootstrap SCRAM verifier"))
+               (let ((iterations (parse-integer rounds)))
+                 (unless (<= 1 iterations #x7fffffff)
+                   (error "invalid bootstrap SCRAM iteration count"))
+                 (list (bootstrap-scram-hex salt 16) iterations
+                       (bootstrap-scram-hex stored 32) (bootstrap-scram-hex server 32))))))
+      (if stream (close stream) (sb-posix:close fd)))))
+
+(defun authenticate-bootstrap-scram (stream user)
+  (let ((verifier (when (string= user "postgres")
+                    (handler-case (read-bootstrap-scram-verifier)
+                      (pg-error (condition) (error condition))
+                      (error () nil)))))
+    (unless verifier (ereport-fatal "28P01" "password authentication failed"))
+    (sb-ext:with-timeout 10
+      (apply #'scram-authenticate-stream stream verifier))))

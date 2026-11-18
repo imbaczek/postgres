@@ -180,8 +180,8 @@ Require matching address families and return the number of fields consumed."
 
 (defun hba-parse-rule (fields source line)
   "Build a rule with its source and logical line for diagnostics.
-Only supported transports and trust or reject methods are accepted; unsupported
-selectors, methods, options and extra fields fail the parse."
+Check the supported transports, selectors and authentication methods.
+Options and extra fields fail the parse."
   (unless (>= (length fields) 4) (error "authentication rule has too few fields"))
   (let* ((name (hba-token-text (hba-single-token (first fields) "connection type")))
          (transport (cdr (assoc name '(("local" . :local) ("host" . :host)
@@ -196,7 +196,7 @@ selectors, methods, options and extra fields fail the parse."
       (unless (= (length remaining) (1+ consumed))
         (error "authentication options or extra fields are unsupported"))
       (let* ((name (hba-token-text (hba-single-token (nth consumed remaining) "method")))
-             (method (cdr (assoc name '(("trust" . :trust) ("reject" . :reject)) :test #'string=))))
+             (method (cdr (assoc name '(("trust" . :trust) ("reject" . :reject) ("scram-sha-256" . :scram)) :test #'string=))))
         (unless method (error "unsupported authentication method ~s" name))
         (make-hba-rule :transport transport :databases databases :users users
                        :network network :mask mask :method method :source source :line line)))))

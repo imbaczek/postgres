@@ -1,6 +1,7 @@
 """Exercise pinned Patroni's initial native primary bootstrap without a DCS."""
 
 import ctypes
+from contextlib import closing
 import importlib.metadata
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 
+import psycopg2
 from patroni.postgresql import Postgresql
 from patroni.postgresql.mpp import Null
 
@@ -53,7 +55,7 @@ def check_sync_config(node, port):
     print("Patroni 4.1.5 synchronous standby names set, no-op and clear PASS", flush=True)
 
 
-def check_bootstrap(root, precreated):
+def check_bootstrap(root, precreated, password=None):
     root.mkdir(mode=0o700)
     data = root / "fresh pgdata"
     if precreated:
@@ -61,7 +63,13 @@ def check_bootstrap(root, precreated):
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    node = Postgresql(FOLLOW["configuration"](data, port, root, major_version=160000), Null())
+    config = FOLLOW["configuration"](data, port, root, major_version=160000)
+    initdb = ["no-locale", {"encoding": "UTF8"}]
+    if password:
+        config["authentication"]["superuser"]["password"] = password
+        config["pg_hba"] = [line.replace(" trust", " scram-sha-256") for line in config["pg_hba"]]
+        initdb.append({"auth-host": "scram-sha-256"})
+    node = Postgresql(config, Null())
     start = node.start
     offline_identity = []
 
@@ -70,22 +78,35 @@ def check_bootstrap(root, precreated):
         assert facts["Database cluster state"] == "shut down", facts
         assert not (data / "postmaster.pid").exists()
         assert (data / "PG_VERSION").stat().st_mode & 0o777 == 0o600
+        if password:
+            assert (data / "global/pg_bootstrap_scram").stat().st_mode & 0o777 == 0o600
         offline_identity.append(facts["Database system identifier"])
         return start(*args, **kwargs)
 
     node.start = check_before_start
+
+    def query(statement):
+        if not password:
+            return FOLLOW["query"](port, statement)
+        with closing(psycopg2.connect(host="127.0.0.1", port=port, user="postgres", dbname="postgres",
+                                     password=password, connect_timeout=5)) as connection:
+            connection.autocommit = True
+            with connection.cursor() as cursor:
+                cursor.execute(statement)
+                return cursor.fetchall() if cursor.description else None
+
     try:
-        assert node.bootstrap.bootstrap({"initdb": ["no-locale", {"encoding": "UTF8"}]})
+        assert node.bootstrap.bootstrap({"initdb": initdb})
         assert len(offline_identity) == 1
-        assert FOLLOW["query"](port, "SELECT pg_is_in_recovery(), current_user") == [(False, "postgres")]
-        FOLLOW["query"](port, "CREATE TABLE fresh_primary (id integer); INSERT INTO fresh_primary VALUES (42)")
-        assert FOLLOW["query"](port, "SELECT id FROM fresh_primary") == [(42,)]
+        assert query("SELECT pg_is_in_recovery(), current_user") == [(False, "postgres")]
+        query("CREATE TABLE fresh_primary (id integer); INSERT INTO fresh_primary VALUES (42)")
+        assert query("SELECT id FROM fresh_primary") == [(42,)]
         assert node.controldata()["Database system identifier"] == offline_identity[0]
         assert (data / "PG_VERSION").is_file() and not list(root.glob(".pg-lisp-initdb-*"))
         retry = subprocess.run([BIN / "initdb", data], capture_output=True, timeout=20)
         assert retry.returncode == 1
-        assert FOLLOW["query"](port, "SELECT id FROM fresh_primary") == [(42,)]
-        if not precreated:
+        assert query("SELECT id FROM fresh_primary") == [(42,)]
+        if not precreated and not password:
             check_sync_config(node, port)
     finally:
         node.connection_pool.close()
@@ -105,6 +126,7 @@ def main():
         check_rejected_targets(root)
         check_bootstrap(root / "absent", precreated=False)
         check_bootstrap(root / "empty", precreated=True)
+        check_bootstrap(root / "scram", precreated=False, password="patroni-bootstrap-fixture")
 
 
 if __name__ == "__main__":
