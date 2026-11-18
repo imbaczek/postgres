@@ -226,3 +226,28 @@
                  (ok (probe-file moved))
                  (ok (probe-file path))))
           (sb-posix:close fd)))))
+
+(deftest rewind-offline-archive-fallback-requires-a-missing-local-name
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root)
+             (local (pg::wal-segment-path 0 1 :timeline))
+             (cached (merge-pathnames "archived.wal" root))
+             (calls nil)
+             (pg::*wal-offline-segment-fallback*
+               (lambda (path) (push path calls) cached)))
+        (ensure-directories-exist local)
+        (write-startup-config local "invalid local WAL still takes precedence")
+        (ok (equal local (pg::wal-read-segment-path 0 1 :timeline)))
+        (ok (null calls))
+        (delete-file local)
+        (ok (equal cached (pg::wal-read-segment-path 0 1 :timeline)))
+        (ok (equal (list local) calls)))))
+
+(deftest rewind-restore-command-uses-only-frontend-placeholders
+    (ok (equal "restore X.wal ../scratch/X.wal '%'"
+               (pg::physical-rewind-restore-command "restore %f %p '%%'" "X.wal" "../scratch/X.wal")))
+  (dolist (template '("restore %" "restore %r" "restore %s"))
+    (ok (signals (pg::physical-rewind-restore-command template "X.wal" "scratch") 'error)))
+  (ok (signals (pg::startup-normalize-setting "restore_command" "cp %f %p") 'error))
+  (let ((pg::*startup-rewind-restore-command-p* t))
+    (ok (equal "cp %f %p" (pg::startup-normalize-setting "restore_command" "cp %f %p")))))

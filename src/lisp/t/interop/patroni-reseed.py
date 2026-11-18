@@ -537,6 +537,59 @@ class RewindCliAcceptance(RewindInstallAcceptance):
         self.check_rejoined(target, port)
 
 
+class RewindArchiveCliAcceptance(RewindCliAcceptance):
+    label = "rewind-cli-target-archive"
+
+    def execute_rewind(self, target, conninfo):
+        archive = target.parent / "target-archive"
+        archive.mkdir(mode=0o700)
+        files = list((target / "pg_wal").glob("*.wal"))
+        assert files
+        for path in files:
+            path.rename(archive / path.name)
+        archived = preserved_tree(archive)
+        self.old_tree = preserved_tree(target)
+        config = target.parent / "target-archive.conf"
+        trace = target.parent / "target-archive-reads"
+        env = dict(os.environ, SBCL=self.sbcl, PG_LIBPQ_HELPER=self.helper)
+        command = [str(cancellation.LISP / "bin/pg_rewind"), "-D", str(target),
+                   "--source-server", conninfo]
+        self.process("rewind-without-target-archive", command, timeout=90, env=env, expected=1)
+        assert preserved_tree(target) == self.old_tree
+        restore = ["--restore-target-wal", f"--config-file={config}"]
+        config.write_text("restore_command = 'printf x > %p'\n")
+        self.process("rewind-with-truncated-archive", command + restore,
+                     timeout=90, env=env, expected=1)
+        assert preserved_tree(target) == self.old_tree
+        assert not list(target.parent.glob(".pg-rewind-wal.*"))
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        settings = follow.configuration(target, port, self.server.root)
+        settings["config_dir"] = str(target.parent / "archive-config")
+        Path(settings["config_dir"]).mkdir(mode=0o700)
+        node = Postgresql(settings, Null())
+        try:
+            template = f'cd "{archive}" && echo %f >> "{trace}" && cp "%f" "%p"'
+            Path(node.config.postgresql_conf).write_text(f"restore_command = '{template}'\n")
+            with patch.dict(os.environ, env), patch.object(node.cancellable, "call", wraps=node.cancellable.call) as call:
+                assert node.get_guc_value("restore_command") == template
+                assert Rewind(node).pg_rewind({"host": "127.0.0.1", "port": self.server.port,
+                                               "user": "postgres", "dbname": "postgres"})
+            arguments = call.call_args.args[0]
+            assert "--restore-target-wal" in arguments
+            assert f"--config-file={node.config.postgresql_conf}" in arguments
+            output = call.call_args.kwargs["communicate"]["stdout"]
+        finally:
+            node.connection_pool.close()
+        restored = trace.read_text().splitlines()
+        assert restored and len(set(restored)) == len(restored)
+        assert set(restored) <= {path.name for path in files}
+        assert preserved_tree(archive) == archived
+        assert not list(target.parent.glob(".pg-rewind-wal.*"))
+        return output
+
+
 class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
     label = "rewind-cli-capture-resume"
     capture_hook = "native-patroni-rewind-crash-after-capture"
@@ -901,6 +954,7 @@ def main():
              "rewind-shared-history": RewindSharedHistoryAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
+               "rewind-cli-target-archive": RewindArchiveCliAcceptance,
              "rewind-cli-capture-resume": RewindCaptureResumeCliAcceptance,
              "rewind-cli-first-capture": RewindFirstCaptureCliAcceptance,
                "rewind-cli-partial-capture": RewindPartialCaptureCliAcceptance,
