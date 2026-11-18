@@ -704,23 +704,24 @@ Check ownership under WAL and save changes before updating the in-memory slot."
               nil))))
     (when rejection (error rejection))))
 
-(defun physical-stream-feedback (stream owner)
+(defun physical-stream-feedback (stream owner &optional horizon-handler)
   "Read status and process any interleaved feedback. Frame reads share one
 deadline. Feedback processing itself runs outside the socket timeout."
   (let ((deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second))))
     (replication-standby-status
      stream t
-     (lambda (data catalog)
-       (with-live-operation (physical-source-confirm-xmin owner data catalog)))
+     (or horizon-handler
+         (lambda (data catalog)
+           (with-live-operation (physical-source-confirm-xmin owner data catalog))))
      (lambda (input)
        (let ((remaining (- deadline (get-internal-real-time))))
          (unless (plusp remaining) (error 'sb-ext:timeout))
          (sb-ext:with-timeout (/ remaining internal-time-units-per-second)
            (read-message-frame input)))))))
 
-(defun physical-stream-read-status (stream owner previous sent base)
+(defun physical-stream-read-status (stream owner previous sent base &optional horizon-handler)
   "Read outside admission; validate monotonic progress under short admission."
-  (multiple-value-bind (reply done) (physical-stream-feedback stream owner)
+  (multiple-value-bind (reply done) (physical-stream-feedback stream owner horizon-handler)
     (when done (signal 'physical-stream-copy-done))
     (when reply
       (with-live-operation
@@ -848,20 +849,27 @@ At the fork, complete without entering Copy mode. Always release both sender cla
                     (sb-ext:with-timeout 10 (send-copy-both-response stream))
                     (setf copy-mode t)
                     (let ((status (list :write cursor :flush cursor :apply base))
-                          (feedback nil))
+                          (feedback nil)
+                          ;; Keep the latest report until the resume prefix is verified.
+                          (horizons nil))
                       (multiple-value-bind (verified digest origin-proof)
                           (physical-source-validate-resume
                            command owner
                            (lambda (durable)
                              (physical-stream-send-keepalive stream (if limit (min durable limit) durable))
-                             (setf status (physical-stream-read-status stream owner status cursor base))
+                             (setf status
+                                   (physical-stream-read-status
+                                    stream owner status cursor base
+                                    (lambda (data catalog) (setf horizons (list data catalog)))))
                              (unless status (error 'end-of-file :stream stream))
                              (setf feedback status)))
                         (declare (ignore verified))
                         (with-live-operation
                           (if feedback
                               (physical-source-confirm-initial-status command owner feedback origin-proof)
-                              (physical-source-confirm-receipt name owner cursor digest origin-proof)))))
+                              (physical-source-confirm-receipt name owner cursor digest origin-proof))
+                          (when horizons
+                            (apply #'physical-source-confirm-xmin owner horizons)))))
                     (multiple-value-bind (result status)
                         (physical-stream-send-loop stream command owner limit)
                       (when (and (eq result :switch)
