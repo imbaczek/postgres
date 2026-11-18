@@ -17,12 +17,13 @@
   (print-unreadable-object (object stream :type t :identity t)))
 
 (defstruct (physical-follow-desired
-            (:constructor %make-physical-follow-desired (conninfo slot fallback policy policy-token claimed-p predecessor))
+            (:constructor %make-physical-follow-desired (conninfo slot fallback policy policy-token claimed-p predecessor archive-receipt-p))
             (:conc-name %physical-follow-desired-)
             (:print-function physical-follow-print-desired))
   "One private desired generation with owned copies of its settings.
 IDENTITY and PREDECESSOR are opaque tokens used to reject stale installs.
-The complete conninfo bytes distinguish generations; printing hides credentials."
+The complete conninfo bytes and archive-only receipt eligibility distinguish
+generations. Printing hides credentials."
   (identity (list nil) :read-only t)
   (predecessor nil :read-only t)
   (conninfo #() :read-only t)
@@ -30,7 +31,8 @@ The complete conninfo bytes distinguish generations; printing hides credentials.
   (fallback "" :read-only t)
   (policy nil :read-only t)
   (policy-token nil :read-only t)
-  (claimed-p nil :read-only t))
+  (claimed-p nil :read-only t)
+  (archive-receipt-p nil :read-only t))
 
 (defvar *physical-follow-desired* nil)
 
@@ -73,7 +75,7 @@ The complete conninfo bytes distinguish generations; printing hides credentials.
     (error "invalid primary_slot_name"))
   (when (plusp (length slot)) (copy-seq slot)))
 
-(defun physical-follow-next-desired (previous conninfo slot fallback policy claimed-p)
+(defun physical-follow-next-desired (previous conninfo slot fallback policy claimed-p &optional archive-receipt-p)
   "Return the existing generation if unchanged, or an owned successor snapshot."
   (let* ((bytes (etypecase conninfo
                   (string (string->bytes conninfo))
@@ -90,10 +92,12 @@ The complete conninfo bytes distinguish generations; printing hides credentials.
              (equal fallback (%physical-follow-desired-fallback previous))
              (eq policy (%physical-follow-desired-policy-token previous))
              (equalp saved-policy (%physical-follow-desired-policy previous))
-             (eq claimed (%physical-follow-desired-claimed-p previous)))
+             (eq claimed (%physical-follow-desired-claimed-p previous))
+             (eq archive-receipt-p (%physical-follow-desired-archive-receipt-p previous)))
         previous
         (%make-physical-follow-desired bytes slot (copy-seq fallback) saved-policy policy claimed
-                                       (when previous (%physical-follow-desired-identity previous))))))
+                                       (when previous (%physical-follow-desired-identity previous))
+                                       archive-receipt-p))))
 
 (defun physical-follow-managed-path ()
   (merge-pathnames "physical-follow-managed.control" *pgdata*))

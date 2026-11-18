@@ -152,7 +152,26 @@ def exercise(root, source_port, target_port):
                     source.wait(timeout=10)
 
 
-def restore_then_stream(root, source_port, target_port):
+def reload_archive_only(node, port, root, config):
+    process = node.is_running()
+    command = config["recovery_conf"]["restore_command"]
+    node.reload_config({**config, "recovery_conf": {"restore_command": ""}})
+    assert node.follow(None, do_reload=True) is True
+    follow.wait_for(lambda: follow.query(port, "SHOW primary_conninfo") == [("",)]
+                    and follow.query(port, "SHOW restore_command") == [("",)])
+    follow.wait_for(lambda: ":REPLAY-ONLY" in follow.control(
+        process, root / "target.sock",
+        "(when (and *physical-follow-runtime* "
+        "(eq *physical-follow-desired* *physical-follow-desired-applied*) "
+        "(physical-follow-receiver-stopped-p *physical-follow-runtime*)) :replay-only)"))
+    node.reload_config(config)
+    assert node.follow(None, do_reload=True) is True
+    follow.wait_for(lambda: follow.query(port, "SHOW restore_command") == [(command,)])
+    assert follow.query(port, "SHOW primary_conninfo") == [("",)]
+    assert node.is_running().pid == process.pid
+
+
+def restore_then_stream(root, source_port, target_port, reload_restore):
     source_data, target_data = root / "source", root / "replica"
     source_socket = root / "source.sock"
     archive = root / "archive"
@@ -238,6 +257,8 @@ def restore_then_stream(root, source_port, target_port):
             first_attempt = f"{proof_name} 0000000000000000.wal"
             follow.wait_for(lambda: attempts.is_file() and first_attempt in attempts.read_text().splitlines())
             assert follow.query(target_port, rows) == [(0, None)]
+            if reload_restore:
+                reload_archive_only(node, target_port, root, config)
             withheld.rename(proof)
             follow.wait_for(lambda: follow.query(
                 target_port, "SELECT pg_last_wal_replay_lsn() > '0/1000000'::pg_lsn") == [(True,)])
@@ -250,6 +271,8 @@ def restore_then_stream(root, source_port, target_port):
             source_socket.unlink(missing_ok=True)
             source = subprocess.Popen(args, stdout=log, stderr=log)
             follow.wait_for(lambda: follow.query(source_port, "SELECT 1") == [(1,)])
+            if reload_restore:
+                assert node.follow(member, do_reload=True) is True
             follow.query(source_port, f"INSERT INTO archive_probe VALUES ({last + 1})")
             follow.wait_for(lambda: follow.query(target_port, rows) == [(last + 1, last + 1)])
             follow.wait_for(lambda: follow.query(target_port, receiver) == [("streaming", "follow_one")])
@@ -270,7 +293,9 @@ def restore_then_stream(root, source_port, target_port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--restore-then-stream", action="store_true")
+    cases = parser.add_mutually_exclusive_group()
+    cases.add_argument("--restore-then-stream", action="store_true")
+    cases.add_argument("--reload-restore", action="store_true")
     options = parser.parse_args()
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     root = Path(tempfile.mkdtemp(prefix="pg-standby-archive."))
@@ -282,8 +307,10 @@ def main():
         second.bind(("127.0.0.1", 0))
         ports = first.getsockname()[1], second.getsockname()[1]
     print(f"standby-archive: artifacts={root} ports={ports}", flush=True)
-    case = restore_then_stream if options.restore_then_stream else exercise
-    case(root, *ports)
+    if options.restore_then_stream or options.reload_restore:
+        restore_then_stream(root, *ports, reload_restore=options.reload_restore)
+    else:
+        exercise(root, *ports)
 
 
 if __name__ == "__main__":

@@ -209,14 +209,17 @@ state, not from the previously installed root."
   (let* ((entry (and settings (gethash "primary_conninfo" settings)))
          (slot (and settings (gethash "primary_slot_name" settings)))
          (cluster (and settings (gethash "cluster_name" settings)))
-         (name (and cluster (getf cluster :value))))
+         (name (and cluster (getf cluster :value)))
+         (conninfo (if entry (getf entry :value) ""))
+         (restore (and settings (startup-setting-value settings "restore_command"))))
     (physical-follow-next-desired
-     previous (if entry (getf entry :value) "")
+     previous conninfo
      (if slot (getf slot :value) "")
      (if (and (stringp name) (plusp (length name))) name "walreceiver")
      timeline-policy
      (or force-claim managed-p
-         (and entry (not (eq :default (getf entry :source))))))))
+         (and entry (not (eq :default (getf entry :source)))))
+     (and (zerop (length conninfo)) (stringp restore) (plusp (length restore))))))
 
 (defun physical-follow-plan-settings (settings &optional force-claim)
   "Snapshot configured settings and retain an existing management claim."

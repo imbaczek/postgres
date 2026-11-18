@@ -74,6 +74,25 @@
         (ok (= 226 (aref input 1022)))
         (ok (= 1025 (length (pg::physical-follow-desired-conninfo desired)))))))
 
+(deftest restore-only-reload-changes-desired-receipt-generation
+    (let ((settings (make-hash-table :test #'equal)))
+      (setf (gethash "primary_conninfo" settings) (list :value "" :source :file)
+            (gethash "restore_command" settings) (list :value "" :source :file))
+      (flet ((plan (previous)
+               (pg::physical-follow-plan-settings-from-basis settings previous nil t)))
+        (let ((disabled (plan nil)))
+          (setf (getf (gethash "restore_command" settings) :value) "restore %f %p")
+          (let ((enabled (plan disabled)))
+            (ok (not (eq enabled disabled)))
+            (setf (getf (gethash "restore_command" settings) :value) "other %f %p")
+            (ok (eq enabled (plan enabled)))
+            (setf (getf (gethash "restore_command" settings) :value) "")
+            (ok (not (member (plan enabled) (list enabled disabled))))))
+        (setf (getf (gethash "primary_conninfo" settings) :value) "host=127.0.0.1")
+        (let ((streaming (plan nil)))
+          (setf (getf (gethash "restore_command" settings) :value) "restore %f %p")
+          (ok (eq streaming (plan streaming)))))))
+
 (deftest follow-desired-claim-survives-removal-and-empty-conninfo
     (let* ((unmanaged (pg::physical-follow-next-desired nil "" "" "rx" nil nil))
            (slot-only (pg::physical-follow-next-desired unmanaged "" "public_slot" "rx" nil nil))
