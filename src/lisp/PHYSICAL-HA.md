@@ -3,7 +3,7 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-## Scope check after native rewind page reuse
+## Scope check after standby archiving
 
 Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and
 C-to-Lisp. The mixed-engine tests use logical replication. Native physical
@@ -29,7 +29,8 @@ Native rewind keeps fetched segments in a private cache outside PGDATA.
 With no checkpoint hint, stock Patroni checks the source timeline through SQL
 and completes rewind and rejoin. The fixture uses distinct connection settings
 with the same login. Offline configuration queries report `archive_mode` and
-`archive_command`. Primary WAL archiving now runs with `archive_mode=on`.
+`archive_command`. Primary WAL archiving runs with `archive_mode=on`.
+Standby `archive_mode=always` archives complete streamed WAL segments.
 C `pg_rewind` maps pages changed on the target and relies on recovery to replay
 subsequent source changes. Native rewind reuses whole matching relation files.
 When discovery proves the fork, it also offers up to 256 candidate pages across
@@ -60,8 +61,12 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Add standby
-   `archive_mode=always` and qualify archive retries across repeated promotion.
+2. Qualify archive retries across repeated promotion. The standby queue
+   retains completed files and rescans receipts. It still needs safe
+   reclamation and bounded backlog scans. C also archives WAL restored during
+   online recovery and timeline histories received by a standby. Native online
+   recovery still rejects a nonempty `restore_command`. The offline rewind
+   restore path has its own acceptance above.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -133,8 +138,8 @@ runs a final pass after the checkpoint and waits up to ten seconds for the
 worker. A command may be repeated after a crash or a timeout. Commands must
 tolerate retries, including an overlapping attempt after a crash, and return
 zero only after the destination is complete. Backlog processing still rescans
-completed receipts under the WAL lock. Startup rejects `archive_mode=always`
-until standby archiving is implemented.
+completed receipts under the WAL lock. Standby `archive_mode=always` also
+archives complete durable receive segments, including while replay is paused.
 
 In the live restart test, the command initially failed and the candidate
 remained pending. After orderly restart, `cp -a` produced a regular file
@@ -229,9 +234,8 @@ The reader verifies the whole inventory before returning bytes.
 
 The focused fixture covers full and short segments, an open tail, a timeline
 mismatch, and an otherwise valid inventory with the checked overlap removed.
-Strict compilation and two focused heads took 66.13 s. Runtime integration
-still needs to stage complete durable receive segments while replay is paused
-and retain them through compaction and restart until archive completion.
+Strict compilation and two focused heads took 66.13 s. At that checkpoint,
+runtime integration still needed to stage and retain the segments.
 
 The receive-store reader now checks the durable spool under store ownership.
 It assembles the requested segment through the flush frontier, using a
@@ -240,9 +244,19 @@ For an interior base it uses a checked indexed overlap first and reads the
 manifest-bound base file only when needed. The reader requires durable
 rotation on the same timeline for a short segment. The disk-spool fixture
 rejects an unflushed successor and reads the closed segment after reopen.
-The worker still needs to stage these bytes durably and invoke the command
-outside the receive-store mutex. Strict compilation and three focused test
-heads took 67.67 s.
+At that checkpoint, the worker still needed to stage these bytes durably and
+invoke the command outside the receive-store mutex. Strict compilation and
+three focused test heads took 67.67 s.
+
+The standby worker now stages complete durable receive segments and invokes the
+archive command outside the receive-store mutex. Pending work survives a clean
+stop and offline restart, and queued archive work remains available after
+promotion. A live standby test paused replay, exercised a failing command,
+stopped cleanly during a staging outage, and verified that the restartpoint
+advanced while the receive floor stayed in place. It restarted with the source
+offline, promoted, and later archived the two queued segments. Both archive
+files matched the source WAL. The final run took 35.55 s on the ramdisk.
+Three focused tests took 3.61 s.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
@@ -254,9 +268,9 @@ command succeeds can cause the same file to be submitted again.
 Compare native and C behavior with an initially failing command, a restart
 while archive work is pending, and an eventual successful archive followed
 by recycling. Verify the copied bytes independently and use a produced archive
-in the existing stopped-target restore fixture. Qualify timeline history and
-standby `archive_mode=always` separately, since the receive store and its
-retained extents have different owners from the primary writer. In C,
+in the existing stopped-target restore fixture. Continue comparing timeline
+history and standby archiving with C, since the receive store and its retained
+extents have different owners from the primary writer. In C,
 `archive_mode=on` archives WAL from normal operation. `always` also archives
 files received or restored during recovery.
 
