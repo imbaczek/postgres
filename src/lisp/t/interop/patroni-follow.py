@@ -163,6 +163,35 @@ def check_live_receiver(node, host, port):
     assert conninfo and conninfo.get('host') == host and conninfo.get('port') == str(port), conninfo
 
 
+def check_feedback_reload(node, root, target_data, ports, target_pid):
+    path = target_data / 'postgresql.conf'
+    config = path.read_text()
+    slot_query = ("SELECT xmin::text, catalog_xmin::text FROM pg_replication_slots "
+                  "WHERE slot_name = 'follow_one'")
+    owner_query = "SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'follow_one'"
+    owner = query(ports[0], owner_query)
+    assert owner[0][0] is not None, owner
+    assert query(ports[0], slot_query) == [(None, None)]
+    # Native SIGHUP also reloads code, which can restart the receiver. Use the
+    # configuration worker alone to check that an existing session sees reloads.
+    def reload_configuration():
+        control(node.is_running(), root / 'target.sock', '(request-configuration-reload)')
+
+    try:
+        path.write_text(config + "\nhot_standby_feedback = on\nwal_receiver_status_interval = 1\n")
+        reload_configuration()
+        wait_for(lambda: query(ports[1], 'SHOW hot_standby_feedback') == [('on',)])
+        wait_for(lambda: any(xmin is not None and catalog_xmin is None
+                             for xmin, catalog_xmin in query(ports[0], slot_query)))
+    finally:
+        path.write_text(config)
+        reload_configuration()
+    wait_for(lambda: query(ports[0], slot_query) == [(None, None)])
+    assert query(ports[0], owner_query) == owner
+    assert int((target_data / 'postmaster.pid').read_text().splitlines()[0]) == target_pid
+    print('patroni-follow: standby feedback publishes and clears data xmin on reload PASS', flush=True)
+
+
 def exercise(root, ports, source_log):
     source_data, target_data = root / 'source', root / "replica 'one'"
     source_socket = root / 'source.sock'
@@ -212,6 +241,7 @@ def exercise(root, ports, source_log):
         check_recovery_conf(node, member, (False, False))
         check_live_receiver(node, '127.0.0.1', ports[0])
         check_source_sender(source, root)
+        check_feedback_reload(node, root, target_data, ports, target_pid)
         replacement = Member(0, 'source', None,
                              {'conn_url': f'postgres://localhost:{ports[0]}/postgres'})
         check_recovery_conf(node, replacement, (True, False))

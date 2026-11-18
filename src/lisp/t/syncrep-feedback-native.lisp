@@ -29,6 +29,8 @@ The caller holds the private feedback lock; actual and reported credit stay orde
   "Cap an owned replica's reply and always forward a valid status frame.
 The private lock serializes arming with transmission. Record reported positions
 only after the underlying send succeeds; actual receive and replay keep running."
+  (when (and (= (length payload) 25) (= (aref payload 0) (char-code #\h)))
+    (return-from physical-client-feedback (call-next-method)))
   (assert (and (= (length payload) 34) (= (aref payload 0) (char-code #\r))))
   (sb-thread:with-mutex (*syncrep-test-feedback-lock*)
     (multiple-value-bind (copy reported) (syncrep-test-cap-feedback payload)

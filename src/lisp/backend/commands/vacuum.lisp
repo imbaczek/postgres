@@ -7,16 +7,8 @@
 
 (defun vacuum-data-oldest-xmin (&optional exclude-snapshot)
   "Return the data removal horizon from local snapshots, transactions, and physical slots.
-Exclude EXCLUDE-SNAPSHOT from the local horizon. Lost slots and slots without
-a data horizon do not hold back cleanup."
-  (let ((oldest (oldest-xmin exclude-snapshot)))
-    (sb-thread:with-mutex (*wal-lock*)
-      (loop for slot being the hash-values of *wal-replication-slots*
-            when (and (wal-physical-slot-p slot)
-                      (not (eq :lost (wal-replication-slot-wal-status slot))))
-              do (let ((xmin (first (physical-slot-horizons slot))))
-                   (when xmin (setf oldest (min oldest xmin))))))
-    oldest))
+Exclude EXCLUDE-SNAPSHOT from the local horizon."
+  (wal-limit-xmin-by-physical-slots (oldest-xmin exclude-snapshot)))
 
 (defun vacuum-compute-freeze-cutoff
     (old-relfrozenxid oldest-xmin next-xid &key forced-freeze-cutoff)

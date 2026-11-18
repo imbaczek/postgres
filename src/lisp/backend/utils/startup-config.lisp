@@ -238,6 +238,8 @@ synchronous configuration plan against the same source and generation."
     ("synchronous_commit" :user :synchronous-commit "on")
     ("recovery_target_timeline" :postmaster :timeline "latest")
     ("hot_standby" :postmaster :boolean "on")
+    ("hot_standby_feedback" :sighup :boolean "off")
+    ("wal_receiver_status_interval" :sighup :integer "10" 0 2147483 :seconds)
     ("wal_level" :postmaster :wal-level "replica")
     ("wal_log_hints" :postmaster :boolean "off")
     ("full_page_writes" :sighup :boolean "on")

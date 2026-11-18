@@ -355,6 +355,24 @@
       (setf (pg::wal-replication-slot-kind slot) :unknown)
       (ok (signals (pg::wal-encode-replication-slot slot) 'error))))
 
+(deftest standby-feedback-xmin-uses-applied-running-xids-and-readers
+    (let* ((pg::*wal-replication-slots* (make-hash-table :test #'equal))
+           (pg::*active-snapshot-set* (make-hash-table :test #'eq))
+           (pg::*next-xid* 55)
+           (pg::*last-replay-lsn* 128)
+           (pg::*physical-recovery-state*
+             (list :source-xids (list :complete t :next-xid 55 :through 128 :running '(40 49))))
+           (snapshot (pg::make-snapshot-struct :xmin 38)))
+      (ok (= 40 (pg::physical-follow-data-feedback-xmin)))
+      (setf (gethash snapshot pg::*active-snapshot-set*) t)
+      (ok (= 38 (pg::physical-follow-data-feedback-xmin)))
+      (let ((slot (physical-slot-test-object)))
+        (setf (gethash "public_physical" pg::*wal-replication-slots*) slot
+              (pg::physical-slot-horizons slot) '(36 33))
+        (ok (= 36 (pg::physical-follow-data-feedback-xmin))))
+      (incf pg::*last-replay-lsn*)
+      (ok (null (pg::physical-follow-data-feedback-xmin)))))
+
 (deftest physical-slot-data-horizon-bounds-vacuum
     (let* ((pg::*wal-replication-slots* (make-hash-table :test #'equal))
            (pg::*next-xid* 100)

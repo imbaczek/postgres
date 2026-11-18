@@ -1546,21 +1546,70 @@ the feedback send and network completion run outside the fence."
     (prog1 (sb-ext:with-timeout 10 (physical-client-finish client next limit))
       (with-live-operation (physical-follow-require-runtime-generation runtime)))))
 
+(defun physical-follow-data-feedback-xmin ()
+  "Return the data horizon at a complete, applied source transaction boundary.
+Include local readers and physical slots. Return NIL until replay supplies
+complete source XID coverage."
+  (let ((xmin
+          (sb-thread:with-mutex (*xid-lock*)
+            (let ((source (getf *physical-recovery-state* :source-xids)))
+              (when (and (getf source :complete)
+                         (eql *next-xid* (getf source :next-xid))
+                         (eql *last-replay-lsn* (getf source :through)))
+                (let ((snapshot-xmin (oldest-active-snapshot-xmin)))
+                  (reduce #'min (getf source :running)
+                          :initial-value (min *next-xid* (or snapshot-xmin *next-xid*)))))))))
+    (when xmin (wal-limit-xmin-by-physical-slots xmin))))
+
+(defun physical-follow-send-horizon-feedback (client runtime sent-at sent-enabled)
+  "Send periodic data feedback for a public slot, or clear it when disabled.
+Return the last successful send time and enabled state. Wait for a valid xmin
+before sending an enabled report."
+  (unless (physical-follow-config-public-slot (physical-follow-runtime-config runtime))
+    (return-from physical-follow-send-horizon-feedback (values sent-at sent-enabled)))
+  (let* ((configuration (startup-capture-configuration))
+         (settings (when configuration (startup-configuration-settings configuration)))
+         (interval (when settings (startup-setting-value settings "wal_receiver_status_interval")))
+         (enabled (and interval (plusp interval)
+                       (startup-setting-value settings "hot_standby_feedback")))
+         (now (get-internal-real-time)))
+    (when (and configuration *enable-hot-standby*
+               (or (not (eql enabled sent-enabled))
+                   (and enabled (>= (- now sent-at)
+                                    (* interval internal-time-units-per-second)))))
+      (let ((xmin (with-physical-follow-generation-operation
+                    (physical-follow-require-runtime-generation runtime)
+                    (check-recovery-available)
+                    (when enabled (physical-follow-data-feedback-xmin)))))
+        (when (or (not enabled) (running-xacts-normal-xid-p xmin))
+          (let ((payload (make-payload)))
+            (payload-push-byte payload (char-code #\h))
+            (pg-client-push-u64 payload (postgres-current-timestamp))
+            (payload-push-u32 payload (if xmin (xid32-of xmin) 0))
+            (payload-push-u32 payload (if xmin (ldb (byte 32 32) xmin) 0))
+            (pg-client-push-u64 payload 0)
+            (sb-ext:with-timeout 10 (physical-client-feedback client payload)))
+          (return-from physical-follow-send-horizon-feedback (values now enabled)))))
+    (values sent-at sent-enabled)))
+
 (defun physical-follow-copy-stream (client runtime)
   (physical-follow-monitor-connected runtime)
-  (loop until (physical-follow-receiver-stopped-p runtime)
-        do (multiple-value-bind (kind payload)
-               (physical-client-receive client)
-             (case kind
-               (:data (with-live-operation (physical-follow-process-frame payload runtime)))
-               (:done
-                (unless (physical-follow-runtime-binding runtime)
-                  (physical-follow-reject "unexpected native CopyDone"))
-                (return-from physical-follow-copy-stream
-                  (physical-follow-finish-bound-stream client runtime)))
-               (:idle nil)
-               (otherwise (physical-follow-reject "unexpected native replication frame"))))
-           (physical-follow-feedback client runtime)))
+  (let ((sent-at 0) (sent-enabled :unknown))
+    (loop until (physical-follow-receiver-stopped-p runtime)
+          do (multiple-value-bind (kind payload)
+                 (physical-client-receive client)
+               (case kind
+                 (:data (with-live-operation (physical-follow-process-frame payload runtime)))
+                 (:done
+                  (unless (physical-follow-runtime-binding runtime)
+                    (physical-follow-reject "unexpected native CopyDone"))
+                  (return-from physical-follow-copy-stream
+                    (physical-follow-finish-bound-stream client runtime)))
+                 (:idle nil)
+                 (otherwise (physical-follow-reject "unexpected native replication frame"))))
+             (multiple-value-setq (sent-at sent-enabled)
+               (physical-follow-send-horizon-feedback client runtime sent-at sent-enabled))
+             (physical-follow-feedback client runtime))))
 
 (defun physical-follow-bound-completion (runtime result)
   "Accept retained completion only at the bound next timeline and fork.

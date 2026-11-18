@@ -260,6 +260,16 @@ Logical updates guard identity, progress and the first terminal cause."
   "Test the explicit physical kind, not the database field."
   (eq :physical (wal-replication-slot-kind slot)))
 
+(defun wal-limit-xmin-by-physical-slots (xmin)
+  "Lower XMIN to the data horizon of any nonlost physical slot."
+  (sb-thread:with-mutex (*wal-lock*)
+    (loop for slot being the hash-values of *wal-replication-slots*
+          when (and (wal-physical-slot-p slot)
+                    (not (eq :lost (wal-replication-slot-wal-status slot))))
+            do (let ((slot-xmin (first (physical-slot-horizons slot))))
+                 (when slot-xmin (setf xmin (min xmin slot-xmin))))))
+  xmin)
+
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
   "A standard slot must be database-bound and confirmed in its first durable image."
   (and (stringp plugin)
