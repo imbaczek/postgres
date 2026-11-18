@@ -151,7 +151,7 @@ Only explicit proof_kind retained_timeline selects the retained proof."
 ;; Allocate the stage before CopyOutResponse, and delete it on every exit,
 ;; including before CopyDone and successful command completion.  After COPY
 ;; starts, report errors if possible and abort the stream before propagating.
-(defun call-with-native-backup-copy-out (stream tag producer &key reuse)
+(defun call-with-native-backup-copy-out (stream tag producer &key reuse retain-stage)
   (call-with-wal-sender-stream
    (lambda ()
      (let ((stage nil) (copy-mode nil))
@@ -168,14 +168,15 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                                (setf copy-mode t)
                                (copy-write-frame stream #\H response)
                                (finish-output stream))))
-                      (multiple-value-bind (manifest expected-entries) (funcall producer stage #'begin-copy)
+                      (multiple-value-bind (manifest expected-entries retained) (funcall producer stage #'begin-copy)
                         (unless copy-mode (error "native backup producer did not start COPY"))
-                        (physical-bootstrap-test-point :before-stream stage)
-                        (physical-backup-send-bundle
-                         stage manifest
-                         (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
-                         :reuse reuse :expected-entries expected-entries))))
-               (when stage (physical-backup-delete-stage stage)))
+                        (let ((image (or retained stage)))
+                          (physical-bootstrap-test-point :before-stream image)
+                          (physical-backup-send-bundle
+                           image manifest
+                           (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
+                           :reuse reuse :expected-entries expected-entries)))))
+               (when stage (physical-backup-delete-stage stage :missing-ok retain-stage)))
              (copy-write-frame stream #\c (make-payload))
              (send-command-complete stream tag)
              (send-ready-for-query stream (transaction-status-char)))

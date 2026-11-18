@@ -218,7 +218,7 @@ active timeline goal before recovery preparation or redo."
             (sb-posix:mkdtemp (namestring (merge-pathnames "stage.XXXXXX" root))))
         (sb-posix:close fd)))))
 
-(defun physical-backup-delete-stage (stage)
+(defun physical-backup-delete-stage (stage &key missing-ok)
   (sb-thread:with-mutex (*physical-backup-stage-lock*)
     (multiple-value-bind (fd root) (physical-backup-open-stage-container *catalog*)
       (unless fd (error "native backup stage container disappeared"))
@@ -228,9 +228,110 @@ active timeline goal before recovery preparation or redo."
                           (equal (truename root)
                                  (truename (uiop:pathname-parent-directory-pathname stage))))
                (error "native backup stage cleanup has a foreign path"))
-             (physical-backup-remove-stage-tree fd name)
-             (sb-posix:fsync fd))
+             (when (or (not missing-ok)
+                       (query-temp-lstat (pathname (query-temp-fd-child-path fd name))))
+               (physical-backup-remove-stage-tree fd name)
+               (sb-posix:fsync fd)))
         (sb-posix:close fd)))))
+
+(defvar *physical-rewind-stage-readers* (make-hash-table :test #'equal))
+
+(defvar *physical-rewind-stage-retirements* (make-hash-table :test #'equal))
+
+(defvar *physical-rewind-stage-count-limit* 16)
+
+(defvar *physical-rewind-stage-byte-limit* (* 16 1024 1024 1024))
+
+(defun physical-rewind-stage-name (lease-name)
+  (unless (wal-valid-replication-slot-name-p lease-name)
+    (error "invalid rewind stage lease name"))
+  (concatenate 'string "rewind." lease-name))
+
+(defun physical-rewind-stage-lease-name (name)
+  (when (uiop:string-prefix-p "rewind." name)
+    (let ((lease-name (subseq name 7)))
+      (when (wal-valid-replication-slot-name-p lease-name) lease-name))))
+
+(defun physical-rewind-stage-names (container)
+  (multiple-value-bind (names complete) (query-temp-directory-entry-names container)
+    (unless complete (error "rewind stage enumeration failed"))
+    (remove-if-not #'physical-rewind-stage-lease-name names)))
+
+(defun physical-rewind-open-stage-directory (container name)
+  (let ((child (physical-backup-open-directory
+                (pathname (query-temp-fd-child-path container name)))))
+    (handler-case (progn (physical-backup-check-stage-directory child) child)
+      (error (condition)
+        (sb-posix:close child)
+        (error condition)))))
+
+(defun physical-rewind-retain-stage (stage lease-name entries)
+  (when (> (reduce #'+ entries :key #'second) *physical-rewind-stage-byte-limit*)
+    (error "rewind image exceeds retained stage capacity"))
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (multiple-value-bind (container root) (physical-backup-open-stage-container *catalog*)
+      (unless container (error "rewind stage container disappeared"))
+      (unwind-protect
+           (let* ((name (car (last (pathname-directory stage))))
+                  (retained (physical-rewind-stage-name lease-name))
+                  (from (query-temp-fd-child-path container name))
+                  (to (query-temp-fd-child-path container retained)))
+             (unless (and (physical-backup-stage-name-p name)
+                          (equal root (uiop:pathname-parent-directory-pathname stage))
+                          (not (query-temp-lstat (pathname to)))
+                          (< (length (physical-rewind-stage-names container))
+                             *physical-rewind-stage-count-limit*))
+               (error "rewind stage cannot be retained in its source workspace"))
+             (let ((child (physical-rewind-open-stage-directory container name)))
+               (unwind-protect
+                    (progn
+                      (sb-posix:fsync child)
+                      (sb-posix:rename from to)
+                      (sb-posix:fsync container)
+                      (setf (gethash lease-name *physical-rewind-stage-readers*) 1)
+                      (merge-pathnames (concatenate 'string retained "/") root))
+                 (sb-posix:close child))))
+        (sb-posix:close container)))))
+
+(defun physical-rewind-remove-retained-stage (container name)
+  (when (query-temp-lstat (pathname (query-temp-fd-child-path container name)))
+    (sb-posix:close (physical-rewind-open-stage-directory container name))
+    (physical-backup-remove-stage-tree container name)
+    (sb-posix:fsync container)))
+
+(defun physical-rewind-remove-stage-under-lock (lease-name)
+  (multiple-value-bind (container root) (physical-backup-open-stage-container *catalog*)
+    (declare (ignore root))
+    (when container
+      (unwind-protect
+           (physical-rewind-remove-retained-stage container (physical-rewind-stage-name lease-name))
+        (sb-posix:close container)))))
+
+(defun physical-rewind-retire-stage (record)
+  (when (member (getf record :phase) '(:interrupted :closing :closed))
+    (let ((lease-name (getf (getf record :request) :name)))
+      (sb-thread:with-mutex (*physical-backup-stage-lock*)
+        (if (gethash lease-name *physical-rewind-stage-readers*)
+            (setf (gethash lease-name *physical-rewind-stage-retirements*) t)
+            (physical-rewind-remove-stage-under-lock lease-name))))))
+
+(defun physical-rewind-release-stage (lease-name)
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (remhash lease-name *physical-rewind-stage-readers*)
+    (when (remhash lease-name *physical-rewind-stage-retirements*)
+      (physical-rewind-remove-stage-under-lock lease-name))))
+
+(defun physical-rewind-cleanup-stages-at-startup (lease-records)
+  (sb-thread:with-mutex (*physical-backup-stage-lock*)
+    (multiple-value-bind (container root) (physical-backup-open-stage-container *catalog*)
+      (declare (ignore root))
+      (when container
+        (unwind-protect
+             (dolist (name (physical-rewind-stage-names container))
+               (let ((record (gethash (physical-rewind-stage-lease-name name) lease-records)))
+                 (unless (and (eq :ready (getf record :phase)) (getf record :rewind-seal-digest))
+                   (physical-rewind-remove-retained-stage container name))))
+          (sb-posix:close container))))))
 
 (defun physical-bootstrap-target (directory)
   "Require an existing empty target outside the source directory hierarchy."

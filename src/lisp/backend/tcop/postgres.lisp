@@ -1088,6 +1088,7 @@ throughout replay and shutdown."
           (physical-backup-lease-load-standby-pins))
         (physical-export-origin-load)
         (physical-backup-lease-reconcile-startup)
+        (physical-rewind-cleanup-stages-at-startup *physical-backup-lease-records*)
         (if imported
             (logical-slot-imported-startup-check-policy)
             (physical-follow-prepare-managed-startup))

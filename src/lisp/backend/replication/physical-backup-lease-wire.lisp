@@ -325,11 +325,57 @@ Each unique entry contains a relation name, size and digest."
                     (physical-backup-lease-handoff
                      request (cdr (assoc "successor" (logical-replication-command-options command)
                                          :test #'equal)))))))
+          (when (getf record :rewind-seal-digest)
+            (physical-rewind-retire-stage record))
           (send-native-backup-lease-result
            stream request record (car (rassoc kind *physical-backup-lease-wire-verbs*)))))
     (wal-input-validation-error () (ereport "55000" "backup lease request is not valid for this source"))
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "native backup lease command failed"))))
+
+(defun call-with-native-rewind-capture (stream tag request offers)
+  (let ((retained nil)
+        (retain-attempted nil)
+        (complete nil)
+        (name (getf request :name)))
+    (unwind-protect
+         (multiple-value-prog1
+             (call-with-native-backup-copy-out
+              stream tag
+              (lambda (stage begin-copy)
+                (let ((base nil) (entries nil))
+                  (multiple-value-bind (manifest claimed)
+                      (physical-backup-lease-capture
+                       stage request :on-start begin-copy
+                       :before-ready
+                       (lambda (directory verified digest)
+                         (setf base (physical-backup-lease-captured-base verified digest)
+                               entries (physical-backup-bundle-entries
+                                        directory verified :manifest-digest digest))
+                         (let ((seal-digest (physical-rewind-write-stage-seal directory request base entries)))
+                           (sb-sys:without-interrupts
+                             (setf retain-attempted t
+                                   retained (physical-rewind-retain-stage directory name entries)))
+                           seal-digest)))
+                    (unless claimed
+                      (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
+                    (let ((ready (physical-backup-lease-status request)))
+                      (unless (and (eq :ready (getf ready :phase))
+                                   (equal base (getf ready :base))
+                                   (equal entries (physical-rewind-stage-sealed-entries
+                                                   retained request base manifest
+                                                   (getf ready :rewind-seal-digest))))
+                        (error "rewind stage seal differs from the verified capture")))
+                    (values manifest entries retained))))
+              :retain-stage t
+              :reuse (when offers
+                       (lambda (entry)
+                         (equal entry (gethash (first entry) offers)))))
+           (setf complete t))
+      (when retained (physical-rewind-release-stage name))
+      (when (and retain-attempted (not complete))
+        (let ((record (ignore-errors (physical-backup-lease-status request))))
+          (when record (physical-rewind-retire-stage record)))))))
 
 ;; Start COPY only after a new claim is durably CAPTURING.  An existing claim
 ;; returns an error before COPY; it cannot retransmit an earlier stage.
@@ -339,38 +385,19 @@ Each unique entry contains a relation name, size and digest."
         (physical-backup-lease-wire-preflight command)
         (let* ((kind (logical-replication-command-type command))
                (tag (car (rassoc kind *physical-backup-lease-wire-verbs*)))
-               (offers (cdr (assoc "relation_offers" (logical-replication-command-options command)
-                                   :test #'equal))))
-          (call-with-native-backup-copy-out
-           stream tag
-           (lambda (stage begin-copy)
-             (let ((request (physical-backup-lease-command-request command))
-                   (base nil)
-                   (entries nil))
-               (multiple-value-bind (manifest claimed)
-                   (physical-backup-lease-capture
-                    stage request
-                    :on-start begin-copy
-                    :before-ready (when (eq kind :physical-lease-capture-rewind)
-                                    (lambda (directory verified digest)
-                                      (setf base (physical-backup-lease-captured-base verified digest)
-                                            entries (physical-backup-bundle-entries
-                                                     directory verified :manifest-digest digest))
-                                      (physical-rewind-write-stage-seal directory request base entries))))
-                 (unless claimed
-                   (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
-                 (when base
-                   (let ((ready (physical-backup-lease-status request)))
-                     (unless (and (eq :ready (getf ready :phase))
-                                  (equal base (getf ready :base))
-                                  (equal entries (physical-rewind-stage-sealed-entries
-                                                  stage request base manifest
-                                                  (getf ready :rewind-seal-digest))))
-                       (error "rewind stage seal differs from the verified capture"))))
-                 (values manifest entries))))
-           :reuse (when offers
-                    (lambda (entry)
-                      (equal entry (gethash (first entry) offers)))))))
+               (request (physical-backup-lease-command-request command)))
+          (if (eq kind :physical-lease-capture-rewind)
+              (call-with-native-rewind-capture
+               stream tag request (cdr (assoc "relation_offers" (logical-replication-command-options command)
+                                              :test #'equal)))
+              (call-with-native-backup-copy-out
+               stream tag
+               (lambda (stage begin-copy)
+                 (multiple-value-bind (manifest claimed)
+                     (physical-backup-lease-capture stage request :on-start begin-copy)
+                   (unless claimed
+                     (ereport "55000" "backup lease already exists; use BACKUP_LEASE_STATUS or BACKUP_LEASE_ABORT"))
+                   manifest))))))
     (wal-input-validation-error () (ereport "55000" "backup lease capture is not valid for this source"))
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "leased native backup failed"))))
