@@ -861,7 +861,18 @@
                          (pg::physical-retained-archive-segment
                           directory root identity history 1 0
                           :base-prefix-reader (lambda () (subseq (getf fixture :base) 0 (getf identity :base))))))))))
-     :rotation-gap 17))
+     :rotation-gap 17)
+  (call-with-historical-segment-source
+   (lambda (fixture)
+     (let* ((identity (getf fixture :identity))
+            (base (getf identity :base)))
+       (multiple-value-bind (bytes end)
+           (pg::physical-retained-archive-segment
+            (getf fixture :directory) (getf (getf fixture :reference) :root-id)
+            identity (pg::timeline-parse-history 1 "") 1 0)
+         (ok (equalp bytes (subseq (getf fixture :base) 0 base)))
+         (ok (eql end base)))))
+   :base-gap t))
 
 (defun call-with-test-logical-wal-archive (function)
   (pg::call-with-logical-wal-archive

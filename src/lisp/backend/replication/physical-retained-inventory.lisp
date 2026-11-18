@@ -268,16 +268,17 @@ proof, logical coverage and source authority."
 ON-RECORD receives each validated record and its original bytes, including records
 past any endpoint of interest. ON-EXTENT receives read-only provisional metadata
 and bytes. Keep callback results private until validation finishes.
-Return the freshly decoded payload."
+Return the freshly decoded payload and its checked base overlap."
   ;; READER may bind I/O to a held archive directory.  Like the default reader,
   ;; it must enforce each requested content ID and byte limit.
-  (let ((payload (physical-retained-inventory-read-index directory id identity history reader)))
+  (let* ((payload (physical-retained-inventory-read-index directory id identity history reader))
+         (overlap (physical-retained-inventory-read-overlap directory payload reader)))
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
      (lambda (image-id)
        (funcall reader directory :extent image-id +physical-retained-image-limit+))
-     (physical-retained-inventory-read-overlap directory payload reader) on-record on-extent)
-    payload))
+     overlap on-record on-extent)
+    (values payload overlap)))
 
 (defun physical-retained-archive-base-prefix-matches-p (base-prefix candidate start)
   (and base-prefix
@@ -289,30 +290,34 @@ Return the freshly decoded payload."
   "Return a sealed segment image and end when the inventory proves both closure
 and contiguous coverage from the segment start or verified base overlap.
 BASE-PREFIX-READER can supply a matching base prefix when overlap is absent.
-A following contiguous extent can prove closure of a short image."
-  (let ((candidate nil) (end nil) (complete nil)
-                        (prefix-start nil) (prefix-end nil) (contiguous t) (candidate-covered nil))
-    (let ((inventory
-            (physical-retained-inventory-load
-             directory root identity history
-             :on-extent
-             (lambda (metadata bytes)
-               (let ((number (getf metadata :segment))
-                     (start (getf metadata :start))
-                     (finish (getf metadata :end)))
-                 (when (= number segment)
-                   (unless prefix-start (setf prefix-start start))
-                   (when (and prefix-end (/= prefix-end start))
-                     (setf contiguous nil))
-                   (setf prefix-end finish))
-                 (when (= timeline (getf metadata :file-timeline))
-                   (cond ((= number segment)
-                          (setf candidate bytes
-                                end finish
-                                candidate-covered contiguous
-                                complete (= (length bytes) +wal-segment-size+)))
-                         ((and candidate (= (1+ segment) number) (= end start))
-                          (setf complete t)))))))))
+A following contiguous extent can prove closure of a short image. It can also
+close a verified base prefix that has no receive extent of its own."
+  (let ((base (getf identity :base)) (base-successor nil)
+                                     (candidate nil) (end nil) (complete nil)
+                                     (prefix-start nil) (prefix-end nil) (contiguous t) (candidate-covered nil))
+    (multiple-value-bind (inventory overlap)
+        (physical-retained-inventory-load
+         directory root identity history
+         :on-extent
+         (lambda (metadata bytes)
+           (let ((number (getf metadata :segment))
+                 (start (getf metadata :start))
+                 (finish (getf metadata :end)))
+             (when (= number segment)
+               (unless prefix-start (setf prefix-start start))
+               (when (and prefix-end (/= prefix-end start))
+                 (setf contiguous nil))
+               (setf prefix-end finish))
+             (when (= timeline (getf metadata :file-timeline))
+               (when (and (= number (1+ segment)) (= start base))
+                 (setf base-successor t))
+               (cond ((= number segment)
+                      (setf candidate bytes
+                            end finish
+                            candidate-covered contiguous
+                            complete (= (length bytes) +wal-segment-size+)))
+                     ((and candidate (= (1+ segment) number) (= end start))
+                      (setf complete t)))))))
       (when (and complete candidate-covered
                  (or (<= prefix-start (* segment +wal-segment-size+))
                      (and (= prefix-start (getf identity :base))
@@ -320,7 +325,12 @@ A following contiguous extent can prove closure of a short image."
                               (and base-prefix-reader
                                    (physical-retained-archive-base-prefix-matches-p
                                     (funcall base-prefix-reader) candidate prefix-start))))))
-        (values candidate end)))))
+        (return-from physical-retained-archive-segment (values candidate end)))
+      (when (and overlap base-successor (null prefix-start)
+                 (= timeline (getf identity :base-timeline))
+                 (= segment (floor base +wal-segment-size+))
+                 (plusp (mod base +wal-segment-size+)))
+        (values (second overlap) base)))))
 
 (defun physical-retained-inventory-keep-entries (entries ids)
   "Select unique IDs from the previous inventory, preserving entry order."
