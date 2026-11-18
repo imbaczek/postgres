@@ -56,24 +56,27 @@ and rejoined after killing both initial capture and the first repair. Strict
 compilation and three focused test heads took 58.23 s. These are milestone
 timings for distinct workloads. They give no before-and-after speed comparison.
 
-The native backend has demonstrated the main physical HA operations in separate
-process tests. The open acceptance question is whether stock Patroni can compose
-them through one supported lifecycle. The existing supplied-leader test proves
-offline rejoin, and the separate clone, follow, promote, and synchronous
-replication tests establish individual operations.
+Pinned Patroni 4.1.5 now composes clone, follow, restart, promotion, rewind
+and rejoin in one supplied-leader lifecycle. The harness starts the original
+source and restarts the promoted source, creates physical slots through SQL,
+reloads source configuration for `FIRST 1`, and seeds divergence while the old
+writer is isolated. The test checks named slots after restart and a `remote_apply`
+row before and after promotion and after rejoin. Configuration probes complete
+without warnings. `pg_stat_replication` itself is still missing, although
+Patroni's underlying activity and sender functions work. The run took 282.16 s
+on the ramdisk, including 2.06 s for clone and 263.09 s for the configured phase.
+The existing `rewind-patroni` regression passed in 251.55 s with its fixture's
+missing configuration probe warnings.
 
-1. Run one stock Patroni 4.1.5 lifecycle with leadership supplied by the
-   harness. Cover clone, follow, promotion, and former-primary rewind and
-   rejoin. Include generated configuration, utility invocation, connection
-   recovery, and the supported physical slot and synchronous settings. Use
-   this run to identify which backend gaps block the workflow.
-2. Implement online archive recovery. C recovery can obtain WAL from archive,
+Two recovery areas remain open.
+
+1. Implement online archive recovery. C recovery can obtain WAL from archive,
    local files, and streaming through `WaitForWALToBecomeAvailable` and
    `RestoreArchivedFile`. Native online recovery rejects a nonempty
    `restore_command`. Offline rewind already has a separate restore path.
    Archive producer work still needs repeated-promotion and mode-handoff
    tests, safe queue reclamation, and bounded backlog scans.
-3. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
+2. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
    both histories and can find a fork before the immediate parent. The
    native live evidence covers the immediate-child case. Torn private replay
    prefixes can also require manual repair. State both limits in the

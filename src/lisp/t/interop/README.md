@@ -252,6 +252,27 @@ files and nested directory identities survive in quarantine along with the exact
 auxiliary guard, and that the standby can cold restart, restart with the source
 offline and reconnect. It also checks a table created only on the child timeline.
 
+Run the supplied-leader Patroni lifecycle with the same dependencies and a
+fresh output directory under the RAM job's temporary directory.
+
+```sh
+./t/test-ramdisk.sh setup 4G
+PATH="/path/to/c/bin:$PATH" PG_CONFIG=/path/to/c/bin/pg_config ./t/test-ramdisk.sh run \
+  sh -c 'exec "$1" t/interop/patroni-reseed.py --case patroni-lifecycle --output "$TMPDIR/patroni-lifecycle"' \
+  sh "$PATRONI_PYTHON"
+```
+
+Stock Patroni 4.1.5 performs clone, follow, restart, promotion, rewind and
+rejoin. The harness supplies leadership, starts the original source, restarts
+the promoted source, creates physical slots through SQL, reloads source
+configuration for `FIRST 1`, and seeds divergence while the former primary is
+isolated. The test checks named slots after restart and a `remote_apply` row
+before and after promotion and after rejoin. Configuration probes complete
+without warnings. `pg_stat_replication` is missing, although Patroni's underlying
+activity and sender functions work. This runs no DCS, election or HA loop. The
+verified ramdisk run took 282.16 s, including 2.06 s for clone and 263.09 s for
+the configured phase.
+
 Run the manual failover rehearsal with the same pinned Patroni 4.1.5 environment
 and dependencies, using a fresh output directory under the RAM job's temporary
 directory:
