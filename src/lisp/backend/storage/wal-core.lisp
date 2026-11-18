@@ -4129,17 +4129,20 @@ release their claims to the retained WAL."
 
 (declaim (ftype function timeline-history-filename))
 
+(declaim (ftype function timeline-archive-history-items))
+
 (defun wal-archive-item-name (item)
   "Name the current committed timeline's history or a segment in its namespace."
-  (if (eq item :history)
-      (timeline-history-filename *wal-insert-timeline*)
+  (if (consp item)
+      (timeline-history-filename (cdr item))
       (wal-segment-filename item *wal-insert-timeline* *wal-segment-namespace*)))
 
 (defun wal-archive-item-ready-p (item)
   "Admit current child timeline history when the primary is ready.
 Apply the durable, closed segment checks to WAL segments."
-  (if (eq item :history)
-      (and (wal-archive-primary-ready-p) (> *wal-insert-timeline* 1))
+  (if (consp item)
+      (and (wal-archive-primary-ready-p)
+           (member item (wal-archive-history-items) :test #'equal))
       (wal-archive-ready-segment-p item)))
 
 (defun wal-archive-create-ready (directory-fd item)
@@ -4189,6 +4192,7 @@ The caller holds the WAL lock and syncs the status directory."
     (error "WAL directory no longer names the held archive source directory")))
 
 (defun wal-archive-check-source (wal-fd name source-fd)
+  "Check that the named regular archive source still matches the held file facts."
   (let ((facts (physical-image-file-facts source-fd)))
     (unless (and (= sb-posix:s-ifreg (logand (third facts) sb-posix:s-ifmt))
                  (= 1 (fourth facts))
@@ -4198,6 +4202,41 @@ The caller holds the WAL lock and syncs the status directory."
                  (equal facts (physical-image-file-facts wal-fd name)))
       (error "WAL archive source no longer names the held segment: ~a" name))
     facts))
+
+(declaim (ftype function timeline-read-history-stream))
+
+(defun wal-archive-read-history-bytes (wal-fd timeline)
+  "Read history through a held source descriptor and recheck its named file facts."
+  (let* ((name (timeline-history-filename timeline))
+         (fd (wal-archive-open-source wal-fd name))
+         (stream nil))
+    (unwind-protect
+         (let ((facts (wal-archive-check-source wal-fd name fd)))
+           (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8)))
+           (let ((bytes (timeline-read-history-stream stream)))
+             (unless (equal facts (wal-archive-check-source wal-fd name fd))
+               (error "WAL archive history changed during read: ~a" name))
+             (values bytes facts)))
+      (if stream (close stream) (sb-posix:close fd)))))
+
+(defun wal-archive-history-items (&optional source-name source-facts)
+  "Select committed history and eligible ancestor prefixes from the held WAL directory.
+When SOURCE-NAME is selected, require its facts to match the held archive source."
+  (when (> *wal-insert-timeline* 1)
+    (sb-sys:without-interrupts
+      (let ((wal-fd (wal-archive-open-wal-directory)))
+        (unwind-protect
+             (progn
+               (wal-archive-check-wal-directory wal-fd)
+               (timeline-archive-history-items
+                *wal-insert-timeline*
+                (lambda (timeline)
+                  (multiple-value-bind (bytes facts) (wal-archive-read-history-bytes wal-fd timeline)
+                    (when (and source-name (string= source-name (timeline-history-filename timeline))
+                               (not (equal source-facts facts)))
+                      (error "WAL archive history changed before command: ~a" source-name))
+                    bytes))))
+          (sb-posix:close wal-fd))))))
 
 (defun wal-archive-check-status-directory (wal-fd status-fd)
   (let ((facts (physical-image-file-facts status-fd)))
@@ -4210,7 +4249,7 @@ The caller holds the WAL lock and syncs the status directory."
 
 (defun wal-archive-run-shell (template name wal-fd directory)
   "Run the archive command and wait for it to exit.
-The caller keeps SOURCE-FD open for the command and holds no WAL lock."
+The caller keeps WAL-FD open for the command and holds no WAL lock."
   (let* ((path (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) wal-fd name))
          (command (wal-shell-file-command template name path "archive_command"))
          (process (sb-ext:run-program "/bin/sh" (list "-c" command)
@@ -4225,8 +4264,8 @@ The caller keeps SOURCE-FD open for the command and holds no WAL lock."
   (format nil "WAL-ARCHIVE ~a~{ ~d~}~%" name (subseq facts 0 8)))
 
 (defun wal-archive-done-matches-p (wal-fd status-fd name source-fd &key (sync t))
-  "Check the exact completion receipt for the held source and sync the receipt and directory.
-Recheck the named receipt and source before returning true."
+  "Check the exact completion receipt for the held source.
+When SYNC is true, sync the receipt and directory. Recheck both named files."
   (let* ((flags (logior sb-posix:o-rdonly sb-posix:o-nonblock
                         sb-posix:o-nofollow +postmaster-o-cloexec+))
          (marker (concatenate 'string name ".done"))
@@ -4341,7 +4380,9 @@ under the lock, and publish completion only after success."
                                      (eql (second epoch) *wal-insert-timeline*)
                                      (eq (third epoch) *wal-segment-namespace*)
                                      (wal-archive-primary-ready-p)))
-                            (wal-archive-item-ready-p item))
+                            (if (consp item)
+                                (wal-archive-primary-ready-p)
+                                (wal-archive-ready-segment-p item)))
                  (return-from wal-archive-attempt nil))
                (setf incarnation *wal-storage-incarnation*
                      name (wal-archive-item-name item)
@@ -4350,7 +4391,10 @@ under the lock, and publish completion only after success."
                      source-fd (wal-archive-open-source wal-fd name))
                (wal-archive-check-wal-directory wal-fd)
                (wal-archive-check-status-directory wal-fd status-fd)
-               (setf facts (wal-archive-check-source wal-fd name source-fd)))
+               (setf facts (wal-archive-check-source wal-fd name source-fd))
+               (when (consp item)
+                 (unless (member item (wal-archive-history-items name facts) :test #'equal)
+                   (return-from wal-archive-attempt nil))))
              ;; Keep the WAL directory descriptor open for the shell's source path.
              (when (wal-archive-run-shell template name wal-fd directory)
                (sb-thread:with-mutex (*wal-lock*)
@@ -4408,7 +4452,7 @@ Exclude the open output segment and sync the status directory."
 Ensure its ready marker is durable and return the item and storage epoch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (wal-archive-primary-ready-p)
-    (let ((items (append (when (> *wal-insert-timeline* 1) (list :history))
+    (let ((items (append (wal-archive-history-items)
                          (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments))))
           (wal-fd nil) (status-fd nil))
       (when items

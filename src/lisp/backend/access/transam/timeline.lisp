@@ -223,6 +223,17 @@ Native ancestry requires the parent history and a forward fork; no role is chang
 (defun timeline-history-test-point (point)
   (when *timeline-history-test-hook* (funcall *timeline-history-test-hook* point)))
 
+(defun timeline-read-history-stream (stream)
+  (let* ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
+         (length (sb-posix:stat-size stat)))
+    (unless (and (= sb-posix:s-ifreg (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
+                 (<= 0 length (* 16 1024 1024)))
+      (ereport "58030" "invalid or oversized timeline history file"))
+    (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
+      (unless (= length (read-sequence bytes stream))
+        (ereport "XX001" "short timeline history read"))
+      bytes)))
+
 (defun timeline-history-bytes (timeline &optional (directory *pgdata*))
   "Read an immutable history file without hanging on special files or following growth."
   (let* ((path (timeline-history-path timeline directory))
@@ -235,20 +246,38 @@ Native ancestry requires the parent history and a forward fork; no role is chang
                           "could not open timeline history file ~s" (namestring path)))))
          (stream nil))
     (unwind-protect
-         (let* ((stat (sb-posix:fstat fd)) (length (sb-posix:stat-size stat)))
-           (unless (and (= sb-posix:s-ifreg (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
-                        (<= 0 length (* 16 1024 1024)))
-             (ereport "58030" "invalid or oversized timeline history file"))
+         (progn
            (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8)))
-           (let ((bytes (make-array length :element-type '(unsigned-byte 8))))
-             (unless (= length (read-sequence bytes stream))
-               (ereport "XX001" "short timeline history read"))
-             bytes))
+           (timeline-read-history-stream stream))
       (if stream (close stream) (sb-posix:close fd)))))
 
 (defun timeline-read-history (timeline &optional (directory *pgdata*))
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
+
+(defun timeline-archive-history-items (current read-history)
+  "Return the committed history followed by eligible ancestor histories.
+Include an ancestor only when its bytes are an exact prefix of the current history
+and its parsed lineage agrees. Skip missing, unsafe, or invalid ancestors."
+  (when (> current 1)
+    (let* ((bytes (funcall read-history current))
+           (lineage (timeline-check-lineage
+                     (timeline-parse-history current (bytes->string bytes)))))
+      (cons (cons :history current)
+            (loop for entry in (rest lineage)
+                  for ancestor = (timeline-history-entry-timeline entry)
+                  for prefix = (and (> ancestor 1)
+                                    (handler-case (funcall read-history ancestor)
+                                      (error () nil)))
+                  when (and prefix
+                            (< (length prefix) (length bytes))
+                            (null (mismatch prefix bytes :end2 (length prefix)))
+                            (handler-case
+                                (= ancestor (timeline-common-ancestor
+                                             lineage (timeline-parse-history
+                                                      ancestor (bytes->string prefix))))
+                              (error () nil)))
+                    collect (cons :history ancestor))))))
 
 ;; The hard link gives the inode two names at :installed.  Removing the scratch
 ;; name leaves one link; directory fsync follows that removal.  Cleanup owns the
