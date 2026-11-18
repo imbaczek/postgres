@@ -4569,11 +4569,24 @@ under the lock, and publish completion only after success."
                (when status-fd (sb-posix:close status-fd))
             (when wal-fd (sb-posix:close wal-fd))))))))
 
+(defun wal-archive-segment-proof-name (name)
+  (concatenate 'string name ".proof"))
+
+(defun wal-archive-proof-segment-name (name)
+  (when (uiop:string-suffix-p name ".wal.proof")
+    (subseq name 0 (- (length name) (length ".proof")))))
+
+(defun wal-archive-staged-segment-done-p (directory-fd status-fd name)
+  (let ((source-fd (wal-archive-open-source directory-fd name)))
+    (unwind-protect
+         (wal-archive-done-matches-p directory-fd status-fd name source-fd)
+      (sb-posix:close source-fd))))
+
 (defun wal-archive-attempt-staged (directory-fd name template check-directory)
   "Archive one immutable staged standby file and record success.
 The caller holds DIRECTORY-FD and serializes attempts for this staging area.
 Return :ARCHIVED for new success, :ALREADY-DONE for a matching receipt, or NIL
-when the command fails."
+when the command fails or its WAL segment has no completion receipt."
   (when (or (zerop (length template)) (sb-thread:holding-mutex-p *wal-lock*))
     (error "staged WAL archive attempt requires a command and an unlocked WAL mutex"))
   (let ((directory *pgdata*)
@@ -4594,9 +4607,11 @@ when the command fails."
                    ((wal-archive-done-matches-p directory-fd status-fd name source-fd)
                     (check-directories)
                     :already-done)
-                   ((progn
-                      (sb-posix:fsync directory-fd)
-                      (wal-archive-run-shell template name directory-fd directory))
+                   ((let ((segment-name (wal-archive-proof-segment-name name)))
+                      (when (or (not segment-name)
+                                (wal-archive-staged-segment-done-p directory-fd status-fd segment-name))
+                        (sb-posix:fsync directory-fd)
+                        (wal-archive-run-shell template name directory-fd directory)))
                     (check-directories)
                     (unless (equal facts (wal-archive-check-source directory-fd name source-fd))
                       (error "staged WAL archive source changed during command: ~a" name))
@@ -4684,11 +4699,12 @@ Ensure its ready marker is durable and return the item and storage epoch."
               (when wal-fd (sb-posix:close wal-fd)))))))))
 
 (defun wal-archive-staged-name-p (name)
-  (cond ((and (= (length name) 28) (uiop:string-suffix-p name ".wal"))
-         (wal-parse-segment-name (subseq name 0 24) :timeline))
-        ((and (= (length name) 16) (uiop:string-suffix-p name ".history")
-              (every (lambda (char) (find char "0123456789ABCDEF")) (subseq name 0 8)))
-         (> (parse-integer name :end 8 :radix 16) 1))))
+  (let ((segment-name (or (wal-archive-proof-segment-name name) name)))
+    (cond ((and (= (length segment-name) 28) (uiop:string-suffix-p segment-name ".wal"))
+           (wal-parse-segment-name (subseq segment-name 0 24) :timeline))
+          ((and (= (length name) 16) (uiop:string-suffix-p name ".history")
+                (every (lambda (char) (find char "0123456789ABCDEF")) (subseq name 0 8)))
+           (> (parse-integer name :end 8 :radix 16) 1)))))
 
 (defun wal-archiver-step-staged (template)
   "Archive the earliest pending staged file, retaining failed work for retry."
@@ -4708,7 +4724,8 @@ Ensure its ready marker is durable and return the item and storage epoch."
                   (:already-done nil)
                   (otherwise
                    (warn "archive_command failed for staged WAL ~a; will retry" name)
-                   (return nil)))))))
+                   (unless (wal-archive-proof-segment-name name)
+                     (return nil))))))))
 
 (declaim (ftype function startup-standby-wal-archive-enabled-p))
 

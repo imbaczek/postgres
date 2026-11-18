@@ -163,9 +163,9 @@ Return the staged name and proved end, or NIL until the segment is closed."
   (dolist (entry entries)
     (destructuring-bind (timeline segment &rest ignored) entry
       (declare (ignore ignored))
-      (let ((bytes (physical-store-live-archive-segment-under-lock store timeline segment)))
+      (multiple-value-bind (bytes end) (physical-store-live-archive-segment-under-lock store timeline segment)
         (when bytes
-          (handler-case (funcall stage-archive timeline segment bytes)
+          (handler-case (funcall stage-archive timeline segment bytes end)
             (error (condition)
               (return condition))))))))
 
@@ -205,8 +205,13 @@ Return the staged name and proved end, or NIL until the segment is closed."
                                   (failure
                                     (physical-store-stage-archive-candidates-under-lock
                                      store entries
-                                     (lambda (timeline segment bytes)
-                                       (publish (wal-segment-filename segment timeline :timeline) bytes)))))
+                                     (lambda (timeline segment bytes end)
+                                       (let* ((name (wal-segment-filename segment timeline :timeline))
+                                              (proof (wal-encode-archive-segment-proof
+                                                      (physical-store-system-id store)
+                                                      timeline segment :timeline end bytes)))
+                                         (publish name bytes)
+                                         (publish (wal-archive-segment-proof-name name) proof))))))
                              (unless failure (setf (physical-store-archive-scan-limit store) limit))
                              failure))))))
                (when failure (error failure)))))
@@ -222,7 +227,11 @@ back into STORE. Return the callback's error without fencing the receive store."
   (let* ((limit (floor cursor +wal-segment-size+))
          (entries (remove-if-not (lambda (entry) (< (second entry) limit))
                                  (physical-store-history-segment-entries store))))
-    (physical-store-stage-archive-candidates-under-lock store entries stage-archive)))
+    (physical-store-stage-archive-candidates-under-lock
+     store entries
+     (lambda (timeline segment bytes end)
+       (declare (ignore end))
+       (funcall stage-archive timeline segment bytes)))))
 
 (defun physical-retained-seal-start-group (seal record timeline)
   "Start a segment group using the verified prefix, coalescing the latest entry when possible."

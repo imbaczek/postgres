@@ -39,6 +39,7 @@ def exercise(root, source_port, target_port):
     source_socket = root / "source.sock"
     archive = root / "archive"
     allow = root / "allow-archive"
+    allow_proofs = root / "allow-archive-proofs"
     attempts = root / "archive-attempts"
     archive.mkdir()
     pg_wal = target_data / "pg_wal"
@@ -58,6 +59,7 @@ def exercise(root, source_port, target_port):
             (target_data / "postgresql.conf").write_text("# Native base managed by Patroni.\n")
             command = (
                 f'echo "%f" >> {shlex.quote(str(attempts))}; '
+                f'case "%f" in *.proof) test -f {shlex.quote(str(allow_proofs))} || exit 1;; esac; '
                 f'test -f {shlex.quote(str(allow))} && cp -- "%p" {shlex.quote(str(archive))}/"%f"'
             )
             (target_data / "postgresql.auto.conf").write_text(
@@ -113,7 +115,16 @@ def exercise(root, source_port, target_port):
                 follow.wait_for(lambda: (queue / "archive_status" / (name + ".done")).is_file())
                 with (archive / name).open("rb") as stream:
                     assert hashlib.file_digest(stream, "sha256").digest() == expected[name]
-            print("standby-archive: promoted writer accepted a write and archived the queued receive WAL", flush=True)
+                assert not (archive / (name + ".proof")).exists()
+            allow_proofs.touch()
+            for index, name in enumerate((first, second)):
+                proof_name = name + ".proof"
+                follow.wait_for(lambda: (queue / "archive_status" / (proof_name + ".done")).is_file())
+                proof = (archive / proof_name).read_bytes()
+                assert len(proof) == 52 and proof[:4] == b"PWAP"
+                end = index * 16 * 1024 * 1024 + (archive / name).stat().st_size
+                assert int.from_bytes(proof[32:40], "little") == end
+            print("standby-archive: promoted writer archived receive WAL and its end proofs", flush=True)
             assert node.stop(mode="fast", checkpoint=False, stop_timeout=45)
         finally:
             try:
