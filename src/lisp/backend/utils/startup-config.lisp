@@ -207,6 +207,8 @@ synchronous configuration plan against the same source and generation."
     ("hba_file" :postmaster :string nil)
     ("ident_file" :postmaster :string nil)
     ("cluster_name" :postmaster :string "")
+    ("archive_mode" :postmaster :archive-mode "off")
+    ("archive_command" :sighup :string "")
     ("restore_command" :sighup :string "")
     ("primary_conninfo" :sighup :conninfo "")
     ("primary_slot_name" :sighup :slot "")
@@ -371,7 +373,9 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
         (if (equalp bytes (string->bytes text)) text (copy-seq bytes)))
     (error () (copy-seq bytes))))
 
-(defun startup-setting-text (name value)
+(defun startup-setting-text (name value &optional (archive-mode "off"))
+  (when (and (equal name "archive_command") (equal archive-mode "off"))
+    (return-from startup-setting-text "(disabled)"))
   (case (third (assoc name *startup-setting-specs* :test #'string=))
     (:boolean (if value "on" "off"))
     (:conninfo (startup-render-conninfo value))
@@ -403,7 +407,7 @@ to replica. Feature admission separately rejects minimal."
           ((member value '("archive" "hot_standby") :test #'string=) "replica")
           (t (error "invalid value for configuration parameter wal_level: ~s" text)))))
 
-(defvar *startup-rewind-restore-command-p* nil)
+(defvar *startup-inspect-archive-settings-p* nil)
 
 (defun startup-normalize-setting (name input)
   "Normalize a startup setting from text or literal octets.
@@ -429,15 +433,21 @@ original spelling. Synchronous commit values use the session normalizer."
       (ecase (third spec)
         (:integer (startup-parse-integer-setting spec text))
         (:wal-level (startup-parse-wal-level text))
+        (:archive-mode
+         (let ((value (string-downcase text)))
+           (cond ((equal value "always") "always")
+                 ((member value '("on" "true" "yes" "1") :test #'equal) "on")
+                 ((member value '("off" "false" "no" "0") :test #'equal) "off")
+                 (t (error "invalid value for configuration parameter archive_mode: ~s" text)))))
         (:boolean (startup-parse-boolean-setting text))
         (:timeline (startup-parse-recovery-timeline text) text)
         (:standby-names (parse-sync-standby-names text) text)
         (:synchronous-commit (session-normalize-synchronous-commit text))
         (:string
          (when (and (string= name "restore_command") (not (equal text ""))
-                    (not *startup-rewind-restore-command-p*))
+                    (not *startup-inspect-archive-settings-p*))
            (error "nonempty restore_command requires unimplemented archive recovery"))
-         (unless (or (member name '("restore_command" "hba_file" "ident_file") :test #'string=)
+         (unless (or (member name '("archive_command" "restore_command" "hba_file" "ident_file") :test #'string=)
                      (member name *startup-recovery-target-settings* :test #'string=)
                      (plusp (length text)))
            (error "invalid empty configuration parameter ~a" name))
@@ -708,6 +718,9 @@ commit timestamp tracking off, and each listed recovery target empty.
 Return SETTINGS after validation."
   (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
     (error "wal_level=minimal requires unimplemented minimal WAL generation"))
+  (unless (or *startup-inspect-archive-settings-p*
+              (equal "off" (startup-setting-value settings "archive_mode")))
+    (error "archive_mode requires unimplemented WAL archiving"))
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
     (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
   (when (startup-setting-value settings "track_commit_timestamp")
@@ -1178,12 +1191,13 @@ environment."
                            :command-line :environment)))))
     (vector name (startup-setting-text name value) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
-            (case (third spec) (:integer "integer") (:boolean "bool") ((:wal-level :synchronous-commit) "enum") (t "string"))
+            (case (third spec) (:integer "integer") (:boolean "bool") ((:wal-level :archive-mode :synchronous-commit) "enum") (t "string"))
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
             (let ((choices (case (third spec)
                              (:wal-level (vector "minimal" "replica" "logical"))
+                             (:archive-mode (vector "always" "on" "off"))
                              (:synchronous-commit (vector "local" "remote_write" "remote_apply" "on")))))
               (if choices
                   (make-sql-array :element-type-id :text :elements choices
@@ -1238,7 +1252,7 @@ installing settings, taking PGDATA ownership or starting listeners."
     (let ((name (gethash "config-output" native)))
       (when name
         ;; Read restore_command for configuration reporting before startup.
-        (let* ((*startup-rewind-restore-command-p* t)
+        (let* ((*startup-inspect-archive-settings-p* t)
                (settings (startup-load-settings native overrides))
                (entry (gethash (string-downcase name) settings)))
           (unless (uiop:directory-exists-p (startup-setting-value settings "data_directory"))
@@ -1247,7 +1261,8 @@ installing settings, taking PGDATA ownership or starting listeners."
           (let ((value (getf entry :value)))
             (if (and (string-equal name "data_directory") (> (length value) 1))
                 (string-right-trim "/" value)
-                (startup-setting-text (string-downcase name) value))))))))
+                (startup-setting-text (string-downcase name) value
+                                      (startup-setting-value settings "archive_mode")))))))))
 
 (defun startup-print-configuration-value (value)
   (finish-output *standard-output*)
@@ -1266,7 +1281,7 @@ As in C's zero-initialized reset fields, booleans report FALSE and integers 0;
 strings and enums use boot values. These are not runtime or -C defaults."
   (loop for (name context kind boot minimum maximum) in *startup-setting-specs*
         for type = (case kind
-                     (:integer "INTEGER") (:boolean "BOOLEAN") ((:wal-level :synchronous-commit) "ENUM")
+                     (:integer "INTEGER") (:boolean "BOOLEAN") ((:wal-level :archive-mode :synchronous-commit) "ENUM")
                      (t "STRING"))
         for default = (case kind
                         ;; C GucInfoMain builds the registry without initializing reset fields.

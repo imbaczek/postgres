@@ -99,7 +99,7 @@ Require each advance to publish the next step and return the plan's workspace."
 (defun native-rewind-target-restore-command (target config)
   (let ((native (make-hash-table :test #'equal))
         (overrides (make-hash-table :test #'equal))
-        (*startup-rewind-restore-command-p* t))
+        (*startup-inspect-archive-settings-p* t))
     (setf (gethash "pgdata" native) (namestring target))
     (when config (setf (gethash "config_file" native) config))
     (let* ((settings (startup-load-settings native overrides))
