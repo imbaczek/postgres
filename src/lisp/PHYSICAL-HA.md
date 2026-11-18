@@ -22,9 +22,10 @@ Three areas still separate this evidence from closeout:
 
 1. Connect native standby feedback to the primary's cleanup decisions.
    Physical slot images can store separate data and catalog transaction
-   horizons. Receiving, enforcing, and reporting those horizons still need
-   live acceptance against the C fixture. Patroni's logical slot readiness
-   and slot copy path also need their own acceptance.
+   horizons, and the native sender saves them from incoming feedback frames.
+   Standby emission, cleanup enforcement, and SQL reporting still need live
+   acceptance against the C fixture. Patroni's logical slot readiness and slot
+   copy path also need their own acceptance.
 2. Exercise password-backed bootstrap and post-bootstrap role provisioning
    through stock Patroni.
 3. Qualify archive recovery with a configured streaming source across a
@@ -5128,12 +5129,20 @@ clears only `catalog_xmin`.
 C computes the two horizons in `GetReplicationHorizons` and applies them in
 `PhysicalReplicationSlotNewXmin`. Patroni uses the retained catalog horizon
 to assess slot readiness. Native slot reporting currently returns NULL for
-both horizons. Native feedback and support for Patroni's slot-copy path remain
-open.
+both horizons. Standby-side emission, cleanup, and Patroni's slot-copy path
+remain open.
 
 Six focused physical-slot tests passed in 36 ms of Rove execution, covering
 image round trips, checksum rejection, file dispatch, and startup. The full
 physical suite timed out at 180 s.
+
+The native physical sender reads C's standby feedback frame alongside the WAL
+status frames. A valid report can advance or clear each horizon independently.
+The sender checks that it still owns the public slot and saves changes before
+updating the slot in memory. The socket read timer stops before the save. Five
+focused tests passed on the ramdisk in 4 ms of Rove execution, including
+interleaved frames, slot file updates, and rejection after ownership or WAL
+namespace changes.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
