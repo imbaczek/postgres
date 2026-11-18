@@ -167,6 +167,9 @@ logged and treated as empty, as ident mappings are not used by this subset."
 requires them. Validate the files before allowing startup to create defaults."
   (when (authentication-entry-exists-p (merge-pathnames "physical-backup.manifest" directory))
     (let ((manifest (recovery-check-manifest-schema (recovery-read-manifest directory))))
+      (when (find-if #'bootstrap-scram-path-p (getf manifest :files) :key #'first)
+        (let ((*pgdata* directory))
+          (read-bootstrap-scram-verifier)))
       (when (eql 1 (getf manifest :auth-policy-required))
         (authentication-check-marker directory)
         (hba-read-file (merge-pathnames "pg_hba.conf" directory))
@@ -354,34 +357,52 @@ rule signals a fatal error."
         (unless (and high low) (error "invalid bootstrap SCRAM verifier"))
         (setf (aref bytes index) (+ (* 16 high) low))))))
 
+(defconstant +bootstrap-scram-maximum-bytes+ 255)
+
+(defun bootstrap-scram-path-p (name)
+  (equal name "global/pg_bootstrap_scram"))
+
+(defun read-bootstrap-scram-stream (stream)
+  (let* ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
+         (mode (sb-posix:stat-mode stat))
+         (buffer (make-string (1+ +bootstrap-scram-maximum-bytes+))))
+    (unless (and (sb-posix:s-isreg mode) (zerop (logand mode #o077))
+                 (= (sb-posix:stat-uid stat) (sb-posix:geteuid)))
+      (error "invalid bootstrap SCRAM verifier file"))
+    (let ((count (read-sequence buffer stream)))
+      (unless (and (< 1 count (length buffer))
+                   (char= (char buffer (1- count)) #\Newline)
+                   (loop for i below count always (< (char-code (char buffer i)) 128)))
+        (error "invalid bootstrap SCRAM verifier file"))
+      (let ((fields (uiop:split-string (subseq buffer 0 (1- count)) :separator " ")))
+        (unless (= 5 (length fields)) (error "invalid bootstrap SCRAM verifier"))
+        (destructuring-bind (tag rounds salt stored server) fields
+          (unless (and (string= tag "PGSCRAM1") (plusp (length rounds)) (every #'digit-char-p rounds))
+            (error "invalid bootstrap SCRAM verifier"))
+          (let ((iterations (parse-integer rounds)))
+            (unless (<= 1 iterations #x7fffffff)
+              (error "invalid bootstrap SCRAM iteration count"))
+            (values (list (bootstrap-scram-hex salt 16) iterations
+                          (bootstrap-scram-hex stored 32) (bootstrap-scram-hex server 32))
+                    (subseq buffer 0 count))))))))
+
 (defun read-bootstrap-scram-verifier ()
-  "Load salt, iterations and keys from the private offline bootstrap verifier."
-  (let ((fd (sb-posix:open (namestring (pgdata-path "global/pg_bootstrap_scram"))
-                           (logior sb-posix:o-rdonly sb-posix:o-nofollow
-                                   sb-posix:o-nonblock +postmaster-o-cloexec+)))
-        (stream nil))
-    (unwind-protect
-         (let* ((stat (sb-posix:fstat fd))
-                (mode (sb-posix:stat-mode stat))
-                (buffer (make-string 256)))
-           (unless (and (sb-posix:s-isreg mode) (zerop (logand mode #o077))
-                        (= (sb-posix:stat-uid stat) (sb-posix:geteuid)))
-             (error "invalid bootstrap SCRAM verifier file"))
-           (setf stream (sb-sys:make-fd-stream fd :input t :element-type 'character
-                                                  :external-format :latin-1))
-           (let ((count (read-sequence buffer stream)))
-             (unless (and (< 1 count (length buffer))
-                          (char= (char buffer (1- count)) #\Newline))
-               (error "invalid bootstrap SCRAM verifier file"))
-             (destructuring-bind (tag rounds salt stored server)
-                 (uiop:split-string (subseq buffer 0 (1- count)) :separator " ")
-               (unless (string= tag "PGSCRAM1") (error "invalid bootstrap SCRAM verifier"))
-               (let ((iterations (parse-integer rounds)))
-                 (unless (<= 1 iterations #x7fffffff)
-                   (error "invalid bootstrap SCRAM iteration count"))
-                 (list (bootstrap-scram-hex salt 16) iterations
-                       (bootstrap-scram-hex stored 32) (bootstrap-scram-hex server 32))))))
-      (if stream (close stream) (sb-posix:close fd)))))
+  "Load the private bootstrap verifier and return its validated file text as a second value."
+  (let ((path (pgdata-path "global/pg_bootstrap_scram")))
+    (if *physical-image-context*
+        (with-physical-image-input (stream path :external-format :latin-1)
+          (read-bootstrap-scram-stream stream))
+        (sb-sys:without-interrupts
+          (let ((fd nil) (stream nil))
+            (unwind-protect
+                 (progn
+                   (setf fd (sb-posix:open (namestring path)
+                                           (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                                   sb-posix:o-nonblock +postmaster-o-cloexec+))
+                         stream (sb-sys:make-fd-stream fd :input t :element-type 'character
+                                                          :external-format :latin-1))
+                   (sb-sys:with-local-interrupts (read-bootstrap-scram-stream stream)))
+              (if stream (close stream) (when fd (sb-posix:close fd)))))))))
 
 (defun authenticate-bootstrap-scram (stream user)
   (let ((verifier (when (string= user "postgres")

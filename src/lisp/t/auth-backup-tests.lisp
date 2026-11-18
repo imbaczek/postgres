@@ -75,6 +75,27 @@
           (ok (signals (pg::physical-backup-bundle-entries root manifest :manifest-digest digest)
                        'error))))))
 
+(deftest authentication-backup-verifier-is-bounded-and-private
+    (with-physical-store-directory (root)
+      (let* ((manifest (authentication-test-manifest))
+             (name "global/pg_bootstrap_scram")
+             (path (merge-pathnames name root))
+             (text (format nil "PGSCRAM1 4096 ~a ~a ~a~%"
+                           (make-string 32 :initial-element #\a)
+                           (make-string 64 :initial-element #\b)
+                           (make-string 64 :initial-element #\c))))
+        (push (list name 256 0) (getf manifest :files))
+        (ok (signals (pg::recovery-check-manifest-schema manifest) 'error))
+        (setf (second (first (getf manifest :files))) (length text))
+        (ok (eq manifest (pg::recovery-check-manifest-schema manifest)))
+        (write-recovery-manifest-text root (pg::physical-bootstrap-manifest-text manifest))
+        (ensure-directories-exist path)
+        (ok (signals (pg::authentication-check-backup-policy root) 'error))
+        (ok (pg::authentication-create-file path text))
+        (ok (not (signals (pg::authentication-check-backup-policy root) 'error)))
+        (sb-posix:chmod (namestring path) #o644)
+        (ok (signals (pg::authentication-check-backup-policy root) 'error)))))
+
 (deftest authentication-required-backup-never-bootstraps-missing-adjuncts
     (call-with-pid-owner
      (lambda (root)

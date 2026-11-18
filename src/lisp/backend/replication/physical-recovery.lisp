@@ -501,6 +501,7 @@ Child images may include history files no newer than their selected timeline."
   (and (stringp name)
        (or (member name '("PG_VERSION" "pg_xact" "global/pg_control"
                           "global/pg_catalog.dat" "global/pg_wal_control") :test #'equal)
+           (bootstrap-scram-path-p name)
            (and (uiop:string-prefix-p "base/" name)
                 (let* ((suffix (subseq name 5))
                        (digits (if (uiop:string-suffix-p suffix ".vm")
@@ -572,6 +573,8 @@ Child images may include history files no newer than their selected timeline."
       (unless (and (listp entry) (= (length entry) 3)
                    (recovery-manifest-path-p (first entry) (getf manifest :timeline))
                    (typep (second entry) '(unsigned-byte 64))
+                   (or (not (bootstrap-scram-path-p (first entry)))
+                       (<= 1 (second entry) +bootstrap-scram-maximum-bytes+))
                    (typep (third entry) '(unsigned-byte 64))
                    (not (gethash (first entry) names)))
         (error "invalid or duplicate physical recovery file entry"))

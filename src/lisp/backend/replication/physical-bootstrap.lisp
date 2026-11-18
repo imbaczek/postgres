@@ -423,6 +423,8 @@ Validate the selected lineage before constructing the inventory."
   (let ((files (append (physical-bootstrap-relation-inventory)
                        (list "PG_VERSION" "pg_xact" "global/pg_control"
                              "global/pg_catalog.dat" "global/pg_wal_control"))))
+    (when (authentication-entry-exists-p (pgdata-path "global/pg_bootstrap_scram"))
+      (push "global/pg_bootstrap_scram" files))
     (let* ((restart checkpoint-start)
            (last (and (plusp *wal-durable-lsn*) (floor (1- *wal-durable-lsn*) +wal-segment-size+))))
       (when last
@@ -467,6 +469,17 @@ derivation is needed. The source control remains unchanged."
 (defun physical-bootstrap-copy-file (relative target &key limit)
   "Copy and fsync a stable source file or exact prefix, returning its length and checksum.
 Each read writes and hashes the same bytes.  A requested prefix must be complete."
+  (when (bootstrap-scram-path-p relative)
+    (multiple-value-bind (verifier text) (read-bootstrap-scram-verifier)
+      (declare (ignore verifier))
+      (let ((destination (merge-pathnames relative target))
+            (bytes (string->bytes text)))
+        (wal-ensure-directory-durable (uiop:pathname-directory-pathname destination))
+        (unless (authentication-create-file destination text)
+          (error "bootstrap verifier already exists in backup target"))
+        (physical-bootstrap-test-point :after-file target)
+        (return-from physical-bootstrap-copy-file
+          (list relative (length bytes) (physical-store-update-digest #xCBF29CE484222325 bytes))))))
   (when (equal relative "global/pg_wal_control")
     (let ((derived (physical-bootstrap-derived-wal-control target)))
       (when derived
@@ -876,6 +889,20 @@ bytes against the sealed file digest. The caller checks the header and owns outp
 ;; Descriptor-scoped receipt creates relative to held directories; the legacy
 ;; path retains its existing pathname-based file creation and sync behavior.
 
+(defun call-with-private-bootstrap-verifier-output (path function)
+  (sb-sys:without-interrupts
+    (let ((fd nil) (stream nil))
+      (unwind-protect
+           (progn
+             (setf fd (sb-posix:open (namestring path)
+                                     (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                             sb-posix:o-nofollow +postmaster-o-cloexec+)
+                                     #o600))
+             (sb-posix:fchmod fd #o600)
+             (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8)))
+             (sb-sys:with-local-interrupts (funcall function stream)))
+        (if stream (close stream) (when fd (sb-posix:close fd)))))))
+
 (defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1) reuse read-page)
   (unless (physical-backup-bundle-path-p name timeline)
     (error "invalid native backup destination path"))
@@ -899,15 +926,18 @@ bytes against the sealed file digest. The caller checks the header and owns outp
                       (when (and expected read-page (physical-backup-reuse-path-p name))
                         (lambda (offset digest) (funcall read-page name offset digest))))))
                   (let* ((path (merge-pathnames name directory))
-                         (parent (uiop:pathname-directory-pathname path))
-                         (digest nil))
+                         (parent (uiop:pathname-directory-pathname path)))
                     (wal-ensure-directory-durable parent)
-                    (with-open-file (output path :direction :output :if-exists :error
-                                                 :if-does-not-exist :create :element-type '(unsigned-byte 8))
-                      (setf digest (physical-backup-receive-file-content size expected-digest next output))
-                      (fsync-stream output))
-                    (fsync-directory parent)
-                    digest))))
+                    (flet ((receive (output)
+                             (multiple-value-prog1
+                                 (physical-backup-receive-file-content size expected-digest next output)
+                               (fsync-stream output))))
+                      (prog1 (if (bootstrap-scram-path-p name)
+                                 (call-with-private-bootstrap-verifier-output path #'receive)
+                                 (with-open-file (output path :direction :output :if-exists :error
+                                                              :if-does-not-exist :create :element-type '(unsigned-byte 8))
+                                   (receive output)))
+                        (fsync-directory parent)))))))
         (list name size digest)))))
 
 ;; The descriptor route checks all received names, including metadata, against

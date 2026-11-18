@@ -93,7 +93,9 @@ The first WAL segment keeps its prefix; the final segment is bounded at E."
      (mapcar (lambda (name)
                (list name
                      :limit (when (equal name last) (1+ (mod (1- end) +wal-segment-size+)))
-                     :maximum (if (member name auth :test #'equal) 1048576 18446744073709551615)))
+                     :maximum (cond ((bootstrap-scram-path-p name) +bootstrap-scram-maximum-bytes+)
+                                    ((member name auth :test #'equal) 1048576)
+                                    (t 18446744073709551615))))
              (append files auth))
      files)))
 

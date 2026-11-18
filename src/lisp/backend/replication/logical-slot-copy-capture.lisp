@@ -53,6 +53,9 @@
              (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
         (unless (and (typep size '(unsigned-byte 64)) (<= size (sixth before)))
           (error "logical copy source prefix exceeds its file"))
+        (when (and (bootstrap-scram-path-p relative)
+                   (not (<= 1 (sixth before) +bootstrap-scram-maximum-bytes+)))
+          (error "logical copy source has an invalid bootstrap verifier length"))
         (loop with remaining = size
               while (plusp remaining)
               for count = (read-sequence buffer input :end (min remaining (length buffer)))

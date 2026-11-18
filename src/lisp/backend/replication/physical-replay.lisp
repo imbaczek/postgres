@@ -244,6 +244,7 @@ does not excuse a missing file or a different fork."
 
 (defun physical-recovery-immutable-base-file-p (name)
   (or (member name '("PG_VERSION" "global/pg_control" "global/pg_wal_control") :test #'equal)
+      (bootstrap-scram-path-p name)
       (uiop:string-prefix-p "pg_wal/" name)))
 
 (defun physical-recovery-check-streaming-base (manifest control)
