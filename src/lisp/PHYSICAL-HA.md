@@ -3,7 +3,7 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
-## Scope check after standby archiving
+## Scope check after WAL namespace proof migration
 
 Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and
 C-to-Lisp. The mixed-engine tests use logical replication. Native physical
@@ -56,22 +56,36 @@ and rejoined after killing both initial capture and the first repair. Strict
 compilation and three focused test heads took 58.23 s. These are milestone
 timings for distinct workloads. They give no before-and-after speed comparison.
 
-Three items remain for backend closeout.
+The native backend has demonstrated the main physical HA operations in separate
+process tests. The open acceptance question is whether stock Patroni can compose
+them through one supported lifecycle. The existing supplied-leader test proves
+offline rejoin, and the separate clone, follow, promote, and synchronous
+replication tests establish individual operations.
 
-1. Define and exercise the supported bootstrap-through-rejoin contract for
-   stock Patroni 4.1.5. Include generated configuration, utility invocation,
-   connection recovery, and the supported slot and synchronous settings. Keep
-   leadership supplied by the harness.
-2. Qualify archive retries across repeated promotion. The standby queue
-   retains completed files and rescans receipts. It still needs safe
-   reclamation and bounded backlog scans. Receipt handoff across archive mode
-   changes still needs qualification.
-   Native online recovery still rejects a nonempty `restore_command`. The
-   offline rewind restore path has its own acceptance above.
-3. Expand native rewind beyond the qualified immediate-child topology, or
-   record that limit in the supported contract. C can find a common ancestor
-   further back in the timeline histories. Also decide how to handle torn local
-   prefixes and qualify the remaining interruption cases in the supported path.
+1. Run one stock Patroni 4.1.5 lifecycle with leadership supplied by the
+   harness. Cover clone, follow, promotion, and former-primary rewind and
+   rejoin. Include generated configuration, utility invocation, connection
+   recovery, and the supported physical slot and synchronous settings. Use
+   this run to identify which backend gaps block the workflow.
+2. Implement online archive recovery. C recovery can obtain WAL from archive,
+   local files, and streaming through `WaitForWALToBecomeAvailable` and
+   `RestoreArchivedFile`. Native online recovery rejects a nonempty
+   `restore_command`. Offline rewind already has a separate restore path.
+   Archive producer work still needs repeated-promotion and mode-handoff
+   tests, safe queue reclamation, and bounded backlog scans.
+3. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
+   both histories and can find a fork before the immediate parent. The
+   native live evidence covers the immediate-child case. Torn private replay
+   prefixes can also require manual repair. State both limits in the
+   lifecycle contract and qualify any wider support separately.
+
+The current namespace process test passes the crash and restart cases through
+inactive alias cleanup. Its continued-follow case fails on both the proof
+migration change and its parent. The active sender fences the namespace change
+with SQLSTATE 55000, and the receiver stops. The earlier continued-follow pass
+recorded below is historical. A fresh run needs to demonstrate either safe
+reconnection for a legacy standby or an explicit migration procedure that
+restarts follow.
 
 C physical WAL and disk compatibility would require format and replay work
 separate from matching C behavior. The mixed-engine switchovers establish
@@ -279,7 +293,10 @@ durable frontier covers that end. A failed proof does not hold up later archive
 commands. Recycling checks both receipts and verifies that the proof matches
 the WAL bytes before removing the local files. Three focused tests took
 0.49 s. The live test passed on an earlier build in 54.30 s. Online restore
-and proof handling during namespace migration remain open.
+remains open. Namespace migration verifies eligible legacy proofs and stages
+their qualified companions before publishing control. Startup reconciliation
+removes the inactive proof before removing its WAL alias. The focused test
+checks both rollback and committed cleanup.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
