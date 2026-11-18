@@ -293,7 +293,10 @@ Logical updates guard identity, progress and the first terminal cause."
 (defun wal-physical-feedback-horizons (xmin &key include-senders logical-system-id replay-lsn next-xid
                                               logical-history logical-policy)
   "Return separate data and catalog minima under the slot registry lock.
-With LOGICAL-SYSTEM-ID, also consider logical catalog pins covered by replay."
+Registered physical slots contribute their durable data and catalog horizons
+unless their WAL status is lost. INCLUDE-SENDERS adds transient data horizons
+from slotless senders. With LOGICAL-SYSTEM-ID and LOGICAL-HISTORY, also consider
+logical catalog horizons covered by replay."
   (let ((catalog-xmin nil))
     (flet ((note-catalog (catalog)
              (when catalog

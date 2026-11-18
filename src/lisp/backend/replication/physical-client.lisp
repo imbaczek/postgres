@@ -1,3 +1,6 @@
+;;;; Transport-neutral native physical replication exchanges. The caller owns
+;;;; connection lifetime and validates source identity and received WAL.
+
 (in-package #:pg)
 
 ;;; Checked native physical follow exchanges. The caller owns transport and
@@ -198,14 +201,17 @@ or transport failure. Do not perform network I/O under recovery quiescence."
 
 ;; Both transports use these exchanges; changing transport does not relax the
 ;; caller's source, timeline, WAL, and durability checks.
-(defgeneric physical-client-query (client query schema tag &key maximum command-only))
+(defgeneric physical-client-query (client query schema tag &key maximum command-only)
+  (:documentation "Run a bounded command and validate its result against SCHEMA and TAG.
+The caller owns CLIENT and must close it after a protocol violation."))
 
 (defmethod physical-client-query ((client pg-client) query schema tag
                                   &key (maximum 4096) command-only)
   (pg-client-send-query client query)
   (pg-client-native-read-result client schema tag :maximum maximum :command-only command-only))
 
-(defgeneric physical-client-start (client query))
+(defgeneric physical-client-start (client query)
+  (:documentation "Start a stream, returning :COPY-BOTH or (:SWITCH child fork)."))
 
 (defmethod physical-client-start ((client pg-client) query)
   (pg-client-native-start client query))
@@ -215,7 +221,9 @@ or transport failure. Do not perform network I/O under recovery quiescence."
 (defmethod physical-client-finish ((client pg-client) next fork)
   (pg-client-native-finish client next fork))
 
-(defgeneric physical-client-receive (client))
+(defgeneric physical-client-receive (client)
+  (:documentation "Receive :DATA and payload, :DONE and NIL, or :IDLE and NIL.
+Transport and protocol errors are signaled to the owning receiver."))
 
 (defmethod physical-client-receive ((client pg-client))
   (multiple-value-bind (kind payload)
@@ -234,7 +242,8 @@ or transport failure. Do not perform network I/O under recovery quiescence."
 (defmethod physical-client-feedback ((client pg-client) payload)
   (write-message (pg-client-stream client) #\d payload))
 
-(defgeneric physical-client-stop (client))
+(defgeneric physical-client-stop (client)
+  (:documentation "Interrupt a blocked client operation. Its owner still closes CLIENT."))
 
 (defmethod physical-client-stop ((client pg-client))
   (sb-bsd-sockets:socket-shutdown (pg-client-socket client) :direction :io))

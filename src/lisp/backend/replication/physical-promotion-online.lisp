@@ -192,7 +192,9 @@ finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
 before intent.  Other failures after work starts fence the process for restart.
 If backlog replay reaches insufficient capacity, restore recovery workers and
 return :RESOURCE-PAUSED without publishing promotion intent. A staging failure
-similarly returns :ARCHIVE-STAGING-DEFERRED. One publication
+similarly returns :ARCHIVE-STAGING-DEFERRED. If copied logical slots still need replay
+or have been rejected, return :LOGICAL-SLOTS-PENDING and resume the recovery
+workers. One publication
 context carries completion and sender debt through the whole live attempt.
 A completed context prevents an interrupt after publication from fencing an
 already completed promotion; errors before completion still fail closed."

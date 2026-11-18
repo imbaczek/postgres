@@ -12,6 +12,10 @@
 
 ;; These fields bind all phases to the same original attempt and source.
 
+;; The optional rewind origin binds the stopped target's history to the saved
+;; request and stage. Recovery must reacquire ownership and verify the recorded
+;; identities before proceeding.
+
 (defparameter *physical-reseed-attempt-identity-keys* '(:version :local :request :source :stage :rewind-origin))
 
 (defparameter *physical-reseed-local-keys* '(:directory :device :inode :lock-device :lock-inode :pid))

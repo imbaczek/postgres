@@ -7,7 +7,8 @@
                 physical-follow-call-with-controller-blocked))
 
 (defstruct (physical-follow-runtime (:print-function physical-libpq-print-private-object))
-  "CONFIG is the runtime's private saved configuration; TRANSITION requests a
+  "Process-local state shared by one receiver and replay worker generation.
+CONFIG is the runtime's private saved configuration. TRANSITION requests a
 controller handoff. Lifecycle and client ownership use the follow lock; runtime
 publication and retirement also use the generation fence. STOPPED-P stops both
 workers; RECEIVER-STOPPED-P stops receipt alone."
@@ -1582,7 +1583,9 @@ source XID coverage."
 (defun physical-follow-send-horizon-feedback (client runtime sent-at sent-enabled)
   "Send periodic data feedback to the source, or clear it when disabled.
 Return the last successful send time and enabled state. Wait for a valid xmin
-before sending an enabled report."
+before sending an enabled report. The data horizon protects standby readers.
+The optional catalog horizon protects covered logical slots. When effective
+feedback changes from enabled to disabled, send a clearing report."
   (let* ((configuration (startup-capture-configuration))
          (settings (when configuration (startup-configuration-settings configuration)))
          (interval (when settings (startup-setting-value settings "wal_receiver_status_interval")))
@@ -2031,7 +2034,10 @@ The caller still has to compare that overlap and publish the selection."
   (physical-follow-restore-next runtime command cursor))
 
 (defun physical-follow-restore-before-streaming (runtime cursor)
-  "Try the archive at the durable cursor before opening a streaming connection."
+  "Try the archive at the durable cursor before opening a streaming connection.
+Return the resulting cursor, which the caller uses to start streaming when
+configured. A nonterminal restore failure ends the archive attempt. Terminal
+errors and stop requests propagate."
   (let ((command (startup-restore-command)))
     (when (and command (plusp (length command)))
       (loop

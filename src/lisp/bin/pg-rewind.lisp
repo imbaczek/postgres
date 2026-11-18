@@ -2,6 +2,9 @@
 (asdf:load-asd (merge-pathnames "../pg.asd" *load-truename*))
 (asdf:load-system "pg")
 
+;;;; Capture and install a native rewind image, then configure the target to follow.
+;;;; Durable attempt and install journals are owned by the reseed backend.
+
 (in-package #:pg)
 
 (defun native-rewind-options (arguments)
@@ -121,7 +124,8 @@ Require each advance to publish the next step and return the plan's workspace."
 
 (defun native-rewind-install (target profile helper archive)
   "Capture and install a source image while holding the required target owners.
-Publish the install journal before advancing the installation steps."
+Publish the install journal before advancing the installation steps. The journal
+and private workspace let a later invocation resume an interrupted installation."
   (let ((workspace nil))
     (call-with-native-rewind-target-owner
      target archive
