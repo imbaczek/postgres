@@ -9,9 +9,36 @@ import sys
 import tempfile
 import time
 
+import psycopg2
+
 
 peer = importlib.import_module("backend-admission")
 BASE = Path(__file__).resolve().parents[2]
+
+
+def check_catalog_advancement(sql, slot, primary_port, standby_port):
+    reader = psycopg2.connect(host="127.0.0.1", port=standby_port, user="postgres", dbname="postgres")
+    try:
+        reader.set_session(isolation_level="REPEATABLE READ", readonly=True)
+        with reader.cursor() as cursor:
+            cursor.execute("SELECT oid FROM pg_class LIMIT 1")
+            assert cursor.fetchone() is not None
+        catalog = ("SELECT catalog_xmin::text FROM pg_replication_slots "
+                   "WHERE slot_name='local_catalog'")
+        before = int(sql(standby_port, catalog))
+        data = slot("xmin")
+        for _ in range(8):
+            sql(primary_port, "SELECT pg_current_xact_id()")
+        boundary = sql(primary_port, "SELECT pg_log_standby_snapshot()")
+        peer.wait(lambda: sql(standby_port,
+                              f"SELECT pg_last_wal_replay_lsn() >= '{boundary}'::pg_lsn") == "t", 20)
+        sql(standby_port, f"SELECT pg_replication_slot_advance('local_catalog','{boundary}')")
+        after = int(sql(standby_port, catalog))
+        assert after > before, (before, after)
+        peer.wait(lambda: slot("xmin, catalog_xmin") == f"{data}|{after}", 20)
+        print("catalog-horizon-advanced-with-data-pinned", data, before, after, flush=True)
+    finally:
+        reader.close()
 
 
 def exercise(root, binary, primary_port, standby_port, processes):
@@ -78,6 +105,7 @@ def exercise(root, binary, primary_port, standby_port, processes):
                 process.wait(timeout=5)
 
     check("t|t|t", "data-and-catalog-horizons")
+    check_catalog_advancement(sql, slot, primary_port, standby_port)
     peer.stop(BASE, standby, follower)
     check("f|t|t", "disconnected-slot-retains-horizons")
     retained = slot("xmin, catalog_xmin")
