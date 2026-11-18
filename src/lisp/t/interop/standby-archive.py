@@ -1,5 +1,6 @@
-"""Exercise standby WAL archiving across a clean shutdown and promotion."""
+"""Exercise native standby WAL archiving and archive-to-stream recovery."""
 
+import argparse
 from contextlib import closing
 import ctypes
 import hashlib
@@ -151,7 +152,95 @@ def exercise(root, source_port, target_port):
                     source.wait(timeout=10)
 
 
+def restore_then_stream(root, source_port, target_port):
+    source_data, target_data = root / "source", root / "replica"
+    source_socket = root / "source.sock"
+    archive = root / "archive"
+    attempts = root / "restore-attempts"
+    archive.mkdir()
+    archive_command = f'cp -- "%p" {shlex.quote(str(archive))}/"%f"'
+    restore_command = (
+        f'echo "%f" >> {shlex.quote(str(attempts))}; '
+        f'test -f {shlex.quote(str(archive))}/"%f" && cp -- {shlex.quote(str(archive))}/"%f" "%p"'
+    )
+    args = [str(follow.BASE / "pg-lisp.sh"), "-D", str(source_data), "-p", str(source_port),
+            "-c", "archive_mode=on", "-c", f"archive_command={archive_command}",
+            "--control-socket", str(source_socket)]
+    node = None
+    with (root / "source.log").open("w") as log:
+        source = subprocess.Popen(args, stdout=log, stderr=log)
+        try:
+            follow.wait_for(lambda: follow.query(source_port, "SELECT 1") == [(1,)])
+            follow.query(source_port, "CREATE TABLE archive_probe(id integer PRIMARY KEY)")
+            follow.query(source_port, "SELECT pg_create_physical_replication_slot('follow_one',true)")
+            target_data.mkdir(mode=0o700)
+            follow.control(source, source_socket,
+                           f'(physical-base-backup {json.dumps(str(target_data) + "/")} "archive_restore")')
+            (target_data / "postgresql.conf").write_text("# Native base managed by Patroni.\n")
+            config = follow.configuration(target_data, target_port, root)
+            config["recovery_conf"] = {"restore_command": restore_command}
+            node = follow.Postgresql(config, follow.Null())
+            member = follow.Member(0, "source", None,
+                                   {"conn_url": f"postgres://127.0.0.1:{source_port}/postgres"})
+            assert node.follow(member, timeout=90) is True
+            assert follow.query(target_port, "SHOW restore_command") == [(restore_command,)]
+            receiver = "SELECT status,slot_name FROM pg_stat_get_wal_receiver()"
+            follow.wait_for(lambda: follow.query(target_port, receiver) == [("streaming", "follow_one")])
+            assert follow.query(target_port, "SELECT count(*) FROM archive_probe") == [(0,)]
+            assert node.stop(mode="fast", checkpoint=False, stop_timeout=45)
+
+            last = advance_wal(source_port, 1, "0/2000000")
+            for segment in (0, 1):
+                name = f"{segment:016X}.wal"
+                receipt = source_data / "pg_wal/archive_status" / (name + ".proof.done")
+                follow.wait_for(receipt.is_file)
+                assert (archive / name).read_bytes() == (source_data / "pg_wal" / name).read_bytes()
+            source.send_signal(signal.SIGINT)
+            assert source.wait(timeout=45) == 0
+
+            proof_name = "0000000000000000.wal.proof"
+            proof = archive / proof_name
+            withheld = root / proof_name
+            proof.rename(withheld)
+            attempts.unlink(missing_ok=True)
+            assert node.start(timeout=90) is True
+            rows = "SELECT count(*), max(id) FROM archive_probe"
+            follow.wait_for(lambda: attempts.is_file() and proof_name in attempts.read_text().splitlines())
+            assert follow.query(target_port, rows) == [(0, None)]
+            withheld.rename(proof)
+            follow.wait_for(lambda: follow.query(
+                target_port, "SELECT pg_last_wal_replay_lsn() > '0/1000000'::pg_lsn") == [(True,)])
+            follow.wait_for(lambda: 0 < follow.query(target_port, rows)[0][0] < last)
+            archived_count, archived_max = follow.query(target_port, rows)[0]
+            assert archived_count == archived_max
+            assert source.poll() == 0
+            print(f"archive-restore: replayed {archived_count} rows while source was down", flush=True)
+
+            source_socket.unlink(missing_ok=True)
+            source = subprocess.Popen(args, stdout=log, stderr=log)
+            follow.wait_for(lambda: follow.query(source_port, "SELECT 1") == [(1,)])
+            follow.query(source_port, f"INSERT INTO archive_probe VALUES ({last + 1})")
+            follow.wait_for(lambda: follow.query(target_port, rows) == [(last + 1, last + 1)])
+            follow.wait_for(lambda: follow.query(target_port, receiver) == [("streaming", "follow_one")])
+            assert not list((target_data / "pg_wal").glob(".pg-restore.*"))
+            print("archive-restore: streaming resumed on follow_one and replayed the remaining rows", flush=True)
+            assert node.stop(mode="fast", checkpoint=False, stop_timeout=45)
+        finally:
+            try:
+                if node is not None:
+                    node.connection_pool.close()
+                    if node.is_running():
+                        node.stop(mode="immediate", checkpoint=False, stop_timeout=30)
+            finally:
+                if source.poll() is None:
+                    source.kill()
+                    source.wait(timeout=10)
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--restore-then-stream", action="store_true")
+    options = parser.parse_args()
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     root = Path(tempfile.mkdtemp(prefix="pg-standby-archive."))
     helper = root / "libpq-helper"
@@ -162,7 +251,8 @@ def main():
         second.bind(("127.0.0.1", 0))
         ports = first.getsockname()[1], second.getsockname()[1]
     print(f"standby-archive: artifacts={root} ports={ports}", flush=True)
-    exercise(root, *ports)
+    case = restore_then_stream if options.restore_then_stream else exercise
+    case(root, *ports)
 
 
 if __name__ == "__main__":

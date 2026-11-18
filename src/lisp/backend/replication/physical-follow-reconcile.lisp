@@ -29,8 +29,14 @@ and the generation fence. Receiver stop and join precede fenced publication."
      (sb-thread:with-mutex (*physical-follow-command-lock*)
        (physical-follow-check-desired-active desired)
        (check-physical-recovery-worker-start)
-       (physical-follow-quiesce-receiver)
-       (let ((disabled nil))
+       (let* ((runtime *physical-follow-runtime*)
+              (keep-archive
+                (and runtime (physical-follow-runtime-archive-only-p runtime)
+                     (not (physical-follow-receiver-stopped-p runtime))
+                     (eq desired (physical-follow-runtime-generation runtime))))
+              (disabled nil))
+         (unless keep-archive
+           (physical-follow-quiesce-receiver))
          (sb-thread:with-mutex (*reload-run-lock*)
            (with-live-operation-quiescence
              (physical-follow-check-desired-active desired)
@@ -54,8 +60,12 @@ and the generation fence. Receiver stop and join precede fenced publication."
                  (sb-thread:with-mutex (*physical-follow-lock*)
                    (when *physical-follow-runtime*
                      (setf (physical-follow-runtime-config *physical-follow-runtime*) (copy-tree disabled))))))))
+         (when (and *physical-follow-runtime* (not keep-archive)
+                    (physical-follow-archive-receipt-enabled-p disabled))
+           (physical-follow-quiesce-runtime))
          (unless *physical-follow-runtime*
-           (physical-follow-launch-replay-only disabled))
+           (physical-follow-check-desired-active desired)
+           (physical-follow-launch-replay-only disabled desired t))
          disabled)))))
 
 (defun physical-follow-mark-desired-applied (desired)
@@ -67,7 +77,7 @@ and the generation fence. Receiver stop and join precede fenced publication."
 
 (defun physical-follow-reconcile-desired-step ()
   "Reconcile one claimed generation, retrying failures without restoring old receipt.
-An empty conninfo leaves replay running without a receiver. A superseded
+An empty conninfo allows replay and configured archive receipt. A superseded
 attempt cannot publish new attachment authority, current-generation error status
 or the applied marker; cleanup of its exact saved preparation remains allowed.
 The join is outside the generation fence. The native source must support this

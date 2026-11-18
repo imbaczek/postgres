@@ -106,8 +106,13 @@ The caller excludes concurrent mutation and protects the selected store."
          *physical-receive-store* base
          (list *last-replay-lsn* (physical-recovery-replay-timeline))))))
 
-(defun physical-follow-launch-replay-only (config)
-  "Start replay without a receiver for reconciled, disabled standby state.
+(defun physical-follow-archive-receipt-enabled-p (config)
+  (let ((restore (startup-restore-command)))
+    (and restore (plusp (length restore))
+         (eq :receive (getf (physical-follow-launch-decision config) :action)))))
+
+(defun physical-follow-launch-replay-only (config &optional (generation *physical-follow-desired*) configured-p)
+  "Start replay and any local archive receipt for reconciled disabled state.
 An unattached, accepted bootstrap or active binding may be used; the saved
 configuration, base and receive proof are checked before workers start. The
 accepted binding and source owner remain intact. Enabled, preparing, pending
@@ -131,7 +136,9 @@ reload exclusion and live-operation quiescence."
         (error "follow configuration changed before replay-only launch"))
       (physical-follow-check-unowned-bootstrap-base config (physical-recovery-verify-base-state))
       (physical-follow-controller-check-current config)))
-  (physical-follow-launch-workers config nil))
+  (if (physical-follow-archive-receipt-enabled-p config)
+      (physical-follow-launch-workers config :archive-only nil generation configured-p)
+      (physical-follow-launch-workers config nil)))
 
 (define-condition physical-follow-route-unavailable (error)
   ((reason :initarg :reason :reader physical-follow-route-reason))
@@ -756,7 +763,8 @@ recovery for restart reconciliation."
                        (shutdown-in-progress-p))
              (if (physical-follow-controller-enabled-p config)
                  (physical-follow-launch config (getf context :generation) (getf context :configured-p))
-                 (physical-follow-launch-replay-only config)))))))))
+                 (physical-follow-launch-replay-only config (getf context :generation)
+                                                     (getf context :configured-p))))))))))
 
 (declaim (special *physical-follow-prepare-timeout*))
 
@@ -811,7 +819,9 @@ result; restore stopped workers when needed."
           (let ((config (physical-follow-read-config)))
             (if (physical-follow-controller-enabled-p config)
                 (physical-follow-launch config (getf (physical-follow-operation-context operation) :generation))
-                (physical-follow-launch-replay-only config))))
+                (let ((context (physical-follow-operation-context operation)))
+                  (physical-follow-launch-replay-only config (getf context :generation)
+                                                      (getf context :configured-p))))))
         (physical-follow-wait-for-policy
          *physical-follow-runtime* reason
          (and (getf (physical-follow-operation-context operation) :automatic-p)

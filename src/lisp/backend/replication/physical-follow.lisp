@@ -11,7 +11,7 @@
 controller handoff. Lifecycle and client ownership use the follow lock; runtime
 publication and retirement also use the generation fence. STOPPED-P stops both
 workers; RECEIVER-STOPPED-P stops receipt alone."
-  host port pin config generation transition limit next-timeline
+  host port pin config generation transition limit next-timeline archive-only-p
   (stopped-p nil) (receiver-stopped-p nil) (connected-p nil) last-error client receiver-thread replay-thread)
 
 (define-condition physical-follow-receiver-stopped (physical-client-stopped) ()
@@ -1725,16 +1725,21 @@ Receipt ends there; replay remains free to reach its own policy fence."
   "Receive until stopped or a transition is ready.
 A live reload cannot replace this active loop frame; restart the receiver to
 adopt changes to its reset logic."
-  (loop until (or (physical-follow-receiver-stopped-p runtime) (shutdown-in-progress-p))
+  (loop with archive-only = (physical-follow-runtime-archive-only-p runtime)
+        with first-attempt = t
+        until (or (physical-follow-receiver-stopped-p runtime) (shutdown-in-progress-p))
         do (handler-case
                (let ((cursor (with-physical-follow-generation-operation
                                (physical-follow-require-runtime-generation runtime)
                                (check-recovery-available)
-                               (physical-store-reset-unflushed *physical-receive-store*))))
+                               (if (and archive-only (not first-attempt))
+                                   (physical-store-flushed-lsn *physical-receive-store*)
+                                   (physical-store-reset-unflushed *physical-receive-store*)))))
+                 (setf first-attempt nil)
                  (setf cursor (physical-follow-restore-before-streaming runtime cursor))
                  (when (physical-follow-receiver-stopped-p runtime)
                    (return-from physical-follow-receiver-loop :stopped))
-                 (let ((result (physical-follow-session runtime cursor)))
+                 (let ((result (unless archive-only (physical-follow-session runtime cursor))))
                    (when result
                      (physical-follow-publish-transition runtime result)
                      (return-from physical-follow-receiver-loop :switch))))
@@ -1754,7 +1759,8 @@ adopt changes to its reset logic."
                  (when (or (not (physical-follow-receiver-stopped-p runtime))
                            (and terminal (not *physical-recovery-failed-p*)))
                    (physical-follow-note-error runtime condition terminal)))))
-           (unless (physical-follow-receiver-stopped-p runtime) (sleep 0.2))))
+           (unless (physical-follow-receiver-stopped-p runtime)
+             (sleep (if archive-only 1 0.2)))))
 
 (defun physical-follow-replay-loop (runtime)
   (loop until (or (physical-follow-runtime-stopped-p runtime) (shutdown-in-progress-p))
@@ -1805,7 +1811,8 @@ without storage work. No join occurs under these locks."
        (when *physical-follow-runtime* (error "native physical follow already has a runtime; stop it first"))
        (let ((runtime (make-physical-follow-runtime :host (second config) :port (third config)
                                                     :pin (fourth config) :generation generation :config (copy-tree config)
-                                                    :receiver-stopped-p (not receive-p) :transition transition))
+                                                    :receiver-stopped-p (not receive-p) :transition transition
+                                                    :archive-only-p (eq receive-p :archive-only)))
              (ready nil) (success nil))
          (unwind-protect
               (flet ((run (function)
@@ -2067,7 +2074,7 @@ fences recovery."
                  (unless finished (setf *physical-recovery-failed-p* t)))))))))))
 
 (defun physical-follow-autostart ()
-  "Launch admitted startup workers, using replay only for managed or unattached state."
+  "Launch admitted startup workers, using no network receipt for managed or unattached state."
   (sb-thread:with-mutex (*physical-follow-command-lock*)
     (check-physical-recovery-worker-start)
     (when (probe-file (physical-follow-config-path))
