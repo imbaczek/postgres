@@ -611,7 +611,10 @@ The retained-byte extension measures from the durable or flushed endpoint."
   (let* ((physical (wal-physical-slot-p slot))
          (restart (wal-replication-slot-restart-lsn slot))
          (lost (eq :lost (wal-replication-slot-wal-status slot)))
-         (xmin (when (and physical (not lost)) (first (physical-slot-horizons slot))))
+         (horizons (when (and physical (not lost)) (physical-slot-horizons slot)))
+         (xmin (first horizons))
+         (catalog-xmin (unless lost
+                         (if physical (second horizons) (wal-replication-slot-catalog-xmin slot))))
          (database-oid (wal-replication-slot-database-oid slot))
          (database (when database-oid
                      (loop for database being the hash-values of (catalog-databases *catalog*)
@@ -627,7 +630,8 @@ The retained-byte extension measures from the durable or flushed endpoint."
               (not (null (wal-replication-slot-active-owner slot)))
               (if backend (backend-pid backend) +null+)
               (if xmin (xid32-of xmin) +null+)
-              +null+ (if lost +null+ (nullable restart))
+              (if catalog-xmin (xid32-of catalog-xmin) +null+)
+              (if lost +null+ (nullable restart))
               (nullable (wal-replication-slot-confirmed-flush-lsn slot))
               (wal-slot-catalog-status slot policy keep-mb)
               (wal-slot-safe-wal-bytes slot policy keep-mb)

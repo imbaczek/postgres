@@ -1694,14 +1694,17 @@ validation under the snapshot-count lock linearizes creation against release."
   (when (gethash name *wal-replication-slots*)
     (ereport "42710" "replication slot \"~a\" already exists" name))
   (wal-check-replication-slot-capacity)
-  (multiple-value-bind (provenance restart-timeline birth-timeline)
+  (multiple-value-bind (provenance restart-timeline birth-timeline catalog-xmin)
       (logical-slot-creation-evidence-under-lock boundary-lsn restart-lsn register)
+    (unless catalog-xmin
+      (error "logical slot publication requires its registered catalog horizon"))
     (let ((publication-receipt (list :unpublished))
           (completed nil)
           (slot (make-wal-replication-slot
                  :name name :restart-lsn restart-lsn
                  :consistent-lsn boundary-lsn :plugin plugin
                  :logical-provenance provenance :restart-timeline restart-timeline
+                 :catalog-xmin catalog-xmin
                  :invalidation-cause :none
                  :confirmed-flush-lsn (when (string= plugin "pgoutput") boundary-lsn)
                  :confirmed-timeline (when (string= plugin "pgoutput")

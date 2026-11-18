@@ -1121,6 +1121,22 @@
            (ok (not (aref row 6)))
            (ok (= 0 (aref row 22))))))))
 
+(deftest physical-slot-sql-projects-the-committed-catalog-horizon
+    (call-with-physical-slot-api-fixture
+     (lambda (root)
+       (declare (ignore root))
+       (let ((slot (physical-slot-test-object :restart 32)))
+         (setf (gethash "public_physical" pg::*wal-replication-slots*) slot
+               (pg::physical-slot-horizons slot) (list (+ (ash 1 32) 101) (+ (ash 1 32) 90)))
+         (let ((row (first (pg::sql-replication-slot-rows))))
+           (ok (= 101 (aref row 8)))
+           (ok (= 90 (aref row 9))))
+         (multiple-value-bind (record present) (funcall (pg::make-replication-slot-result-iterator))
+           (ok present)
+           (ok (= 90 (aref (pg::sql-record-values record) 8))))
+         (setf (pg::wal-replication-slot-wal-status slot) :lost)
+         (ok (eq pg::+null+ (aref (first (pg::sql-replication-slot-rows)) 9)))))))
+
 (deftest lost-slot-catalog-hides-the-invalid-restart-position
     (call-with-physical-slot-api-fixture
      (lambda (root)

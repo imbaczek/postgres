@@ -63,7 +63,8 @@ or authority."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (let* ((boundary (snapshot-registration-wal-boundary registration))
          (system-id (physical-slot-startup-system-id))
-         (history (logical-slot-primary-history-under-lock)))
+         (history (logical-slot-primary-history-under-lock))
+         (catalog-xmin nil))
     (unless (and *catalog*
                  (not *catalog-identity-needs-persist-p*)
                  (eql system-id (catalog-system-identifier))
@@ -91,7 +92,12 @@ or authority."
                            (timeline-prefix-boundary-p
                             (snapshot-wal-boundary-restart-timeline boundary)
                             restart-lsn history)))))
-        (error "logical slot creation requires matching captured WAL evidence")))
+        (error "logical slot creation requires matching captured WAL evidence"))
+      (let ((snapshot (snapshot-registration-snapshot registration)))
+        (when snapshot
+          (setf catalog-xmin (snapshot-xmin snapshot))
+          (unless (running-xacts-normal-xid-p catalog-xmin)
+            (error "logical slot creation requires a normal captured catalog horizon")))))
     (let ((on (snapshot-wal-boundary-logical-on-start-lsn boundary))
           (on-timeline (snapshot-wal-boundary-logical-on-start-timeline boundary)))
       (unless (or (and (null on) (null on-timeline))
@@ -103,7 +109,8 @@ or authority."
         system-id (logical-slot-new-generation) boundary-lsn
         (snapshot-wal-boundary-timeline boundary) on on-timeline)
        (snapshot-wal-boundary-restart-timeline boundary)
-       (snapshot-wal-boundary-timeline boundary)))))
+       (snapshot-wal-boundary-timeline boundary)
+       catalog-xmin))))
 
 (defun logical-slot-check-startup-candidate-identities (slots)
   "Check known slots, including lost ones, against durable cluster identity.
@@ -431,6 +438,8 @@ may belong to a child timeline while confirmed belongs to its parent."
   (and
    (wal-replication-slot-p slot)
    (wal-logical-slot-p slot)
+   (or (null (wal-replication-slot-catalog-xmin slot))
+       (running-xacts-normal-xid-p (wal-replication-slot-catalog-xmin slot)))
    (let* ((restart (wal-replication-slot-restart-lsn slot))
           (birth (wal-replication-slot-consistent-lsn slot))
           (confirmed (wal-replication-slot-confirmed-flush-lsn slot))
@@ -475,7 +484,8 @@ may belong to a child timeline while confirmed belongs to its parent."
 
 (defun logical-slot-state-required-p (slot)
   "Use PGSLOT6/7 when older images cannot store provenance, owner or cause."
-  (or (wal-replication-slot-child-owner slot)
+  (or (wal-replication-slot-catalog-xmin slot)
+      (wal-replication-slot-child-owner slot)
       (wal-replication-slot-logical-provenance slot)
       (eq :wal-level-insufficient (logical-slot-effective-invalidation-cause slot))))
 
@@ -508,12 +518,13 @@ confirmed LSN is absent."
 
 (defun logical-slot-state-encode (slot)
   "Encode canonical logical state, using PGSLOT7 for a child-owner token.
-PGSLOT6 keeps its 17 tokens. PGSLOT7 adds the child owner before the CRC.
+PGSLOT7 adds the child owner. A catalog horizon, when present, precedes the CRC.
 Neither image grants import authority."
   (unless (and (logical-slot-state-valid-p slot)
                (wal-replication-slot-invalidation-cause slot))
     (error "invalid durable logical slot state"))
   (let* ((owner (wal-replication-slot-child-owner slot))
+         (catalog-xmin (wal-replication-slot-catalog-xmin slot))
          (fields (append
                   (list (if owner "PGSLOT7" "PGSLOT6") (wal-replication-slot-name slot)
                         (logical-slot-integer-token (wal-replication-slot-database-oid slot))
@@ -524,7 +535,8 @@ Neither image grants import authority."
                         (if (eq :text (wal-slot-profile slot)) "text" "binary-bytea"))
                   (logical-slot-state-provenance-tokens slot)
                   (list (logical-slot-cause-token (logical-slot-effective-invalidation-cause slot)))
-                  (when owner (list (logical-slot-generation-token owner)))))
+                  (when owner (list (logical-slot-generation-token owner)))
+                  (when catalog-xmin (list (logical-slot-integer-token catalog-xmin)))))
          (prefix (format nil "~{~A~^ ~}" fields)))
     (string->bytes (format nil "~A ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))
 
@@ -548,7 +560,7 @@ The complete decoder checks canonical tokens and line termination by re-encoding
            (fields (and line (wal-split-fields line)))
            (count (cond ((equal (first fields) "PGSLOT6") 17)
                         ((equal (first fields) "PGSLOT7") 18))))
-      (unless (and count (= count (length fields))
+      (unless (and count (<= count (length fields) (1+ count))
                    (every (lambda (field) (plusp (length field))) fields)
                    (stringp expected-name) (string= (second fields) expected-name)
                    (null (read-line stream nil nil)))
@@ -587,6 +599,9 @@ identity and history checks."
   (let* ((fields (logical-slot-state-read-fields bytes expected-name))
          (birth (logical-slot-state-parse-integer (nth 4 fields)))
          (cause (logical-slot-parse-cause (nth 15 fields)))
+         (v7-p (string= (first fields) "PGSLOT7"))
+         (catalog-xmin (when (= (length fields) (if v7-p 19 18))
+                         (logical-slot-state-parse-integer (nth (if v7-p 17 16) fields))))
          (profile (cond ((string= (nth 7 fields) "text") :text)
                         ((string= (nth 7 fields) "binary-bytea") :binary-bytea)
                         (t (error "invalid logical slot profile")))))
@@ -599,9 +614,10 @@ identity and history checks."
                    :consistent-lsn birth
                    :confirmed-flush-lsn (logical-slot-state-parse-integer (nth 5 fields) t)
                    :plugin (nth 6 fields) :logical-provenance provenance
+                   :catalog-xmin catalog-xmin
                    :restart-timeline restart-timeline :confirmed-timeline confirmed-timeline
                    :invalidation-cause cause :wal-status (if (eq cause :none) :reserved :lost)
-                   :child-owner (when (string= (first fields) "PGSLOT7")
+                   :child-owner (when v7-p
                                   (logical-slot-parse-generation (nth 16 fields))))))
         (wal-slot-set-initial-profile slot profile)
         (unless (equalp bytes (logical-slot-state-encode slot))

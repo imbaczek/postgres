@@ -129,8 +129,12 @@
     (dolist (entry '(("standard" :standard) ("sql" :sql)))
       (call-with-logical-slot-creation-test
        (lambda ()
-         (let ((name (first entry))
-               (expected-on (wal-report-logical-decoding-status t)))
+         (let* ((name (first entry))
+                (expected-on (wal-report-logical-decoding-status t))
+                (captured-xmin nil)
+                (*wal-test-after-snapshot-boundary-registration-hook*
+                  (lambda (registration)
+                    (setf captured-xmin (snapshot-xmin (snapshot-registration-snapshot registration))))))
            (ecase (second entry)
              (:standard (create-standard-logical-slot name :nothing))
              (:sql (create-sql-logical-replication-slot name "pgoutput" nil nil nil)))
@@ -140,7 +144,17 @@
                   (restored (wal-replication-slot-logical-provenance saved)))
              (rove:ok provenance)
              (rove:ok restored)
+             (rove:ok (running-xacts-normal-xid-p captured-xmin))
+             (rove:ok (eql captured-xmin (wal-replication-slot-catalog-xmin slot)))
+             (rove:ok (eql captured-xmin (wal-replication-slot-catalog-xmin saved)))
+             (when captured-xmin
+               (let ((row (sql-public-replication-slot-row slot (make-wal-slot-retention-policy :mode :bytes) 0)))
+                 (rove:ok (= (xid32-of captured-xmin) (aref row 9)))))
              (when (and provenance restored)
+               (let* ((owner (logxor 1 (logical-slot-provenance-generation restored)))
+                      (child (wal-decode-replication-slot-image
+                              (logical-slot-copy-import-child-image saved owner :none) name)))
+                 (rove:ok (eql captured-xmin (wal-replication-slot-catalog-xmin child))))
                (rove:ok (= (catalog-system-identifier)
                            (logical-slot-provenance-system-id provenance)
                            (logical-slot-provenance-system-id restored)))
@@ -1328,6 +1342,35 @@
   (let ((data (cl-spec:result-data
                (cl-spec:run-property 'logical-slot-child-owner-detached-roundtrip :seed 627))))
     (rove:ok (eq :passed (getf data :status)) (format nil "~s" data))
+    (rove:ok (= 100 (getf data :trials)))))
+
+(cl-spec:defproperty logical-slot-catalog-xmin-detached-roundtrip
+    ((epoch (range integer 0 4294967295))
+     (xid (range integer 3 4294967295)))
+  (:about wal-encode-replication-slot wal-decode-replication-slot-image)
+  (:trials (:normal 100))
+  (let ((horizon (+ (ash epoch 32) xid)))
+    (every (lambda (owner)
+             (let ((slot (unit-logical-provenance-slot :child-owner owner)))
+               (setf (wal-replication-slot-catalog-xmin slot) horizon)
+               (let* ((bytes (wal-encode-replication-slot slot))
+                      (decoded (wal-decode-replication-slot-image bytes "fixture")))
+                 (and (eql horizon (wal-replication-slot-catalog-xmin decoded))
+                      (eql owner (wal-replication-slot-child-owner decoded))
+                      (equalp bytes (wal-encode-replication-slot decoded))))))
+           '(nil 1))))
+
+(rove:deftest logical-slot-catalog-xmin-codec-preserves-legacy-absence
+    (let* ((slot (unit-logical-provenance-slot))
+           (legacy (wal-encode-replication-slot slot)))
+      (rove:ok (null (wal-replication-slot-catalog-xmin
+                      (wal-decode-replication-slot-image legacy "fixture"))))
+      (dolist (invalid '(0 2 4294967297 18446744073709551616))
+        (setf (wal-replication-slot-catalog-xmin slot) invalid)
+        (rove:ok (rove:signals (wal-encode-replication-slot slot) 'error))))
+  (let ((data (cl-spec:result-data
+               (cl-spec:run-property 'logical-slot-catalog-xmin-detached-roundtrip :seed 628))))
+    (rove:ok (eq :passed (getf data :status)))
     (rove:ok (= 100 (getf data :trials)))))
 
 (rove:deftest logical-slot-child-owner-rejects-malformed-images

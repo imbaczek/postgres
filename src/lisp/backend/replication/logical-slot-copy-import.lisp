@@ -27,6 +27,7 @@ must differ from the source owner and generation; this does not mint authority."
                 :restart-lsn (wal-replication-slot-restart-lsn source)
                 :consistent-lsn (wal-replication-slot-consistent-lsn source)
                 :confirmed-flush-lsn (wal-replication-slot-confirmed-flush-lsn source)
+                :catalog-xmin (wal-replication-slot-catalog-xmin source)
                 :plugin (wal-replication-slot-plugin source)
                 :logical-provenance (wal-replication-slot-logical-provenance source)
                 :restart-timeline (wal-replication-slot-restart-timeline source)
