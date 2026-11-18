@@ -725,6 +725,12 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
     def recover_target(self, target, node, rewind, leader):
         pass
 
+    def checkpoint_hint(self, config):
+        return {"checkpoint_after_promote": True}
+
+    def execute_patroni_rewind(self, rewind, leader):
+        rewind.execute(leader)
+
     def check_checksum_rejection(self, target, node):
         path = next(path for path in sorted((target / "base").iterdir())
                     if path.name.isdecimal() and path.stat().st_size >= 8192)
@@ -751,12 +757,13 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
         config = follow.configuration(target, port, self.server.root)
         config.update(use_pg_rewind=True, remove_data_directory_on_diverged_timelines=False,
                       remove_data_directory_on_rewind_failure=False)
+        checkpoint_hint = self.checkpoint_hint(config)
         node = Postgresql(config, Null())
         rewind = Rewind(node)
         follow.query(self.server.port, "CHECKPOINT")
         leader = Leader(0, None, Member(0, "source", None, {
             "conn_url": f"postgres://127.0.0.1:{self.server.port}/postgres",
-            "role": PostgresqlRole.PRIMARY, "checkpoint_after_promote": True}))
+            "role": PostgresqlRole.PRIMARY, **checkpoint_hint}))
         logger = logging.getLogger("patroni.postgresql.rewind")
         level = logger.level
         with closing(logging.FileHandler(self.output / "patroni-rewind.log", mode="x")) as handler:
@@ -769,7 +776,7 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
                     self.check_checksum_rejection(target, node)
                     rewind.trigger_check_diverged_lsn()
                     assert rewind.rewind_or_reinitialize_needed_and_possible(leader)
-                    rewind.execute(leader)
+                    self.execute_patroni_rewind(rewind, leader)
             finally:
                 logger.setLevel(level)
                 logger.removeHandler(handler)
@@ -780,6 +787,30 @@ class RewindPatroniAcceptance(RewindInstallAcceptance):
         self.check_quarantine(workspace / "quarantine")
         assert not (target / "postmaster.pid").exists()
         self.check_rejoined(target, port)
+
+
+class RewindPatroniCheckpointAcceptance(RewindPatroniAcceptance):
+    label = "rewind-patroni-checkpoint-query"
+
+    def checkpoint_hint(self, config):
+        config["authentication"]["rewind"] = {"username": "postgres",
+                                               "application_name": "rewind_checkpoint_probe"}
+        config_dir = self.server.root / "checkpoint-probe-config"
+        config_dir.mkdir(mode=0o700)
+        (config_dir / "postgresql.conf").write_text("archive_mode = off\n")
+        config["config_dir"] = str(config_dir)
+        return {}
+
+    def execute_patroni_rewind(self, rewind, leader):
+        assert leader.checkpoint_after_promote is None
+        assert rewind._postgresql.get_guc_value("archive_mode") == "off"
+        assert rewind._postgresql.get_guc_value("archive_command") == "(disabled)"
+        assert rewind.get_archive_command() is None
+        with patch.object(rewind, "check_leader_has_run_checkpoint",
+                          wraps=rewind.check_leader_has_run_checkpoint) as gate:
+            rewind.execute(leader)
+        gate.assert_called_once()
+        assert gate.call_args.args[0]["application_name"] == "rewind_checkpoint_probe"
 
 
 class RewindDirtyPatroniAcceptance(RewindPatroniAcceptance):
@@ -960,6 +991,7 @@ def main():
                "rewind-cli-partial-capture": RewindPartialCaptureCliAcceptance,
              "rewind-cli-resume": RewindResumeCliAcceptance,
              "rewind-patroni": RewindPatroniAcceptance,
+               "rewind-patroni-checkpoint-query": RewindPatroniCheckpointAcceptance,
              "rewind-patroni-dirty": RewindDirtyPatroniAcceptance,
              "manual-failover": ManualFailoverAcceptance}
     parser.add_argument("--case", choices=cases, default="synthetic")

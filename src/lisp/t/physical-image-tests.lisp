@@ -249,5 +249,5 @@
   (dolist (template '("restore %" "restore %r" "restore %s"))
     (ok (signals (pg::physical-rewind-restore-command template "X.wal" "scratch") 'error)))
   (ok (signals (pg::startup-normalize-setting "restore_command" "cp %f %p") 'error))
-  (let ((pg::*startup-rewind-restore-command-p* t))
+  (let ((pg::*startup-inspect-archive-settings-p* t))
     (ok (equal "cp %f %p" (pg::startup-normalize-setting "restore_command" "cp %f %p")))))
