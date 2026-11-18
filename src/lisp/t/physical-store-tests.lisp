@@ -553,7 +553,29 @@
           (pg::physical-store-close store))
         (let ((reopened (pg::physical-store-open root 123 1)))
           (unwind-protect
-               (ok (equalp (pg::physical-store-live-archive-segment reopened 1 0) first))
+               (let* ((directory (merge-pathnames "archive-stage/" root))
+                      (fd (progn
+                            (sb-posix:mkdir (string-right-trim "/" (namestring directory)) #o700)
+                            (sb-posix:open (namestring directory)
+                                           (logior sb-posix:o-rdonly sb-posix:o-directory))))
+                      (name (pg::wal-segment-filename 0 1 :timeline)))
+                 (unwind-protect
+                      (flet ((check-directory (directory-fd)
+                               (pg::physical-image-check-directory directory-fd nil t)))
+                        (multiple-value-bind (staged end)
+                            (pg::physical-store-stage-live-archive-segment
+                             reopened 1 0 fd #'check-directory)
+                          (ok (equal staged name))
+                          (ok (= end (length first))))
+                        (multiple-value-bind (staged-bytes facts)
+                            (pg::wal-archive-read-source-bytes fd name)
+                          (ok (equalp staged-bytes first))
+                          (ok (equal name (pg::physical-store-stage-live-archive-segment
+                                           reopened 1 0 fd #'check-directory)))
+                          (ok (signals (pg::wal-archive-stage-source
+                                        fd name second #'check-directory) 'error))
+                          (ok (equal facts (nth-value 1 (pg::wal-archive-read-source-bytes fd name))))))
+                   (sb-posix:close fd)))
             (pg::physical-store-close reopened))))))
 
 (deftest physical-store-preserves-source-octets

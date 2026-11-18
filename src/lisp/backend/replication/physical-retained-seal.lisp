@@ -122,6 +122,14 @@ timeline. Return the image and end only after closure is proved."
         (when (and complete (eql owner timeline))
           (values (physical-retained-seal-bytes seal) end))))))
 
+(defun physical-store-stage-live-archive-segment (store timeline segment directory-fd check-directory)
+  "Publish a closed receive segment in a held directory separate from the receive spool.
+Return the staged name and proved end, or NIL until the segment is closed."
+  (multiple-value-bind (bytes end) (physical-store-live-archive-segment store timeline segment)
+    (when bytes
+      (let ((name (wal-segment-filename segment timeline :timeline)))
+        (values (wal-archive-stage-source directory-fd name bytes check-directory) end)))))
+
 (defun physical-retained-seal-start-group (seal record timeline)
   "Start a segment group using the verified prefix, coalescing the latest entry when possible."
   (let* ((segment (floor (wal-record-start record) +wal-segment-size+))
