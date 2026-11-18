@@ -87,6 +87,22 @@ def check(native, reference):
         "DO $$BEGIN PERFORM nextval('do_perform_seq') FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) d; END;$$",
         "SELECT nextval('do_perform_seq')",
         "DO $$BEGIN PERFORM NULL::text; PERFORM false; END;$$",
+        "CREATE TABLE do_found_rows (n integer)",
+        "INSERT INTO do_found_rows VALUES (1)",
+        """DO $$BEGIN
+            IF FOUND THEN PERFORM 1/0; END IF;
+            PERFORM NULL::text;
+            BEGIN
+                IF FOUND THEN SET application_name = 'do-found'; ELSE PERFORM 1/0; END IF;
+            END;
+            PERFORM n FROM do_found_rows WHERE n = 2;
+            IF FOUND THEN PERFORM 1/0; ELSE SET application_name = 'do-empty'; END IF;
+            PERFORM n FROM do_found_rows WHERE n = 1;
+            IF NOT FOUND THEN PERFORM 1/0; END IF;
+        END;$$""",
+        "SHOW application_name",
+        "DO $$BEGIN PERFORM 1; END;$$",
+        "DO $$BEGIN IF FOUND THEN PERFORM 1/0; END IF; END;$$",
         "DO $$not valid plpgsql$$",
         "DO LANGUAGE no_such_language $$BEGIN END$$",
         "DO LANGUAGE sql $$BEGIN END$$",

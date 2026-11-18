@@ -1579,6 +1579,8 @@ Release these locks before waiting for commit or sending replies."
           (ereport "42704" "language ~a does not exist" language)))
     (compile-do-source source)))
 
+(defvar *inline-do-found-p* nil)
+
 (defun execute-do-statement (stream ast)
   "Run an inline statement without starting or ending a transaction.
 SQL children register a statement snapshot and advance the command ID; cleanup
@@ -1589,6 +1591,11 @@ restores the caller's snapshot. Blocks and NULL need no snapshot of their own."
     (:do-block
         (dolist (statement (getf ast :statements))
           (execute-do-statement stream statement)))
+    (:do-if-found
+        (dolist (statement (getf ast (if (eq *inline-do-found-p* (getf ast :negated-p))
+                                         :else
+                                         :then)))
+          (execute-do-statement stream statement)))
     (otherwise
      (let ((saved-snapshot (backend-snapshot *backend*))
            (*statement-snapshot-override* nil))
@@ -1598,7 +1605,7 @@ restores the caller's snapshot. Blocks and NULL need no snapshot of their own."
               (recovery-check-statement
                (if (eq (getf ast :type) :perform) (getf ast :query) ast))
               (case (getf ast :type)
-                (:perform (exec-perform (getf ast :query)))
+                (:perform (setf *inline-do-found-p* (exec-perform (getf ast :query))))
                 (:set (exec-set stream ast))
                 (:reset (exec-reset stream ast))
                 (t (ereport "0A000" "unsupported inline statement"))))
@@ -1611,6 +1618,7 @@ bindings until transaction end. Discard child command tags and emit one DO
 completion after success; anonymous source cannot inherit Bind parameters."
   (let ((block (do-statement-block ast))
         (*executing-do-p* t)
+        (*inline-do-found-p* nil)
         (*query-parameter-types* nil)
         (*query-parameter-values* nil))
     (session-remember-settings)

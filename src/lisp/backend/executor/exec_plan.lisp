@@ -2541,15 +2541,20 @@ Compare the advertised column shape, independently of result format codes."
   columns)
 
 (defun exec-perform (ast)
-  "Execute a SELECT plan for its effects, discarding rows and checking interrupts."
+  "Execute a SELECT for its effects and report whether it returned any rows."
   (let* ((plan (plan-select-query ast))
-         (relations (getf (query-plan-prepared plan) :relations)))
-    (flet ((discard-row (row) (declare (ignore row)) (check-for-interrupts)))
+         (relations (getf (query-plan-prepared plan) :relations))
+         (found-p nil))
+    (flet ((discard-row (row)
+             (declare (ignore row))
+             (check-for-interrupts)
+             (setf found-p t)))
       (if relations
           (with-registered-select-relations (registered relations)
             (reconcile-query-plan-access-paths plan registered)
             (execute-query-plan plan registered #'discard-row))
-          (execute-query-plan plan nil #'discard-row)))))
+          (execute-query-plan plan nil #'discard-row)))
+    found-p))
 
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))

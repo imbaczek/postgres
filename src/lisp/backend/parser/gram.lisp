@@ -161,21 +161,34 @@ Range and negative checks occur when the LIMIT executes."
     (unless options (syntax-error p "expected inline code or LANGUAGE"))
     (list :type :do :options (nreverse options))))
 
+(defun parse-do-statements (p terminators)
+  (loop until (some (lambda (keyword) (kw-p p keyword)) terminators)
+        collect (prog1 (parse-do-procedural-statement p)
+                  (expect-punct p #\;))))
+
+(defun parse-do-if-found (p)
+  (let ((negated-p (match-kw p "not")))
+    (expect-kw p "found")
+    (expect-kw p "then")
+    (let* ((then (parse-do-statements p '("else" "end")))
+           (else (when (match-kw p "else")
+                   (parse-do-statements p '("end")))))
+      (expect-kw p "end")
+      (expect-kw p "if")
+      (list :type :do-if-found :negated-p negated-p :then then :else else))))
+
 (defun parse-do-block (p)
   "Parse a BEGIN/END block of supported procedural statements."
   (expect-kw p "begin")
-  (let ((statements nil))
-    (loop until (kw-p p "end")
-          do (when (at-eof-p p) (syntax-error p "expected END"))
-             (push (parse-do-procedural-statement p) statements)
-             (expect-punct p #\;))
+  (let ((statements (parse-do-statements p '("end"))))
     (expect-kw p "end")
-    (list :type :do-block :statements (nreverse statements))))
+    (list :type :do-block :statements statements)))
 
 (defun parse-do-procedural-statement (p)
-  "Parse nested blocks, NULL, SET, RESET or PERFORM; reject other statements."
   (cond
+    ((at-eof-p p) (syntax-error p "expected END"))
     ((kw-p p "begin") (parse-do-block p))
+    ((match-kw p "if") (parse-do-if-found p))
     ((match-kw p "null") (list :type :do-null))
     ((match-kw p "perform") (list :type :perform :query (parse-select p)))
     ((match-kw p "set") (parse-set p))
