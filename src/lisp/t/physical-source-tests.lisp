@@ -98,6 +98,39 @@
                       'error))
          (ok (not (probe-file changed)))))))
 
+(deftest primary-archive-recycling-stops-at-the-first-unproved-segment
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (checkpoint (* 3 pg::+wal-segment-size+)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on")
+         (pg::with-wal-critical (pg::wal-archive-reconcile-ready-under-lock))
+         (ok (pg::wal-archive-attempt 1 "true"))
+         (pg::with-wal-critical
+           (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint))
+         (ok (equal '(0 1 2 3) (pg::wal-discover-segments)))
+         (ok (pg::wal-archive-attempt 0 "true"))
+         (let* ((name (file-namestring (pg::wal-segment-path 0)))
+                (marker (merge-pathnames (concatenate 'string "archive_status/" name ".done")
+                                         (pg::wal-directory))))
+           (sb-posix:chmod (namestring marker) #o666)
+           (pg::with-wal-critical
+             (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint))
+           (ok (equal '(0 1 2 3) (pg::wal-discover-segments)))
+           (sb-posix:chmod (namestring marker) #o600))
+         (let ((path (pg::wal-segment-path 1)))
+           (with-open-file (stream path :direction :io :if-exists :overwrite
+                                        :element-type '(unsigned-byte 8))
+             (write-byte 42 stream)
+             (pg::fsync-stream stream)))
+         (pg::with-wal-critical
+           (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint))
+         (ok (equal '(1 2 3) (pg::wal-discover-segments)))
+         (ok (pg::wal-archive-attempt 1 "true"))
+         (pg::with-wal-critical
+           (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint))
+         (ok (equal '(2 3) (pg::wal-discover-segments)))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()

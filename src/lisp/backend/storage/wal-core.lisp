@@ -4146,6 +4146,26 @@ The caller holds the WAL lock and syncs the status directory."
                (sb-posix:fsync fd))
           (sb-posix:close fd))))))
 
+(defun wal-archive-open-wal-directory ()
+  (sb-posix:open (string-right-trim "/" (namestring (wal-directory)))
+                 (logior sb-posix:o-rdonly sb-posix:o-directory
+                         sb-posix:o-nofollow +postmaster-o-cloexec+)))
+
+(defun wal-archive-open-status-directory (wal-fd)
+  (let ((fd (physical-image-openat
+             wal-fd "archive_status"
+             (logior sb-posix:o-rdonly sb-posix:o-directory
+                     sb-posix:o-nofollow +postmaster-o-cloexec+) 0)))
+    (when (minusp fd) (error "cannot open WAL archive status directory"))
+    fd))
+
+(defun wal-archive-open-source (wal-fd name)
+  (let ((fd (physical-image-openat
+             wal-fd name (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                 sb-posix:o-nonblock +postmaster-o-cloexec+) 0)))
+    (when (minusp fd) (error "cannot open WAL archive source: ~a" name))
+    fd))
+
 (defun wal-archive-check-wal-directory (wal-fd)
   (physical-image-check-directory wal-fd nil t)
   (unless (equal (physical-image-file-facts wal-fd)
@@ -4186,6 +4206,67 @@ The caller keeps SOURCE-FD open for the command and holds no WAL lock."
               (eql 0 (sb-ext:process-exit-code process)))
       (sb-ext:process-close process))))
 
+(defun wal-archive-done-text (name facts)
+  (format nil "WAL-ARCHIVE ~a~{ ~d~}~%" name (subseq facts 0 8)))
+
+(defun wal-archive-done-matches-p (wal-fd status-fd name source-fd)
+  "Check the exact completion receipt for the held source and sync the receipt and directory.
+Recheck the named receipt and source before returning true."
+  (let* ((flags (logior sb-posix:o-rdonly sb-posix:o-nonblock
+                        sb-posix:o-nofollow +postmaster-o-cloexec+))
+         (marker (concatenate 'string name ".done"))
+         (fd (physical-image-openat status-fd marker flags 0))
+         (stream nil))
+    (when (minusp fd) (return-from wal-archive-done-matches-p nil))
+    (unwind-protect
+         (let* ((source (wal-archive-check-source wal-fd name source-fd))
+                (facts (physical-image-file-facts fd))
+                (expected (sb-ext:string-to-octets
+                           (wal-archive-done-text name source) :external-format :ascii)))
+           (when (and (= sb-posix:s-ifreg (logand (third facts) sb-posix:s-ifmt))
+                      (= #o600 (logand (third facts) #o7777))
+                      (= 1 (fourth facts))
+                      (= (sb-posix:geteuid) (fifth facts))
+                      (= (length expected) (sixth facts))
+                      (= (ninth facts) (ninth (physical-image-file-facts status-fd))))
+             (setf stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8)))
+             (let ((bytes (make-array (length expected) :element-type '(unsigned-byte 8))))
+               (when (and (= (length bytes) (read-sequence bytes stream))
+                          (equalp expected bytes))
+                 (sb-posix:fsync fd)
+                 (sb-posix:fsync status-fd)
+                 (and (equal facts (physical-image-file-facts status-fd marker))
+                      (equal source (wal-archive-check-source wal-fd name source-fd)))))))
+      (if stream (close stream) (sb-posix:close fd)))))
+
+(defun wal-archive-recycle-segment (segment)
+  "Under the WAL lock, unlink a segment only after its completion receipt matches.
+Keep the descriptors open through unlink and sync the WAL directory."
+  (when (wal-archive-ready-segment-p segment)
+    (let ((name (file-namestring (wal-segment-path segment)))
+          (wal-fd nil) (status-fd nil) (source-fd nil))
+      (unwind-protect
+           (when (and (handler-case
+                          (progn
+                            (setf wal-fd (wal-archive-open-wal-directory)
+                                  status-fd (wal-archive-open-status-directory wal-fd)
+                                  source-fd (wal-archive-open-source wal-fd name))
+                            (wal-archive-check-wal-directory wal-fd)
+                            (wal-archive-check-status-directory wal-fd status-fd)
+                            (when (wal-archive-done-matches-p wal-fd status-fd name source-fd)
+                              (wal-archive-check-wal-directory wal-fd)
+                              (wal-archive-check-status-directory wal-fd status-fd)
+                              t))
+                        (error () nil))
+                      (zerop (port-unlinkat wal-fd name 0)))
+             (sb-posix:fsync wal-fd)
+             t)
+        (unwind-protect
+             (when source-fd (sb-posix:close source-fd))
+          (unwind-protect
+               (when status-fd (sb-posix:close status-fd))
+            (when wal-fd (sb-posix:close wal-fd))))))))
+
 (defun wal-archive-publish-done (status-fd name facts)
   "Write and sync the completion file, rename it, then sync the status directory."
   (let ((temporary (merge-pathnames ".archive-done-XXXXXX"
@@ -4197,7 +4278,7 @@ The caller keeps SOURCE-FD open for the command and holds no WAL lock."
            (multiple-value-bind (descriptor path) (open-exclusive-temporary-file temporary)
              (setf fd descriptor leaf (file-namestring path)))
            (setf stream (sb-sys:make-fd-stream fd :output t :element-type 'character))
-           (format stream "WAL-ARCHIVE ~a~{ ~d~}~%" name (subseq facts 0 8))
+           (write-string (wal-archive-done-text name facts) stream)
            (finish-output stream)
            (sb-posix:fsync fd)
            (unless (equal (physical-image-file-facts fd)
@@ -4232,19 +4313,9 @@ under the lock, and publish completion only after success."
                  (return-from wal-archive-attempt nil))
                (setf incarnation *wal-storage-incarnation*
                      name (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*)
-                     wal-fd (sb-posix:open
-                             (string-right-trim "/" (namestring (wal-directory)))
-                             (logior sb-posix:o-rdonly sb-posix:o-directory
-                                     sb-posix:o-nofollow +postmaster-o-cloexec+)))
-               (let* ((flags (logior sb-posix:o-rdonly sb-posix:o-nofollow
-                                     sb-posix:o-nonblock +postmaster-o-cloexec+))
-                      (status (physical-image-openat wal-fd "archive_status"
-                                                     (logior flags sb-posix:o-directory) 0)))
-                 (when (minusp status) (error "cannot open WAL archive status directory"))
-                 (setf status-fd status)
-                 (let ((source (physical-image-openat wal-fd name flags 0)))
-                   (when (minusp source) (error "cannot open WAL archive source: ~a" name))
-                   (setf source-fd source)))
+                     wal-fd (wal-archive-open-wal-directory)
+                     status-fd (wal-archive-open-status-directory wal-fd)
+                     source-fd (wal-archive-open-source wal-fd name))
                (wal-archive-check-wal-directory wal-fd)
                (wal-archive-check-status-directory wal-fd status-fd)
                (setf facts (wal-archive-check-source wal-fd name source-fd)))
@@ -4300,11 +4371,9 @@ Active standard-policy owners defer removal in a process-local ticket; the calle
 retries outside locks after stopping them. Independent XID and snapshot floors
 also constrain removal. CURRENT freezes the endpoint across that retry, while
 each calculation captures the current retention settings."
-  ;; Publish ready markers before other recycling fences. Retain all WAL while
-  ;; archiving is enabled, including when marker creation fails.
+  ;; Publish ready markers before other recycling fences.
   (when (startup-primary-wal-archive-enabled-p)
-    (wal-archive-try-reconcile-ready-under-lock)
-    (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
+    (wal-archive-try-reconcile-ready-under-lock))
   (when (logical-slot-continuation-gc-fenced-p *pgdata*)
     (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (when *wal-shutdown-defer-recycling*
@@ -4321,17 +4390,21 @@ each calculation captures the current retention settings."
           (values nil requests)))
       (logical-test-failpoint :before-slot-wal-removal keep-segment)
       (setf *wal-slot-recycling-pending* nil)
-      (let ((removed nil))
+      (let ((removed nil)
+            (archiving (startup-primary-wal-archive-enabled-p)))
         (dolist (segment (wal-discover-segments))
           (when (< segment keep-segment)
-            (when (and *wal-output-stream* (eql segment *wal-output-segment*))
-              (close *wal-output-stream*)
-              (setf *wal-output-stream* nil *wal-output-segment* nil))
-            (handler-case
+            (if archiving
+                (unless (wal-archive-recycle-segment segment) (return))
                 (progn
-                  (delete-file (wal-segment-path segment))
-                  (setf removed t))
-              (file-error () (return)))))
+                  (when (and *wal-output-stream* (eql segment *wal-output-segment*))
+                    (close *wal-output-stream*)
+                    (setf *wal-output-stream* nil *wal-output-segment* nil))
+                  (handler-case
+                      (progn
+                        (delete-file (wal-segment-path segment))
+                        (setf removed t))
+                    (file-error () (return)))))))
         (when removed (fsync-directory (wal-directory))))))
   (values))
 
