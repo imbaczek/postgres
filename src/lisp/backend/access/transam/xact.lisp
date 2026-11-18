@@ -830,6 +830,15 @@ Take the relation lock before the XID lock, as in transaction cleanup."
               (when (and marker (/= marker boundary))
                 (error "XID wrap marker ~a does not match next XID ~a"
                        marker boundary))
+              ;; Feedback publication uses this same WAL lock and cannot add
+              ;; an old horizon once allocation reaches BOUNDARY. A marker
+              ;; means the heap or CLOG may already have changed.
+              (when (< (wal-limit-xmin-by-physical-feedback
+                        boundary :include-senders t :include-catalog t)
+                       boundary)
+                (when marker
+                  (error "XID wrap in progress conflicts with retained physical feedback"))
+                (return-from complete-xid-wraparound :feedback-blocked))
               (sb-thread:with-mutex (*xid-wrap-lock*)
                 (setf *xid-wrap-pending* t))
               ;; Persist the boundary before publishing the marker. No XID from

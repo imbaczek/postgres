@@ -672,19 +672,26 @@ receipt confirmation succeeds."
 
 (defun physical-source-confirm-xmin (owner data catalog)
   "Publish feedback for the current sender under WAL.
-Ignore the whole report if either horizon is outside the recent XID range.
+Ignore the whole report if either horizon is outside the current epoch's
+recent XID range.
 For a public slot, NIL clears a field and a reported XID can only advance it.
 Save those changes before updating the slot in memory.
 For a slotless sender, replace its transient horizon with the older of the
 reported XIDs when DATA is present, or clear it when DATA is NIL."
-  (let ((next (next-full-xid)))
-    (unless (every (lambda (xid)
-                     (or (null xid) (<= 0 (- next xid) #x80000000)))
-                   (list data catalog))
-      (return-from physical-source-confirm-xmin nil)))
   (let ((rejection
           (block publish
             (with-wal-publication-fence (begin-publication)
+              ;; The wrap check relies on old feedback staying out once
+              ;; allocation reaches the boundary. The exhaustion sentinel
+              ;; belongs to the last usable epoch for this comparison.
+              (let* ((next (next-full-xid))
+                     (epoch-start (xid-epoch-start (min next +max-xid+))))
+                (unless (every (lambda (xid)
+                                 (or (null xid)
+                                     (and (<= epoch-start xid)
+                                          (<= 0 (- next xid) #x80000000))))
+                               (list data catalog))
+                  (return-from publish nil)))
               ;; A namespace change is a reconnect, even between frame read and save.
               (handler-case
                   (physical-source-check-sender-under-lock (physical-sender-name owner) owner)
