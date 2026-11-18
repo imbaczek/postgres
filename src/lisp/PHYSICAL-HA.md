@@ -5235,7 +5235,17 @@ restart. `--logical-slot-before-base` verifies the same sequence for a slot
 created before the standby base. The latest pre-base run used a dedicated
 `NATIVE_REWIND` login under local trust and took 38.90 s on the ramdisk. The
 earlier post-base run took 23.07 s. Ordinary follow and promotion took 80.45 s.
-The psycopg3 fallback remains open.
+The same post-base and pre-base cases passed with Patroni's psycopg3 fallback
+using psycopg 3.2.10 in 25.64 s and 25.69 s in concurrent ramdisk runs. Set
+`PATRONI_TEST_PSYCOPG3=1` with both driver packages available. The fixture
+keeps psycopg2 for its own logical replication client. Patroni's SQL
+connections use psycopg3. Extended Parse infers types for the array parameters
+used by settings and slot lookups and from the replication-slot function
+signatures. The fixed slot-copy query's string literals are accepted by
+the parameterized shape check shared with the rewind authorization path.
+C PostgreSQL still reports different SQLSTATEs for some malformed calls
+with unspecified parameter types, including a slot-advance call that uses
+the same parameter for both the slot name and the LSN.
 
 The native pgoutput sender now tracks the terminal LSN and full catalog XID
 from a complete running-transaction record. It saves a newer horizon only
