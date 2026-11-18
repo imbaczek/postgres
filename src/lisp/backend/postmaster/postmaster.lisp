@@ -365,6 +365,7 @@ including during smart shutdown. The signal worker remains available for immedia
           (call-with-live-operation #'postmaster-retire-abandoned-backends)
           (physical-recovery-prepare-shutdown))
         (prepare-primary-shutdown))
+    (stop-wal-archiver)
     (sb-thread:with-mutex (*shutdown-lock*)
       (setf *shutdown-finished* t)))
   (values))

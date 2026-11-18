@@ -69,6 +69,11 @@ A missing root is an error; there is no fallback to globals."
          (member (startup-setting-value (startup-configuration-settings configuration) "archive_mode")
                  '("on" "always") :test #'equal))))
 
+(defun startup-archive-command ()
+  (let ((configuration (startup-capture-configuration)))
+    (when configuration
+      (startup-setting-value (startup-configuration-settings configuration) "archive_command"))))
+
 (defun startup-wal-writer-settings ()
   "Read writer delay and flush threshold from one installed configuration root."
   (let ((settings (startup-configuration-settings (startup-require-configuration))))
@@ -724,10 +729,9 @@ commit timestamp tracking off, and each listed recovery target empty.
 Return SETTINGS after validation."
   (unless (member (startup-setting-value settings "wal_level") '("replica" "logical") :test #'equal)
     (error "wal_level=minimal requires unimplemented minimal WAL generation"))
-  ;; Configuration inspection can report an archive mode that server admission rejects.
-  (unless (or *startup-inspect-archive-settings-p*
-              (equal "off" (startup-setting-value settings "archive_mode")))
-    (error "archive_mode requires unimplemented WAL archiving"))
+  (when (and (not *startup-inspect-archive-settings-p*)
+             (equal "always" (startup-setting-value settings "archive_mode")))
+    (error "archive_mode=always requires unimplemented standby WAL archiving"))
   (when (plusp (startup-setting-value settings "max_prepared_transactions"))
     (error "positive max_prepared_transactions requires unimplemented prepared transactions"))
   (when (startup-setting-value settings "track_commit_timestamp")
@@ -1194,7 +1198,11 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
                 source (if (gethash "max-slot-wal-keep-bytes"
                                     (startup-configuration-native configuration))
                            :command-line :environment)))))
-    (vector name (startup-setting-text name value) unit
+    (vector name (startup-setting-text
+                  name value (or (and configuration
+                                      (startup-setting-value
+                                       (startup-configuration-settings configuration) "archive_mode"))
+                                 "off")) unit
             (if spec (string-downcase (symbol-name (second spec))) "postmaster")
             (case (third spec) (:integer "integer") (:boolean "bool") ((:wal-level :archive-mode :synchronous-commit) "enum") (t "string"))
             (ecase source
@@ -1246,7 +1254,10 @@ Without an installed root, return session rows."
                        (let ((limit (wal-slot-retention-policy-limit
                                      (startup-configuration-slot-policy configuration))))
                          (if limit (startup-format-unit limit :bytes) "-1")))
-                      (t (startup-setting-text name value)))
+                      (t (startup-setting-text
+                          name value (startup-setting-value
+                                      (startup-configuration-settings configuration)
+                                      "archive_mode"))))
                     t)))))))
 
 (defun startup-configuration-output (argv)

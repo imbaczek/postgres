@@ -1641,7 +1641,7 @@
         (ok (null (pg::startup-configuration-output (append args '("--control-port" "6433")))))
         (ok (not (probe-file (merge-pathnames "postmaster.pid" root)))))))
 
-(deftest startup-archive-reporting-keeps-server-admission-closed
+(deftest startup-archive-admits-primary-mode-and-rejects-always
     (with-physical-store-directory (root)
       (let* ((configuration (merge-pathnames "postgresql.conf" root))
              (args (list "-D" (namestring root))))
@@ -1656,6 +1656,10 @@
         (ok (equal "always" (pg::startup-configuration-output
                              (append args '("-c" "archive_mode=always" "-C" "archive_mode")))))
         (multiple-value-bind (native overrides) (pg::startup-cli-inputs args)
+          (ok (equal "on" (pg::startup-setting-value
+                           (pg::startup-load-settings native overrides) "archive_mode"))))
+        (multiple-value-bind (native overrides)
+            (pg::startup-cli-inputs (append args '("-c" "archive_mode=always")))
           (ok (intake-fails-p (lambda () (pg::startup-load-settings native overrides))))))))
 
 (deftest startup-config-output-does-not-create-a-missing-data-directory

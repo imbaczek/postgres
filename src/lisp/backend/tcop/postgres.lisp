@@ -1107,6 +1107,7 @@ throughout replay and shutdown."
         (unless (recovery-in-progress-p) (start-primary-wal-writer))
         (enable-reload)
         (enable-shutdown-handlers)
+        (start-wal-archiver)
         (start-swank-listener swank-port swank-bind-address)
         (start-control-plane :port control-port :socket-path control-socket)
         (if imported

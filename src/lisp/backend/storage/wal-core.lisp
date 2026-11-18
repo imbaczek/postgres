@@ -4193,10 +4193,10 @@ The caller holds the WAL lock and syncs the status directory."
                  (equal facts (physical-image-file-facts wal-fd "archive_status")))
       (error "invalid WAL archive status directory"))))
 
-(defun wal-archive-run-shell (template name source-fd directory)
+(defun wal-archive-run-shell (template name wal-fd directory)
   "Run the archive command and wait for it to exit.
 The caller keeps SOURCE-FD open for the command and holds no WAL lock."
-  (let* ((path (format nil "/proc/~d/fd/~d" (sb-posix:getpid) source-fd))
+  (let* ((path (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) wal-fd name))
          (command (wal-shell-file-command template name path "archive_command"))
          (process (sb-ext:run-program "/bin/sh" (list "-c" command)
                                       :directory directory :wait t :input nil
@@ -4209,7 +4209,7 @@ The caller keeps SOURCE-FD open for the command and holds no WAL lock."
 (defun wal-archive-done-text (name facts)
   (format nil "WAL-ARCHIVE ~a~{ ~d~}~%" name (subseq facts 0 8)))
 
-(defun wal-archive-done-matches-p (wal-fd status-fd name source-fd)
+(defun wal-archive-done-matches-p (wal-fd status-fd name source-fd &key (sync t))
   "Check the exact completion receipt for the held source and sync the receipt and directory.
 Recheck the named receipt and source before returning true."
   (let* ((flags (logior sb-posix:o-rdonly sb-posix:o-nonblock
@@ -4233,8 +4233,9 @@ Recheck the named receipt and source before returning true."
              (let ((bytes (make-array (length expected) :element-type '(unsigned-byte 8))))
                (when (and (= (length bytes) (read-sequence bytes stream))
                           (equalp expected bytes))
-                 (sb-posix:fsync fd)
-                 (sb-posix:fsync status-fd)
+                 (when sync
+                   (sb-posix:fsync fd)
+                   (sb-posix:fsync status-fd))
                  (and (equal facts (physical-image-file-facts status-fd marker))
                       (equal source (wal-archive-check-source wal-fd name source-fd)))))))
       (if stream (close stream) (sb-posix:close fd)))))
@@ -4296,7 +4297,16 @@ Keep the descriptors open through unlink and sync the WAL directory."
         (cond (stream (close stream :abort t))
               (fd (sb-posix:close fd)))))))
 
-(defun wal-archive-attempt (segment template)
+(defun wal-archive-primary-ready-p ()
+  "Check whether the primary WAL state permits archiver work."
+  (and *wal-ready*
+       (not *wal-poisoned*)
+       (not (recovery-in-progress-p))
+       (not *physical-promotion-stopping-p*)
+       (member (getf *wal-control-metadata* :db-state)
+               (list +db-in-production+ +db-shutdowning+ +db-shutdowned+))))
+
+(defun wal-archive-attempt (segment template &key epoch)
   "Archive one durable segment with the command outside the WAL lock.
 Keep the source and directory descriptors open through the command, recheck them
 under the lock, and publish completion only after success."
@@ -4309,6 +4319,11 @@ under the lock, and publish completion only after success."
            (progn
              (sb-thread:with-mutex (*wal-lock*)
                (unless (and (startup-primary-wal-archive-enabled-p)
+                            (or (null epoch)
+                                (and (eq (first epoch) *wal-storage-incarnation*)
+                                     (eql (second epoch) *wal-insert-timeline*)
+                                     (eq (third epoch) *wal-segment-namespace*)
+                                     (wal-archive-primary-ready-p)))
                             (wal-archive-ready-segment-p segment))
                  (return-from wal-archive-attempt nil))
                (setf incarnation *wal-storage-incarnation*
@@ -4319,10 +4334,11 @@ under the lock, and publish completion only after success."
                (wal-archive-check-wal-directory wal-fd)
                (wal-archive-check-status-directory wal-fd status-fd)
                (setf facts (wal-archive-check-source wal-fd name source-fd)))
-             ;; The shell uses the held source descriptor until it exits.
-             (when (wal-archive-run-shell template name source-fd directory)
+             ;; Keep the WAL directory descriptor open for the shell's source path.
+             (when (wal-archive-run-shell template name wal-fd directory)
                (sb-thread:with-mutex (*wal-lock*)
-                 (unless (and (eq incarnation *wal-storage-incarnation*)
+                 (unless (and (or (null epoch) (wal-archive-primary-ready-p))
+                              (eq incarnation *wal-storage-incarnation*)
                               (string= name (wal-segment-filename
                                              segment *wal-insert-timeline* *wal-segment-namespace*))
                               (wal-archive-ready-segment-p segment)
@@ -4363,6 +4379,94 @@ Exclude the open output segment and sync the status directory."
   (handler-case (wal-archive-reconcile-ready-under-lock)
     (error (condition)
       (warn "WAL archive notification failed: ~a" condition)))
+  (values))
+
+(declaim (ftype function startup-archive-command))
+
+(defvar *wal-archiver-thread* nil)
+
+(defvar *wal-archiver-stop* nil)
+
+(defun wal-archive-pending-segment-under-lock ()
+  "Find a completed segment without a matching receipt under the WAL lock.
+Ensure its ready marker is durable and return the segment and storage epoch."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (wal-archive-primary-ready-p)
+    (let ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments)))
+          (wal-fd nil) (status-fd nil))
+      (when segments
+        (wal-ensure-directory-durable (merge-pathnames "archive_status/" (wal-directory)))
+        (sb-sys:without-interrupts
+          (unwind-protect
+               (progn
+                 (setf wal-fd (wal-archive-open-wal-directory)
+                       status-fd (wal-archive-open-status-directory wal-fd))
+                 (wal-archive-check-wal-directory wal-fd)
+                 (wal-archive-check-status-directory wal-fd status-fd)
+                 (dolist (segment segments)
+                   (let* ((name (file-namestring (wal-segment-path segment)))
+                          (fd (wal-archive-open-source wal-fd name)))
+                     (unwind-protect
+                          (unless (wal-archive-done-matches-p wal-fd status-fd name fd :sync nil)
+                            (wal-archive-create-ready status-fd segment)
+                            (sb-posix:fsync status-fd)
+                            (return-from wal-archive-pending-segment-under-lock
+                              (values segment (list *wal-storage-incarnation*
+                                                    *wal-insert-timeline*
+                                                    *wal-segment-namespace*))))
+                       (sb-posix:close fd)))))
+            (unwind-protect
+                 (when status-fd (sb-posix:close status-fd))
+              (when wal-fd (sb-posix:close wal-fd)))))))))
+
+(defun wal-archiver-step ()
+  (let ((template (startup-archive-command)))
+    (when (and template (plusp (length template)))
+      (multiple-value-bind (segment epoch)
+          (sb-thread:with-mutex (*wal-lock*)
+            (wal-archive-pending-segment-under-lock))
+        (when segment
+          (if (wal-archive-attempt segment template :epoch epoch)
+              t
+              (progn
+                (warn "archive_command failed for WAL segment ~d; will retry" segment)
+                nil)))))))
+
+(defun wal-archiver-try-step ()
+  (handler-case (wal-archiver-step)
+    (error (condition)
+      (warn "WAL archiver will retry: ~a" condition)
+      nil)))
+
+(defun start-wal-archiver ()
+  "Start the archiver when enabled. Retry pending work and drain it on shutdown."
+  (when (startup-primary-wal-archive-enabled-p)
+    (when *wal-archiver-thread* (error "WAL archiver has already started"))
+    (let ((stop (sb-thread:make-semaphore))
+          (directory *pgdata*))
+      (setf *wal-archiver-stop* stop
+            *wal-archiver-thread*
+            (sb-thread:make-thread
+             (lambda ()
+               (let ((*pgdata* directory))
+                 (loop
+                   for archived = (wal-archiver-try-step)
+                   until (if archived
+                             (sb-thread:try-semaphore stop)
+                             (sb-thread:wait-on-semaphore stop :timeout 1)))
+                 ;; The shutdown checkpoint may have made another segment ready.
+                 (loop while (wal-archiver-try-step))))
+             :name "pg WAL archiver"))))
+  (values))
+
+(defun stop-wal-archiver ()
+  "Signal the archiver and wait for its final drain, with a bounded join."
+  (when *wal-archiver-thread*
+    (sb-thread:signal-semaphore *wal-archiver-stop*)
+    (when (eq :timeout (sb-thread:join-thread *wal-archiver-thread*
+                                              :timeout 10 :default :timeout))
+      (error "WAL archiver did not stop within 10 seconds"))
+    (setf *wal-archiver-thread* nil *wal-archiver-stop* nil))
   (values))
 
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn &optional (current *wal-durable-lsn*))

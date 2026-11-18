@@ -94,7 +94,7 @@
          (ok (uiop:string-prefix-p (format nil "WAL-ARCHIVE ~a " name)
                                    (uiop:read-file-line done)))
          (ok (signals (pg::wal-archive-attempt
-                       1 "mv -- \"pg_wal/%f\" moved-wal && cp -- \"%p\" \"pg_wal/%f\"")
+                       1 "mv -- \"pg_wal/%f\" moved-wal && cp -- moved-wal \"pg_wal/%f\"")
                       'error))
          (ok (not (probe-file changed)))))))
 
@@ -130,6 +130,36 @@
          (pg::with-wal-critical
            (pg::wal-remove-checkpointed-segments-under-wal-lock checkpoint))
          (ok (equal '(2 3) (pg::wal-discover-segments)))))))
+
+(deftest primary-archiver-retries-and-skips-completed-segments
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-ready* t)
+              (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (name (file-namestring (pg::wal-segment-path 0)))
+              (command "test -f archive-enabled && cp -a -- \"%p\" \"archived-%f\"")
+              (archived (merge-pathnames (concatenate 'string "archived-" name) pg::*pgdata*)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on"
+               (getf (gethash "archive_command" settings) :value) command)
+         (handler-bind ((warning #'muffle-warning))
+           (ok (not (pg::wal-archiver-step))))
+         (ok (not (probe-file archived)))
+         (with-open-file (stream (merge-pathnames "archive-enabled" pg::*pgdata*)
+                                 :direction :output)
+           (write-line "enabled" stream))
+         (ok (pg::wal-archiver-step))
+         (ok (sb-posix:s-isreg (sb-posix:stat-mode (pg::query-temp-lstat archived))))
+         (with-open-file (stream archived :element-type '(unsigned-byte 8))
+           (ok (= 0 (read-byte stream)))
+           (ok (eq :eof (read-byte stream nil :eof))))
+         (delete-file archived)
+         (ok (pg::wal-archiver-step))
+         (ok (not (probe-file archived)))
+         (ok (probe-file
+              (merge-pathnames (concatenate 'string "archived-"
+                                            (file-namestring (pg::wal-segment-path 1)))
+                               pg::*pgdata*)))))))
 
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
