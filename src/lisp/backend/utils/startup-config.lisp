@@ -403,6 +403,8 @@ to replica. Feature admission separately rejects minimal."
           ((member value '("archive" "hot_standby") :test #'string=) "replica")
           (t (error "invalid value for configuration parameter wal_level: ~s" text)))))
 
+(defvar *startup-rewind-restore-command-p* nil)
+
 (defun startup-normalize-setting (name input)
   "Normalize a startup setting from text or literal octets.
 For cluster_name, postmaster SQL_ASCII clips 63 raw bytes before ASCII cleaning,
@@ -432,7 +434,8 @@ original spelling. Synchronous commit values use the session normalizer."
         (:standby-names (parse-sync-standby-names text) text)
         (:synchronous-commit (session-normalize-synchronous-commit text))
         (:string
-         (when (and (string= name "restore_command") (not (equal text "")))
+         (when (and (string= name "restore_command") (not (equal text ""))
+                    (not *startup-rewind-restore-command-p*))
            (error "nonempty restore_command requires unimplemented archive recovery"))
          (unless (or (member name '("restore_command" "hba_file" "ident_file") :test #'string=)
                      (member name *startup-recovery-target-settings* :test #'string=)
@@ -1234,7 +1237,8 @@ installing settings, taking PGDATA ownership or starting listeners."
   (multiple-value-bind (native overrides) (startup-cli-inputs argv)
     (let ((name (gethash "config-output" native)))
       (when name
-        (let* ((settings (startup-load-settings native overrides))
+        (let* ((*startup-rewind-restore-command-p* t)
+               (settings (startup-load-settings native overrides))
                (entry (gethash (string-downcase name) settings)))
           (unless (uiop:directory-exists-p (startup-setting-value settings "data_directory"))
             (error "configuration output requires an existing data directory"))

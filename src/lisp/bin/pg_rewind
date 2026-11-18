@@ -5,7 +5,9 @@ case "${1:-}" in
     --help|'-?')
         printf '%s\n' 'usage: pg_rewind -D DIR --source-server CONNINFO' \
             '       pg_rewind -D DIR --resume  Continue from a saved install or follow journal' \
-            '       pg_rewind -D DIR --finish  Finish configuration handoff after retirement'
+            '       pg_rewind -D DIR --finish  Finish configuration handoff after retirement' \
+            '       -c, --restore-target-wal  Retrieve missing target WAL using restore_command' \
+            '       --config-file PATH        Read restore_command from this target configuration'
         exit 0 ;;
 esac
 UTILITY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

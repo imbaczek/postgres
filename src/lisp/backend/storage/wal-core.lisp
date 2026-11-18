@@ -696,6 +696,20 @@ Legacy 16-hex segment names always belong to timeline 1."
                                    (namespace *wal-segment-namespace*))
   (merge-pathnames (wal-segment-filename segment timeline namespace) (wal-directory)))
 
+(defvar *wal-offline-segment-fallback* nil)
+
+(defun wal-read-segment-path (segment &optional (timeline *wal-insert-timeline*)
+                                        (namespace *wal-segment-namespace*))
+  (let ((path (wal-segment-path segment timeline namespace)))
+    (if (and *wal-offline-segment-fallback* (not *physical-image-context*)
+             (handler-case (progn (sb-posix:lstat (namestring path)) nil)
+               (sb-posix:syscall-error (condition)
+                 (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+                     t
+                     (error condition)))))
+        (or (funcall *wal-offline-segment-fallback* path) path)
+        path)))
+
 (defun wal-control-path ()
   (pgdata-resolve-path "global/pg_wal_control" *pgdata*))
 

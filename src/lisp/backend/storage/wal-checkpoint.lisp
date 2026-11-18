@@ -294,7 +294,7 @@ Boolean fact is false."
                (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+)))
     (error "invalid checkpoint record coordinates"))
   (let ((bytes (make-array (- end start) :element-type '(unsigned-byte 8)))
-        (path (wal-segment-path (floor start +wal-segment-size+))))
+        (path (wal-read-segment-path (floor start +wal-segment-size+))))
     (flet ((read-exact (stream)
              (unless (and (file-position stream (mod start +wal-segment-size+))
                           (= (read-sequence bytes stream) (length bytes)))

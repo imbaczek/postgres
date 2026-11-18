@@ -26,7 +26,7 @@
 (defun wal-lineage-open-segment (segment history previous-file-timeline namespace)
   "Open the first C-ordered candidate; only ENOENT permits an older candidate."
   (dolist (timeline (timeline-segment-candidates segment history previous-file-timeline))
-    (let* ((path (wal-segment-path segment timeline namespace))
+    (let* ((path (wal-read-segment-path segment timeline namespace))
            (fd (handler-case
                    (sb-posix:open (namestring path)
                                   (logior sb-posix:o-rdonly sb-posix:o-nonblock

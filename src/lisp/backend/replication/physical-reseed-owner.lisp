@@ -162,3 +162,99 @@ A reseed owner must hold a stopped target with no PID file."
 
 (defun physical-rewind-inspect-primary (owner)
   (physical-inspect-clean-primary owner #'physical-rewind-check-reader))
+
+(defun physical-rewind-restore-command (template filename output)
+  (with-output-to-string (command)
+    (loop for offset from 0 below (length template)
+          for character = (char template offset)
+          do (if (char/= character #\%)
+                 (write-char character command)
+                 (progn
+                   (incf offset)
+                   (when (= offset (length template))
+                     (error "incomplete rewind restore_command placeholder"))
+                   (case (char template offset)
+                     (#\% (write-char #\% command))
+                     (#\f (write-string filename command))
+                     (#\p (write-string output command))
+                     (otherwise (error "unsupported rewind restore_command placeholder"))))))))
+
+(defun physical-rewind-check-archived-segment (directory-fd filename)
+  (let ((facts (physical-image-file-facts directory-fd filename)))
+    (unless (and (= sb-posix:s-ifreg (logand (third facts) sb-posix:s-ifmt))
+                 (= 1 (fourth facts))
+                 (= (sb-posix:geteuid) (fifth facts))
+                 (<= 1 (sixth facts) +wal-segment-size+)
+                 (= (ninth facts) (ninth (physical-image-file-facts directory-fd))))
+      (error "invalid archived native WAL segment"))
+    facts))
+
+(defun call-with-physical-rewind-wal-archive (owner template function)
+  (physical-rewind-check-reader owner)
+  (let* ((target (physical-adoption-owner-directory owner))
+         (parent (uiop:pathname-parent-directory-pathname target))
+         (wal-directory (merge-pathnames "pg_wal/" target))
+         (cache (make-hash-table :test #'equal))
+         (directory nil) (directory-fd nil) (parent-fd nil) (facts nil))
+    (labels ((ensure-directory ()
+               (unless directory
+                 (sb-sys:without-interrupts
+                   (setf parent-fd (physical-backup-open-directory parent)
+                         directory (uiop:ensure-directory-pathname
+                                    (sb-posix:mkdtemp (namestring
+                                                       (merge-pathnames ".pg-rewind-wal.XXXXXX"
+                                                                        (physical-image-fd-path parent-fd)))))
+                         directory-fd (physical-backup-open-directory directory)
+                         facts (physical-image-file-facts directory-fd)))))
+             (check-directory (leaf)
+               (let ((named (physical-image-file-facts parent-fd leaf)))
+                 (unless (and (equal (subseq facts 0 3) (subseq named 0 3))
+                              (= (fifth facts) (fifth named)) (= (ninth facts) (ninth named)))
+                   (error "rewind archive directory was replaced"))))
+             (restore (path)
+               (unless (equal wal-directory (uiop:pathname-directory-pathname path))
+                 (return-from restore nil))
+               (physical-rewind-check-reader owner)
+               (ensure-directory)
+               (let* ((name (file-namestring path))
+                      (leaf (car (last (pathname-directory directory))))
+                      (output (merge-pathnames name (physical-image-fd-path directory-fd))))
+                 (multiple-value-bind (saved found) (gethash name cache)
+                   (when found
+                     (when saved
+                       (unless (equal saved (physical-rewind-check-archived-segment directory-fd name))
+                         (error "archived WAL segment changed during rewind"))
+                       (return-from restore output))
+                     (return-from restore nil)))
+                 (check-directory leaf)
+                 (when (query-temp-lstat output)
+                   (error "rewind archive output already exists"))
+                 (let ((command (physical-rewind-restore-command
+                                 template name
+                                 (format nil "/proc/~d/fd/~d/~a" (sb-posix:getpid) directory-fd name))))
+                   (multiple-value-bind (out err status)
+                       (uiop:run-program (list "/bin/sh" "-c" command)
+                                         :output nil :error-output nil
+                                         :ignore-error-status t)
+                     (declare (ignore out err))
+                     (physical-rewind-check-reader owner)
+                     (check-directory leaf)
+                     (cond ((zerop status)
+                            (if (query-temp-lstat output)
+                                (progn
+                                  (setf (gethash name cache)
+                                        (physical-rewind-check-archived-segment directory-fd name))
+                                  output)
+                                (setf (gethash name cache) nil)))
+                           ((>= status 126) (error "rewind restore_command could not run"))
+                           (t (setf (gethash name cache) nil))))))))
+      (unwind-protect
+           (let ((*wal-offline-segment-fallback* #'restore))
+             (funcall function owner))
+        (unwind-protect
+             (when facts
+               (physical-backup-remove-stage-tree
+                parent-fd (car (last (pathname-directory directory)))
+                :mount (ninth facts) :expected facts))
+          (when directory-fd (sb-posix:close directory-fd))
+          (when parent-fd (sb-posix:close parent-fd)))))))
