@@ -4131,19 +4131,29 @@ release their claims to the retained WAL."
 
 (declaim (ftype function timeline-archive-history-items))
 
+(declaim (ftype function timeline-archive-partial-coordinates
+                wal-archive-promotion-partial-name wal-archive-partial-items
+                wal-archive-partial-matches-p))
+
+(defun wal-archive-partial-item-p (item)
+  (and (consp item) (eq (car item) :partial)))
+
 (defun wal-archive-item-name (item)
-  "Name the current committed timeline's history or a segment in its namespace."
-  (if (consp item)
-      (timeline-history-filename (cdr item))
-      (wal-segment-filename item *wal-insert-timeline* *wal-segment-namespace*)))
+  "Name a selected history, partial, or current timeline segment."
+  (cond ((wal-archive-partial-item-p item) (second item))
+        ((consp item) (timeline-history-filename (cdr item)))
+        (t (wal-segment-filename item *wal-insert-timeline* *wal-segment-namespace*))))
 
 (defun wal-archive-item-ready-p (item)
-  "Admit current child timeline history when the primary is ready.
+  "Admit selected committed histories and partials when the primary is ready.
 Apply the durable, closed segment checks to WAL segments."
-  (if (consp item)
-      (and (wal-archive-primary-ready-p)
-           (member item (wal-archive-history-items) :test #'equal))
-      (wal-archive-ready-segment-p item)))
+  (cond ((wal-archive-partial-item-p item)
+         (and (wal-archive-primary-ready-p)
+              (member item (wal-archive-partial-items) :test #'equal)))
+        ((consp item)
+         (and (wal-archive-primary-ready-p)
+              (member item (wal-archive-history-items) :test #'equal)))
+        (t (wal-archive-ready-segment-p item))))
 
 (defun wal-archive-create-ready (directory-fd item)
   "Create or validate an empty regular ready marker and sync it.
@@ -4238,6 +4248,46 @@ When SOURCE-NAME is selected, require its facts to match the held archive source
                       (error "WAL archive history changed before command: ~a" source-name))
                     bytes))))
           (sb-posix:close wal-fd))))))
+
+(defun wal-archive-partial-items ()
+  "Select existing partial files at durable forks in the committed history.
+Skip absent files and files with unsuitable type or length."
+  (when (> *wal-insert-timeline* 1)
+    (sb-sys:without-interrupts
+      (let ((wal-fd (wal-archive-open-wal-directory)))
+        (unwind-protect
+             (progn
+               (wal-archive-check-wal-directory wal-fd)
+               (loop for (parent child fork) in
+                                             (timeline-archive-partial-coordinates
+                                              *wal-insert-timeline*
+                                              (wal-archive-read-source-bytes
+                                               wal-fd (timeline-history-filename *wal-insert-timeline*)))
+                     for (segment offset) = (multiple-value-list (wal-segment-and-offset fork))
+                     when (and (plusp offset) (<= fork *wal-durable-lsn*))
+                       append (loop for namespace in (if (= parent 1) '(:timeline :legacy) '(:timeline))
+                                    for name = (wal-archive-promotion-partial-name parent fork namespace)
+                                    for stat = (query-temp-lstat (merge-pathnames name (wal-directory)))
+                                    when (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                                              (= offset (sb-posix:stat-size stat)))
+                                      collect (list :partial name
+                                                    (wal-segment-filename segment child :timeline)
+                                                    offset))))
+          (sb-posix:close wal-fd))))))
+
+(defun wal-archive-partial-matches-p (wal-fd item &optional source-facts)
+  "Check that the partial matches the child segment prefix and any held source facts.
+Return NIL when either file cannot be safely checked."
+  (destructuring-bind (kind name child length) item
+    (declare (ignore kind))
+    (handler-case
+        (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd name)
+          (and (= (length bytes) length)
+               (or (null source-facts) (equal source-facts facts))
+               (let ((child-bytes (wal-archive-read-source-bytes wal-fd child)))
+                 (and (<= length (length child-bytes))
+                      (null (mismatch bytes child-bytes :end2 length))))))
+      (error () nil))))
 
 (defun wal-archive-check-status-directory (wal-fd status-fd)
   (let ((facts (physical-image-file-facts status-fd)))
@@ -4393,9 +4443,13 @@ under the lock, and publish completion only after success."
                (wal-archive-check-wal-directory wal-fd)
                (wal-archive-check-status-directory wal-fd status-fd)
                (setf facts (wal-archive-check-source wal-fd name source-fd))
-               (when (consp item)
-                 (unless (member item (wal-archive-history-items name facts) :test #'equal)
-                   (return-from wal-archive-attempt nil))))
+               (cond ((wal-archive-partial-item-p item)
+                      (unless (and (wal-archive-item-ready-p item)
+                                   (wal-archive-partial-matches-p wal-fd item facts))
+                        (return-from wal-archive-attempt nil)))
+                     ((consp item)
+                      (unless (member item (wal-archive-history-items name facts) :test #'equal)
+                        (return-from wal-archive-attempt nil)))))
              ;; Keep the WAL directory descriptor open for the shell's source path.
              (when (wal-archive-run-shell template name wal-fd directory)
                (sb-thread:with-mutex (*wal-lock*)
@@ -4403,6 +4457,8 @@ under the lock, and publish completion only after success."
                               (eq incarnation *wal-storage-incarnation*)
                               (string= name (wal-archive-item-name item))
                               (wal-archive-item-ready-p item)
+                              (or (not (wal-archive-partial-item-p item))
+                                  (wal-archive-partial-matches-p wal-fd item facts))
                               (equal facts (wal-archive-check-source wal-fd name source-fd)))
                    (error "WAL archive source changed during command: ~a" name))
                  (wal-archive-check-wal-directory wal-fd)
@@ -4448,12 +4504,27 @@ Exclude the open output segment and sync the status directory."
 
 (defvar *wal-archiver-stop* nil)
 
+(defun wal-archive-item-pending-p (wal-fd status-fd item)
+  "Check for a matching receipt and create a ready marker for pending work.
+Skip an optional partial when it cannot be checked or does not match."
+  (let ((partial (wal-archive-partial-item-p item)))
+    (flet ((pending ()
+             (let* ((name (wal-archive-item-name item))
+                    (fd (wal-archive-open-source wal-fd name)))
+               (unwind-protect
+                    (and (not (wal-archive-done-matches-p wal-fd status-fd name fd :sync nil))
+                         (or (not partial) (wal-archive-partial-matches-p wal-fd item))
+                         (progn (wal-archive-create-ready status-fd item) t))
+                 (sb-posix:close fd)))))
+      (if partial (handler-case (pending) (error () nil)) (pending)))))
+
 (defun wal-archive-pending-item-under-lock ()
   "Find pending history or a completed segment under the WAL lock.
 Ensure its ready marker is durable and return the item and storage epoch."
   (assert (sb-thread:holding-mutex-p *wal-lock*))
   (when (wal-archive-primary-ready-p)
     (let ((items (append (wal-archive-history-items)
+                         (wal-archive-partial-items)
                          (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments))))
           (wal-fd nil) (status-fd nil))
       (when items
@@ -4466,17 +4537,12 @@ Ensure its ready marker is durable and return the item and storage epoch."
                  (wal-archive-check-wal-directory wal-fd)
                  (wal-archive-check-status-directory wal-fd status-fd)
                  (dolist (item items)
-                   (let* ((name (wal-archive-item-name item))
-                          (fd (wal-archive-open-source wal-fd name)))
-                     (unwind-protect
-                          (unless (wal-archive-done-matches-p wal-fd status-fd name fd :sync nil)
-                            (wal-archive-create-ready status-fd item)
-                            (sb-posix:fsync status-fd)
-                            (return-from wal-archive-pending-item-under-lock
-                              (values item (list *wal-storage-incarnation*
-                                                 *wal-insert-timeline*
-                                                 *wal-segment-namespace*))))
-                       (sb-posix:close fd)))))
+                   (when (wal-archive-item-pending-p wal-fd status-fd item)
+                     (sb-posix:fsync status-fd)
+                     (return-from wal-archive-pending-item-under-lock
+                       (values item (list *wal-storage-incarnation*
+                                          *wal-insert-timeline*
+                                          *wal-segment-namespace*))))))
             (unwind-protect
                  (when status-fd (sb-posix:close status-fd))
               (when wal-fd (sb-posix:close wal-fd)))))))))

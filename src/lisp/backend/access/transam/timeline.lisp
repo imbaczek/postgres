@@ -255,6 +255,16 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   (if (= timeline 1) (timeline-parse-history 1 "")
       (timeline-parse-history timeline (bytes->string (timeline-history-bytes timeline directory)))))
 
+(defun timeline-archive-partial-coordinates (current bytes)
+  "Validate committed history and return its parent, child, and fork coordinates."
+  (let ((lineage (timeline-check-lineage
+                  (timeline-parse-history current (bytes->string bytes)))))
+    (loop for (child parent) on lineage
+          while parent
+          collect (list (timeline-history-entry-timeline parent)
+                        (timeline-history-entry-timeline child)
+                        (timeline-history-entry-begin child)))))
+
 (defun timeline-archive-history-items (current read-history)
   "Return the committed history followed by eligible ancestor histories.
 Include an ancestor only when its bytes are an exact prefix of the current history

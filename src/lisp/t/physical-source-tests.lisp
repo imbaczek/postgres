@@ -233,6 +233,46 @@
          (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy) 'error))
          (ok (equalp prefix (pg::read-bounded-regular-file path 5)))))))
 
+(deftest primary-archiver-requires-partial-to-match-committed-child
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((pg::*wal-ready* t)
+              (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
+              (pg::*wal-insert-timeline* 2)
+              (pg::*wal-segment-namespace* :timeline)
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (prefix (make-array 5 :element-type '(unsigned-byte 8) :initial-element 7))
+              (name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy))
+              (target (merge-pathnames (concatenate 'string "archive-" name) pg::*pgdata*)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on"
+               (getf (gethash "archive_command" settings) :value) "cp -a -- \"%p\" \"archive-%f\"")
+         (pg::timeline-write-history 2 1 5 "committed child")
+         (with-open-file (stream (pg::wal-segment-path 0) :direction :output
+                                                          :element-type '(unsigned-byte 8))
+           (write-sequence prefix stream)
+           (write-byte 9 stream))
+         (ok (pg::wal-archiver-step))
+         (ok (not (probe-file target)))
+         (let ((pg::*wal-durable-lsn* 6))
+           (with-open-file (stream (merge-pathnames name (pg::wal-directory))
+                                   :direction :io :if-exists :overwrite
+                                   :element-type '(unsigned-byte 8))
+             (write-byte 8 stream))
+           (ok (not (pg::wal-archiver-step)))
+           (with-open-file (stream (merge-pathnames name (pg::wal-directory))
+                                   :direction :io :if-exists :overwrite
+                                   :element-type '(unsigned-byte 8))
+             (write-byte 7 stream))
+           (ok (pg::wal-archiver-step))
+           (ok (equalp prefix (pg::read-bounded-regular-file target 5)))
+           (sb-posix:link (namestring (merge-pathnames name (pg::wal-directory)))
+                          (namestring (merge-pathnames "unsafe-partial" pg::*pgdata*)))
+           (ok (not (pg::wal-archiver-step))))
+         (ok (pg::wal-archiver-step))
+         (ok (probe-file (merge-pathnames
+                          (concatenate 'string "archive-" (file-namestring (pg::wal-segment-path 0)))
+                          pg::*pgdata*)))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()
