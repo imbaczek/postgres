@@ -5185,11 +5185,21 @@ Once the allocator reaches the boundary, reports can clear a horizon or advance
 it into the new epoch. An old pin can keep writes stopped until feedback is
 cleared, its sender disconnects if slotless, or its slot is dropped.
 
-A preexisting wrap marker with an older pin stops startup rather than assuming
-the interrupted wrap left old transaction status intact. Replay of reset records
-written by older builds still needs separate qualification. Four focused Rove
+A preexisting wrap marker with an older pin stops startup. Four focused Rove
 tests passed in 36 ms, covering a blocked wrap, marker conflict, completion
 after release, and feedback at the end of the FullXID range.
+
+Cold primary startup also checks restored slot horizons after WAL redo and
+before admitting clients. A replayed reset establishes the CLOG boundary,
+and a next XID past the start of an epoch proves that epoch has begun. An
+old checkpoint taken exactly at the first XID of an epoch can hide the reset
+record. In that case startup can reject feedback from earlier epochs but
+cannot distinguish an already-reset previous epoch from one waiting to wrap.
+The preceding epoch's pin still defers a fresh reset.
+
+The live CLOG fail-stop regression passed in 23.73 s on the ramdisk, including
+a crash after durable reset WAL and before CLOG replacement. Focused Rove
+tests separately covered the replayed boundary and startup's slot checks.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
