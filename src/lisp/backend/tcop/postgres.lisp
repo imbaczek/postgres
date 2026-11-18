@@ -934,6 +934,8 @@ Hold the drained admission gate and borrow the real postmaster ownership."
         (wal-init)
         (xact-init)
         (wal-recover)
+        (when (startup-primary-wal-archive-enabled-p)
+          (with-wal-critical (wal-archive-try-reconcile-ready-under-lock)))
         (note-primary-startup-replay)
         ;; Replay can change the state checked above.  Check again before
         ;; restoring slots, which can also remove temporary slot files.

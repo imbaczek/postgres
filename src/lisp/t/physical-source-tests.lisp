@@ -31,6 +31,40 @@
           (pg::fsync-stream stream)))
       (funcall function))))
 
+(deftest primary-archive-ready-follows-control-and-fences-recycling
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((directory (merge-pathnames "archive_status/" (pg::wal-directory)))
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (ready (loop for segment below 4
+                           collect (merge-pathnames
+                                    (concatenate 'string
+                                                 (file-namestring (pg::wal-segment-path segment))
+                                                 ".ready")
+                                    directory))))
+         (setf (getf (gethash "archive_mode" settings) :value) "on")
+         (pg::with-wal-critical
+           (let ((pg::*wal-durable-lsn* (* 2 pg::+wal-segment-size+))
+                 (pg::*wal-output-stream* t)
+                 (pg::*wal-output-segment* 1))
+             (pg::wal-archive-reconcile-ready-under-lock)
+             (ok (probe-file (first ready)))
+             (ok (null (some #'probe-file (rest ready)))))
+           (let ((pg::*wal-durable-lsn* 0))
+             (ok (not (pg::wal-archive-ready-segment-p 1))))
+           (delete-file (first ready))
+           (let ((pg::*wal-shutdown-defer-recycling* t))
+             (pg::wal-remove-checkpointed-segments-under-wal-lock pg::*wal-checkpoint-lsn*))
+           (ok (probe-file (first ready)))
+           (pg::wal-archive-reconcile-ready-under-lock)
+           (ok (every #'probe-file (subseq ready 0 3)))
+           (ok (not (probe-file (fourth ready))))
+           (with-open-file (stream (make-pathname :type "done" :defaults (first ready))
+                                   :direction :output :if-does-not-exist :create)
+             (write-line "unverified" stream))
+           (pg::wal-remove-checkpointed-segments-under-wal-lock pg::*wal-checkpoint-lsn*)
+           (ok (equal '(0 1 2 3) (pg::wal-discover-segments))))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()

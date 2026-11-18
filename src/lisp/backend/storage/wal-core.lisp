@@ -4112,12 +4112,78 @@ release their claims to the retained WAL."
   "Return the segment containing the checkpoint's last byte; zero for LSN zero."
   (if (zerop checkpoint-lsn) 0 (floor (1- checkpoint-lsn) +wal-segment-size+)))
 
+(declaim (ftype function startup-primary-wal-archive-enabled-p query-temp-lstat))
+
+(declaim (ftype function query-temp-open-directory query-temp-fd-child-path))
+
+(defun wal-archive-ready-segment-p (segment)
+  "Check the durable frontier and exclude the open WAL output."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (and (not *wal-poisoned*)
+       (< segment (floor *wal-durable-lsn* +wal-segment-size+))
+       (not (and *wal-output-stream* (eql segment *wal-output-segment*)))
+       (let ((stat (query-temp-lstat (wal-segment-path segment))))
+         (and stat
+              (= sb-posix:s-ifreg (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
+              (<= 1 (sb-posix:stat-size stat) +wal-segment-size+)))))
+
+(defun wal-archive-create-ready (directory-fd segment)
+  "Create or validate an empty regular ready marker and sync it.
+The caller holds the WAL lock and syncs the status directory."
+  (let* ((filename (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*))
+         (marker (query-temp-fd-child-path directory-fd (concatenate 'string filename ".ready")))
+         (flags (logior sb-posix:o-wronly sb-posix:o-creat
+                        sb-posix:o-nofollow sb-posix:o-nonblock)))
+    (sb-sys:without-interrupts
+      (let ((fd (sb-posix:open marker flags #o600)))
+        (unwind-protect
+             (let ((stat (sb-posix:fstat fd)))
+               (unless (and (= sb-posix:s-ifreg
+                               (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt))
+                            (= 1 (sb-posix:stat-nlink stat))
+                            (zerop (sb-posix:stat-size stat)))
+                 (error "invalid WAL archive ready marker for ~a" filename))
+               (sb-posix:fsync fd))
+          (sb-posix:close fd))))))
+
+(defun wal-archive-reconcile-ready-under-lock ()
+  "Create ready markers for completed durable segments under the WAL lock.
+Exclude the open output segment and sync the status directory."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (and (startup-primary-wal-archive-enabled-p) (not *wal-poisoned*))
+    (let ((segments (remove-if-not #'wal-archive-ready-segment-p (wal-discover-segments))))
+      (when segments
+        (let ((directory (merge-pathnames "archive_status/" (wal-directory))))
+          (wal-ensure-directory-durable directory)
+          (sb-sys:without-interrupts
+            (let ((fd (or (query-temp-open-directory directory)
+                          (error "cannot open the WAL archive status directory"))))
+              (unwind-protect
+                   (sb-sys:with-local-interrupts
+                     (dolist (segment segments)
+                       (wal-archive-create-ready fd segment))
+                     (sb-posix:fsync fd))
+                (sb-posix:close fd))))))))
+  (values))
+
+(defun wal-archive-try-reconcile-ready-under-lock ()
+  "Report a failed archive notification without giving up WAL retention."
+  (handler-case (wal-archive-reconcile-ready-under-lock)
+    (error (condition)
+      (warn "WAL archive notification failed: ~a" condition)))
+  (values))
+
 (defun wal-remove-checkpointed-segments-under-wal-lock (checkpoint-lsn &optional (current *wal-durable-lsn*))
   "Plan and remove a contiguous WAL prefix under WAL exclusion.
 Active standard-policy owners defer removal in a process-local ticket; the caller
 retries outside locks after stopping them. Independent XID and snapshot floors
 also constrain removal. CURRENT freezes the endpoint across that retry, while
 each calculation captures the current retention settings."
+  ;; Publish ready markers before other recycling fences. Retain all WAL while
+  ;; archiving is enabled, including when marker creation fails.
+  (when (startup-primary-wal-archive-enabled-p)
+    (wal-archive-try-reconcile-ready-under-lock)
+    (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (when (logical-slot-continuation-gc-fenced-p *pgdata*)
     (return-from wal-remove-checkpointed-segments-under-wal-lock (values)))
   (when *wal-shutdown-defer-recycling*

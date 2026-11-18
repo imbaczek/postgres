@@ -63,6 +63,12 @@ A missing root is an error; there is no fallback to globals."
     (values (startup-configuration-slot-policy configuration)
             (startup-configuration-keep-mb configuration))))
 
+(defun startup-primary-wal-archive-enabled-p ()
+  (let ((configuration (startup-capture-configuration)))
+    (and configuration
+         (member (startup-setting-value (startup-configuration-settings configuration) "archive_mode")
+                 '("on" "always") :test #'equal))))
+
 (defun startup-wal-writer-settings ()
   "Read writer delay and flush threshold from one installed configuration root."
   (let ((settings (startup-configuration-settings (startup-require-configuration))))
