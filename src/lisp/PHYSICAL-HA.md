@@ -3,6 +3,39 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
+## Goal closeout check
+
+The goal covers native physical HA and the PostgreSQL backend behavior used
+by pinned Patroni 4.1.5. The test supplies the leader. Election, fencing,
+automatic failover, and blue-green orchestration are future work. Native
+physical WAL and storage use Lisp formats. The Lisp-to-C and C-to-Lisp
+writer switchovers use logical replication.
+
+Native tests exercise clone, continuous physical follow, restart, promotion,
+rewind, and former-primary rejoin. A separate crash fixture verifies
+synchronous durability from a client acknowledgment ledger. The stock Patroni
+lifecycle fixture drives clone through rejoin using a supplied leader. Stock
+Patroni monitoring, synchronous candidate selection, recovery configuration,
+and trust bootstrap also have direct acceptance tests.
+
+Three areas still separate this evidence from closeout:
+
+1. Connect native standby feedback to the primary's cleanup decisions.
+   Physical slot images can store separate data and catalog transaction
+   horizons. Receiving, enforcing, and reporting those horizons still need
+   live acceptance against the C fixture. Patroni's logical slot readiness
+   and slot copy path also need their own acceptance.
+2. Exercise password-backed bootstrap and post-bootstrap role provisioning
+   through stock Patroni.
+3. Qualify archive recovery with a configured streaming source across a
+   timeline fork, and settle archive backlog and cleanup behavior. State the
+   tested rewind topology and interruption limits in the supported lifecycle
+   contract.
+
+Close the goal against those backend cases and a rerun of the supplied-leader
+lifecycle. Record broader C behavior gaps separately so that the acceptance
+target stays tied to the tested HA workflow.
+
 ## Scope check after WAL namespace proof migration
 
 Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and
@@ -5097,6 +5130,10 @@ C computes the two horizons in `GetReplicationHorizons` and applies them in
 to assess slot readiness. Native slot reporting currently returns NULL for
 both horizons. Native feedback and support for Patroni's slot-copy path remain
 open.
+
+Six focused physical-slot tests passed in 36 ms of Rove execution, covering
+image round trips, checksum rejection, file dispatch, and startup. The full
+physical suite timed out at 180 s.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
