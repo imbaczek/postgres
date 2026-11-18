@@ -5064,11 +5064,21 @@ Grouped and window aggregates retain the JSON element type. C comparison
 tests cover compact and pretty output, empty sets and NULL arguments.
 Five focused spill tests and nine window tests passed.
 
+Pinned Patroni 4.1.5 `Postgresql.initdb` invokes standalone `initdb` directly.
+`Bootstrap.bootstrap` initializes PGDATA, writes managed configuration, and
+starts a primary under trust authentication for `postgres`.
+`t/interop/patroni-bootstrap.py` passed in 16.00 s on the ramdisk with absent
+and precreated empty PGDATA. It checks the clean control state and absence of
+a PID file before startup, then verifies the system identifier and a SQL
+write. Failure cases include reinitialization, a failed child process,
+symlink and nonempty targets, and unsupported host authentication. Native
+init builds a sibling directory and publishes it with an atomic rename.
+A precreated empty PGDATA receives a new directory inode.
+
 Distinct backend gaps remain:
 
-- Initial `Bootstrap.bootstrap` calls `pg_ctl initdb`, which the native
-  utility does not implement. Authentication and role provisioning also
-  require acceptance.
+- Password-backed `initdb` and `post_bootstrap` role provisioning still need
+  implementation and acceptance.
 - Patroni-managed logical-slot synchronization needs separate work and testing,
   including `hot_standby_feedback`, `pg_read_binary_file` and C slot files.
 - Stock `SyncHandler.current_state`, `ConfigHandler.set_synchronous_standby_names`
