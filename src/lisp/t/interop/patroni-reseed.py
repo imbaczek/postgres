@@ -620,13 +620,17 @@ class RewindCliAcceptance(RewindInstallAcceptance):
 class RewindArchiveCliAcceptance(RewindCliAcceptance):
     label = "rewind-cli-target-archive"
 
-    def execute_rewind(self, target, conninfo):
+    def prepare_target_archive(self, target):
         archive = target.parent / "target-archive"
         archive.mkdir(mode=0o700)
         files = list((target / "pg_wal").glob("*.wal"))
         assert files
         for path in files:
             path.rename(archive / path.name)
+        return archive, {path.name for path in files}
+
+    def execute_rewind(self, target, conninfo):
+        archive, removed = self.prepare_target_archive(target)
         archived = preserved_tree(archive)
         self.old_tree = preserved_tree(target)
         config = target.parent / "target-archive.conf"
@@ -664,10 +668,73 @@ class RewindArchiveCliAcceptance(RewindCliAcceptance):
             node.connection_pool.close()
         restored = trace.read_text().splitlines()
         assert restored and len(set(restored)) == len(restored)
-        assert set(restored) <= {path.name for path in files}
+        assert set(restored) <= removed
+        self.result["restored_target_wal"] = restored
         assert preserved_tree(archive) == archived
         assert not list(target.parent.glob(".pg-rewind-wal.*"))
         return output
+
+
+class RewindWorkerArchiveAcceptance(RewindArchiveCliAcceptance):
+    label = "rewind-worker-target-archive"
+
+    def prove_divergence(self):
+        self.archive = self.server.root / "worker-target-archive"
+        self.archive.mkdir(mode=0o700)
+        data = self.server.data
+        auto_conf = data / "postgresql.auto.conf"
+        old_config = auto_conf.read_bytes() if auto_conf.exists() else None
+        command = 'cp -a -- "%p" ' + shlex.quote(str(self.archive)) + '/"%f"'
+        try:
+            auto_conf.write_bytes((old_config or b"") + (
+                "\narchive_mode = on\narchive_command = '" + command.replace("'", "''") + "'\n").encode())
+            self.start()
+            follow.query(self.server.port, "INSERT INTO patroni_reseed_probe VALUES(999)")
+            follow.query(self.server.port, "CREATE TABLE archive_wal_padding(id integer)")
+            with closing(follow.psycopg2.connect(
+                    host="127.0.0.1", port=self.server.port, user="postgres",
+                    dbname="postgres", connect_timeout=2)) as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    for row in range(2200):
+                        cursor.execute("INSERT INTO archive_wal_padding VALUES (%s)", (row,))
+            divergent = identity(self.server.port)
+            assert lsn_number(divergent["position"]) >= 16 * 1024 * 1024
+            wal = data / "pg_wal"
+            name = "0000000000000000.wal"
+            receipt = wal / "archive_status" / (name + ".done")
+            follow.wait_for(receipt.is_file)
+            archived = self.archive / name
+            assert stat.S_ISREG(archived.lstat().st_mode)
+            assert archived.read_bytes() == (wal / name).read_bytes()
+            self.produced = {"name": name, "bytes": archived.stat().st_size,
+                             "sha256": hashlib.sha256(archived.read_bytes()).hexdigest()}
+            self.produced_receipt = receipt.read_text()
+            return divergent
+        finally:
+            try:
+                self.stop()
+            finally:
+                if old_config is None:
+                    auto_conf.unlink(missing_ok=True)
+                else:
+                    auto_conf.write_bytes(old_config)
+
+    def prepare_target_archive(self, target):
+        assert self.result["former_primary"]["fork_lsn"] < 16 * 1024 * 1024
+        name = self.produced["name"]
+        wal = target / "pg_wal"
+        receipt = wal / "archive_status" / (name + ".done")
+        assert receipt.read_text() == self.produced_receipt
+        archived = self.archive / name
+        assert hashlib.sha256(archived.read_bytes()).hexdigest() == self.produced["sha256"]
+        local = wal / name
+        if local.exists():
+            assert local.read_bytes() == archived.read_bytes()
+            local.unlink()
+        assert not local.exists()
+        self.result["worker_archive"] = self.produced
+        return self.archive, {name}
 
 
 class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
@@ -1068,6 +1135,7 @@ def main():
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,
                "rewind-cli-target-archive": RewindArchiveCliAcceptance,
+                "rewind-worker-target-archive": RewindWorkerArchiveAcceptance,
              "rewind-cli-capture-resume": RewindCaptureResumeCliAcceptance,
              "rewind-cli-first-capture": RewindFirstCaptureCliAcceptance,
                "rewind-cli-partial-capture": RewindPartialCaptureCliAcceptance,

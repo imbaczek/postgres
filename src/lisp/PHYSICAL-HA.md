@@ -61,9 +61,7 @@ Three items remain for backend closeout.
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
 2. Complete the server-side archive comparison against C. Add standby
-   `archive_mode=always`, use an archive produced by the worker for
-   stopped-target restore, and qualify archive retries across repeated
-   promotion.
+   `archive_mode=always` and qualify archive retries across repeated promotion.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -210,6 +208,15 @@ WAL archiving available. The live Patroni case recorded completion for the
 1,807,425-byte partial and compared the archived bytes against the local child
 prefix. The full-file archive name was absent. The run took 27.28 s. Strict
 compilation and eight focused heads took 63.22 s.
+
+The `rewind-worker-target-archive` case uses the native archiver on a divergent
+former primary to produce the WAL segment that contains the common fork.
+The fixture checks the worker's receipt and the archive bytes before stopping
+the target. It makes that segment unavailable locally and checks that rewind
+refuses both a missing archive and a truncated restore. Stock Patroni 4.1.5 then
+restores the worker-produced file exactly once, rewinds the target, and rejoins
+it to the promoted source. The 16,772,156-byte archive remains unchanged through
+rewind. The reviewed run took 235.59 s.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
