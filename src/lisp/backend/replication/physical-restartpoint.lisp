@@ -613,7 +613,7 @@ The configuration lock is released before inspecting the store."
          (startup-configuration-timeout configuration)
          (startup-configuration-wal-bytes configuration))))))
 
-(defun physical-recovery-restartpoint-core ()
+(defun physical-recovery-restartpoint-core (&key stage-archive)
   "Publish while admission pins replay, or while this thread owns quiescence.
 Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (unless (or (plusp *live-operation-depth*)
@@ -626,8 +626,13 @@ Never acquire the reload mutex here: a replayer may own it while draining SQL."
   (when *swank-listener-enabled-p* (error "restartpoint requires Swank to be off"))
   (let ((finished nil))
     (unwind-protect
-         (let ((lsn (physical-store-compact *physical-receive-store* *last-replay-lsn*
-                                            #'physical-restartpoint-publish)))
+         (let ((lsn (handler-case
+                        (physical-store-compact *physical-receive-store* *last-replay-lsn*
+                                                #'physical-restartpoint-publish :stage-archive stage-archive)
+                      (physical-archive-staging-error (condition)
+                        (unless (physical-store-failed-p *physical-receive-store*)
+                          (setf finished t))
+                        (error condition)))))
            (physical-restartpoint-remove-old-generations)
            (setf *physical-restartpoint-last-time* (get-internal-real-time)
                  finished t)
@@ -671,9 +676,15 @@ using a fresh configuration for that decision."
       (when (with-live-operation (physical-restartpoint-needed-p))
         (physical-recovery-restartpoint :automatic t))
     (error (condition)
-      (setf *physical-recovery-failed-p* t)
-      (admin-log "native standby restartpoint failed: ~a" condition)
-      :failed)))
+      (cond
+        ((and (typep condition 'physical-archive-staging-error)
+              (not *physical-recovery-failed-p*))
+         (admin-log "native standby restartpoint deferred: ~a" condition)
+         :deferred)
+        (t
+         (setf *physical-recovery-failed-p* t)
+         (admin-log "native standby restartpoint failed: ~a" condition)
+         :failed)))))
 
 (defun physical-restartpoint-worker-loop ()
   (loop until (or *physical-shutdown-state* *physical-promotion-stopping-p*

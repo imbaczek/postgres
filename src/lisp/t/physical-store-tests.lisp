@@ -582,8 +582,23 @@
                                (pg::physical-store-compact
                                 reopened cursor (lambda (digest) (declare (ignore digest)) (setf published t))
                                 :stage-archive (lambda (&rest args) (declare (ignore args)) (error "staging failed")))
-                               'error))
+                               'pg::physical-archive-staging-error))
                           (ok (not published))
+                          (let ((pg::*pgdata* root)
+                                (pg::*physical-recovery-state* '(:phase 2))
+                                (pg::*physical-recovery-failed-p* nil)
+                                (pg::*physical-shutdown-state* nil)
+                                (pg::*physical-receive-store* reopened)
+                                (pg::*last-replay-lsn* cursor)
+                                (pg::*swank-listener-enabled-p* nil)
+                                (pg::*live-operation-depth* 1))
+                            (ok (signals (pg::physical-recovery-restartpoint-core
+                                          :stage-archive
+                                          (lambda (&rest args)
+                                            (declare (ignore args))
+                                            (error "restartpoint staging failed")))
+                                         'pg::physical-archive-staging-error))
+                            (ok (not pg::*physical-recovery-failed-p*)))
                           (ok (zerop (pg::physical-store-floor-lsn reopened)))
                           (ok (every #'probe-file paths))
                           (pg::physical-store-compact

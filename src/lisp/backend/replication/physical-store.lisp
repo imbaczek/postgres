@@ -356,6 +356,12 @@ external modification."
              (fsync-stream stream))))))
     (fsync-directory (physical-store-directory store))))
 
+(define-condition physical-archive-staging-error (error)
+  ((cause :initarg :cause :reader physical-archive-staging-error-cause))
+  (:report (lambda (condition stream)
+             (format stream "receive WAL archive staging failed: ~a"
+                     (physical-archive-staging-error-cause condition)))))
+
 (defun physical-store-compact (store cursor publish-restartpoint &key stage-archive)
   "Publish a durable restartpoint before advancing and cleaning the receive floor.
 
@@ -407,7 +413,9 @@ is reported after releasing the mutex."
               (sb-sys:without-interrupts
                 (physical-store-test-point :before-compaction-cleanup store)
                 (unless finished (setf (physical-store-failed-p store) t)))))))
-    (if stage-error (error stage-error) result)))
+    (if stage-error
+        (error 'physical-archive-staging-error :cause stage-error)
+        result)))
 
 (defun physical-store-close (store)
   "Release local ownership without converting unacknowledged writes into flush progress."
