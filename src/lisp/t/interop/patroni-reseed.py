@@ -517,6 +517,58 @@ class ArchiveHistoryAcceptance(RewindSharedHistoryAcceptance):
         self.create_rewind_target()
 
 
+class ArchiveDescendantAcceptance(ArchiveHistoryAcceptance):
+    label = "archive-descendant"
+
+    def verify_promotion(self, port):
+        super().verify_promotion(port)
+        follow.query(port, "CREATE TABLE archive_descendant_padding(id integer)")
+        with closing(follow.psycopg2.connect(
+                host="127.0.0.1", port=port, user="postgres", dbname="postgres")) as connection:
+            connection.autocommit = True
+            with connection.cursor() as cursor:
+                for row in range(3000):
+                    cursor.execute("INSERT INTO archive_descendant_padding VALUES (%s)", (row,))
+                    if row % 100 == 0:
+                        cursor.execute("SELECT pg_current_wal_flush_lsn() >= '0/1000000'::pg_lsn")
+                        if cursor.fetchone() == (True,):
+                            break
+                else:
+                    raise AssertionError("promoted source did not close the child segment")
+        proof = "000000020000000000000000.wal.proof"
+        follow.wait_for((self.archive / proof).is_file)
+
+        root = self.server.root / "archive-observer"
+        data = root / "data"
+        root.mkdir(mode=0o700)
+        shutil.copytree(self.origin, data)
+        (data / "postgresql.conf").write_text("# Archive-only observer.\n")
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            observer_port = reservation.getsockname()[1]
+        config = follow.configuration(data, observer_port, root)
+        archive = shlex.quote(str(self.archive))
+        config["recovery_conf"] = {"restore_command": f'test -f {archive}/"%f" && cp -- {archive}/"%f" "%p"'}
+        node = Postgresql(config, Null())
+        try:
+            assert node.follow(None, timeout=90) is True
+            assert follow.query(observer_port, "SHOW primary_conninfo") == [("",)]
+            follow.wait_for(lambda: self.has_child_row(observer_port))
+            assert follow.query(observer_port, "SELECT pg_is_in_recovery()") == [(True,)]
+            assert node.restart(timeout=90) is True
+            assert self.has_child_row(observer_port)
+            self.result["checks"].append(self.label)
+        finally:
+            self.stop_target(node)
+
+    @staticmethod
+    def has_child_row(port):
+        try:
+            return follow.query(port, "SELECT id FROM patroni_reseed_child_only") == [(42,)]
+        except follow.psycopg2.errors.UndefinedTable:
+            return False
+
+
 class RewindPageReuseAcceptance(RewindSharedHistoryAcceptance):
     label = "rewind-page-reuse"
     replay_pages = True
@@ -1215,6 +1267,7 @@ def main():
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
                "rewind-shared-history": RewindSharedHistoryAcceptance,
                "archive-promotion-history": ArchiveHistoryAcceptance,
+                 "archive-descendant": ArchiveDescendantAcceptance,
                "rewind-page-reuse": RewindPageReuseAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,

@@ -1380,7 +1380,9 @@ Flush when required. The follow lock is released before store operations."
   (let ((binding (physical-follow-runtime-binding runtime)))
     (if binding
         (let ((after (getf binding :after))) (or (eighth after) (second after)))
-        (getf *physical-recovery-state* :timeline))))
+        (if (and (physical-follow-runtime-archive-only-p runtime) *physical-receive-store*)
+            (physical-store-selected-timeline *physical-receive-store*)
+            (getf *physical-recovery-state* :timeline)))))
 
 (defun physical-follow-runtime-boundary (runtime)
   (let ((binding (physical-follow-runtime-binding runtime)))
@@ -1817,12 +1819,13 @@ Selection still requires WAL transition evidence and durable publication."
                (when (eql fork end) bytes))))
       (or (fetch :timeline) (when (= parent 1) (fetch :legacy))))))
 
-(defun physical-follow-archive-transition (runtime command local-history cursor)
+(defun physical-follow-archive-transition (runtime command local-history cursor &optional candidate)
   "Return immediate child history and EOR evidence at the durable parent fork.
 Return the child extent and the bytes covering the parent overlap as well.
 The caller still has to compare that overlap and publish the selection."
   (multiple-value-bind (latest latest-text)
-      (physical-follow-find-archive-history runtime command local-history cursor)
+      (if candidate (values-list candidate)
+          (physical-follow-find-archive-history runtime command local-history cursor))
     (when latest
       (let* ((parent (timeline-history-entry-timeline (first local-history)))
              (position (position parent latest :key #'timeline-history-entry-timeline))
@@ -1858,11 +1861,11 @@ The caller still has to compare that overlap and publish the selection."
                         (when (or (zerop (mod cursor +wal-segment-size+)) fork-bytes)
                           (values child text raw segment bytes fork-bytes))))))))))))))
 
-(defun physical-follow-restore-next (runtime command cursor)
+(defun physical-follow-restore-next (runtime command cursor &optional archive-limit)
   (let* ((timeline (physical-follow-runtime-receive-timeline runtime))
          (system-id (getf *physical-recovery-state* :system-id))
          (segment (floor cursor +wal-segment-size+))
-         (limit (physical-follow-runtime-boundary runtime)))
+         (limit (or (physical-follow-runtime-boundary runtime) archive-limit)))
     (labels ((fetch (number)
                (flet ((from-namespace (namespace)
                         (physical-follow-fetch-archive-with-limit
@@ -1889,12 +1892,74 @@ The caller still has to compare that overlap and publish the selection."
                  (multiple-value-bind (next next-end) (fetch (1+ segment))
                    (admit (1+ segment) next next-end (when (eql end cursor) bytes))))))))))
 
+(defun physical-follow-archive-discovery-p (runtime)
+  (and (physical-follow-runtime-archive-only-p runtime)
+       (null (physical-follow-runtime-binding runtime))
+       (null (getf (getf *physical-recovery-state* :timeline-policy) :target))))
+
+(defun physical-follow-publish-archive-history (runtime cursor child text eor fork-bytes)
+  "Commit checked archive history while this receiver still owns receipt."
+  ;; A lifecycle operation can hold either lock while joining this receiver.
+  (sb-thread:with-mutex (*physical-follow-command-lock* :wait-p nil)
+    (sb-thread:with-mutex (*reload-run-lock* :wait-p nil)
+      (with-live-operation-quiescence
+        (with-physical-follow-controller-publication (obsolete)
+          (physical-follow-require-runtime-generation runtime)
+          (check-physical-recovery-work)
+          (unless (and (eq runtime *physical-follow-runtime*)
+                       (physical-follow-archive-discovery-p runtime)
+                       (not (physical-follow-receiver-stopped-p runtime)))
+            (return-from physical-follow-publish-archive-history nil))
+          (let* ((store *physical-receive-store*)
+                 (path (timeline-history-path child *pgdata*))
+                 (bytes (string->bytes text))
+                 (selected nil) (finished nil))
+            (when (and (wal-namespace-file-stat path t)
+                       (not (equalp bytes (read-bounded-regular-file path +timeline-history-max-bytes+))))
+              (error "archive candidate differs from local timeline history"))
+            (unwind-protect
+                 (when (setf selected (physical-store-select-archive-history
+                                       store child text eor cursor fork-bytes))
+                   (physical-recovery-publish-selected-history store)
+                   (let ((candidate (physical-recovery-attach-selected-store *physical-recovery-state* store)))
+                     (setf *physical-recovery-state*
+                           (physical-recovery-write-control candidate 2 *last-replay-lsn* *next-xid*)))
+                   (multiple-value-bind (source retired)
+                       (sync-replication-new-source-incarnation :defer-notifications t)
+                     (declare (ignore source))
+                     (setf obsolete retired))
+                   (setf finished t))
+              (when (and (not finished) (or selected (physical-store-failed-p store)))
+                (setf *physical-recovery-failed-p* t)))))))))
+
+(defun physical-follow-restore-archive-step (runtime command cursor)
+  "Restore up to a discovered parent fork, then select a proved child."
+  (when (physical-follow-archive-discovery-p runtime)
+    (let ((history (physical-store-retained-history *physical-receive-store*)))
+      (multiple-value-bind (latest latest-text)
+          (physical-follow-find-archive-history runtime command history cursor)
+        (when latest
+          (let* ((parent (timeline-history-entry-timeline (first history)))
+                 (entry (find parent latest :key #'timeline-history-entry-timeline))
+                 (fork (timeline-history-entry-end entry)))
+            (if (< cursor fork)
+                (return-from physical-follow-restore-archive-step
+                  (physical-follow-restore-next runtime command cursor fork))
+                (multiple-value-bind (child text eor segment bytes fork-bytes)
+                    (physical-follow-archive-transition runtime command history cursor (list latest latest-text))
+                  (declare (ignore segment bytes))
+                  (return-from physical-follow-restore-archive-step
+                    (when (and child (physical-follow-publish-archive-history
+                                      runtime cursor child text eor fork-bytes))
+                      cursor)))))))))
+  (physical-follow-restore-next runtime command cursor))
+
 (defun physical-follow-restore-before-streaming (runtime cursor)
   "Try the archive at the durable cursor before opening a streaming connection."
   (let ((command (startup-restore-command)))
     (when (and command (plusp (length command)))
       (loop
-        (let ((next (handler-case (physical-follow-restore-next runtime command cursor)
+        (let ((next (handler-case (physical-follow-restore-archive-step runtime command cursor)
                       (physical-client-stopped (condition) (error condition))
                       (error (condition)
                         (when (physical-follow-terminal-p condition) (error condition))
