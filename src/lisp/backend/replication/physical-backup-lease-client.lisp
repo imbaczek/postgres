@@ -244,7 +244,7 @@
 ;; Finish the stream, reread the manifest, and bind it to a READY status for
 ;; the original request before accepting the received inventory.
 
-(defun pg-client-native-rewind-capture-query (request offers)
+(defun pg-client-native-rewind-capture-query (request offers &optional pages)
   (unless (<= (length offers) +native-rewind-offer-limit+)
     (error "invalid native rewind relation offer count"))
   (let ((options (pg-client-native-backup-lease-options request)))
@@ -260,18 +260,24 @@
                             collect (format nil "~a:~d:~d" name size digest)))))
         (physical-rewind-decode-offers text)
         (setf options (append options (list (cons "relation_offers" text))))))
+    (when pages
+      (let ((text (format nil "~{~a~^,~}"
+                          (loop for (name offset digest) in pages
+                                collect (format nil "~a:~d:~d" name offset digest)))))
+        (physical-rewind-decode-page-offers text)
+        (setf options (append options (list (cons "page_offers" text))))))
     (pg-client-native-backup-lease-option-query "CAPTURE_REWIND_NATIVE" options)))
 
-(defun physical-backup-lease-receive-remote (target channel request &key rewind replay offers reuse)
+(defun physical-backup-lease-receive-remote (target channel request &key rewind replay offers reuse pages read-page)
   (let ((tag (cond (replay "REPLAY_REWIND_NATIVE")
                    (rewind "CAPTURE_REWIND_NATIVE")
                    (t "CAPTURE_BACKUP_NATIVE"))))
     (physical-libpq-start-copy-out
      channel (if rewind
-                 (pg-client-native-rewind-capture-query request offers)
+                 (pg-client-native-rewind-capture-query request offers pages)
                  (pg-client-native-backup-lease-query tag request)))
     (let ((manifest (physical-backup-receive-bundle
-                     target (lambda () (physical-backup-next-copy-frame channel tag)) :reuse reuse)))
+                     target (lambda () (physical-backup-next-copy-frame channel tag)) :reuse reuse :read-page read-page)))
       (physical-backup-finish-copy channel tag)
       (multiple-value-bind (actual digest) (recovery-read-manifest target)
         (unless (equal manifest actual) (pg-client-native-reject "received backup manifest changed"))
@@ -286,9 +292,10 @@
 ;; Receive into the caller's empty directory, verify the manifest, then check
 ;; STATUS against the received image.  READY describes source retention at
 ;; that check, not a permanent guarantee; follow or handoff must revalidate.
-(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd rewind replay offers reuse)
+(defun physical-backup-lease-capture-remote (directory channel request &key directory-fd rewind replay offers reuse pages read-page)
   (unless (and (eq (null offers) (null reuse))
-               (or (null offers) rewind)
+               (eq (null pages) (null read-page))
+               (or (not (or offers pages)) rewind)
                (or (not (or rewind replay)) directory-fd)
                (not (and rewind replay)))
     (error "native rewind capture requires a descriptor and a receiver for any offers"))
@@ -301,5 +308,6 @@
            directory-fd
            (lambda (anchored)
              (physical-backup-lease-receive-remote
-              anchored channel request :rewind rewind :replay replay :offers offers :reuse reuse))))
+              anchored channel request :rewind rewind :replay replay :offers offers :reuse reuse
+              :pages pages :read-page read-page))))
         (physical-backup-lease-receive-remote target channel request))))

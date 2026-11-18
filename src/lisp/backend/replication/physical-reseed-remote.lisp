@@ -106,7 +106,7 @@
            (funcall function client))
       (when client (physical-client-close client)))))
 
-(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check rewind-origin accepted-source)
+(defun %physical-reseed-start-remote (owner directory request profile &key helper stage-check rewind-origin rewind-fork accepted-source)
   ;; The optional check adds caller-specific observations at each stage check.
   ;; Publish the ordinary attempt journal before CAPTURE so a reopened attempt
   ;; can use status or cancellation without issuing CAPTURE again.
@@ -141,7 +141,7 @@
                 (check-stage t)
                 (multiple-value-prog1
                     (if (getf record :rewind-origin)
-                        (physical-rewind-capture-image owner stage fd client (getf record :request))
+                        (physical-rewind-capture-image owner stage fd client (getf record :request) :fork rewind-fork)
                         (physical-backup-lease-capture-remote stage client (getf record :request)
                                                               :directory-fd fd))
                   (physical-reseed-remote-test-point :after-capture)
@@ -193,12 +193,11 @@ publication verify that historical export identity against the source."
   "Discover the source origin and start a journaled remote rewind capture.
 Bind capture to the accepted source observed during discovery."
   (physical-reseed-check-owner owner)
-  (multiple-value-bind (origin request source resolved)
+  (multiple-value-bind (origin request source resolved fork)
       (call-with-physical-reseed-discovery
        profile helper
        (lambda (client resolved)
          (multiple-value-bind (origin fork child) (physical-rewind-discover-history owner client)
-           (declare (ignore fork))
            (let* ((target (physical-rewind-inspect-primary owner))
                   (request
                     (list :version 1
@@ -209,9 +208,9 @@ Bind capture to the accepted source observed during discovery."
                           :system-id (getf target :system-id)
                           :cluster-identity (getf target :cluster-identity)
                           :timeline child)))
-             (values origin request (physical-adoption-attempt-accepted-source client profile) resolved)))))
+             (values origin request (physical-adoption-attempt-accepted-source client profile) resolved fork)))))
     (%physical-reseed-start-remote
-     owner directory request profile :helper resolved :rewind-origin origin :accepted-source source)))
+     owner directory request profile :helper resolved :rewind-origin origin :rewind-fork fork :accepted-source source)))
 
 (defun physical-reseed-source-result (record source)
   (let ((source (when source (physical-backup-lease-copy source))))
@@ -331,13 +330,12 @@ Bind capture to the accepted source observed during discovery."
                            record (pg-client-native-backup-lease-status client request)))
               (error "native rewind source claim appeared during resume"))
             (multiple-value-bind (origin fork timeline) (physical-rewind-discover-history owner client)
-              (declare (ignore fork))
               (unless (and (equal origin (getf record :rewind-origin))
                            (= timeline (getf request :timeline)))
-                (error "native rewind source changed before capture resume")))
-            (physical-reseed-require-journal owner record)
-            (physical-reseed-stage-facts owner directory fd :empty t :expected stage)
-            (physical-rewind-capture-image owner directory fd client request))
+                (error "native rewind source changed before capture resume"))
+              (physical-reseed-require-journal owner record)
+              (physical-reseed-stage-facts owner directory fd :empty t :expected stage)
+              (physical-rewind-capture-image owner directory fd client request :fork fork)))
           :helper helper :capture t))
        :expected stage))))
 

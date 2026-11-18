@@ -697,7 +697,20 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
       (replication-push-u64 header digest)
       header)))
 
-(defun physical-backup-send-file (directory entry timeline emit)
+(defun physical-backup-page-reference (offset digest)
+  (let ((payload (make-payload)))
+    (payload-push-byte payload (char-code #\P))
+    (replication-push-u64 payload offset)
+    (replication-push-u64 payload digest)
+    payload))
+
+(defun physical-backup-file-data (buffer count)
+  (let ((payload (make-array (1+ count) :element-type '(unsigned-byte 8))))
+    (setf (aref payload 0) (char-code #\D))
+    (replace payload buffer :start1 1 :end2 count)
+    payload))
+
+(defun physical-backup-send-file (directory entry timeline emit &key pages)
   "Send a checked bundle file as a header, data frames and an end frame.
 Each data frame owns a fresh payload; hash the same bytes copied into it.
 Check the file length and digest before sending the end frame."
@@ -716,14 +729,24 @@ Check the file length and digest before sending the end frame."
                (unless (= size actual-size) (error "native backup bundle file length changed"))
                (funcall emit header)
                (loop with remaining = size
+                     with offsets = (when pages
+                                      (sort (loop for offset being the hash-keys of pages collect offset) #'<))
                      while (plusp remaining)
-                     for count = (read-sequence buffer input :end (min remaining (length buffer)))
+                     for offset = (- size remaining)
+                     for offered = (when (eql offset (first offsets))
+                                     (gethash (pop offsets) pages))
+                     for extent = (cond (offered +blcksz+)
+                                        (offsets (- (first offsets) offset))
+                                        (t (length buffer)))
+                     for count = (read-sequence buffer input :end (min remaining extent (length buffer)))
                      do (when (zerop count) (error "native backup bundle file was truncated"))
-                        (let ((payload (make-array (1+ count) :element-type '(unsigned-byte 8))))
-                          (setf digest (physical-store-update-digest-span digest buffer 0 count)
-                                (aref payload 0) (char-code #\D))
-                          (replace payload buffer :start1 1 :end2 count)
-                          (funcall emit payload))
+                        (setf digest (physical-store-update-digest-span digest buffer 0 count))
+                        (let ((hash (and offered (= count +blcksz+)
+                                         (physical-store-update-digest-span
+                                          #xCBF29CE484222325 buffer 0 count))))
+                          (funcall emit (if (and hash (= offered hash))
+                                            (physical-backup-page-reference offset hash)
+                                            (physical-backup-file-data buffer count))))
                         (decf remaining count))
                (unless (and (eq :eof (read-byte input nil :eof)) (= digest expected-digest))
                  (error "native backup bundle file changed"))
@@ -761,7 +784,7 @@ Check the file length and digest before sending the end frame."
 ;; Send B (bundle header), F/D/E (file header, data and end), then Z
 ;; (count and checksum).  The checksum covers all preceding payloads, including
 ;; file checksums; it detects corruption and is not an authentication mechanism.
-(defun physical-backup-send-bundle (directory manifest emit &key reuse expected-entries)
+(defun physical-backup-send-bundle (directory manifest emit &key reuse expected-entries pages)
   (let* ((entries (physical-backup-bundle-entries directory manifest))
          (digest #xCBF29CE484222325))
     (when (and expected-entries (not (equal expected-entries entries)))
@@ -777,7 +800,8 @@ Check the file length and digest before sending the end frame."
       (dolist (entry entries)
         (if (and reuse (physical-backup-reuse-path-p (first entry)) (funcall reuse entry))
             (send (physical-backup-file-header-image entry #\R))
-            (physical-backup-send-file directory entry (getf manifest :timeline) #'send))))
+            (physical-backup-send-file directory entry (getf manifest :timeline) #'send
+                                       :pages (and pages (gethash (first entry) pages))))))
     (let ((end (make-payload)))
       (payload-push-byte end (char-code #\Z))
       (payload-push-u32 end (length entries))
@@ -807,7 +831,19 @@ Check the file length and digest before sending the end frame."
 ;; Consume exactly the declared data extent and its end frame while checking
 ;; the digest; the caller owns the output stream and its durability.
 
-(defun physical-backup-receive-file-content (size expected-digest next output &optional relative)
+(defun physical-backup-read-page-reference (frame offset remaining reader)
+  (unless (and reader (= (length frame) 17) (zerop (mod offset +blcksz+))
+               (<= +blcksz+ remaining) (= offset (replication-read-u64 frame 1)))
+    (error "invalid native backup page reference"))
+  (let* ((digest (replication-read-u64 frame 9))
+         (page (funcall reader offset digest)))
+    (unless (and (typep page '(vector (unsigned-byte 8)))
+                 (= (length page) +blcksz+)
+                 (= digest (physical-store-update-digest #xCBF29CE484222325 page)))
+      (error "native backup page reference disagrees with the target"))
+    page))
+
+(defun physical-backup-receive-file-content (size expected-digest next output &optional relative page-reader)
   "Receive file data and return its digest after checking the end frame.
 Validate each data extent before writing it, and hash the same bytes written.
 The caller checks the file header and owns the output."
@@ -815,15 +851,20 @@ The caller checks the file header and owns the output."
     (loop with remaining = size
           while (plusp remaining)
           for frame = (physical-backup-read-frame next)
-          for count = (1- (length frame))
-          do (unless (and (= (aref frame 0) (char-code #\D)) (<= 1 count remaining))
-               (error "invalid native backup file data extent"))
-             (setf digest (physical-store-update-digest-span digest frame 1 (1+ count)))
-             (write-sequence frame output :start 1 :end (1+ count))
-             (when (and relative *physical-image-test-hook* (< count remaining))
-               (finish-output output)
-               (funcall *physical-image-test-hook* :after-partial-receive relative))
-             (decf remaining count))
+          do (multiple-value-bind (bytes start)
+                 (case (code-char (aref frame 0))
+                   (#\D (values frame 1))
+                   (#\P (values (physical-backup-read-page-reference
+                                 frame (- size remaining) remaining page-reader) 0))
+                   (otherwise (error "invalid native backup file data extent")))
+               (let ((count (- (length bytes) start)))
+                 (unless (<= 1 count remaining) (error "invalid native backup file data extent"))
+                 (setf digest (physical-store-update-digest-span digest bytes start (length bytes)))
+                 (write-sequence bytes output :start start)
+                 (when (and relative *physical-image-test-hook* (< count remaining))
+                   (finish-output output)
+                   (funcall *physical-image-test-hook* :after-partial-receive relative))
+                 (decf remaining count))))
     (let ((end (physical-backup-read-frame next)))
       (unless (and (= (length end) 1) (= (aref end 0) (char-code #\E))
                    (= expected-digest digest))
@@ -833,7 +874,7 @@ The caller checks the file header and owns the output."
 ;; Descriptor-scoped receipt creates relative to held directories; the legacy
 ;; path retains its existing pathname-based file creation and sync behavior.
 
-(defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1) reuse)
+(defun physical-backup-receive-file (directory name maximum next &key expected (timeline 1) reuse read-page)
   (unless (physical-backup-bundle-path-p name timeline)
     (error "invalid native backup destination path"))
   (let ((header (physical-backup-read-frame next)))
@@ -851,7 +892,10 @@ The caller checks the file header and owns the output."
                   (call-with-physical-image-output
                    directory name
                    (lambda (output)
-                     (physical-backup-receive-file-content size expected-digest next output name)))
+                     (physical-backup-receive-file-content
+                      size expected-digest next output name
+                      (when (and expected read-page (physical-backup-reuse-path-p name))
+                        (lambda (offset digest) (funcall read-page name offset digest))))))
                   (let* ((path (merge-pathnames name directory))
                          (parent (uiop:pathname-directory-pathname path))
                          (digest nil))
@@ -884,7 +928,7 @@ The caller checks the file header and owns the output."
 ;; Bound the file count and metadata sizes before receiving the manifest and
 ;; its inventory.  Check order, paths, sizes and checksums, then verify the
 ;; immutable recovery image and copied authentication policy before publication.
-(defun physical-backup-receive-bundle (directory next &key reuse)
+(defun physical-backup-receive-bundle (directory next &key reuse read-page)
   (let ((digest #xCBF29CE484222325)
         (magic (string->bytes "PGNATIVEBACKUP1")))
     (flet ((receive-frame ()
@@ -910,7 +954,8 @@ The caller checks the file header and owns the output."
               (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame))
             (dolist (entry (getf manifest :files))
               (physical-backup-receive-file directory (first entry) (second entry) #'receive-frame
-                                            :expected entry :timeline (getf manifest :timeline) :reuse reuse))
+                                            :expected entry :timeline (getf manifest :timeline)
+                                            :reuse reuse :read-page read-page))
             (let ((end (physical-backup-read-frame next)))
               (unless (and (= 13 (length end)) (= (aref end 0) (char-code #\Z))
                            (= count (bytes-to-u32 end 1)) (= digest (replication-read-u64 end 5)))

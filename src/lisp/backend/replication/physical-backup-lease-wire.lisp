@@ -51,6 +51,28 @@ Each unique entry contains a relation name, size and digest."
                 (list name (physical-stream-u64 size) (physical-stream-u64 digest))))))
     offers))
 
+(defun physical-rewind-decode-page-offers (text)
+  (unless (<= 1 (length text) 65536)
+    (wal-invalid-input "native rewind page offers exceed their size bound"))
+  (let ((fields (uiop:split-string text :separator '(#\,)))
+        (offers (make-hash-table :test #'equal)))
+    (unless (<= (length fields) +native-rewind-offer-limit+)
+      (wal-invalid-input "native rewind has too many page offers"))
+    (dolist (field fields)
+      (let ((parts (uiop:split-string field :separator '(#\:))))
+        (unless (and (= (length parts) 3)
+                     (<= (length (first parts)) 32)
+                     (physical-backup-reuse-path-p (first parts)))
+          (wal-invalid-input "invalid native rewind page offer"))
+        (destructuring-bind (name position digest) parts
+          (let* ((offset (physical-stream-u64 position))
+                 (pages (or (gethash name offers)
+                            (setf (gethash name offers) (make-hash-table :test #'eql)))))
+            (unless (and (zerop (mod offset +blcksz+)) (not (gethash offset pages)))
+              (wal-invalid-input "unaligned or duplicate native rewind page offer"))
+            (setf (gethash offset pages) (physical-stream-u64 digest))))))
+    offers))
+
 (defun physical-backup-lease-wire-option-keys (kind)
   (append '("native_format" "lease_name" "lease_token" "cluster_identity" "system_id" "source_timeline")
           (case kind
@@ -91,7 +113,7 @@ Each unique entry contains a relation name, size and digest."
              (options (parse-replication-generic-options (rest words)))
              (keys (physical-backup-lease-wire-option-keys kind))
              (optional (case kind
-                         (:physical-lease-capture-rewind '("relation_offers"))
+                         (:physical-lease-capture-rewind '("relation_offers" "page_offers"))
                          ((:physical-lease-prepare-follow :physical-lease-cancel-follow)
                           '("follow_proof_kind")))))
         (unless (and kind
@@ -127,6 +149,10 @@ Each unique entry contains a relation name, size and digest."
                                          (assoc "relation_offers" options :test #'equal))
                                 (list (cons "relation_offers"
                                             (physical-rewind-decode-offers (value "relation_offers")))))
+                              (when (and (eq kind :physical-lease-capture-rewind)
+                                         (assoc "page_offers" options :test #'equal))
+                                (list (cons "page_offers"
+                                            (physical-rewind-decode-page-offers (value "page_offers")))))
                               (when (eq kind :physical-lease-prove-rewind)
                                 (loop for key in *physical-rewind-origin-wire-input*
                                       for text = (value key)
@@ -333,7 +359,7 @@ Each unique entry contains a relation name, size and digest."
     (pg-error (condition) (error condition))
     (error () (ereport "XX000" "native backup lease command failed"))))
 
-(defun call-with-native-rewind-capture (stream tag request offers)
+(defun call-with-native-rewind-capture (stream tag request offers pages)
   (let ((retained nil)
         (retain-attempted nil)
         (complete nil)
@@ -367,7 +393,7 @@ Each unique entry contains a relation name, size and digest."
                                                    (getf ready :rewind-seal-digest))))
                         (error "rewind stage seal differs from the verified capture")))
                     (values manifest entries retained))))
-              :retain-stage t
+              :retain-stage t :pages pages
               :reuse (when offers
                        (lambda (entry)
                          (equal entry (gethash (first entry) offers)))))
@@ -389,7 +415,8 @@ Each unique entry contains a relation name, size and digest."
           (if (eq kind :physical-lease-capture-rewind)
               (call-with-native-rewind-capture
                stream tag request (cdr (assoc "relation_offers" (logical-replication-command-options command)
-                                              :test #'equal)))
+                                              :test #'equal))
+               (cdr (assoc "page_offers" (logical-replication-command-options command) :test #'equal)))
               (call-with-native-backup-copy-out
                stream tag
                (lambda (stage begin-copy)

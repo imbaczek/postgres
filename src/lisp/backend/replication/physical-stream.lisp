@@ -151,7 +151,7 @@ Only explicit proof_kind retained_timeline selects the retained proof."
 ;; Allocate the stage before CopyOutResponse, and delete it on every exit,
 ;; including before CopyDone and successful command completion.  After COPY
 ;; starts, report errors if possible and abort the stream before propagating.
-(defun call-with-native-backup-copy-out (stream tag producer &key reuse retain-stage with-existing-image)
+(defun call-with-native-backup-copy-out (stream tag producer &key reuse pages retain-stage with-existing-image)
   (call-with-wal-sender-stream
    (lambda ()
      (let ((copy-mode nil))
@@ -172,7 +172,7 @@ Only explicit proof_kind retained_timeline selects the retained proof."
                       (physical-backup-send-bundle
                        image manifest
                        (lambda (payload) (copy-write-frame stream #\d payload) (finish-output stream))
-                       :reuse reuse :expected-entries expected-entries)))))
+                       :reuse reuse :pages pages :expected-entries expected-entries)))))
          (handler-case
              (progn
                (if with-existing-image

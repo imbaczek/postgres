@@ -321,14 +321,93 @@ Installation requires separate checks."
           (error "native rewind offer file changed"))
         (list name size digest)))))
 
-(defun physical-rewind-capture-image (owner destination destination-fd client request)
+(defun physical-rewind-page-name (relfilenode fork)
+  (format nil "base/~d~a" relfilenode (ecase fork (:main "") (:visibility ".vm"))))
+
+(defun physical-rewind-page-candidates (offers)
+  (let ((candidates (make-hash-table :test #'equal))
+        (remaining 256)
+        (eligible offers))
+    (loop for offset from 0 by +blcksz+
+          while (and eligible (plusp remaining))
+          do (setf eligible (remove-if (lambda (entry) (< (second entry) (+ offset +blcksz+)))
+                                       eligible))
+             (loop for (name) in eligible
+                   while (plusp remaining)
+                   do (setf (gethash (list name offset) candidates) t)
+                      (decf remaining)))
+    candidates))
+
+(defun physical-rewind-filter-changed-pages (owner target fork candidates)
+  (let ((*pgdata* (physical-adoption-owner-directory owner))
+        (*physical-image-context* nil))
+    (multiple-value-bind (cursor files complete)
+        (wal-scan-lineage
+         (lambda (record timeline carrier)
+           (declare (ignore timeline carrier))
+           (let ((type (wal-record-type record)))
+             (cond
+               ((= type +wal-record-pages+)
+                (dolist (image (wal-decode-page-images (wal-record-payload record)
+                                                       (wal-record-end record)
+                                                       (wal-record-version record)))
+                  (remhash (list (physical-rewind-page-name (wal-page-image-relfilenode image)
+                                                            (wal-page-image-fork image))
+                                 (* +blcksz+ (wal-page-image-block image)))
+                           candidates)))
+               ((= type +wal-record-relation-reset+)
+                (destructuring-bind (relation fork) (wal-decode-relation-reset record)
+                  (let ((name (physical-rewind-page-name relation fork)))
+                    (maphash (lambda (key value)
+                               (declare (ignore value))
+                               (when (equal name (first key)) (remhash key candidates)))
+                             candidates))))
+               ((member type (list +wal-record-catalog+ +wal-record-catalog-chunk+))
+                (clrhash candidates))))
+           nil)
+         (getf target :history) fork (getf target :end) :namespace (getf target :namespace))
+      (declare (ignore files))
+      (unless (and complete (= cursor (getf target :end)))
+        (error "rewind page map did not reach the target endpoint"))))
+  candidates)
+
+(defun physical-rewind-read-local-page (context name offset)
+  (multiple-value-bind (parent leaf) (physical-image-parent context name)
+    (call-with-physical-image-input-at
+     parent leaf
+     (lambda (input)
+       (let* ((fd (sb-sys:fd-stream-fd input))
+              (facts (physical-image-file-facts fd))
+              (page (make-array +blcksz+ :element-type '(unsigned-byte 8))))
+         (unless (and (<= (+ offset +blcksz+) (sixth facts))
+                      (file-position input offset) (= (read-sequence page input) +blcksz+))
+           (error "rewind local page no longer fits its relation"))
+         (physical-rewind-check-file-observation fd parent leaf facts)
+         page))
+     :element-type '(unsigned-byte 8))))
+
+(defun physical-rewind-page-offers (owner target fork offers context)
+  (when fork
+    (let ((candidates (physical-rewind-filter-changed-pages
+                       owner target fork (physical-rewind-page-candidates offers))))
+      (loop for (name offset) in
+                              (sort (loop for key being the hash-keys of candidates collect key)
+                                    (lambda (left right)
+                                      (if (equal (first left) (first right))
+                                          (< (second left) (second right))
+                                          (string< (first left) (first right)))))
+            for page = (physical-rewind-read-local-page context name offset)
+            collect (list name offset (physical-store-update-digest #xCBF29CE484222325 page))))))
+
+(defun physical-rewind-capture-image (owner destination destination-fd client request &key fork)
   "Receive a source image using relation offers from the locked target.
 Hold a read descriptor for the target and a receive descriptor for the image.
 Reuse files only when the offered name, size and digest match. Verify the
 complete image and READY source lease, then recheck the target.
 Return the manifest, lease record and reused entries."
   (let* ((target (physical-rewind-inspect-primary owner))
-         (reused nil))
+         (reused nil)
+         (reused-pages nil))
     (call-with-physical-directory-root
      owner
      (lambda (root-fd anchored)
@@ -343,6 +422,7 @@ Return the manifest, lease record and reused entries."
                    (loop for name in (sort (physical-bootstrap-relation-inventory) #'string<)
                          repeat +native-rewind-offer-limit+
                          collect (physical-rewind-relation-offer source-root name)))
+                 (pages (physical-rewind-page-offers owner target fork offers source-context))
                  (offered (make-hash-table :test #'equal)))
             (dolist (entry offers)
               (setf (gethash (first entry) offered) entry))
@@ -351,6 +431,14 @@ Return the manifest, lease record and reused entries."
                       (*physical-image-context* nil))
                   (physical-backup-lease-capture-remote
                    destination client request :directory-fd destination-fd :rewind t :offers offers
+                   :pages pages
+                   :read-page (when pages
+                                (lambda (name offset digest)
+                                  (let ((entry (list name offset digest)))
+                                    (unless (member entry pages :test #'equal)
+                                      (error "native rewind source requested an unoffered page"))
+                                    (push entry reused-pages)
+                                    (physical-rewind-read-local-page source-context name offset))))
                    :reuse (when offers
                             (lambda (entry)
                               (destructuring-bind (name size digest) entry
@@ -364,7 +452,7 @@ Return the manifest, lease record and reused entries."
                     (*physical-image-context* nil))
                 (unless (equalp (getf target :capture) (native-control-capture))
                   (error "native rewind target changed during capture")))
-              (values manifest record (nreverse reused))))))))))
+              (values manifest record (nreverse reused) (nreverse reused-pages) pages)))))))))
 
 ;; Copy a verified received stage into a separate empty incoming directory.
 ;; Check the original source is READY before and after the copy, and recheck the
