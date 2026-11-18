@@ -89,7 +89,7 @@
              (unless present (return (values nil nil)))
              (unless (or whole-p peers-p)
                (let ((row (advance first origins presence)))
-                 (return (values (project row (window-transition-results states)) t
+                 (return (values (project row (aggregate-transition-results states aggregates nil)) t
                                  (window-output-origins origins (getf stage :width) functions transition-origins)
                                  nil presence))))
              (setf buffer (make-query-replay-store nil))
@@ -106,7 +106,7 @@
                    (append-query-replay-row buffer (advance item item-origins item-presence) item-origins item-presence))))
              (query-row-spool-seal (query-replay-store-spool buffer))
              (setf (query-replay-store-eof-p buffer) t
-                   results (window-transition-results states)
+                   results (aggregate-transition-results states aggregates nil)
                    results-origins (and transition-origins (copy-seq transition-origins))
                    reader (make-query-replay-reader buffer)))))
        (lambda ()

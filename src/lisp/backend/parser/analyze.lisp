@@ -485,6 +485,28 @@ result is text for typeof and int4 for array_length."
       (ereport "0A000" "to_jsonb for type ~a is not supported" type))
     (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
 
+(defun analyze-json-container-function (name arguments)
+  "Resolve record and array JSON conversion with optional pretty printing."
+  (let* ((row-p (string= name "row_to_json"))
+         (value (first arguments))
+         (type (when value (expr-type value)))
+         (pretty (second arguments)))
+    (unless (and (<= 1 (length arguments) 2)
+                 (if row-p
+                     (or (eq type :record) (in-unknown-constant-p value))
+                     (or (sql-array-element-type type) (eq type :int2vector)
+                         (in-unknown-constant-p value)))
+                 (or (null pretty) (eq (expr-type pretty) :bool)
+                     (in-unknown-constant-p pretty)))
+      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+    (when (and (not row-p) (in-unknown-constant-p value))
+      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
+    (list :func name
+          (cons (if (in-unknown-constant-p value)
+                    (coerce-common-expression value :record) value)
+                (when pretty (list (coerce-common-expression pretty :bool))))
+          :type :json :typmod -1)))
+
 (defun analyze-byte-bit-function (name arguments)
   "Resolve the bytea and fixed-bit get/set overloads."
   (let* ((bit-p (member name '("get_bit" "set_bit") :test #'string=))
@@ -1669,6 +1691,8 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
+      ((member name '("row_to_json" "array_to_json") :test #'string=)
+       (analyze-json-container-function name args))
       ((member name '("to_json" "to_jsonb") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3813,7 +3837,7 @@ checks still apply."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "json_build_array" "json_build_object"
+                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                                    "jsonb_build_array" "jsonb_build_object" "get_byte" "set_byte" "get_bit" "set_bit"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
                                    "chr" "array_to_string" "string_to_array" "greatest" "least"
@@ -3849,8 +3873,9 @@ checks still apply."
        (analyze-to-jsonb-function "to_json" (list argument))
        (values argument :json))
       (:array-agg
-       (unless (eq type :text) (ereport "0A000" "array_agg currently supports text input"))
-       (values argument :text-array))
+       (unless (member type '(:text :json))
+         (ereport "0A000" "array_agg currently supports text and json input"))
+       (values argument (sql-array-type type)))
       ((:sum :avg)
        (unless (member type '(:int2 :int4 :int8 :numeric :float4 :float8 :interval))
          (ereport "42883" "function ~a(~a) does not exist" (second raw) (typed-arg-name argument)))
@@ -5187,9 +5212,10 @@ truncate and interpret the result at TYPE's signed width."
               (sql-byte-bit-function name arguments (expr-type (first (third expr)))))
              ((string= name "to_jsonb")
               (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
-             ((string= name "to_json")
-              (if (eq (first arguments) +null+) +null+
-                  (sql-to-json (first arguments) (expr-type (first (third expr))))))
+             ((member name '("to_json" "row_to_json" "array_to_json") :test #'string=)
+              (if (member +null+ arguments) +null+
+                  (sql-to-json (first arguments) (expr-type (first (third expr)))
+                               0 (second arguments))))
              ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
               (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
              (t (eval-analyzed-function name arguments type)))))
@@ -5426,7 +5452,7 @@ truncate and interpret the result at TYPE's signed width."
                         (loop for child across item do (push (cons child (1+ depth)) pending)))))
         (make-sql-jsonb root)))))
 
-(defun sql-write-json (value type out &optional (depth 0))
+(defun sql-write-json (value type out &optional (depth 0) pretty)
   "Write a typed datum as JSON to caller-owned OUT, preserving JSON input verbatim."
   ;; Record fields retain their order and duplicate names.  This internal
   ;; renderer writes NULL as JSON null; the SQL to_json call is strict.
@@ -5434,7 +5460,12 @@ truncate and interpret the result at TYPE's signed width."
   (when (eq value +null+)
     (write-string "null" out)
     (return-from sql-write-json))
-  (labels ((scalar (item item-type)
+  (labels ((separator (outer-p)
+             (write-char #\, out)
+             (when (and pretty outer-p)
+               (terpri out)
+               (write-char #\Space out)))
+           (scalar (item item-type)
              (cond ((eq item +null+) (write-string "null" out))
                    ((eq item-type :json) (write-string item out))
                    ((eq item-type :record)
@@ -5443,7 +5474,7 @@ truncate and interpret the result at TYPE's signed width."
                           for field-value across (sql-record-values item)
                           for first = t then nil for index from 0
                           do (when (zerop (mod index 4096)) (check-for-interrupts))
-                             (unless first (write-char #\, out))
+                             (unless first (separator t))
                              (sql-jsonb-write-string name out)
                              (write-char #\: out)
                              (sql-write-json field-value field-type out (1+ depth)))
@@ -5455,13 +5486,13 @@ truncate and interpret the result at TYPE's signed width."
                           (write-string text out))))
                    (t (sql-jsonb-write (sql-to-jsonb item item-type) out))))
            (array-value (array item-type)
-             (let ((elements (sql-array-elements array)) (position 0))
+             (let ((elements (sql-array-elements array)) (position 0) (outer-depth depth))
                (labels ((dimension (dims depth)
                           (when (> depth 512) (ereport "54001" "JSON nesting exceeds supported depth"))
                           (write-char #\[ out)
                           (dotimes (i (first dims))
                             (when (zerop (mod position 4096)) (check-for-interrupts))
-                            (when (plusp i) (write-char #\, out))
+                            (when (plusp i) (separator (= depth outer-depth)))
                             (if (rest dims) (dimension (rest dims) (1+ depth))
                                 (progn (scalar (aref elements position) item-type) (incf position))))
                           (write-char #\] out)))
@@ -5474,15 +5505,15 @@ truncate and interpret the result at TYPE's signed width."
                  (progn (write-char #\[ out)
                         (loop for number across value for first = t then nil for i from 0
                               do (when (zerop (mod i 4096)) (check-for-interrupts))
-                                 (unless first (write-char #\, out))
+                                 (unless first (separator t))
                                  (scalar number :int2))
                         (write-char #\] out))))
             (t (scalar value type))))))
 
-(defun sql-to-json (value type &optional (depth 0))
+(defun sql-to-json (value type &optional (depth 0) pretty)
   "Return JSON text using the same renderer as sql-write-json."
   (with-output-to-string (out)
-    (sql-write-json value type out depth)))
+    (sql-write-json value type out depth pretty)))
 
 (defun sql-json-build (name values types &optional variadic)
   "Build JSON text or normalized JSONB, evaluating each argument once."

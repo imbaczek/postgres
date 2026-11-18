@@ -14,12 +14,14 @@ import tempfile
 import traceback
 from threading import Lock
 import time
+from types import SimpleNamespace
 
 import psycopg2
 import psutil
 from psycopg2.extras import PhysicalReplicationConnection
 
 from patroni import global_config
+from patroni.api import RestApiHandler
 from patroni.dcs import Member
 from patroni.exceptions import PostgresConnectionException
 from patroni.postgresql import Postgresql
@@ -81,6 +83,27 @@ def configure(connection, names):
     return directory
 
 
+def rest_status(node):
+    handler = SimpleNamespace(
+        server=SimpleNamespace(patroni=SimpleNamespace(
+            postgresql=node, dcs=SimpleNamespace(cluster=None, last_seen=0),
+            ha=SimpleNamespace(failsafe_is_active=lambda: False))),
+        query=lambda sql, retry=False: node.query(sql),
+    )
+    return RestApiHandler.get_postgresql_status(handler)
+
+
+def check_rest_status(node, states):
+    status = rest_status(node)
+    assert status['role'] == PostgresqlRole.PRIMARY and status['timeline'] == 1, status
+    rows = status.get('replication', [])
+    assert len(rows) == len(states), rows
+    assert {row['application_name']: row['sync_state'] for row in rows} == states, rows
+    for row in rows:
+        assert row['usename'] == 'postgres' and row['client_addr'] == '127.0.0.1', row
+        assert row['state'] == 'streaming' and isinstance(row['sync_priority'], int), row
+
+
 def check_one(connection, label):
     directory = configure(connection, 'FIRST 1 (missing_peer)')
     for role in (PostgresqlRole.PRIMARY, PostgresqlRole.PROMOTED):
@@ -91,6 +114,7 @@ def check_one(connection, label):
             assert len(row) == 16, row
             assert row[0] > 0 and row[13:] == ('on', 'FIRST 1 (missing_peer)', None), row
             assert node.synchronous_standby_names() == 'FIRST 1 (missing_peer)'
+            check_rest_status(node, {})
             before = node.last_operation()
             wal_before = scalar(connection, 'SELECT pg_current_wal_lsn()')
             handler = SyncHandler(node)
@@ -162,6 +186,7 @@ def check_streaming(connection, label):
                                     'write_lsn', 'flush_lsn', 'replay_lsn'}, row
                 assert row['pid'] > 0
                 assert row['write_lsn'] == row['replay_lsn'] == start, row
+            check_rest_status(node, states)
         node._should_query_slots = True
         assert len(node.query(node.cluster_info_query)[0]) == 16
         senders.pop().close()
@@ -254,6 +279,7 @@ def check_native_streaming(connection, server):
                 assert set(row) == {'pid', 'application_name', 'sync_state',
                                     'write_lsn', 'flush_lsn', 'replay_lsn'}, row
                 assert 0 < row['replay_lsn'] <= row['flush_lsn'] <= row['write_lsn'], row
+            check_rest_status(monitor_node, states)
             handler._handle_synchronous_standby_names_change()
             assert monitor_node._cluster_info_state == {}
         assert any(sql.startswith('DO $$') for sql in trace)
@@ -299,13 +325,34 @@ def check_replay_timestamp(connection, standby):
             'SELECT pg_last_wal_replay_lsn()')[0][0]) >= barrier)
         timestamp = standby.query(timestamp_sql)[0][0]
         assert before <= timestamp <= after, (before, timestamp, after)
+    status = rest_status(standby)
+    assert status['role'] == PostgresqlRole.REPLICA and status['timeline'] == 1, status
+    assert status['replication_state'] == 'streaming', status
+    assert status['xlog']['replayed_timestamp'] == timestamp, status
+    assert status['xlog']['replayed_location'] >= barrier, status
     print('native: replay timestamp tracks applied commits and stays unchanged while paused PASS', flush=True)
+
+
+def check_json_conversion(native, reference):
+    queries = (
+        "SELECT row_to_json(r, true)::text FROM (SELECT 1 AS n, NULL::text AS empty) r",
+        "SELECT array_to_json(ARRAY[[1,2],[3,4]], true)::text",
+        "SELECT array_to_json(array_agg(x), false)::text FROM "
+        """(SELECT '{"x" : 1}'::json AS x UNION ALL SELECT NULL::json) t""",
+        "SELECT array_to_json(array_agg(x)) FROM (SELECT NULL::json AS x WHERE false) t",
+        "SELECT row_to_json(NULL), array_to_json(ARRAY[1], NULL)",
+    )
+    for sql in queries:
+        result = peers['result'](native, sql)
+        expected = peers['result'](reference, sql)
+        assert expected[0] == 'rows' and result == expected, (sql, result, expected)
 
 
 def check(native, reference, server):
     assert importlib.metadata.version('patroni') == '4.1.5'
     global_config.update(None, {'synchronous_mode': True})
     assert global_config.is_synchronous_mode
+    check_json_conversion(native, reference)
     for connection in (native, reference):
         with connection.cursor() as cursor:
             cursor.execute('SELECT pg_catalog.pg_last_xact_replay_timestamp()')

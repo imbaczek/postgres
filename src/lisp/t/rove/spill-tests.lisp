@@ -280,7 +280,7 @@
                                         (step-aggregate-transition-states states descriptors (vector "€") 0))
                                       (rove:ok (< (query-row-spool-count
                                                    (json-aggregate-transition-spool (aref states 0))) 50))
-                                      (rove:ok (equal (aref (window-transition-results states) 0)
+                                      (rove:ok (equal (aref (aggregate-transition-results states descriptors nil) 0)
                                                       (format nil "[~{~a~^, ~}]" (make-list 300 :initial-element token)))))
                                  (close-aggregate-transition-states states))))))
 
@@ -297,7 +297,7 @@
                                       (dolist (value values)
                                         (step-aggregate-transition-states states descriptors (vector value) 0))
                                       (rove:ok
-                                       (equal (aref (window-transition-results states) 0)
+                                       (equal (aref (aggregate-transition-results states descriptors nil) 0)
                                               (format nil "[~{~a~^, ~}]"
                                                       (mapcar (lambda (value) (sql-to-json value :text)) values))))
                                       (let* ((state (aref states 0))
@@ -346,10 +346,10 @@
                                         (setf (gethash "timezone" (backend-settings *backend*)) "Europe/Warsaw")
                                         (let ((second (sql-to-json value :timestamptz)))
                                           (rove:ok (not (equal first second)))
-                                          (rove:ok (equal (aref (window-transition-results states) 0)
+                                          (rove:ok (equal (aref (aggregate-transition-results states descriptors nil) 0)
                                                           (concatenate 'string "[" first "]")))
                                           (step-aggregate-transition-states states descriptors (vector value) 0)
-                                          (rove:ok (equal (aref (window-transition-results states) 0)
+                                          (rove:ok (equal (aref (aggregate-transition-results states descriptors nil) 0)
                                                           (concatenate 'string "[" first ", " second "]")))))
                                    (close-aggregate-transition-states states)))))))
 
@@ -366,7 +366,7 @@
                                       (progn
                                         (step-aggregate-transition-states states descriptors (vector input) 0)
                                         (setf (char (aref (sql-record-values input) 0) 0) #\X)
-                                        (let ((first (aref (window-transition-results states) 0)))
+                                        (let ((first (aref (aggregate-transition-results states descriptors nil) 0)))
                                           (rove:ok (equal first "[{\"label\":\"before\"}]"))
                                           (setf (char first 1) #\X))
                                         (rove:ok (not (query-row-spool-sealed-p
@@ -375,9 +375,27 @@
                                          states descriptors
                                          (vector (make-sql-record :fields '(("label" :text)) :values (vector "after"))) 0)
                                         (let ((expected (format nil "[{\"label\":\"before\"}, ~% {\"label\":\"after\"}]")))
-                                          (rove:ok (equal (aref (window-transition-results states) 0) expected))
-                                          (rove:ok (equal (aref (finalize-aggregate-transition-states states) 0) expected))))
+                                          (rove:ok (equal (aref (aggregate-transition-results states descriptors nil) 0) expected))
+                                          (rove:ok (equal (aref (aggregate-transition-results states descriptors) 0) expected))))
                                    (close-aggregate-transition-states states)))))))
+
+(rove:deftest json-array-aggregate-preserves-element-type-in-window-snapshots
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (*query-work-memory-bytes* 1)
+          (descriptors '((:kind :array-agg :input (:col 1 :type :json) :type :json-array))))
+      (with-query-temp-files ()
+                             (let ((states (make-aggregate-transition-states descriptors)))
+                               (unwind-protect
+                                    (progn
+                                      (step-aggregate-transition-states states descriptors (vector "{\"a\":1}") 0)
+                                      (let ((value (aref (aggregate-transition-results states descriptors nil) 0)))
+                                        (rove:ok (eq :json (sql-array-element-type-id value)))
+                                        (rove:ok (equalp #("{\"a\":1}") (sql-array-elements value))))
+                                      (step-aggregate-transition-states states descriptors (vector +null+) 0)
+                                      (let ((value (aref (aggregate-transition-results states descriptors) 0)))
+                                        (rove:ok (eq :json (sql-array-element-type-id value)))
+                                        (rove:ok (equalp (vector "{\"a\":1}" +null+) (sql-array-elements value)))))
+                                 (close-aggregate-transition-states states))))))
 
 (rove:deftest json-aggregate-cleans-spills-on-stop-consumer-error-and-limit
     (let* ((directory (merge-pathnames (format nil "pg-json-aggregate-~a/" (gensym))

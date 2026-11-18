@@ -1532,21 +1532,28 @@ on an abnormal exit."
              (:array-agg (query-row-spool-append state value))
              (:json-agg (append-json-aggregate-value state value)))))
 
-(defun finalize-aggregate-transition-states (states)
+(defun aggregate-transition-results (states descriptors &optional (seal-p t))
+  "Return typed group results, or snapshot appendable window transitions."
   (map 'vector
-       (lambda (state)
-         (cond ((json-aggregate-transition-p state) (json-aggregate-result state))
+       (lambda (state descriptor)
+         (cond ((json-aggregate-transition-p state) (json-aggregate-result state seal-p))
                ((query-row-spool-p state)
                 (if (zerop (query-row-spool-count state)) +null+
                     (let ((result (make-array (query-row-spool-count state))))
-                      (query-row-spool-seal state)
-                      (map-query-row-spool state (lambda (value index)
-                                                   (check-for-interrupts)
-                                                   (setf (aref result index) value)))
-                      (make-sql-array :element-type-id :text :elements result
-                                      :dimensions (list (length result)) :lower-bounds (list 1)))))
+                      (if seal-p
+                          (progn
+                            (query-row-spool-seal state)
+                            (map-query-row-spool state (lambda (value index)
+                                                         (check-for-interrupts)
+                                                         (setf (aref result index) value))))
+                          (map-query-row-spool-prefix
+                           state (lambda (value index)
+                                   (setf (aref result index) (copy-query-sort-value value)))))
+                      (make-sql-array :element-type-id (sql-array-element-type (getf descriptor :type))
+                                      :elements result :dimensions (list (length result))
+                                      :lower-bounds (list 1)))))
                (t (scalar-aggregate-transition-result state))))
-       states))
+       states descriptors))
 
 (defun aggregate-input-row (environment group-keys descriptors)
   "Evaluate inputs before spilling; replay never repeats scalar side effects."
@@ -1588,7 +1595,7 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
                                                           (concatenate 'vector group-origins transition-origins))))
                                                (funcall callback
                                                         (concatenate 'vector current-values
-                                                                     (finalize-aggregate-transition-states states))))
+                                                                     (aggregate-transition-results states descriptors))))
                                           (close-aggregate-transition-states states)
                                           (setf states nil))))
                                     (consume (row)

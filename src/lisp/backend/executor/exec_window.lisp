@@ -56,24 +56,6 @@
   (and (= (length left) (length right))
        (loop for a across left for b across right always (zerop (order-compare a b)))))
 
-(defun window-array-snapshot (spool)
-  ;; The prefix mapper lends its values, so detach each value in the result.
-  (let ((result (make-array (query-row-spool-count spool))))
-    (map-query-row-spool-prefix
-     spool (lambda (value index)
-             (setf (aref result index) (copy-query-sort-value value))))
-    (if (zerop (length result)) +null+
-        (make-sql-array :element-type-id :text :elements result
-                        :dimensions (list (length result)) :lower-bounds (list 1)))))
-
-(defun window-transition-results (states)
-  (map 'vector
-       (lambda (state)
-         (cond ((query-row-spool-p state) (window-array-snapshot state))
-               ((json-aggregate-transition-p state) (json-aggregate-result state nil))
-               (t (scalar-aggregate-transition-result state))))
-       states))
-
 (defun window-aggregate-inputs (aggregates environment)
   ;; Copy evaluated inputs before transition state can retain them across rows.
   (let ((values (make-array (length aggregates) :initial-element +null+))
@@ -168,7 +150,7 @@
                                 (flush-buffer ()
                                   (when buffer
                                     (query-row-spool-seal buffer)
-                                    (let ((results (window-transition-results states)))
+                                    (let ((results (aggregate-transition-results states aggregates nil)))
                                       (unwind-protect
                                            (when (eq (map-query-row-spool
                                                       buffer
@@ -210,7 +192,7 @@
                                           (query-row-spool-append buffer (list (copy-query-sort-value environment) position rank dense
                                                                                (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*))
                                                                                *query-row-presence*)))
-                                        (output environment (window-transition-results states) position rank dense))))
+                                        (output environment (aggregate-transition-results states aggregates nil) position rank dense))))
                                 (input (callback)
                                   (funcall source
                                            (lambda (environment)
