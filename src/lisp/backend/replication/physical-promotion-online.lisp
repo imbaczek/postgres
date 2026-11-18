@@ -76,27 +76,32 @@ after release."
         (return-from physical-promotion-try-online :awaiting-child-initialization))
       (call-with-physical-promotion-readers
        (lambda ()
-         (let ((drained (physical-promotion-replay-backlog)))
-           (cond
-             (*physical-resource-pause* :resource-paused)
-             ((not drained) :deferred)
-             (t
-              (physical-recovery-restartpoint-core)
-              (with-physical-follow-controller-publication (obsolete)
-                (unwind-protect
-                     (progn
-                       (physical-promotion-test-point :before-online-intent)
-                       (physical-promotion-check-online)
-                       (physical-promotion-publish-intent)
-                       (physical-promotion-test-point :after-online-intent)
-                       (physical-promotion-install-prefix)
-                       (multiple-value-prog1
-                           (physical-promotion-complete-child publication)
-                         (sb-thread:with-mutex (*wal-lock*)
-                           (start-primary-wal-writer-under-lock)
-                           (setf *physical-promotion-stopping-p* nil
-                                 (physical-promotion-publication-completed-p publication) t))))
-                  (setf obsolete (physical-promotion-publication-obsolete publication))))))))
+         (block attempt
+           (let ((drained (physical-promotion-replay-backlog)))
+             (cond
+               (*physical-resource-pause* :resource-paused)
+               ((not drained) :deferred)
+               (t
+                (handler-case (physical-recovery-restartpoint-core)
+                  (physical-archive-staging-error (condition)
+                    (when *physical-recovery-failed-p* (error condition))
+                    (admin-log "native promotion deferred: ~a" condition)
+                    (return-from attempt :archive-staging-deferred)))
+                (with-physical-follow-controller-publication (obsolete)
+                  (unwind-protect
+                       (progn
+                         (physical-promotion-test-point :before-online-intent)
+                         (physical-promotion-check-online)
+                         (physical-promotion-publish-intent)
+                         (physical-promotion-test-point :after-online-intent)
+                         (physical-promotion-install-prefix)
+                         (multiple-value-prog1
+                             (physical-promotion-complete-child publication)
+                           (sb-thread:with-mutex (*wal-lock*)
+                             (start-primary-wal-writer-under-lock)
+                             (setf *physical-promotion-stopping-p* nil
+                                   (physical-promotion-publication-completed-p publication) t))))
+                    (setf obsolete (physical-promotion-publication-obsolete publication)))))))))
        publication))))
 
 (defun physical-promotion-awaiting-child-initialization-p ()
@@ -182,7 +187,8 @@ Retry unsafe complete replay barriers outside the gates, allowing readers to
 finish.  Return the child checkpoint end, or :SHUTDOWN if shutdown takes over
 before intent.  Other failures after work starts fence the process for restart.
 If backlog replay reaches insufficient capacity, restore recovery workers and
-return :RESOURCE-PAUSED without publishing promotion intent. One publication
+return :RESOURCE-PAUSED without publishing promotion intent. A staging failure
+similarly returns :ARCHIVE-STAGING-DEFERRED. One publication
 context carries completion and sender debt through the whole live attempt.
 A completed context prevents an interrupt after publication from fencing an
 already completed promotion; errors before completion still fail closed."
@@ -229,11 +235,11 @@ already completed promotion; errors before completion still fail closed."
                       (physical-promotion-test-point :after-online-worker-join)
                       (loop for result = (physical-promotion-try-online publication)
                             unless (eq result :deferred)
-                              do (when (member result '(:awaiting-child-initialization :resource-paused))
+                              do (when (member result '(:awaiting-child-initialization :resource-paused :archive-staging-deferred))
                                    (physical-promotion-resume-recovery-workers config paused restartpoint))
                                  (setf finished t) (return result)
                             do (sleep 0.05)))
-                  (physical-promotion-shutdown (condition)
+                  ((or physical-promotion-shutdown physical-recovery-worker-shutdown) (condition)
                     (unless (physical-promotion-can-yield-to-shutdown-p)
                       (error condition))
                     (setf finished t)
@@ -344,21 +350,27 @@ writer admission. Cold startup also uses it to discard stale requests."
       (fsync-directory *pgdata*)
       t)))
 
+(defvar *physical-promotion-accepted-p* nil
+  "Worker-owned request after consuming the promotion signal file.")
+
 (defun physical-promotion-worker-step ()
-  "Keep an accepted request pending while child initialization is incomplete.
-If the wait is discovered after workers stop, restore them and republish the request.
-A SQL timeout does not withdraw the accepted request."
-  (when *physical-promotion-requested-p*
+  "Retain a consumed request through healthy pre-intent deferrals."
+  (when (or *physical-promotion-requested-p* *physical-promotion-accepted-p*)
     (setf *physical-promotion-requested-p* nil)
     (handler-case
         (if (with-live-operation
               (physical-promotion-check-online)
               (physical-promotion-awaiting-child-initialization-p))
             (setf *physical-promotion-requested-p* t)
-            (when (physical-promotion-consume-signal)
-              (admin-log "received promote request")
-              (when (eq :awaiting-child-initialization (physical-recovery-promote))
-                (with-live-operation (physical-promotion-request-from-sql)))))
+            (progn
+              (when (physical-promotion-consume-signal)
+                (setf *physical-promotion-accepted-p* t)
+                (admin-log "received promote request"))
+              (when *physical-promotion-accepted-p*
+                (let ((result (physical-recovery-promote)))
+                  (setf *physical-promotion-accepted-p*
+                        (not (null (member result '(:awaiting-child-initialization :archive-staging-deferred)))))
+                  result))))
       (error (condition)
         (admin-log "native promotion failed: ~a" condition)))))
 
@@ -368,14 +380,15 @@ Keep this separate from the postmaster worker so shutdown stays responsive."
   (loop while (and (recovery-in-progress-p) (not (shutdown-in-progress-p))
                    (not *physical-recovery-failed-p*))
         do (physical-promotion-worker-step)
-           (sleep 0.05)))
+           (sleep (if *physical-promotion-accepted-p* 1 0.05))))
 
 (defun physical-promotion-initialize-requests ()
   "Discard stale request state after PGDATA ownership, before recovery startup.
 MAIN installs the signal handler before publishing its PID file. Requests queued
 after this reset remain pending until the worker starts."
   (physical-promotion-consume-signal)
-  (setf *physical-promotion-requested-p* nil))
+  (setf *physical-promotion-accepted-p* nil
+        *physical-promotion-requested-p* nil))
 
 (defun physical-promotion-start-worker ()
   "Start at most one request worker after recovery storage has been initialized.
