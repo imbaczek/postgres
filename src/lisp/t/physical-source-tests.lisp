@@ -54,7 +54,18 @@
            (ok (= (length bytes)
                   (pg::wal-verify-archive-segment-proof
                    (pg::read-bounded-regular-file proof pg::+wal-archive-segment-proof-size+)
-                   (pg::catalog-system-identifier) 1 0 :legacy bytes))))))))
+                   (pg::catalog-system-identifier) 1 0 :legacy bytes))))
+         (delete-file proof)
+         (sb-posix:mkdir (namestring proof) #o700)
+         (let ((pg::*wal-end-lsn* (length later))
+               (warned nil))
+           (unwind-protect
+                (handler-bind ((warning (lambda (condition)
+                                          (setf warned t)
+                                          (muffle-warning condition))))
+                  (ok (streamp (pg::wal-open-output 1)))
+                  (ok warned))
+             (when pg::*wal-output-stream* (close pg::*wal-output-stream*))))))))
 
 (deftest primary-archive-ready-follows-control-and-fences-recycling
     (call-with-physical-source-fixture

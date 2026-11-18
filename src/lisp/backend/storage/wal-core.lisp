@@ -1558,7 +1558,9 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   (when (and (plusp *wal-end-lsn*) (startup-primary-wal-archive-enabled-p))
     (let ((previous (floor (1- *wal-end-lsn*) +wal-segment-size+)))
       (when (< previous next-segment)
-        (wal-record-primary-archive-rotation previous *wal-end-lsn*)))))
+        (handler-case (wal-record-primary-archive-rotation previous *wal-end-lsn*)
+          (error (condition)
+            (warn "could not record archive proof for WAL segment ~a: ~a" previous condition)))))))
 
 (defun wal-open-output (segment)
   (unless (eql segment *wal-output-segment*)
@@ -4586,8 +4588,8 @@ under the lock, and publish completion only after success."
 (defun wal-record-primary-archive-rotation (segment end)
   "Persist the writer's end before the first record enters the next segment."
   (sb-sys:without-interrupts
-    (let ((fd (wal-archive-open-wal-directory))
-          (name (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*)))
+    (let ((name (wal-segment-filename segment *wal-insert-timeline* *wal-segment-namespace*))
+          (fd (wal-archive-open-wal-directory)))
       (unwind-protect
            (progn
              (wal-archive-check-wal-directory fd)
