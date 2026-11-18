@@ -20,8 +20,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 timeout --foreground --kill-after=5 "${WAL_KEEP_DRIVER_TIMEOUT:-240}s" \
-    "$PYTHON" "$BASE/t/interop/wal-keep.py" "$BASE" "$TMP/native" "$PORT" "$BASE/pg-lisp.sh" --native
+    "$PYTHON" "$BASE/t/interop/wal-keep.py" "$BASE" "$TMP/native" "$PORT" "$BASE/pg-lisp.sh" --native "$@"
 if [ -n "${REFERENCE_POSTGRES:-}" ]; then
     timeout --foreground --kill-after=5 "${WAL_KEEP_DRIVER_TIMEOUT:-240}s" \
-        "$PYTHON" "$BASE/t/interop/wal-keep.py" "$BASE" "$TMP/reference" "$((PORT + 1))" "$REFERENCE_POSTGRES"
+        "$PYTHON" "$BASE/t/interop/wal-keep.py" "$BASE" "$TMP/reference" "$((PORT + 1))" "$REFERENCE_POSTGRES" "$@"
 fi

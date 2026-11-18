@@ -50,6 +50,51 @@ def exercise(base, root, port, native):
         connection.close()
 
 
+def exercise_checkpoint_loss(root, port, native):
+    connection = peer.connect(port)
+    try:
+        config = root / 'data/postgresql.conf'
+        config.write_text('wal_keep_size=32\nmax_slot_wal_keep_size=1\n')
+        assert connection.query('SELECT pg_reload_conf()') == [['t']]
+        peer.wait(lambda: connection.query('SHOW max_slot_wal_keep_size') == [['1MB']], 120)
+        connection.query('CREATE TABLE slot_cap_payload(id integer)')
+        connection.query("SELECT pg_create_physical_replication_slot('cap_test', true)")
+        restart = connection.query("SELECT restart_lsn FROM pg_replication_slots WHERE slot_name='cap_test'")[0][0]
+        segment = lsn(restart) // SIZE
+        boundary = (segment + 2) * SIZE
+        filename = f'{segment:016X}.wal' if native else f'00000001{segment // 256:08X}{segment % 256:08X}'
+        retained = root / 'data/pg_wal' / filename
+        if native:
+            for index in range(6000):
+                connection.query(f'INSERT INTO slot_cap_payload VALUES ({index})')
+                if index % 64 == 0 and lsn(connection.query('SELECT pg_current_wal_lsn()')[0][0]) >= boundary:
+                    break
+            else:
+                raise AssertionError('native writer did not cross the slot retention boundary')
+        else:
+            for step in range(2):
+                connection.query(f"SELECT pg_create_restore_point('cap_loss_{step}')")
+                connection.query('SELECT pg_switch_wal()')
+        connection.query('CHECKPOINT')
+        assert connection.query("SELECT restart_lsn, invalidation_reason FROM pg_replication_slots "
+                                "WHERE slot_name='cap_test'") == [[restart, None]]
+        assert retained.is_file(), retained
+        config.write_text('wal_keep_size=0\nmax_slot_wal_keep_size=1\n')
+        assert connection.query('SELECT pg_reload_conf()') == [['t']]
+        peer.wait(lambda: connection.query('SHOW wal_keep_size') == [['0']], 120)
+        connection.query('CHECKPOINT')
+        check_lost(connection)
+        assert not retained.exists(), retained
+    finally:
+        connection.close()
+
+
+def check_lost(connection):
+    assert connection.query("SELECT restart_lsn, wal_status, safe_wal_size, invalidation_reason "
+                            "FROM pg_replication_slots WHERE slot_name='cap_test'") == [
+                                [None, 'lost', None, 'wal_removed']]
+
+
 def main():
     if not __debug__:
         raise RuntimeError('Run this assertion-based oracle without Python -O.')
@@ -59,6 +104,8 @@ def main():
     parser.add_argument('port', type=int)
     parser.add_argument('executable', type=Path)
     parser.add_argument('--native', action='store_true')
+    parser.add_argument('--checkpoint-loss', action='store_true',
+                        help='run only the checkpoint and restart scenario')
     args = parser.parse_args()
     base, root, executable = args.base.resolve(), args.root.resolve(), args.executable.resolve()
     root.mkdir(mode=0o700)
@@ -74,7 +121,18 @@ def main():
     processes = []
     try:
         process = peer.start(base, root, executable, args.port, 'server', args.native, processes)
-        exercise(base, root, args.port, args.native)
+        if args.checkpoint_loss:
+            exercise_checkpoint_loss(root, args.port, args.native)
+            peer.stop(base, root, process)
+            process = peer.start(base, root, executable, args.port, 'restarted', args.native, processes)
+            connection = peer.connect(args.port)
+            try:
+                check_lost(connection)
+                print('wal-keep: checkpoint loss after floor removal persists across restart PASS', flush=True)
+            finally:
+                connection.close()
+        else:
+            exercise(base, root, args.port, args.native)
         peer.stop(base, root, process)
     finally:
         if (root / 'owned').exists():
