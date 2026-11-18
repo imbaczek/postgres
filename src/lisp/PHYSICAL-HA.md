@@ -50,6 +50,12 @@ follow-configuration and retirement interruption case took 293.36 s.
 All three runs recorded only expected process exits and left no recorded
 process IDs alive.
 
+After moving disabled-hot-standby rejection before the peer socket lookup,
+the native and C wire tests passed in 45.59 s. The supplied-leader SCRAM
+lifecycle passed again in 374.30 s while the physical suite and other
+verification workers were active. Clone took 2.14 s and former-primary
+construction took 57.17 s. All recorded processes exited as expected.
+
 ## Scope check after WAL namespace proof migration
 
 Three manual writer switchovers have passed: Lisp-to-Lisp, Lisp-to-C, and

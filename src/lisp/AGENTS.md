@@ -358,6 +358,10 @@ appropriate instead of replacing the native C peer or adding a message relay.
   seconds even with a higher test timeout, while its Lisp worker and subprocesses
   continue running. Check the original worker and its active children before
   rerunning. A tool timeout does not establish a test result.
+- Give parallel cold ASDF workers separate output directories on the ramdisk.
+  Set `ASDF_OUTPUT_TRANSLATIONS` before starting each worker so test subprocesses
+  inherit its cache. Four workers sharing the default cache raced while writing
+  test FASLs, and one worker failed to load a file it had just compiled.
 - Raw Rove reports use `×` for failures. Check the process exit status, final
   summary and actual markers. A scan for `✗` alone missed two failed fixtures
   during a full run in this session.
