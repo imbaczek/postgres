@@ -16,7 +16,7 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
   written-lsn flushed-lsn decoder
   (written-digest #xCBF29CE484222325) (flushed-digest #xCBF29CE484222325)
   lock-stream stream segment segment-timeline selection retained-identity retained-root retained-directory-value
-  archive-scan-limit
+  archive-scan-limit archive-scan-selection
   (failed-p nil) (closed-p nil)
   (mutex (sb-thread:make-mutex :name "physical WAL receive store")))
 

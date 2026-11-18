@@ -4464,6 +4464,34 @@ Keep the descriptors open through unlink and sync the WAL directory."
        (member (getf *wal-control-metadata* :db-state)
                (list +db-in-production+ +db-shutdowning+ +db-shutdowned+))))
 
+(declaim (ftype function startup-standby-wal-archive-enabled-p))
+
+(defun wal-archive-staged-history-state (wal-fd name primary-facts)
+  "Recognize a matching history already owned by the standby archive queue."
+  (handler-case
+      (call-with-standby-wal-archive-directory
+       (lambda (stage-fd check-directory)
+         (let ((path (merge-pathnames name (physical-image-fd-path stage-fd))))
+           (when (wal-namespace-file-stat path t)
+             (sb-sys:without-interrupts
+               (let ((source-fd (wal-archive-open-source stage-fd name)))
+                 (unwind-protect
+                      (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes stage-fd name)
+                        (when (and (equal facts (wal-archive-check-source stage-fd name source-fd))
+                                   (multiple-value-bind (primary-bytes facts) (wal-archive-read-source-bytes wal-fd name)
+                                     (and (equal primary-facts facts) (equalp bytes primary-bytes))))
+                          (let ((status-fd (wal-archive-open-status-directory stage-fd)))
+                            (unwind-protect
+                                 (let ((done (wal-archive-done-matches-p stage-fd status-fd name source-fd)))
+                                   (funcall check-directory stage-fd)
+                                   (wal-archive-check-status-directory stage-fd status-fd)
+                                   (unless (equal facts (wal-archive-check-source stage-fd name source-fd))
+                                     (error "staged history changed during archive handoff"))
+                                   (if done :done :pending))
+                              (sb-posix:close status-fd)))))
+                   (sb-posix:close source-fd))))))))
+    (error () nil)))
+
 (defun wal-archive-attempt (item template &key epoch)
   "Archive one durable WAL file with the command outside the WAL lock.
 Keep the source and directory descriptors open through the command, recheck them
@@ -4501,36 +4529,40 @@ under the lock, and publish completion only after success."
                      ((consp item)
                       (unless (member item (wal-archive-history-items name facts) :test #'equal)
                         (return-from wal-archive-attempt nil)))))
-             ;; Keep the WAL directory descriptor open for the shell's source path.
-             (when (wal-archive-run-shell template name wal-fd directory)
-               (sb-thread:with-mutex (*wal-lock*)
-                 (unless (and (or (null epoch) (wal-archive-primary-ready-p))
-                              (eq incarnation *wal-storage-incarnation*)
-                              (string= name (wal-archive-item-name item))
-                              (wal-archive-item-ready-p item)
-                              (or (not (wal-archive-partial-item-p item))
-                                  (wal-archive-partial-matches-p wal-fd item facts))
-                              (equal facts (wal-archive-check-source wal-fd name source-fd)))
-                   (error "WAL archive source changed during command: ~a" name))
-                 (wal-archive-check-wal-directory wal-fd)
-                 (wal-archive-check-status-directory wal-fd status-fd)
-                 (wal-archive-publish-done status-fd name facts))
-               t))
+             ;; Reuse the standby receipt only for identical committed history.
+             (let ((staged (when (and (consp item) (not (wal-archive-partial-item-p item))
+                                      (startup-standby-wal-archive-enabled-p))
+                             (wal-archive-staged-history-state wal-fd name facts))))
+               (when (eq staged :pending)
+                 (return-from wal-archive-attempt (values nil :staged-pending)))
+               (when (or (eq staged :done) (wal-archive-run-shell template name wal-fd directory))
+                 (sb-thread:with-mutex (*wal-lock*)
+                   (unless (and (or (null epoch) (wal-archive-primary-ready-p))
+                                (eq incarnation *wal-storage-incarnation*)
+                                (string= name (wal-archive-item-name item))
+                                (wal-archive-item-ready-p item)
+                                (or (not (wal-archive-partial-item-p item))
+                                    (wal-archive-partial-matches-p wal-fd item facts))
+                                (equal facts (wal-archive-check-source wal-fd name source-fd)))
+                     (error "WAL archive source changed during command: ~a" name))
+                   (wal-archive-check-wal-directory wal-fd)
+                   (wal-archive-check-status-directory wal-fd status-fd)
+                   (wal-archive-publish-done status-fd name facts))
+                 t)))
         (unwind-protect
              (when source-fd (sb-posix:close source-fd))
           (unwind-protect
                (when status-fd (sb-posix:close status-fd))
             (when wal-fd (sb-posix:close wal-fd))))))))
 
-(defun wal-archive-attempt-staged (directory-fd timeline segment template check-directory)
-  "Archive one immutable staged standby segment and record success.
+(defun wal-archive-attempt-staged (directory-fd name template check-directory)
+  "Archive one immutable staged standby file and record success.
 The caller holds DIRECTORY-FD and serializes attempts for this staging area.
 Return :ARCHIVED for new success, :ALREADY-DONE for a matching receipt, or NIL
 when the command fails."
   (when (or (zerop (length template)) (sb-thread:holding-mutex-p *wal-lock*))
     (error "staged WAL archive attempt requires a command and an unlocked WAL mutex"))
-  (let ((name (wal-segment-filename segment timeline :timeline))
-        (directory *pgdata*)
+  (let ((directory *pgdata*)
         (status-fd nil)
         (source-fd nil))
     (sb-sys:without-interrupts
@@ -4637,22 +4669,32 @@ Ensure its ready marker is durable and return the item and storage epoch."
                  (when status-fd (sb-posix:close status-fd))
               (when wal-fd (sb-posix:close wal-fd)))))))))
 
+(defun wal-archive-staged-name-p (name)
+  (cond ((and (= (length name) 28) (uiop:string-suffix-p name ".wal"))
+         (wal-parse-segment-name (subseq name 0 24) :timeline))
+        ((and (= (length name) 16) (uiop:string-suffix-p name ".history")
+              (every (lambda (char) (find char "0123456789ABCDEF")) (subseq name 0 8)))
+         (> (parse-integer name :end 8 :radix 16) 1))))
+
 (defun wal-archiver-step-staged (template)
-  "Archive the earliest pending staged segment, retaining failed work for retry."
+  "Archive the earliest pending staged file, retaining failed work for retry."
   (call-with-standby-wal-archive-directory
    (lambda (fd check-directory)
      (loop for name in (sort (directory-entry-names (physical-image-fd-path fd)
                                                     :follow-symlinks t)
-                             #'string<)
-           do (multiple-value-bind (timeline segment)
-                  (wal-parse-segment-name (subseq name 0 (- (length name) 4)) :timeline)
-                (when timeline
-                  (case (wal-archive-attempt-staged fd timeline segment template check-directory)
-                    (:archived (return t))
-                    (:already-done nil)
-                    (otherwise
-                     (warn "archive_command failed for staged WAL ~a; will retry" name)
-                     (return nil)))))))))
+                             (lambda (left right)
+                               (let ((left-history (uiop:string-suffix-p left ".history"))
+                                     (right-history (uiop:string-suffix-p right ".history")))
+                                 (if (eq left-history right-history)
+                                     (string< left right)
+                                     left-history))))
+           when (wal-archive-staged-name-p name)
+             do (case (wal-archive-attempt-staged fd name template check-directory)
+                  (:archived (return t))
+                  (:already-done nil)
+                  (otherwise
+                   (warn "archive_command failed for staged WAL ~a; will retry" name)
+                   (return nil)))))))
 
 (declaim (ftype function startup-standby-wal-archive-enabled-p))
 
@@ -4673,11 +4715,10 @@ Ensure its ready marker is durable and return the item and storage epoch."
                 (sb-thread:with-mutex (*wal-lock*)
                   (wal-archive-pending-item-under-lock))
               (when item
-                (if (wal-archive-attempt item template :epoch epoch)
-                    t
-                    (progn
-                      (warn "archive_command failed for WAL item ~a; will retry" item)
-                      nil)))))))))
+                (multiple-value-bind (archived status) (wal-archive-attempt item template :epoch epoch)
+                  (unless (or archived (eq status :staged-pending))
+                    (warn "archive_command failed for WAL item ~a; will retry" item))
+                  archived))))))))
 
 (defun wal-archiver-try-step ()
   (handler-case (wal-archiver-step)

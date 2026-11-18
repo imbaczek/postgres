@@ -169,30 +169,46 @@ Return the staged name and proved end, or NIL until the segment is closed."
             (error (condition)
               (return condition))))))))
 
+(defun physical-store-stage-archive-history-under-lock (store publish)
+  "Queue the checked durable history chain before its WAL, including before replay."
+  (let ((selection (physical-store-selection store)))
+    (when (and selection (not (eq selection (physical-store-archive-scan-selection store))))
+      (let ((checked (nth-value 1 (physical-store-read-retained-control
+                                   store (physical-store-control-tuple store)))))
+        (dolist (node (reverse (loop for item = checked then (getf item :previous) while item collect item)))
+          (funcall publish (timeline-history-filename (getf node :target))
+                   (string->bytes (getf node :history-text)))))
+      (setf (physical-store-archive-scan-selection store) selection))))
+
 (defun physical-store-stage-receive-archive (store)
-  "Stage complete segments through durable receipt, independently of replay."
+  "Stage the selected history and closed segments through durable receipt."
   (flet ((start ()
            (or (physical-store-archive-scan-limit store)
                (floor (physical-store-base-lsn store) +wal-segment-size+)))
          (limit ()
            (floor (physical-store-flushed-lsn store) +wal-segment-size+)))
-    (when (< (start) (limit))
+    (when (or (< (start) (limit))
+              (not (eq (physical-store-selection store) (physical-store-archive-scan-selection store))))
       (handler-case
           (call-with-standby-wal-archive-directory
            (lambda (fd check-directory)
              (let ((failure
                      (with-physical-store (store)
-                       (let* ((limit (limit))
-                              (entries (physical-store-archive-candidates-under-lock store (start) limit))
-                              (failure
-                                (physical-store-stage-archive-candidates-under-lock
-                                 store entries
-                                 (lambda (timeline segment bytes)
-                                   (wal-archive-stage-source
-                                    fd (wal-segment-filename segment timeline :timeline) bytes check-directory)))))
-                         (unless failure
-                           (setf (physical-store-archive-scan-limit store) limit))
-                         failure))))
+                       (block stage
+                         (flet ((publish (name bytes)
+                                  (handler-case (wal-archive-stage-source fd name bytes check-directory)
+                                    (error (condition) (return-from stage condition)))))
+                           (physical-store-stage-archive-history-under-lock store #'publish)
+                           (let* ((limit (limit))
+                                  (entries (when (< (start) limit)
+                                             (physical-store-archive-candidates-under-lock store (start) limit)))
+                                  (failure
+                                    (physical-store-stage-archive-candidates-under-lock
+                                     store entries
+                                     (lambda (timeline segment bytes)
+                                       (publish (wal-segment-filename segment timeline :timeline) bytes)))))
+                             (unless failure (setf (physical-store-archive-scan-limit store) limit))
+                             failure))))))
                (when failure (error failure)))))
         (error (condition)
           (if (physical-store-failed-p store)

@@ -75,7 +75,7 @@ The root update calls this outside the archive mutex."
     (physical-store-load-control probe)
     (unless (equal expected (physical-store-control-tuple probe))
       (error "receive control readback differs from its complete expected tuple"))
-    (physical-store-retained-root probe)))
+    (values (physical-store-retained-root probe) (physical-store-selection probe))))
 
 (defun physical-store-restore-retained-reference (store)
   "Restore or reconcile local root ownership from the store's durable control."

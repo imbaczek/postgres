@@ -202,6 +202,23 @@
          (ok (probe-file archived-segment))
          (ok (not (probe-file archived-sibling)))
          (ok (not (pg::wal-archiver-step)))
+         (pg::call-with-standby-wal-archive-directory
+          (lambda (fd check-directory)
+            (pg::wal-archive-stage-source fd "00000002.history"
+                                          (pg::recovery-read-bytes archived-ancestor) check-directory)))
+         (delete-file archived-ancestor)
+         (delete-file (merge-pathnames "archive_status/00000002.history.done" (pg::wal-directory)))
+         (setf (getf (gethash "archive_mode" settings) :value) "always"
+               (getf (gethash "archive_command" settings) :value) "exit 1")
+         (multiple-value-bind (archived status)
+             (pg::wal-archive-attempt '(:history . 2) "cp -- \"%p\" \"archived-%f\"")
+           (ok (not archived))
+           (ok (eq status :staged-pending))
+           (ok (not (probe-file archived-ancestor))))
+         (ok (pg::wal-archiver-step-staged "cp -- \"%p\" \"archived-%f\""))
+         (ok (pg::wal-archiver-step))
+         (ok (probe-file (merge-pathnames "archive_status/00000002.history.done" (pg::wal-directory))))
+         (ok (not (pg::wal-archiver-step)))
          (let ((path (pg::timeline-history-path 2 pg::*pgdata*)))
            (sb-posix:link (namestring path)
                           (namestring (merge-pathnames "history-hardlink" pg::*pgdata*)))
