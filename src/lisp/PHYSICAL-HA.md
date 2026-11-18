@@ -30,7 +30,8 @@ With no checkpoint hint, stock Patroni checks the source timeline through SQL
 and completes rewind and rejoin. The fixture uses distinct connection settings
 with the same login. Offline configuration queries report `archive_mode` and
 `archive_command`. Primary WAL archiving runs with `archive_mode=on`.
-Standby `archive_mode=always` archives complete streamed WAL segments.
+Standby `archive_mode=always` archives complete streamed WAL segments and
+durably selected timeline histories.
 C `pg_rewind` maps pages changed on the target and relies on recovery to replay
 subsequent source changes. Native rewind reuses whole matching relation files.
 When discovery proves the fork, it also offers up to 256 candidate pages across
@@ -63,10 +64,10 @@ Three items remain for backend closeout.
    leadership supplied by the harness.
 2. Qualify archive retries across repeated promotion. The standby queue
    retains completed files and rescans receipts. It still needs safe
-   reclamation and bounded backlog scans. C also archives WAL restored during
-   online recovery and timeline histories received by a standby. Native online
-   recovery still rejects a nonempty `restore_command`. The offline rewind
-   restore path has its own acceptance above.
+   reclamation and bounded backlog scans. Receipt handoff across archive mode
+   changes still needs qualification.
+   Native online recovery still rejects a nonempty `restore_command`. The
+   offline rewind restore path has its own acceptance above.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -257,6 +258,14 @@ advanced while the receive floor stayed in place. It restarted with the source
 offline, promoted, and later archived the two queued segments. Both archive
 files matched the source WAL. The final run took 35.55 s on the ramdisk.
 Three focused tests took 3.61 s.
+
+The standby worker stages the exact history bytes referenced by durable receive
+control. It processes histories before queued WAL segments. With
+`archive_mode=always`, a promoted primary can reuse a staged receipt after
+checking that both files contain the same bytes. Three focused tests took
+1.18 s. The live standby segment regression passed on an earlier build in
+72.08 s, including cold compilation. A live multi-timeline history test
+remains open.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
