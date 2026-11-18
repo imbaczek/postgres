@@ -149,6 +149,45 @@ The archive is a trusted source. Checksums detect accidental changes."
       (error "WAL archive proof differs from the expected segment"))
     end))
 
+(defun wal-restore-archive-file (template name directory-fd minimum maximum)
+  (let* ((path (merge-pathnames name (physical-image-fd-path directory-fd)))
+         (status (wal-run-restore-command template name directory-fd)))
+    (physical-image-check-directory directory-fd)
+    (cond ((zerop status)
+           (handler-case
+               (read-bounded-regular-file path maximum :minimum minimum)
+             (sb-posix:syscall-error (condition)
+               (unless (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+                 (error condition)))))
+          ((>= status 126) (error "restore_command could not run for ~a" name)))))
+
+(defun wal-restore-proved-segment (template directory-fd system-id timeline segment namespace)
+  "Fetch a closed segment into an empty private directory owned by the caller.
+Return its bytes and proved end. A missing archive file returns NIL. The caller
+discards the entire staging directory after each attempt."
+  (physical-image-check-directory directory-fd)
+  (let* ((directory (physical-image-fd-path directory-fd))
+         (name (wal-segment-filename segment timeline namespace))
+         (proof-name (wal-archive-segment-proof-name name)))
+    (directory-entry-names directory :follow-symlinks t :maximum-entries 0)
+    (let ((bytes (wal-restore-archive-file template name directory-fd
+                                           +wal-header-size+ +wal-segment-size+)))
+      (when bytes
+        ;; A command for the segment must not also supply its proof output.
+        (handler-case
+            (progn
+              (sb-posix:lstat (namestring (merge-pathnames proof-name directory)))
+              (error "restore proof output already exists"))
+          (sb-posix:syscall-error (condition)
+            (unless (= (sb-posix:syscall-errno condition) sb-posix:enoent)
+              (error condition))))
+        (let ((proof (wal-restore-archive-file template proof-name directory-fd
+                                               +wal-archive-segment-proof-size+
+                                               +wal-archive-segment-proof-size+)))
+          (when proof
+            (values bytes (wal-verify-archive-segment-proof
+                           proof system-id timeline segment namespace bytes))))))))
+
 (defun physical-store-update-digest-span (digest bytes start end)
   "Extend DIGEST over the half-open span [START, END) without changing BYTES.
 For an unsigned 64-bit digest, simple octet vector and valid fixnum bounds,

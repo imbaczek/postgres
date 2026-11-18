@@ -119,6 +119,38 @@
          (ok (not (probe-file segment)))
          (ok (not (probe-file proof)))))))
 
+(deftest archive-restore-requires-matching-segment-proof
+    (with-physical-store-directory (root)
+      (let* ((name (pg::wal-segment-filename 0 2 :timeline))
+             (proof-name (pg::wal-archive-segment-proof-name name))
+             (archive (merge-pathnames "archive/" root))
+             (segment-path (merge-pathnames name archive))
+             (proof-path (merge-pathnames proof-name archive))
+             (bytes (sample-physical-record))
+             (end (length bytes))
+             (template (format nil "cp -- '~a'\"%f\" \"%p\"" (namestring archive))))
+        (pg::wal-ensure-directory-durable archive)
+        (pg::wal-atomic-write-bytes segment-path bytes)
+        (flet ((restore (leaf &optional (command template))
+                 (let ((stage (merge-pathnames leaf root)))
+                   (sb-posix:mkdir (namestring stage) #o700)
+                   (let ((fd (pg::physical-backup-open-directory stage)))
+                     (unwind-protect
+                          (pg::wal-restore-proved-segment command fd 17 2 0 :timeline)
+                       (sb-posix:close fd))))))
+          (ok (null (restore "missing/")))
+          (pg::wal-atomic-write-bytes proof-path
+                                      (pg::wal-encode-archive-segment-proof 17 2 0 :timeline end bytes))
+          (multiple-value-bind (restored restored-end) (restore "valid/")
+            (ok (equalp restored bytes))
+            (ok (eql restored-end end)))
+          (pg::wal-atomic-write-bytes proof-path
+                                      (pg::wal-encode-archive-segment-proof 18 2 0 :timeline end bytes))
+          (ok (signals (restore "wrong-cluster/") 'error))
+          (ok (signals (restore "unsafe-output/" "ln -s /dev/null \"%p\"") 'error))
+          (ok (signals (restore "nonprivate-output/" "chmod 755 \"$(dirname \"%p\")\"") 'error))
+          (ok (signals (restore "failed-shell/" "exit 127") 'error))))))
+
 (deftest archive-proof-follows-wal-namespace-migration
     (call-with-physical-source-fixture
      (lambda ()
