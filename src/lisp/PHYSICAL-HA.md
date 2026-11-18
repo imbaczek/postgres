@@ -5114,6 +5114,11 @@ symlink and nonempty targets, and unsupported host authentication. Native
 init builds a sibling directory and publishes it with an atomic rename.
 A precreated empty PGDATA receives a new directory inode.
 
+The native SCRAM key routines match PostgreSQL's SHA-256 derivation and
+proof checks. They load OpenSSL 3 through `libcrypto.so.3` on first use.
+The focused Rove vector passed in a fresh Lisp worker and checked both keys,
+the server signature, and rejection of shortened and modified proofs.
+
 Distinct backend gaps remain:
 
 - Password-backed `initdb` and `post_bootstrap` role provisioning still need
