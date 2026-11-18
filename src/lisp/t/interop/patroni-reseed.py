@@ -569,6 +569,15 @@ class RewindCaptureResumeCliAcceptance(RewindCliAcceptance):
             assert self.retained_rewind_stages() == retained
             assert not orphan.exists()
             assert stage.stat().st_ino == stage_inode and seal.stat().st_ino == seal_inode
+            replay = self.server.root / "rewind-replay"
+            replay.mkdir(mode=0o700)
+            arguments = " ".join("#P" + cancellation.lisp_string(str(path) + "/")
+                                 for path in (target, replay))
+            helper = cancellation.lisp_string(self.helper)
+            _, output = self.process("rewind-replay", self.native_arguments() + [
+                "--eval", f"(pg::native-patroni-rewind-replay {arguments} {helper})"],
+                timeout=240, env=env)
+            assert b"REWIND-REPLAY PASS" in output
         else:
             assert not retained
         _, resumed = self.process("rewind-capture-resume", [

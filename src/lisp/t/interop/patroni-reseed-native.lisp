@@ -137,6 +137,45 @@
           (when (eq point :after-capture)
             (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill)))))
 
+(defun native-patroni-rewind-replay (target replay helper)
+  (call-with-physical-reseed-owner
+   target
+   (lambda (owner)
+     (let* ((*pgdata* (physical-adoption-owner-directory owner))
+            (attempt (physical-reseed-attempt-read owner))
+            (request (getf attempt :request))
+            (stage (pathname (getf (getf attempt :stage) :directory)))
+            (wrong (copy-tree request)))
+       (setf (getf wrong :token)
+             (make-string 64 :initial-element
+                          (if (char= #\a (char (getf request :token) 0)) #\b #\a)))
+       (call-with-physical-reseed-client
+        owner attempt
+        (lambda (client)
+          (assert (handler-case
+                      (progn
+                        (physical-libpq-start-copy-out
+                         client (pg-client-native-backup-lease-query "REPLAY_REWIND_NATIVE" wrong))
+                        nil)
+                    (pg-client-error (condition)
+                      (equal "55000" (pg-client-error-sqlstate condition))))))
+        :helper helper)
+       (call-with-physical-reseed-stage
+        owner replay
+        (lambda (directory facts fd)
+          (declare (ignore facts))
+          (call-with-physical-reseed-client
+           owner attempt
+           (lambda (client)
+             (multiple-value-bind (manifest record)
+                 (physical-backup-lease-capture-remote
+                  directory client request :directory-fd fd :replay t)
+               (assert (eq :ready (getf record :phase)))
+               (assert (equal (physical-backup-bundle-entries directory manifest)
+                              (physical-backup-bundle-entries stage manifest)))))
+           :helper helper))))))
+  (write-line "REWIND-REPLAY PASS"))
+
 (defun native-patroni-rewind-crash-before-capture ()
   (setf *physical-reseed-remote-test-hook*
         (lambda (point)
