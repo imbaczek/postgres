@@ -35,6 +35,7 @@
                    (:file "pqcomm")
                    (:file "pqformat")
                    (:file "scram")
+                   (:file "scram-wire")
                    (:file "hba")))
      (:module "storage"
       :serial t

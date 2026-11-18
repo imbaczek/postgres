@@ -119,16 +119,18 @@ as a second value. Blocking reads stay outside OPERATION-WRAPPER."
               (values (concatenate '(vector (unsigned-byte 8)) code-bytes tail)
                       bypass-p))))))))
 
-(defun read-message-frame (stream &optional (maximum +max-query-message-size+))
+(defun read-message-frame (stream &optional (maximum +max-query-message-size+) expected-type)
   "Read one bounded raw frame without validating or constructing a message.
 
 Frontend decoding belongs under live-operation admission; client readers
-validate their own response schema. Only the allocation bound is checked here.
-MAXIMUM bounds the length word value, including its four bytes; its default
-retains the frontend limit."
+validate their own response schema. MAXIMUM bounds the length word, including
+its four bytes. If a supplied EXPECTED-TYPE differs from the type byte, return
+the type and two NIL values immediately, leaving the length and body unread."
   (let ((type-byte (read-byte stream nil nil)))
     (when (null type-byte)
       (return-from read-message-frame (values nil nil nil)))
+    (when (and expected-type (/= type-byte expected-type))
+      (return-from read-message-frame (values type-byte nil nil)))
     (multiple-value-bind (length-bytes got) (read-exact-bytes stream 4)
       (declare (ignore got))
       (unless length-bytes
