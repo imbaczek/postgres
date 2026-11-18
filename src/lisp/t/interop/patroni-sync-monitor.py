@@ -22,7 +22,7 @@ from psycopg2.extras import PhysicalReplicationConnection
 
 from patroni import global_config
 from patroni.api import RestApiHandler
-from patroni.dcs import Member
+from patroni.dcs import Cluster, Member
 from patroni.exceptions import PostgresConnectionException
 from patroni.postgresql import Postgresql
 from patroni.postgresql.connection import ConnectionPool
@@ -45,6 +45,7 @@ def scalar(connection, query):
 
 def monitor(connection, role, directory):
     node = Postgresql.__new__(Postgresql)
+    node.name = 'source'
     node._major_version = connection.server_version
     node._data_dir = str(directory)
     node._state_lock, node._role_lock = Lock(), Lock()
@@ -256,10 +257,11 @@ def check_native_streaming(connection, server):
         slot_row = monitor_node.query(monitor_node.cluster_info_query)[0]
         assert len(slot_row) == 16
         assert {slot['slot_name'] for slot in slot_row[12]} == {'sync_a', 'sync_b'}, slot_row[12]
-        handler = SyncHandler(monitor_node)
-        for names, states in (
-                ('FIRST 1 (sync_a,sync_b)', {'sync_a': 'sync', 'sync_b': 'potential'}),
-                ('ANY 1 (sync_a,sync_b)', {'sync_a': 'quorum', 'sync_b': 'quorum'})):
+        cluster = Cluster.empty()
+        cluster.members.extend(Member(0, name, None, {'state': 'running'}) for name in ('sync_a', 'sync_b'))
+        for quorum, names, states in (
+                (False, 'FIRST 1 (sync_a,sync_b)', {'sync_a': 'sync', 'sync_b': 'potential'}),
+                (True, 'ANY 1 (sync_a,sync_b)', {'sync_a': 'quorum', 'sync_b': 'quorum'})):
             configure(connection, names)
             barrier = lsn_number(scalar(connection, 'SELECT pg_current_wal_flush_lsn()'))
             deadline = time.monotonic() + 20
@@ -280,13 +282,14 @@ def check_native_streaming(connection, server):
                                     'write_lsn', 'flush_lsn', 'replay_lsn'}, row
                 assert 0 < row['replay_lsn'] <= row['flush_lsn'] <= row['write_lsn'], row
             check_rest_status(monitor_node, states)
-            handler._handle_synchronous_standby_names_change()
-            assert monitor_node._cluster_info_state == {}
+            global_config.update(None, {'synchronous_mode': 'quorum' if quorum else True})
+            check_sync_candidates(SyncHandler(monitor_node), monitor_node, cluster, quorum)
         assert any(sql.startswith('DO $$') for sql in trace)
         print('native: real Patroni followers, FIRST/ANY monitoring and unchanged sync-change DO PASS',
               flush=True)
     finally:
         failed = sys.exc_info()[0] is not None
+        global_config.update(None, {'synchronous_mode': True})
         cleanup.callback(configure, connection, '')
         cleanup.callback((server.root / 'patroni-sync-live.trace').write_text, '\n\n'.join(trace))
         try:
@@ -295,6 +298,20 @@ def check_native_streaming(connection, server):
             if not failed:
                 raise
             traceback.print_exc()
+
+
+def check_sync_candidates(handler, node, cluster, quorum):
+    expected = {'sync_a', 'sync_b'} if quorum else {'sync_a'}
+
+    def confirmed():
+        node.reset_cluster_info_state(None)
+        state = handler.current_state(cluster)
+        assert state.sync_type == ('quorum' if quorum else 'priority'), state
+        assert state.numsync == 1 and set(state.sync) == {'sync_a', 'sync_b'}, state
+        assert set(state.active) == expected, state
+        return set(state.sync_confirmed) == expected
+
+    follow['wait_for'](confirmed, seconds=20)
 
 
 def check_replay_timestamp(connection, standby):
