@@ -72,13 +72,23 @@ Two recovery areas still need work.
 
 1. Extend online archive recovery. A native standby configured to stream can
    restore proved closed WAL with `restore_command` before connecting. It uses
-   the selected history and the existing source transition handshake. A focused test
-   exercises the real shell and receiver loop with a simulated streaming handshake.
-   The existing live Patroni follow regression without a restore command passed
-   in 79.70 s on the ramdisk. Archive-only startup, archive history and partial
-   recovery, `%r`, and crash-stage reaping remain open. Offline rewind has a
-   separate restore path. Archive producer work still needs repeated-promotion
-   and mode-handoff tests, safe queue reclamation, and bounded backlog scans.
+   the selected history and the existing source transition handshake. A pinned
+   Patroni standby cold-start test stopped the source, observed a missing first
+   proof with zero rows, then released the proof and saw a retry replay 2,006
+   rows from at least two archived segments while the source remained offline.
+   When the source returned, physical-slot `follow_one` reached the end. The
+   test also checked stage cleanup on normal exit. Run it with
+   `t/interop/standby-archive.py --restore-then-stream` using the pinned Patroni
+   environment. It passed in 38.48 s on the ramdisk. A focused test exercises
+   the real shell and receiver loop with a simulated streaming handshake. The
+   existing live Patroni follow regression
+   without a restore command passed in 79.70 s on the ramdisk. Archive timeline
+   history and partial recovery, `%r`, startup cleanup of crash stages, and
+   enabling `restore_command` live when no receiver exists remain open. Startup
+   from an archive without a prior native receive state still needs qualification.
+   Offline rewind has a separate restore path. Archive producer work still needs
+   repeated-promotion and mode-handoff tests, safe queue reclamation, and
+   bounded backlog scans.
 2. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
    both histories and can find a fork before the immediate parent. The
    native live evidence covers the immediate-child case. Torn private replay
