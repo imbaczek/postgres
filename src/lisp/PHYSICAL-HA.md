@@ -23,10 +23,11 @@ Three areas still separate this evidence from closeout:
 1. Connect native standby feedback to the primary's cleanup decisions.
    Physical slot images can store separate data and catalog transaction
    horizons, and the native sender saves them from incoming feedback frames.
-   Ordinary VACUUM and index builds use the slot's data horizon. Standby
-   emission, SQL reporting, and the interaction with forced XID epoch rollover
-   still need acceptance. Patroni's logical slot readiness and slot copy path
-   also need their own acceptance.
+   The standby sends data feedback for a named physical slot. Ordinary VACUUM
+   and index builds use that horizon, and SQL reports it as `xmin`. Catalog
+   feedback, slotless feedback, and the interaction with forced XID epoch
+   rollover remain open. Patroni's logical slot readiness and slot copy path
+   still need acceptance.
 2. Exercise password-backed bootstrap and post-bootstrap role provisioning
    through stock Patroni.
 3. Qualify archive recovery with a configured streaming source across a
@@ -5129,8 +5130,8 @@ clears only `catalog_xmin`.
 
 C computes the two horizons in `GetReplicationHorizons` and applies them in
 `PhysicalReplicationSlotNewXmin`. Patroni uses the retained catalog horizon
-to assess slot readiness. Native slot reporting currently returns NULL for
-both horizons. Standby-side emission and Patroni's slot-copy path remain open.
+to assess slot readiness. Native SQL reports a physical slot's data `xmin`
+and returns NULL for `catalog_xmin`. Patroni's slot-copy path remains open.
 
 Six focused physical-slot tests passed in 36 ms of Rove execution, covering
 image round trips, checksum rejection, file dispatch, and startup. The full
@@ -5156,6 +5157,20 @@ sets a slot horizon through the control port, deletes a row, and runs VACUUM,
 CREATE INDEX, and VACUUM FULL. The deleted row stays invisible to a new
 snapshot while its index entry survives the rewrite. Three focused Rove tests
 passed in 4 ms of test execution.
+
+A native standby with a named physical slot now reports the oldest XID held
+by applied source transactions, local readers, or local physical slots. A
+disabled report clears the pin. The sender waits for resume proof before
+applying a report received during resume. The reloadable
+`wal_receiver_status_interval` controls the horizon reports. Native WAL
+acknowledgments still run after each receive cycle.
+
+The pinned Patroni follow regression passed in 64.63 s on the ramdisk. It
+enabled and disabled feedback through the configuration worker, checked that
+`pg_replication_slots.xmin` appeared and cleared, and kept both the standby
+postmaster PID and primary sender PID. Native SIGHUP also reloads code and
+can reconnect the receiver. Four focused Rove tests passed in 28 ms of test
+execution.
 
 The three configuration and candidate test runs overlapped on the ramdisk.
 
