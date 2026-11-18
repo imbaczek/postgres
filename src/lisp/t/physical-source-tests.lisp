@@ -65,6 +65,39 @@
            (pg::wal-remove-checkpointed-segments-under-wal-lock pg::*wal-checkpoint-lsn*)
            (ok (equal '(0 1 2 3) (pg::wal-discover-segments))))))))
 
+(deftest primary-archive-command-requires-success-and-the-same-wal-file
+    (call-with-physical-source-fixture
+     (lambda ()
+       (let* ((directory (merge-pathnames "archive_status/" (pg::wal-directory)))
+              (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
+              (name (file-namestring (pg::wal-segment-path 0)))
+              (done (merge-pathnames (concatenate 'string name ".done") directory))
+              (changed (merge-pathnames
+                        (concatenate 'string (file-namestring (pg::wal-segment-path 1)) ".done")
+                        directory)))
+         (setf (getf (gethash "archive_mode" settings) :value) "on")
+         (pg::with-wal-critical (pg::wal-archive-reconcile-ready-under-lock))
+         (ok (not (pg::wal-archive-attempt 0 "exit 42")))
+         (ok (not (probe-file done)))
+         (let ((sentinel (merge-pathnames "archive-sentinel" pg::*pgdata*)))
+           (with-open-file (stream sentinel :direction :output)
+             (write-line "kept" stream))
+           (sb-posix:link
+            (namestring sentinel)
+            (namestring (merge-pathnames (concatenate 'string name ".done.tmp") directory)))
+           (ok (pg::wal-archive-attempt 0 "cp -- \"%p\" \"copy-%f\""))
+           (ok (string= "kept" (uiop:read-file-line sentinel))))
+         (with-open-file (stream (merge-pathnames (concatenate 'string "copy-" name) pg::*pgdata*)
+                                 :element-type '(unsigned-byte 8))
+           (ok (eql 0 (read-byte stream)))
+           (ok (eql :eof (read-byte stream nil :eof))))
+         (ok (uiop:string-prefix-p (format nil "WAL-ARCHIVE ~a " name)
+                                   (uiop:read-file-line done)))
+         (ok (signals (pg::wal-archive-attempt
+                       1 "mv -- \"pg_wal/%f\" moved-wal && cp -- \"%p\" \"pg_wal/%f\"")
+                      'error))
+         (ok (not (probe-file changed)))))))
+
 (deftest physical-source-legacy-pin-is-readable-before-handoff
     (call-with-physical-source-fixture
      (lambda ()
