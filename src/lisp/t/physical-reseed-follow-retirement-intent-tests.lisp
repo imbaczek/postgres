@@ -1019,7 +1019,8 @@
               (loop for form in forms append (list "--eval" (write-to-string form)))))))
 
 (defun run-retirement-intent-test-crash-child
-    (root point cache marker &key (timeout 300) (operation :initial) argument-builder (output t))
+    (root point cache marker &key (timeout 300) (operation :initial) argument-builder
+                               (output (make-pathname :type "log" :defaults marker)))
   (let ((process nil) (pid nil))
     (unwind-protect
          (progn
@@ -1045,8 +1046,10 @@
                       (error "retirement crash child did not exit within ~a seconds" timeout))
                     (sleep 0.05))
            (sb-ext:process-wait process)
-           (assert (eq :signaled (sb-ext:process-status process)))
-           (assert (= sb-posix:sigkill (sb-ext:process-exit-code process)))
+           (unless (and (eq :signaled (sb-ext:process-status process))
+                        (= sb-posix:sigkill (sb-ext:process-exit-code process)))
+             (error "Retirement crash child exited with status ~s, code ~s. Output: ~s"
+                    (sb-ext:process-status process) (sb-ext:process-exit-code process) output))
            (with-open-file (input marker)
              (let ((*read-eval* nil) (*package* (find-package :cl-user)))
                (assert (equal (list pid point) (read input)))
