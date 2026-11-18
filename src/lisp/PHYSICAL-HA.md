@@ -81,14 +81,23 @@ Two recovery areas still need work.
    `t/interop/standby-archive.py --restore-then-stream` using the pinned Patroni
    environment. It passed in 38.48 s on the ramdisk. A focused test exercises
    the real shell and receiver loop with a simulated streaming handshake. The
-   existing live Patroni follow regression
-   without a restore command passed in 79.70 s on the ramdisk. Archive timeline
-   history and partial recovery, startup cleanup of crash stages, and
-   enabling `restore_command` live when no receiver exists remain open. Startup
-   from an archive without a prior native receive state still needs qualification.
+   existing live Patroni follow regression without a restore command passed
+   in 79.70 s on the ramdisk. Recovery from archived timeline history and
+   partial segments remains open, as does enabling `restore_command` on a
+   running standby that has no receiver. Startup from an archive without a
+   prior native receive state still needs qualification.
    Offline rewind has a separate restore path. Archive producer work still needs
    repeated-promotion and mode-handoff tests, safe queue reclamation, and
    bounded backlog scans.
+
+   Startup now removes abandoned restore stages under a pinned, owned PGDATA
+   root. The live archive-to-stream test sent SIGKILL after partial restore
+   output, then checked that startup cleared the stage, replayed 2,006 rows
+   while the source was offline, and switched to streaming. It took 43.83 s
+   on the ramdisk. Three focused tests passed, including unit checks that skip
+   unrelated, symlink, and nonprivate paths. C `xlogrecovery.c` removes its
+   fixed scratch files. Native cleanup matches exact `mkdtemp` names under
+   `pg_wal`.
 2. Set the supported rewind limits. C `findCommonAncestorTimeline` walks
    both histories and can find a fork before the immediate parent. The
    native live evidence covers the immediate-child case. Torn private replay
