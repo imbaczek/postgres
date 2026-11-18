@@ -696,6 +696,23 @@ Legacy 16-hex segment names always belong to timeline 1."
                                    (namespace *wal-segment-namespace*))
   (merge-pathnames (wal-segment-filename segment timeline namespace) (wal-directory)))
 
+(defun wal-shell-file-command (template filename path setting)
+  "Expand the file, path, and literal-percent escapes in a WAL shell command.
+The setting supplies shell quoting. Expand each replacement exactly once."
+  (with-output-to-string (command)
+    (loop for offset below (length template)
+          for character = (char template offset)
+          do (cond
+               ((char/= character #\%) (write-char character command))
+               ((= (incf offset) (length template))
+                (error "incomplete ~a placeholder" setting))
+               (t
+                (case (char template offset)
+                  (#\% (write-char #\% command))
+                  (#\f (write-string filename command))
+                  (#\p (write-string path command))
+                  (otherwise (error "unsupported ~a placeholder" setting))))))))
+
 (defvar *wal-offline-segment-fallback* nil)
 
 (defun wal-read-segment-path (segment &optional (timeline *wal-insert-timeline*)

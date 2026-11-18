@@ -164,20 +164,7 @@ A reseed owner must hold a stopped target with no PID file."
   (physical-inspect-clean-primary owner #'physical-rewind-check-reader))
 
 (defun physical-rewind-restore-command (template filename output)
-  (with-output-to-string (command)
-    (loop for offset from 0 below (length template)
-          for character = (char template offset)
-          do (if (char/= character #\%)
-                 (write-char character command)
-                 (progn
-                   (incf offset)
-                   (when (= offset (length template))
-                     (error "incomplete rewind restore_command placeholder"))
-                   (case (char template offset)
-                     (#\% (write-char #\% command))
-                     (#\f (write-string filename command))
-                     (#\p (write-string output command))
-                     (otherwise (error "unsupported rewind restore_command placeholder"))))))))
+  (wal-shell-file-command template filename output "rewind restore_command"))
 
 (defun physical-rewind-check-archived-segment (directory-fd filename)
   (let ((facts (physical-image-file-facts directory-fd filename)))

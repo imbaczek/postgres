@@ -284,6 +284,8 @@
 (deftest rewind-restore-command-uses-only-frontend-placeholders
     (ok (equal "restore X.wal ../scratch/X.wal '%'"
                (pg::physical-rewind-restore-command "restore %f %p '%%'" "X.wal" "../scratch/X.wal")))
+  (ok (equal "restore %p 'scratch/%f'"
+             (pg::physical-rewind-restore-command "restore %f '%p'" "%p" "scratch/%f")))
   (dolist (template '("restore %" "restore %r" "restore %s"))
     (ok (signals (pg::physical-rewind-restore-command template "X.wal" "scratch") 'error)))
   (ok (signals (pg::startup-normalize-setting "restore_command" "cp %f %p") 'error))
