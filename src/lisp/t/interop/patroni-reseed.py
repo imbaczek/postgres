@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -454,6 +455,38 @@ class RewindSharedHistoryAcceptance(FormerPrimaryAcceptance):
             assert b"REWIND-PAGE-REUSE PASS" in output
         assert all(preserved_tree(path) == inventory for path, inventory in before.items())
         self.result["checks"].append(self.label)
+
+
+class ArchiveHistoryAcceptance(RewindSharedHistoryAcceptance):
+    label = "archive-promotion-history"
+
+    def seed_child(self, data):
+        super().seed_child(data)
+        self.archive = self.server.root / "promotion-archive"
+        self.archive.mkdir(mode=0o700)
+        self.promoted_data = data
+        command = 'cp -a -- "%p" ' + shlex.quote(str(self.archive)) + '/"%f"'
+        (data / "postgresql.auto.conf").write_text(
+            "archive_mode = on\narchive_command = '" + command.replace("'", "''") + "'\n")
+
+    def fence_original(self, node, port):
+        assert follow.query(port, "SHOW archive_mode") == [("on",)]
+        assert not any(self.archive.iterdir())
+        super().fence_original(node, port)
+
+    def verify_promotion(self, port):
+        promoted = identity(port, history=True)
+        name = promoted["history_file"]
+        wal = self.promoted_data / "pg_wal"
+        destination = self.archive / name
+        receipt = wal / "archive_status" / (name + ".done")
+        follow.wait_for(receipt.is_file)
+        assert stat.S_ISREG(destination.lstat().st_mode)
+        assert destination.read_bytes() == (wal / name).read_bytes() == promoted["history"].encode()
+        self.result["archive_history"] = {"name": name, "text": promoted["history"]}
+
+    def configured(self):
+        self.create_rewind_target()
 
 
 class RewindPageReuseAcceptance(RewindSharedHistoryAcceptance):
@@ -1012,7 +1045,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     cases = {"synthetic": Acceptance, "former-primary": FormerPrimaryAcceptance,
-             "rewind-shared-history": RewindSharedHistoryAcceptance,
+               "rewind-shared-history": RewindSharedHistoryAcceptance,
+               "archive-promotion-history": ArchiveHistoryAcceptance,
                "rewind-page-reuse": RewindPageReuseAcceptance,
              "rewind-install": RewindInstallAcceptance,
              "rewind-cli": RewindCliAcceptance,

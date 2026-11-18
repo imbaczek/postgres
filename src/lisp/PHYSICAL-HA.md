@@ -60,9 +60,10 @@ Three items remain for backend closeout.
    stock Patroni 4.1.5. Include generated configuration, utility invocation,
    connection recovery, and the supported slot and synchronous settings. Keep
    leadership supplied by the harness.
-2. Complete the server-side archive comparison against C. Cover timeline
-   history and promotion, add standby `archive_mode=always`, and use an archive
-   produced by the worker for stopped-target restore.
+2. Complete the server-side archive comparison against C. Cover ancestor
+   history and partial segments from the old timeline after promotion, add
+   standby `archive_mode=always`, and use an archive produced by the worker
+   for stopped-target restore.
 3. Expand native rewind beyond the qualified immediate-child topology, or
    record that limit in the supported contract. C can find a common ancestor
    further back in the timeline histories. Also decide how to handle torn local
@@ -168,6 +169,15 @@ visible receipt survived in the running kernel and restart skipped the command.
 Both tests verified the archive bytes after checkpoint recycled the source
 and checked that all 2,550 rows survived. They took 22 s and 21 s, respectively.
 These tests exercise process crashes while the operating system stays up.
+
+The primary worker now archives the current timeline history before eligible
+WAL segments. It waits for committed primary state before selecting the file
+and verifies its identity before recording completion. The pinned Patroni
+4.1.5 `archive-promotion-history` case observed an empty archive on the standby,
+promoted it, and compared the archived `00000002.history` with both the PGDATA
+file and the live `TIMELINE_HISTORY` response. The live run took 28.05 s.
+Strict compilation and six focused test heads took 74.68 s, including 58.98 s
+to load the test system.
 
 The recycle path must preserve archive-eligible files until durable success
 is recorded. Reconstruct pending work after restart from durable WAL and status,
