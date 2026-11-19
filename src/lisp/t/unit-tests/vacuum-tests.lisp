@@ -844,7 +844,7 @@
     (clog-set 7301 +clog-committed+)
     (unwind-protect
          (progn
-           (ensure-directories-exist (relation-file-path heap-relfilenode))
+           (smgr-create heap-relfilenode)
            (check (= (buf-extend heap-relfilenode page) 0)
                   "vacuum horizon fixture creates heap block zero")
            (btree-init index-relfilenode)

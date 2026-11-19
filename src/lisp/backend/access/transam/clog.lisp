@@ -12,8 +12,9 @@
 (defun clog-path ()
   (merge-pathnames "pg_xact" *pgdata*))
 
-(defun clog-init ()
-  (sb-thread:with-mutex (*clog-lock*) (clog-init-under-lock))
+(defun clog-init (&key initialize)
+  "Open transaction status storage. INITIALIZE permits creation for bootstrap."
+  (sb-thread:with-mutex (*clog-lock*) (clog-init-under-lock initialize))
   (values))
 
 (defun xid32-of (xid)
@@ -289,7 +290,7 @@ snapshot alone cannot prevent a new stage."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)))
 
-(defun clog-init-under-lock ()
+(defun clog-init-under-lock (&optional initialize)
   ;; Reopening storage cannot discard pending commits.
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (clog-require-no-pending-under-lock)
@@ -297,8 +298,10 @@ snapshot alone cannot prevent a new stage."
          (existed (probe-file path)))
     (setf *clog-stream*
           (open path :direction :io :element-type '(unsigned-byte 8)
-                     :if-exists :overwrite :if-does-not-exist :create))
-    (unless existed (fsync-directory *pgdata*)))
+                     :if-exists :overwrite :if-does-not-exist (if initialize :create :error)))
+    (unless existed
+      (fsync-stream *clog-stream*)
+      (fsync-directory *pgdata*)))
   (values))
 
 (defun clog-read-status-under-lock (xid)
@@ -436,7 +439,7 @@ identity and any prepared writer epoch from the validated plan."
       (funcall fsync-directory-function *pgdata*)
       (setf *clog-stream*
             (open path :direction :io :element-type '(unsigned-byte 8)
-                       :if-exists :overwrite :if-does-not-exist :create))))
+                       :if-exists :overwrite :if-does-not-exist :error))))
   (publish-primary-wal-writer-clog-reset-under-lock epoch-plan)
   (values))
 

@@ -707,6 +707,7 @@
                        wal-primary-apply-page-spool wal-fail-stop clog-set clog-complete-reserved-commit-under-wal-lock release-xid))
               (saved (mapcar (lambda (name) (cons name (symbol-function name))) names)))
          (ensure-directories-exist *pgdata*)
+         (clog-init :initialize t)
          (unwind-protect
               (dolist (phase '(:flush :slot :clog :apply :release))
                 (let ((*wal-poisoned* nil)

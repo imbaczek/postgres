@@ -83,8 +83,11 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   (applied-logical-event-ids (make-hash-table :test #'equal)))
 
 (defun new-catalog-cluster-identity ()
-  (format nil "~36r-~X"
-          (get-universal-time) (random (ash 1 128))))
+  (with-open-file (entropy #p"/dev/urandom" :element-type '(unsigned-byte 8))
+    (with-output-to-string (identity)
+      (format identity "~36r-" (get-universal-time))
+      (dotimes (i 16)
+        (format identity "~2,'0X" (read-byte entropy))))))
 
 (defstruct (pg-role (:print-function print-pg-role))
   oid name login-p superuser-p replication-p verifier function-grants native-rewind-p)
@@ -111,6 +114,11 @@ the original private cluster identity when loading or migrating catalogs."
           do (setf hash (logand #xFFFFFFFFFFFFFFFF
                                 (* (logxor hash octet) #x100000001B3))))
     hash))
+
+(defun check-primary-catalog-identity (catalog metadata)
+  (when (and metadata
+             (/= (catalog-system-identifier catalog) (getf metadata :system-id)))
+    (error "primary control and catalog system identifiers differ")))
 
 (defvar *catalog-identity-needs-persist-p* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
@@ -700,15 +708,10 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
       (values))))
 
 (defun load-catalog ()
-  (let ((path (catalog-path)))
-    (if (probe-file path)
-        (with-physical-image-input (s path :direction :input :if-does-not-exist nil)
-          (if s
-              (with-standard-io-syntax
-                (let ((*read-eval* nil))
-                  (catalog-from-sexp (read s nil nil))))
-              (make-catalog)))
-        (make-catalog))))
+  (with-physical-image-input (s (catalog-path) :direction :input)
+    (with-standard-io-syntax
+      (let ((*read-eval* nil))
+        (catalog-from-sexp (read s))))))
 
 (defun allocate-oid ()
   (prog1 (catalog-next-oid *catalog*)
@@ -730,9 +733,10 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
           (incf (catalog-next-oid catalog)))))
     changed-p))
 
-(defun catalog-init ()
+(defun catalog-init (&key initialize)
   (setf *catalog-identity-needs-persist-p* nil
-        *catalog* (or (load-catalog) (make-catalog)))
+        *catalog* (if initialize (make-catalog) (load-catalog)))
+  (check-primary-catalog-identity *catalog* *wal-control-metadata*)
   (when (catalog-upgrade-publication-oids *catalog*)
     (setf *catalog-identity-needs-persist-p* t))
   (when *catalog-identity-needs-persist-p*

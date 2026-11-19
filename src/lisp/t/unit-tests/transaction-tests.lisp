@@ -287,7 +287,7 @@
     ;; after-durable callback while *WAL-LOCK* is still held.
     (unwind-protect
          (progn
-           (clog-init)
+           (clog-init :initialize t)
            (setf (backend-state *backend*) :in-progress
                  (backend-explicit *backend*) t
                  (backend-isolation-level *backend*) :repeatable-read
@@ -423,7 +423,7 @@
          (page (page-init (make-page))))
     (setf (gethash "postgres" (catalog-databases *catalog*)) db
           (gethash "wrap_rows" (database-tables db)) table)
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (dolist (spec '((7 0 :committed nil)
                     (7 8 :committed :committed)
                     (9 0 :aborted nil)
@@ -565,7 +565,7 @@
     (save-next-xid)
     (clog-reset)
     (clog-set 7 +clog-committed+)
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (dotimes (block 2)
       (let ((page (page-init (make-page))))
         (page-add-item page (form-heap-tuple (vector (1+ block)) columns 7 0 0 0 0))

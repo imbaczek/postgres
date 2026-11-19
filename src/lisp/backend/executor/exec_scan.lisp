@@ -1351,7 +1351,6 @@ leases before initializing a nonempty new domain."
         (let ((*select-index-lease-domain* (make-select-index-lease-domain :nodes nodes)))
           (when (and nodes (some #'btree-read-lease-active-p *btree-read-leases*))
             (error "cannot initialize an index domain under an existing read lease"))
-          (dolist (node nodes) (btree-ensure-init-before-read node))
           (call-with-select-index-lease-group *select-index-lease-domain* function)))))
 
 (defun call-with-current-select-index-domain (relfilenode function)

@@ -32,7 +32,8 @@
 (defun wal-test-read-dirty-reference (key reference)
   (sb-thread:with-mutex (*wal-lock*) (wal-dirty-read-reference key reference)))
 
-(defun call-with-page-publication-test (function &key (resident-limit 0))
+(defun call-with-page-publication-test
+    (function &key (resident-limit 0) (initialize-storage t))
   (let* ((*pgdata* (merge-pathnames
                     (format nil "pg-page-owner-~d-~d/" (sb-posix:getpid) (random 1000000))
                     (uiop:temporary-directory)))
@@ -57,27 +58,31 @@
          (*backend* (make-backend :xid 44)))
     (ensure-directories-exist (merge-pathnames "base/" *pgdata*))
     (unwind-protect
-         (funcall function)
+         (progn
+           (when initialize-storage
+             (smgr-create 7310)
+             (smgr-create 7311)
+             (clog-init :initialize t))
+           (funcall function))
       (dispose-page-publication-test-owner *wal-pending-page-publication*)
       (sb-thread:with-mutex (*wal-lock*) (wal-clear-page-cache))
       (smgr-close-all)
       (when *clog-stream* (close *clog-stream*))
       (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
 
-(defun call-with-queued-clog-test (function)
+(defun call-with-queued-clog-test (function &key (initialize-storage t))
   (call-with-page-publication-test
    (lambda ()
-     (let ((*clog-stream* nil) (*clog-pending-commits* (make-hash-table :test #'eql))
-                               (*wal-output-stream* nil) (*wal-output-segment* nil) (*wal-new-segments* nil)
-                               (*wal-end-lsn* 0) (*wal-durable-lsn* 0) (*wal-checkpoint-lsn* 0)
-                               (*wal-control-metadata* nil) (*wal-replication-slots* (make-hash-table :test #'equal))
-                               (*wal-xid-first-lsn* (make-hash-table :test #'eql))
-                               (*active-xids* nil) (*next-xid* 100) (*xid-batch-end* 100))
+     (let ((*wal-output-stream* nil) (*wal-output-segment* nil) (*wal-new-segments* nil)
+                                     (*wal-end-lsn* 0) (*wal-durable-lsn* 0) (*wal-checkpoint-lsn* 0)
+                                     (*wal-control-metadata* nil) (*wal-replication-slots* (make-hash-table :test #'equal))
+                                     (*wal-xid-first-lsn* (make-hash-table :test #'eql))
+                                     (*active-xids* nil) (*next-xid* 100) (*xid-batch-end* 100))
        (ensure-directories-exist (wal-directory))
-       (unwind-protect
-            (progn (clog-init) (funcall function))
-         (when *wal-output-stream* (close *wal-output-stream*))
-         (when *clog-stream* (close *clog-stream*)))))))
+       (unwind-protect (funcall function)
+         (when *wal-output-stream* (close *wal-output-stream*)))))
+   :initialize-storage initialize-storage))
+
 (defun call-with-primary-writer-authority-test (function &key (isolate t))
   (let* ((*wal-lock* (if isolate (sb-thread:make-mutex :name "writer authority test WAL")
                          *wal-lock*))
@@ -158,7 +163,7 @@
            (*active-snapshot-set* (make-hash-table :test #'eq))
            (*backend* (make-backend)))
        (ensure-directories-exist (catalog-path))
-       (catalog-init)
+       (catalog-init :initialize t)
        (wal-ensure-directory-durable (wal-replication-slot-directory))
        (unwind-protect
             (funcall function)
@@ -216,7 +221,8 @@
                   (unwind-protect (end-backend-session) (unregister-backend *backend*)))))
          (postmaster-remove-pid-file)
          (when *postmaster-data-lock* (close *postmaster-data-lock*))
-         (setf sb-ext:*exit-hooks* saved-exit-hooks))))))
+         (setf sb-ext:*exit-hooks* saved-exit-hooks))))
+   :initialize-storage nil))
 
 (defun call-with-logical-slot-owned-startup-test (function)
   (call-with-live-operation-startup-quiescence

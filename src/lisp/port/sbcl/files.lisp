@@ -216,13 +216,13 @@ callers needing a coherent view across publications must compare control images.
       (check-revocation))
     t))
 
-(defun open-relation-file (pathname)
-  (ensure-directories-exist pathname)
+(defun open-relation-file (pathname &key create)
+  (when create (ensure-directories-exist pathname))
   (open pathname
         :direction :io
         :element-type '(unsigned-byte 8)
         :if-exists :overwrite
-        :if-does-not-exist :create))
+        :if-does-not-exist (if create :create :error)))
 
 (defun relation-nblocks (stream)
   (let ((len (file-length stream)))

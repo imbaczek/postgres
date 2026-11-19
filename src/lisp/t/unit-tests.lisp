@@ -226,7 +226,7 @@
                 (startup-prepare-installation
                  (startup-default-settings dir) native (make-hash-table :test #'equal)
                  nil)))))
-      (clog-init)
+      (clog-init :initialize t)
       (run-query-and-concurrency-unit-tests)
       (run-backend-protocol-and-wal-unit-tests)
       (run-storage-and-planner-unit-tests)

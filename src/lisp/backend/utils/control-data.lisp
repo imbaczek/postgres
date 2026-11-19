@@ -53,9 +53,7 @@ an existing identity must match the catalog."
   (prevent-recovery-primary-operation "primary control publication")
   (unless (and *wal-ready* *catalog*) (error "primary storage has not been initialized"))
   (let ((system-id (catalog-system-identifier)))
-    (when (and *wal-control-metadata*
-               (/= system-id (getf *wal-control-metadata* :system-id)))
-      (error "primary control and catalog system identifiers differ"))
+    (check-primary-catalog-identity *catalog* *wal-control-metadata*)
     (when (= state +db-shutdowned+)
       (native-control-test-point :before-primary-shutdown-clean))
     (with-wal-critical

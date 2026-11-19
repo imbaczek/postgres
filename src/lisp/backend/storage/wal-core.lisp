@@ -3066,7 +3066,8 @@ src/backend/access/transam/xlogreader.c."
   ;; Validate the terminal and every spooled page before destructive resets.
   ;; Chunked catalog metadata must be reassembled and decoded first. Apply
   ;; resets before the batch's page images; an incomplete batch applies neither.
-  (let ((terminal-function (funcall terminal-preparer)))
+  (let ((terminal-function (funcall terminal-preparer))
+        (*smgr-redo-p* t))
     (unless (functionp terminal-function)
       (error "WAL terminal validation did not produce an apply operation"))
     (when *wal-recovery-page-spool*

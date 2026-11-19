@@ -2838,7 +2838,7 @@ reclaimable."
 
 ;;; ---- startup ----
 
-(defun xact-init ()
+(defun xact-init (&key initialize)
   (ensure-directories-exist (pgdata-path "global/pg_control"))
   (ensure-directories-exist (pgdata-path "base/dummy"))
   (let ((version-file (pgdata-path "PG_VERSION")))
@@ -2871,6 +2871,6 @@ reclaimable."
           (error "XID wrap marker ~a does not match next XID ~a"
                  marker next-xid))
         (setf *xid-wrap-pending* t))))
-  (clog-init)
+  (clog-init :initialize initialize)
   (clog-recover *next-xid*)
   (values))

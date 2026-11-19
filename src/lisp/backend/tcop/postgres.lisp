@@ -962,6 +962,13 @@ CL's RENAME-FILE merges a relative target with the source's directory."
                        epoch-start)))
       (error "cannot verify retained physical feedback across the checkpoint's XID epoch boundary"))))
 
+(defun primary-storage-bootstrap-p ()
+  "Recognize a new cluster before startup creates any storage files."
+  (not (or (some #'probe-file (list (pgdata-path "PG_VERSION") (control-path)
+                                    (wal-control-path) (catalog-path) (clog-path)))
+           (directory-entry-names (pgdata-path "base/") :follow-symlinks t)
+           (wal-segment-entry-names))))
+
 (defun initialize-primary-storage (&key imported-startup)
   "Initialize a cold or promoted primary from its durable WAL/control checkpoint.
 Hold the drained admission gate and borrow the real postmaster ownership."
@@ -974,24 +981,38 @@ Hold the drained admission gate and borrow the real postmaster ownership."
         (check-primary-storage-startup-context gate-owner ownership)
         (when imported-startup
           (logical-slot-imported-startup-check-owned imported-startup))
-        (wal-mark-primary-startup)
-        (wal-init)
-        (xact-init)
-        (let ((reset-boundary (wal-recover)))
-          (when (startup-primary-wal-archive-enabled-p)
-            (with-wal-critical (wal-archive-try-reconcile-ready-under-lock)))
-          (note-primary-startup-replay)
-          ;; Replay can change the state checked above. Check again before
-          ;; restoring slots, which can also remove temporary slot files.
-          (check-primary-storage-startup-context gate-owner ownership)
-          (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
-          (check-primary-feedback-after-replay reset-boundary))
-        (catalog-init)
-        (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
-        (physical-backup-lease-load-records)
-        (physical-source-pin-load)
-        (catalog-remove-orphan-relations)
-        (complete-xid-wraparound))))))
+        (let* ((initialize (primary-storage-bootstrap-p))
+               (catalog (unless initialize
+                          (let ((*catalog-identity-needs-persist-p* nil))
+                            (load-catalog)))))
+          (unless initialize
+            (unless (probe-file (clog-path))
+              (error "transaction status file ~a is missing" (clog-path)))
+            (check-primary-catalog-identity catalog (nth-value 6 (wal-read-control-fields))))
+          (wal-mark-primary-startup)
+          (wal-init)
+          (xact-init :initialize initialize)
+          (let* ((*smgr-redo-existing-main-forks*
+                   (when catalog
+                     (let ((*catalog* catalog)
+                           (forks (make-hash-table :test #'eql)))
+                       (dolist (node (catalog-physical-relfilenodes) forks)
+                         (setf (gethash node forks) t)))))
+                 (reset-boundary (wal-recover)))
+            (when (startup-primary-wal-archive-enabled-p)
+              (with-wal-critical (wal-archive-try-reconcile-ready-under-lock)))
+            (note-primary-startup-replay)
+            ;; Replay can change the state checked above. Check again before
+            ;; restoring slots, which can also remove temporary slot files.
+            (check-primary-storage-startup-context gate-owner ownership)
+            (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
+            (check-primary-feedback-after-replay reset-boundary))
+          (if initialize (catalog-init :initialize t) (catalog-init))
+          (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
+          (physical-backup-lease-load-records)
+          (physical-source-pin-load)
+          (catalog-remove-orphan-relations)
+          (complete-xid-wraparound)))))))
 
 (defun startup-check-cold-installation-state ()
   "Require no page, CLOG or WAL temporary cleanup debt before a cold stage.

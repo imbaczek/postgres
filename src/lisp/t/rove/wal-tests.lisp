@@ -40,7 +40,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (declare (special *clog-pending-commits* *wal-storage-incarnation*))
     (ensure-directories-exist *pgdata*)
     (unwind-protect
-         (progn (clog-init) (funcall function))
+         (progn (clog-init :initialize t) (funcall function))
       (when *clog-stream* (ignore-errors (close *clog-stream*)))
       (uiop:delete-directory-tree *pgdata* :validate t :if-does-not-exist :ignore))))
 
@@ -745,6 +745,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (page (page-init (make-page)))
              (durable-end nil) (after nil))
          (setf (aref page 100) 42)
+         (smgr-create 7315)
          (smgr-write 7315 0 page)
          (smgr-write 7315 1 page)
          (transaction-replace-relation 7315)
@@ -1104,7 +1105,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
 (defun page-publication-test-publish (owner end)
   ;; These page models supply an already appended terminal, not an inserter.
   ;; Install its data-only CLOG obligation explicitly before the real handoff.
-  (unless *clog-stream* (clog-init))
+  (unless *clog-stream* (clog-init :initialize t))
   (let* ((xid (wal-page-publication-xid owner))
          (tag (%make-clog-commit-tag xid *wal-storage-incarnation* *wal-insert-timeline* end))
          (completion (%make-clog-commit-completion tag owner :published)))
@@ -1804,7 +1805,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
        (let ((*wal-control-metadata* '(:page-checksum-version 1))
              (*relation-streams* (make-hash-table :test #'equal))
              (page (page-init (make-page))))
-         (ensure-directories-exist (relation-file-path 123))
+         (smgr-create 123)
          (unwind-protect
               (progn
                 (rove:ok (handler-case (progn (smgr-write 123 0 page) nil)
@@ -2084,6 +2085,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (progn
              (setf (aref original 100) 42
                    (aref replacement 100) 99)
+             (smgr-create 7310)
              (smgr-write 7310 0 original)
              (smgr-write 7310 1 original)
              (transaction-replace-relation 7310)
@@ -2147,6 +2149,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                             never (wal-valid-type-p +wal-record-relation-reset+ version)))
              (rove:ok (wal-valid-type-p +wal-record-relation-reset+ 8))
              (rove:ok (wal-valid-type-p +wal-record-running-xacts+ 7))
+             (smgr-create 7311)
              (dolist (spool-p '(nil t))
                (smgr-reset-fork 7311 :main)
                (smgr-write 7311 0 original)
@@ -2226,6 +2229,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (unwind-protect
            (progn
              (setf (aref original 100) 42)
+             (smgr-create 7312)
              (smgr-write 7312 0 original)
              (smgr-write 7312 1 original)
              (dolist (bad (list
@@ -2281,6 +2285,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                        (format nil "pg-dirty-store-~d-~d/" (sb-posix:getpid) (random 1000000))
                        (uiop:temporary-directory)))
            (*pgdata* directory)
+           (*relation-streams* (make-hash-table :test #'equal))
            (*query-temp-directory* directory)
            (*wal-temp-cleanup-domain* nil)
            (*query-temp-file-limit-bytes* 0)
@@ -2295,6 +2300,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (ensure-directories-exist directory)
       (unwind-protect
            (progn
+             (smgr-create 7310)
              (setf (aref page 100) 1)
              (wal-buffer-write 7310 0 page)
              (rove:ok (= 0 (wal-dirty-store-resident *wal-dirty-store*)))
@@ -2326,6 +2332,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
              (rove:ok (null *wal-dirty-store*))
              (rove:ok (null (uiop:directory-files directory))))
         (clear-wal-test-page-cache)
+        (smgr-close-all)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
 (rove:deftest test-wal-dirty-scratch-seeded-batch-model
@@ -2636,6 +2643,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (ensure-directories-exist *pgdata*)
       (unwind-protect
            (progn
+             (clog-init :initialize t)
              (setf (symbol-function 'wal-append-running-xacts-under-lock)
                    (lambda (xid) (declare (ignore xid)))
                    (symbol-function 'wal-append-batch-start) (lambda () 100)
@@ -2688,6 +2696,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (ensure-directories-exist *pgdata*)
     (unwind-protect
          (progn
+           (clog-init :initialize t)
            (setf (symbol-function 'wal-append-running-xacts-under-lock)
                  (lambda (xid) (declare (ignore xid)))
                  (symbol-function 'wal-append-batch-start) (lambda () 100)
@@ -3120,6 +3129,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
            (old-map (symbol-function 'logical-spool-map-events)))
       (ensure-directories-exist *pgdata*)
+      (clog-init :initialize t)
       (setf (gethash (wal-page-key 7310 0) *wal-page-cache*) (page-init (make-page)))
       (unwind-protect
            (dolist (corrupt-pass '(1 2))

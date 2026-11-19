@@ -399,6 +399,7 @@ Use one data removal horizon for the heap rewrite and index builds."
                          (when (pg-class-toast new-table)
                            (list (pg-toast-relfilenode (pg-class-toast new-table))
                                  (pg-toast-index-relfilenode (pg-class-toast new-table))))))
+           (smgr-create (pg-class-relfilenode new-table))
            (when (pg-class-toast new-table)
              (smgr-create (pg-toast-relfilenode (pg-class-toast new-table)))
              (btree-init (pg-toast-index-relfilenode (pg-class-toast new-table))))

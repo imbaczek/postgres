@@ -14,14 +14,27 @@
              (otherwise (error "unknown relation fork ~a" fork))))
    *pgdata*))
 
-(defun smgr-open-locked (relfilenode &optional (fork :main))
+(defvar *smgr-redo-p* nil)
+(defvar *smgr-redo-existing-main-forks* nil)
+
+(defun smgr-open-locked (relfilenode &optional (fork :main) create)
   ;; Defer interrupts across opening and cache registration so the cached
   ;; stream has an owner before a queued interrupt can be delivered.
   (let ((key (list relfilenode fork)))
     (or (gethash key *relation-streams*)
         (sb-sys:without-interrupts
           (setf (gethash key *relation-streams*)
-                (open-relation-file (relation-file-path relfilenode fork)))))))
+                (open-relation-file (relation-file-path relfilenode fork) :create create))))))
+
+(defun smgr-write-open-locked (relfilenode fork)
+  ;; Redo may need to restore a fork first created (or subsequently dropped)
+  ;; in the replay range. A main fork referenced at primary startup already
+  ;; had to exist before that catalog was published.
+  (smgr-open-locked relfilenode fork
+                    (or (eq fork :visibility)
+                        (and *smgr-redo-p*
+                             (not (and *smgr-redo-existing-main-forks*
+                                       (gethash relfilenode *smgr-redo-existing-main-forks*)))))))
 
 (defun smgr-create (relfilenode &key redo)
   "Durably create an empty main fork before publishing its catalog identity.
@@ -30,7 +43,7 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
     (sb-thread:with-mutex (*smgr-lock*)
       (when (and (not redo) (probe-file path))
         (error "relation storage already exists: ~a" path))
-      (fsync-stream (smgr-open-locked relfilenode)))
+      (fsync-stream (smgr-open-locked relfilenode :main t)))
     (fsync-directory (merge-pathnames "base/" *pgdata*)))
   (values))
 
@@ -61,13 +74,13 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
 
 (defun smgr-write (relfilenode block page &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
-    (smgr-write-page-locked (smgr-open-locked relfilenode fork) relfilenode block page fork))
+    (smgr-write-page-locked (smgr-write-open-locked relfilenode fork) relfilenode block page fork))
   (values))
 
 (defun smgr-extend (relfilenode page &optional (fork :main))
   "Append PAGE and return its block number."
   (sb-thread:with-mutex (*smgr-lock*)
-    (let* ((stream (smgr-open-locked relfilenode fork))
+    (let* ((stream (smgr-write-open-locked relfilenode fork))
            (block (relation-nblocks stream)))
       (smgr-write-page-locked stream relfilenode block page fork)
       block)))
@@ -79,7 +92,7 @@ storage, and is responsible for the eventual fsync. Reopen the cached stream
 under the smgr lock so buffered state cannot survive the truncation."
   (sb-thread:with-mutex (*smgr-lock*)
     (let* ((key (list relfilenode fork))
-           (stream (smgr-open-locked relfilenode fork)))
+           (stream (smgr-write-open-locked relfilenode fork)))
       (finish-output stream)
       (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 0)
       ;; Reopen after truncation to discard both buffered input and output state.

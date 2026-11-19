@@ -264,13 +264,6 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 (defmacro with-btree-relation-read-locks ((relfilenodes) &body body)
   `(call-with-btree-relation-read-locks ,relfilenodes (lambda () ,@body)))
 
-(defun btree-ensure-init-before-read (relfilenode)
-  "Initialize an empty index before entering any shared read-lease set."
-  (unless (plusp (buf-nblocks relfilenode))
-    (with-btree-relation-lock (relfilenode)
-      (btree-ensure-init relfilenode)))
-  (values))
-
 (defun btree-split-generation (relfilenode)
   (sb-thread:with-mutex (*btree-split-lock*)
     (gethash relfilenode *btree-split-generations* 0)))
@@ -464,14 +457,14 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 
 (defun btree-init (relfilenode)
   (with-btree-relation-lock (relfilenode)
-    (btree-init-unlocked relfilenode)))
-
-(defun btree-ensure-init (relfilenode)
-  (when (zerop (buf-nblocks relfilenode))
+    (unless (or (current-relation-replacement relfilenode :main)
+                (probe-file (relation-file-path relfilenode)))
+      (smgr-create relfilenode))
     (btree-init-unlocked relfilenode)))
 
 (defun btree-read-meta (relfilenode)
-  (btree-ensure-init relfilenode)
+  (when (< (buf-nblocks relfilenode) 2)
+    (ereport "XX001" "index storage is incomplete for relation ~a" relfilenode))
   (let ((meta (buf-read relfilenode 0)))
     (unless (and meta (= (page-u32 meta 24) +btree-meta-magic+))
       (ereport "XX000" "index meta page is corrupt"))
@@ -568,13 +561,11 @@ to a single leaf."
 
 (defun btree-search-unlocked (relfilenode key)
   "Return a list of (block . off) heap TIDs for entries whose key equals KEY."
-  (btree-ensure-init relfilenode)
   (multiple-value-bind (level root) (btree-read-meta relfilenode)
     (nreverse (btree-collect-equal relfilenode level root key '()))))
 
 (defun btree-search (relfilenode key)
   "Search one index while excluding its own concurrent page rewrites."
-  (btree-ensure-init-before-read relfilenode)
   (call-with-btree-relation-read-lock
    relfilenode (lambda () (btree-search-unlocked relfilenode key))))
 
@@ -652,7 +643,6 @@ to a single leaf."
 
 (defun call-with-btree-equal-cursor (relfilenode key function)
   "Call FUNCTION with an initialized cursor and its scoped read lease."
-  (btree-ensure-init-before-read relfilenode)
   (call-with-btree-relation-read-lease
    relfilenode
    (lambda (lease)
