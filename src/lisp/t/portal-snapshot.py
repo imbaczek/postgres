@@ -147,6 +147,36 @@ def check_repeatable_read_dml_bind(server, reader, writer):
     reader.query("ROLLBACK")
 
 
+def check_repeatable_read_select_bind(server, reader, writer):
+    writer.query("CREATE TABLE bind_rr_select(id int)")
+    writer.query("INSERT INTO bind_rr_select VALUES (1)")
+    reader.prepare("bind_rr_select", bind=False, statement="rr_select")
+    reader.send(b"S")
+    assert reader.through(b"Z") == b"I"
+    reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    server.control("(defvar pg::*bind-test-result-columns* "
+                   "(symbol-function 'pg::extended-select-result-columns))")
+    try:
+        server.control(
+            "(setf (symbol-function 'pg::extended-select-result-columns) "
+            "(lambda (ast &optional register-p) "
+            "(when register-p "
+            "(assert (pg::backend-transaction-snapshot pg::*backend*)) "
+            "(assert (pg::backend-holds-schema-read-lock-p))) "
+            "(funcall pg::*bind-test-result-columns* ast register-p)))")
+        reader.bind("rr_select", "rr_select_portal")
+        reader.send(b"H")
+        reader.through(b"2")
+    finally:
+        server.control("(setf (symbol-function 'pg::extended-select-result-columns) "
+                       "pg::*bind-test-result-columns*)")
+    writer.query("INSERT INTO bind_rr_select VALUES (2)")
+    assert reader.execute("rr_select_portal") == ([["1"]], ["SELECT 1"], b"T", [])
+    reader.query("COMMIT")
+    writer.query("TRUNCATE bind_rr_select")
+    assert writer.query("SELECT id FROM bind_rr_select") == []
+
+
 def check_snapshot_read_only_transition(reader, writer):
     writer.query("CREATE TABLE export_transition(id int)")
     writer.query("INSERT INTO export_transition VALUES (1)")
@@ -288,6 +318,12 @@ def check_repeated_inline_unique(connection):
 def check_equivalent_inline_keys(connection):
     for table, clauses, surviving in (
             ("pk_unique", "PRIMARY KEY UNIQUE", "pk_unique_pkey"),
+            ("mixed_pk", "PRIMARY KEY, UNIQUE (a)", "mixed_pk_pkey"),
+            ("mixed_unique", "UNIQUE, PRIMARY KEY (a)", "mixed_unique_pkey"),
+            ("mixed_repeated", "CONSTRAINT mixed_key UNIQUE, CONSTRAINT mixed_key UNIQUE (a)",
+             "mixed_key"),
+            ("mixed_transferred", "PRIMARY KEY, CONSTRAINT mixed_named UNIQUE (a)",
+             "mixed_named"),
             ("named_pk", "PRIMARY KEY CONSTRAINT transferred UNIQUE", "transferred"),
             ("preferred_pk", "CONSTRAINT redundant UNIQUE CONSTRAINT preferred PRIMARY KEY",
              "preferred"),
@@ -303,6 +339,23 @@ def check_equivalent_inline_keys(connection):
         connection.query(f"INSERT INTO {table} VALUES (1), (1)")
         assert connection.query(f"SELECT count(*) FROM {table}") == [["2"]]
 
+    connection.query("CREATE TABLE table_first(CONSTRAINT declared_first UNIQUE (a), "
+                     "a int CONSTRAINT declared_second UNIQUE)")
+    connection.query("ALTER TABLE table_first DROP CONSTRAINT declared_first")
+    connection.query("INSERT INTO table_first VALUES (1), (1)")
+    assert connection.query("SELECT count(*) FROM table_first") == [["2"]]
+
+    assert connection.observe(
+        "CREATE TABLE mixed_two_primary(a int PRIMARY KEY, PRIMARY KEY (a))"
+    ) == ("error", "42P16")
+    connection.query("CREATE TABLE mixed_distinct(a int UNIQUE, "
+                     "CONSTRAINT mixed_not_distinct UNIQUE NULLS NOT DISTINCT (a))")
+    connection.query("ALTER TABLE mixed_distinct DROP CONSTRAINT mixed_distinct_a_key")
+    connection.query("INSERT INTO mixed_distinct VALUES (NULL)")
+    assert connection.observe(
+        "INSERT INTO mixed_distinct VALUES (NULL)"
+    ) == ("error", "23505")
+
     connection.query("CREATE TABLE pk_distinct(a int PRIMARY KEY "
                      "CONSTRAINT pk_distinct_unique UNIQUE NULLS NOT DISTINCT)")
     connection.query("ALTER TABLE pk_distinct DROP CONSTRAINT pk_distinct_pkey")
@@ -317,6 +370,7 @@ def run():
         writer, reader = Connection(server.port), Connection(server.port)
         check_dml_bind(reader, writer)
         check_repeatable_read_dml_bind(server, reader, writer)
+        check_repeatable_read_select_bind(server, reader, writer)
         check_snapshot_read_only_transition(reader, writer)
         check_sorted_volatile_slot_projection(writer)
         check_sorted_file_projection(writer)

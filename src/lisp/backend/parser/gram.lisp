@@ -822,6 +822,29 @@ Range and negative checks occur when the LIMIT executes."
         (loop collect (parse-mutation-relation-identifier p)
               while (match-punct p #\,)))))
 
+(defun normalize-create-table-constraints (constraints)
+  "Merge equivalent index keys, taking names in declaration order."
+  (let* ((primary (find :primary constraints :key (lambda (c) (getf c :kind))))
+         (keys (make-hash-table :test #'equal))
+         (result (when primary (list primary))))
+    (when primary
+      (setf (gethash (cons (getf primary :columns) nil) keys) primary))
+    (dolist (constraint constraints)
+      (cond
+        ((eq constraint primary))
+        ((eq (getf constraint :kind) :unique)
+         (let* ((signature (cons (getf constraint :columns)
+                                 (getf constraint :nulls-not-distinct)))
+                (prior (gethash signature keys)))
+           (if prior
+               (unless (getf prior :name)
+                 (setf (getf prior :name) (getf constraint :name)))
+               (progn
+                 (setf (gethash signature keys) constraint)
+                 (push constraint result)))))
+        (t (push constraint result))))
+    (nreverse result)))
+
 (defun parse-create-table (p)
   (let ((if-not-exists
           (when (match-kw p "if")
@@ -845,7 +868,7 @@ Range and negative checks occur when the LIMIT executes."
           :name name
           :if-not-exists if-not-exists
           :columns (nreverse columns)
-          :constraints (nreverse constraints))))
+          :constraints (normalize-create-table-constraints (nreverse constraints)))))
 
 (defun parser-expression-sql (p start)
   "Render a consumed token span without retaining the original statement."
@@ -894,7 +917,7 @@ Range and negative checks occur when the LIMIT executes."
       (setf type (sql-array-type type)))
     (let ((notnull nil) (primary nil)
                         (default-expression nil) (default-sql nil) (checks nil) (constraint-name nil)
-                        (primary-name nil) (uniques nil))
+                        (keys nil))
       (loop
         (cond
           ((match-kw p "constraint")
@@ -906,11 +929,12 @@ Range and negative checks occur when the LIMIT executes."
           ((match-kw p "primary")
            (expect-kw p "key")
            (when primary (ereport "42P16" "multiple primary keys for one column are not allowed"))
-           (setf primary t notnull t primary-name constraint-name constraint-name nil))
+           (push (list :kind :primary :name constraint-name :columns (list name)) keys)
+           (setf primary t notnull t constraint-name nil))
           ((match-kw p "unique")
            (push (list :kind :unique :name constraint-name :columns (list name)
                        :nulls-not-distinct (parse-unique-null-treatment p))
-                 uniques)
+                 keys)
            (setf constraint-name nil))
           ((match-kw p "default")
            (when default-expression (ereport "42601" "multiple default values specified"))
@@ -921,29 +945,11 @@ Range and negative checks occur when the LIMIT executes."
            (setf constraint-name nil))
           ((match-kw p "references") (ereport "0A000" "foreign keys are not supported"))
           (t (when constraint-name (syntax-error p)) (return))))
-      (let ((keys nil))
-        ;; Inline keys share the same column. Merge equivalent NULL treatment
-        ;; and keep the first explicit name, preferring the primary key.
-        (dolist (clause (nreverse uniques))
-          (let* ((distinctness (getf clause :nulls-not-distinct))
-                 (prior (find distinctness keys
-                              :key (lambda (key) (getf key :nulls-not-distinct)))))
-            (cond
-              ((and primary (not distinctness))
-               (unless primary-name (setf primary-name (getf clause :name))))
-              (prior
-               (unless (getf prior :name) (setf (getf prior :name) (getf clause :name))))
-              (t (push clause keys)))))
-        ;; Keep one ordinary UNIQUE in the column's existing representation.
-        (let ((unique (when (and (not primary) (null (rest keys))) (pop keys))))
-          (values
-           (list :name name :type type :typmod typmod
-                 :notnull notnull :primary primary :unique (not (null unique))
-                 :primary-name primary-name :unique-name (getf unique :name)
-                 :nulls-not-distinct (getf unique :nulls-not-distinct)
-                 :default-expression default-expression :default-sql default-sql
-                 :checks (nreverse checks))
-           (nreverse keys)))))))
+      (values
+       (list :name name :type type :typmod typmod :notnull notnull
+             :default-expression default-expression :default-sql default-sql
+             :checks (nreverse checks))
+       (nreverse keys)))))
 
 (defun parse-float-type (p)
   "Resolve SQL FLOAT precision to float4 or float8 as gram.y does."

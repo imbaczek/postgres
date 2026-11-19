@@ -342,11 +342,6 @@
             (lambda ()
               (unless (recovery-in-progress-p)
                 (prepare-xid-wraparound-for-statement *backend*))
-              ;; Acquire the RR schema lease before registering relations. A
-              ;; TRUNCATE can hold the writer side while it waits for readers.
-              ;; READ COMMITTED still takes its snapshot at Execute.
-              (when (eq (backend-isolation-level *backend*) :repeatable-read)
-                (ensure-transaction-snapshot *backend* (backend-command-id *backend*)))
               ;; Disallow isolation changes after Bind has admitted the query.
               (setf (backend-first-snapshot-set *backend*) t)
               (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
@@ -782,6 +777,16 @@
       (unless (and (member (length formats) (list 0 1 (length ranges)))
                    (every (lambda (format) (member format '(0 1))) formats))
         (ereport "08P01" "invalid parameter formats"))
+      ;; SELECT metadata can register relation readers before portal startup.
+      ;; Admit the RR horizon first so those readers cannot block TRUNCATE
+      ;; while waiting for its schema writer lease. DML in RC still snapshots
+      ;; at Execute.
+      (when (and (eq (backend-isolation-level *backend*) :repeatable-read)
+                 (not (eq (getf (extended-statement-ast statement) :type) :do)))
+        (unless (recovery-in-progress-p)
+          (prepare-xid-wraparound-for-statement *backend*))
+        (ensure-transaction-snapshot *backend* (backend-command-id *backend*))
+        (setf (backend-first-snapshot-set *backend*) t))
       (let* ((returns-rows-p (extended-statement-returns-rows-p statement))
              (columns (when returns-rows-p
                         (let ((*query-parameter-types* (extended-statement-types statement)))
