@@ -22,6 +22,9 @@ peer_parameters = {}
 contract = runpy.run_path(str(base / "t/interop/promotion-sql-contract.py"))
 archive = runpy.run_path(str(base / "t/interop/restartpoint-prefix-inspect.py"))
 control_inspector = runpy.run_path(str(base / "t/interop/control-data-inspect.py"))
+check_optional_control = runpy.run_path(
+    str(base / "t/interop/resource_control_fields.py")
+)["check_optional_fields"]
 
 
 def inspect_child_control(state, timeline=2, stopped=False):
@@ -57,9 +60,21 @@ def reject_missing_child_recovery_control():
     print("child-bootstrap: missing recovery control rejects inspection and startup unchanged PASS", flush=True)
 
 
+def read_wal_control_fields(directory, *, derived=False):
+    fields = (directory / "global/pg_wal_control").read_bytes().split()
+    assert fields[0] == b"PGWAL6"
+    assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    if fields[-2].startswith(b"X"):
+        assert not derived, "backup control retained the source CLOG extent"
+        extent = fields.pop(-2)[1:]
+        assert extent.isdigit() and int(extent) <= 2**30
+    check_optional_control(fields[:-1])
+    return fields
+
+
 def check_committed_archive(pending):
-    fields = (data / "global/pg_wal_control").read_bytes().split()
-    assert len(fields) == 17 and crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    fields = read_wal_control_fields(data)
+    assert len(fields) in (17, 21)
     assert [int(value) for value in fields[10:16]] == list(archive["retained_reference"](pending))
     history = (data / "pg_wal/00000003.history").read_text()
     parsed = archive["parsed_history"](3, history)
@@ -286,12 +301,11 @@ try:
     (root / "child-backup.log").write_text(output)
     assert ":TIMELINE 2" in output
     assert (data / "pg_wal/00000002.history").read_bytes() == (root / "copy/pg_wal/00000002.history").read_bytes()
-    source_control = (root / "copy/global/pg_wal_control").read_bytes().split()
-    target_control = (data / "global/pg_wal_control").read_bytes().split()
-    assert len(source_control) == 17 and len(target_control) == 11
-    for fields in (source_control, target_control):
-        assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    source_control = read_wal_control_fields(root / "copy")
+    target_control = read_wal_control_fields(data, derived=True)
+    assert len(source_control) in (17, 21) and len(target_control) in (11, 15)
     assert source_control[:10] == target_control[:10]
+    assert source_control[16:-1] == target_control[10:-1]
     assert not (data / "pg_physical_retained").exists()
     inspect_child_control("starting up", stopped=True)
     reject_missing_child_recovery_control()

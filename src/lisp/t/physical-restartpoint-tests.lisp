@@ -16,6 +16,10 @@
       (pg::wal-ensure-directory-durable (merge-pathnames "base/" root))
       (pg::wal-ensure-directory-durable (merge-pathnames "global/" root))
       (pg::wal-ensure-directory-durable spool)
+      ;; The verified base already has CLOG even though replay opens it later.
+      (let ((pg::*clog-stream* nil))
+        (pg::clog-init :initialize t)
+        (close pg::*clog-stream*))
       (let ((pg::*xid-batch-end* 1003)) (pg::save-next-xid))
       (setf (gethash 900 pg::*physical-replay-seen-relfilenodes*) t)
       (multiple-value-bind (deletes bytes) (pg::wal-decode-catalog-payload

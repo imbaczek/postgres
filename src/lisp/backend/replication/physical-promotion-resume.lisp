@@ -166,11 +166,7 @@ which rejects pending CLOG debt, before installing the selected state."
     (setf (getf *physical-recovery-state* :timeline-policy)
           (physical-promotion-pending-timeline-policy state metadata store)))
   (physical-restartpoint-prepare-storage store)
-  ;; Defer interrupts across open and registration so cleanup can find CLOG
-  ;; as soon as its stream exists.
-  (sb-sys:without-interrupts
-    (setf *clog-stream* (open (clog-path) :direction :input :element-type '(unsigned-byte 8)
-                                          :if-does-not-exist :error)))
+  (clog-open-read-only)
   (physical-recovery-check-live-files)
   (catalog-refresh-oldest-relfrozenxid))
 

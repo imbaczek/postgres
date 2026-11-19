@@ -248,7 +248,8 @@ Recheck identities after waiting and under catalog locks before changing storage
          (if (getf ast :if-not-exists)
              (progn
                (send-notice stream
-                            (format nil "relation \"~a\" already exists, skipping" name))
+                            (format nil "relation \"~a\" already exists, skipping" name)
+                            "NOTICE" "42P07")
                (send-command-complete stream "CREATE SEQUENCE")
                (return-from exec-create-sequence nil))
              (ereport "42P07" "relation \"~a\" already exists" name)))
@@ -953,7 +954,8 @@ before this removal horizon is captured."
       (if (getf ast :if-not-exists)
           (progn
             (send-notice stream
-                         (format nil "relation \"~a\" already exists, skipping" name))
+                         (format nil "relation \"~a\" already exists, skipping" name)
+                         "NOTICE" "42P07")
             (send-command-complete stream "CREATE TABLE")
             (return-from exec-create-table nil))
           (ereport "42P07" "relation \"~a\" already exists" name)))
@@ -1110,12 +1112,15 @@ Release these locks before waiting for commit or sending replies."
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table))
-            existing (relation-name-in-use-p db name)))
+            existing (relation-name-in-use-p db name))
+      (when existing
+        (resolve-attnums table (getf ast :columns))))
     (when existing
       (if if-not-exists
           (progn
             (send-notice stream
-                         (format nil "relation \"~a\" already exists, skipping" name))
+                         (format nil "relation \"~a\" already exists, skipping" name)
+                         "NOTICE" "42P07")
             (send-command-complete stream "CREATE INDEX")
             (return-from exec-create-index nil))
           (ereport "42P07" "relation \"~a\" already exists" name)))
@@ -1128,19 +1133,20 @@ Release these locks before waiting for commit or sending replies."
         ;; acquired, then persist the reservation before creating the relfile.
         (with-write-catalog-locks
           (ensure-current-table table)
-          (setf existing (relation-name-in-use-p db name))
-          (when existing
-            (if if-not-exists
-                (setf skipped t)
-                (ereport "42P07" "relation \"~a\" already exists" name)))
-          (unless skipped
-            (setf idx
-                  (make-index-object
-                   (allocate-oid) name table
-                   (resolve-attnums table (getf ast :columns))
-                   :unique unique
-                   :nulls-not-distinct (getf ast :nulls-not-distinct)))
-            (save-catalog :applied-logical-event-id nil)))
+          (let ((attnums (resolve-attnums table (getf ast :columns))))
+            (setf existing (relation-name-in-use-p db name))
+            (when existing
+              (if if-not-exists
+                  (setf skipped t)
+                  (ereport "42P07" "relation \"~a\" already exists" name)))
+            (unless skipped
+              (setf idx
+                    (make-index-object
+                     (allocate-oid) name table
+                     attnums
+                     :unique unique
+                     :nulls-not-distinct (getf ast :nulls-not-distinct)))
+              (save-catalog :applied-logical-event-id nil))))
         (unless skipped
           (handler-case
               (progn
@@ -1193,7 +1199,8 @@ Release these locks before waiting for commit or sending replies."
               (error condition))))))
     (when skipped
       (send-notice stream
-                   (format nil "relation \"~a\" already exists, skipping" name)))
+                   (format nil "relation \"~a\" already exists, skipping" name)
+                   "NOTICE" "42P07"))
     (send-command-complete stream "CREATE INDEX")))
 
 (defun exec-drop-index (stream ast)

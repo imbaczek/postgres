@@ -937,10 +937,7 @@ installing the recovery store."
                  (error "streaming receive spool lost previously applied WAL"))
                (physical-recovery-publish-selected-history *physical-receive-store*)
                (physical-restartpoint-prepare-storage *physical-receive-store*)
-               (sb-sys:without-interrupts
-                 (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
-                                                       :direction :io :if-exists :overwrite
-                                                       :if-does-not-exist :error)))
+               (clog-init)
                (let ((*physical-replay-restarting-p* t))
                  (physical-replay-from *last-replay-lsn*))
                (physical-recovery-check-required-pair *physical-receive-store*)
@@ -949,9 +946,7 @@ installing the recovery store."
                (physical-recovery-check-live-files)
                (physical-recovery-save-progress *last-replay-lsn* *next-xid*))
              (unless streaming
-               (sb-sys:without-interrupts
-                 (setf *clog-stream* (open (clog-path) :element-type '(unsigned-byte 8)
-                                                       :direction :input :if-does-not-exist :error))))
+               (clog-open-read-only))
              (if streaming
                  (logical-slot-restore-standby-inventory store)
                  (wal-load-replication-slots))

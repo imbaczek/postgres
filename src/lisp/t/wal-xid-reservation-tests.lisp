@@ -104,7 +104,7 @@
                                (pg::*shutdown-finalizing-p* nil) (pg::*shutdown-finished* nil)
                                (pg::*xid-reservation-test-hook* nil))
       (unwind-protect
-           (progn (pg::wal-init) (pg::xact-init) (funcall function))
+           (progn (pg::wal-init) (pg::xact-init :initialize t) (funcall function))
         (when pg::*wal-output-stream* (close pg::*wal-output-stream*))
         (when pg::*clog-stream* (close pg::*clog-stream*))))))
 

@@ -338,7 +338,10 @@ ambiguous failure that may have advanced control on disk."
              (setf replacement (open (clog-path) :direction :io
                                                  :element-type '(unsigned-byte 8)
                                                  :if-exists :overwrite :if-does-not-exist :error))
-             (setf *clog-stream* replacement installed t)
+             (when (< (file-length replacement) (gethash previous *clog-stream-extents* 0))
+               (ereport "XX001" "transaction status file ~a is truncated" (clog-path)))
+             (clog-install-stream-under-lock replacement)
+             (setf installed t)
              (when previous (close previous)))
         (when (and replacement (not installed)) (close replacement)))))
   (values))

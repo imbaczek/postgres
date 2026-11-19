@@ -153,6 +153,44 @@ def check_sorted_volatile_slot_projection(connection):
     connection.query("SELECT pg_drop_replication_slot('slot_retained')")
 
 
+def check_sorted_file_projection(connection):
+    connection.query("CREATE TABLE projection_order(a int)")
+    connection.query("INSERT INTO projection_order VALUES (0), (2)")
+    assert connection.query(
+        "SELECT pg_read_binary_file('PG_VERSION', 0, a - 1, false) "
+        "FROM projection_order ORDER BY a DESC LIMIT 1"
+    ) == [[r"\x31"]]
+    assert connection.observe(
+        "SELECT pg_read_binary_file('PG_VERSION', 0, -1, false)"
+    ) == ("error", "22023")
+
+
+def check_ddl_skip_validation(connection):
+    connection.query("CREATE TABLE index_collision(a int)")
+    connection.query("CREATE INDEX existing_index ON index_collision(a)")
+    for name in ("index_collision", "existing_index"):
+        assert connection.observe(
+            f"CREATE INDEX IF NOT EXISTS {name} ON index_collision(missing)"
+        ) == ("error", "42703")
+        for statement in (
+            f"CREATE INDEX IF NOT EXISTS {name} ON index_collision(a)",
+            f"CREATE SEQUENCE IF NOT EXISTS {name}",
+        ):
+            connection.send(b"Q", statement.encode() + b"\0")
+            notices, commands = [], []
+            while True:
+                kind, body = connection.receive()
+                assert kind != b"E", connection.error_fields(body)
+                if kind == b"N":
+                    notices.append(connection.error_fields(body)["C"])
+                elif kind == b"C":
+                    commands.append(body)
+                elif kind == b"Z":
+                    break
+            assert notices == ["42P07"], (statement, notices)
+            assert commands == [(" ".join(statement.split()[:2]) + "\0").encode()]
+
+
 def run():
     server = wire.OwnedLisp()
     writer = reader = None
@@ -162,6 +200,8 @@ def run():
         check_dml_bind(reader, writer)
         check_snapshot_read_only_transition(reader, writer)
         check_sorted_volatile_slot_projection(writer)
+        check_sorted_file_projection(writer)
+        check_ddl_skip_validation(writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),

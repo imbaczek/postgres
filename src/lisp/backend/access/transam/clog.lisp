@@ -292,16 +292,41 @@ snapshot alone cannot prevent a new stage."
   (sb-thread:with-mutex (*clog-lock*)
     (clog-require-no-pending-under-lock)))
 
+(defun clog-install-stream-under-lock (stream)
+  "Publish STREAM and its initial extent together under the CLOG lock."
+  (assert (sb-thread:holding-mutex-p *clog-lock*))
+  (setf (gethash stream *clog-stream-extents*) (file-length stream)
+        *clog-stream* stream))
+
+(defun clog-open-read-only ()
+  "Open existing CLOG for a static recovery reader."
+  (sb-thread:with-mutex (*clog-lock*)
+    (sb-sys:without-interrupts
+      (let ((stream (open (clog-path) :direction :input
+                                      :element-type '(unsigned-byte 8) :if-does-not-exist :error))
+            (installed nil))
+        (unwind-protect
+             (progn
+               (clog-install-stream-under-lock stream)
+               (setf installed t))
+          (unless installed (close stream))))))
+  (values))
+
 (defun clog-init-under-lock (&optional initialize)
   ;; Reopening storage cannot discard pending commits.
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (clog-require-no-pending-under-lock)
   (let* ((path (clog-path))
          (existed (probe-file path)))
-    (setf *clog-stream*
-          (open path :direction :io :element-type '(unsigned-byte 8)
-                     :if-exists :overwrite :if-does-not-exist (if initialize :create :error)))
-    (setf (gethash *clog-stream* *clog-stream-extents*) (file-length *clog-stream*))
+    (sb-sys:without-interrupts
+      (let ((stream (open path :direction :io :element-type '(unsigned-byte 8)
+                               :if-exists :overwrite :if-does-not-exist (if initialize :create :error)))
+            (installed nil))
+        (unwind-protect
+             (progn
+               (clog-install-stream-under-lock stream)
+               (setf installed t))
+          (unless installed (close stream)))))
     (unless existed
       (fsync-stream *clog-stream*)
       (fsync-directory *pgdata*)))
@@ -459,9 +484,7 @@ identity and any prepared writer epoch from the validated plan."
                                    :if-exists :supersede :if-does-not-exist :create)
         (funcall fsync-function stream))
       (funcall fsync-directory-function *pgdata*)
-      (setf *clog-stream*
-            (open path :direction :io :element-type '(unsigned-byte 8)
-                       :if-exists :overwrite :if-does-not-exist :error))))
+      (clog-init-under-lock)))
   (publish-primary-wal-writer-clog-reset-under-lock epoch-plan)
   (values))
 

@@ -101,7 +101,7 @@
                                  (original nil))
         (unwind-protect
              (progn
-               (pg::clog-init)
+               (pg::clog-init :initialize t)
                (pg::clog-set 3 pg::+clog-committed+ :fsync t)
                (close pg::*clog-stream*)
                (setf original (open path :element-type '(unsigned-byte 8))

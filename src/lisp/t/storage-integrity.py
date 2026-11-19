@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise primary startup and relation opens against isolated, damaged copies."""
+"""Exercise startup and storage reads against isolated, damaged cluster copies."""
 
 import contextlib
 import os
@@ -79,7 +79,7 @@ def sql(port, statement, *, replication=False):
     if replication:
         conninfo += " replication=database"
     return subprocess.run(
-        ["psql", "-XAt", "-v", "ON_ERROR_STOP=1", "-d", conninfo, "-c", statement],
+        ["psql", "-XAt", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-d", conninfo, "-c", statement],
         capture_output=True, text=True, timeout=10,
     )
 
@@ -91,14 +91,18 @@ def query(port, statement, **kwargs):
 
 
 @contextlib.contextmanager
-def start(work, data):
+def start(work, data, *, control=False):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     log = work / f"{data.name}.log"
+    command = [str(SERVER), "-D", str(data), "-p", str(port)]
+    if control:
+        path = work / f"{data.name}.sock"
+        path.unlink(missing_ok=True)
+        command += ["--control-socket", str(path)]
     with log.open("w") as output:
-        process = subprocess.Popen([str(SERVER), "-D", str(data), "-p", str(port)],
-                                   stdout=output, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
         try:
             yield process, port, log
         finally:
@@ -200,9 +204,55 @@ def check_storage(work):
         assert relations(data) == before
 
 
+def control(work, data, expression):
+    path = work / f"{data.name}.sock"
+    result = subprocess.run(
+        [os.environ.get("SBCL", "sbcl"), "--script", str(BASE / "t/control-client.lisp"),
+         "unix", str(path)],
+        input=expression + "\n(quit)\n", capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0 and ";; error:" not in result.stdout, result.stderr + result.stdout
+
+
+def check_standby_clog(work):
+    source = work / "clog-source"
+    base = work / "clog-base"
+    base.mkdir(mode=0o700)
+    with start(work, source, control=True) as server:
+        wait_ready(*server)
+        query(server[1], "CREATE TABLE standby_status_rows(id int)")
+        query(server[1], "INSERT INTO standby_status_rows VALUES (42)")
+        control(work, source, f'(physical-base-backup "{base}/" "clog_extent_test")')
+
+    for mode in ("static", "transitioned", "streaming-restart"):
+        data = work / mode
+        shutil.copytree(base, data)
+        if mode == "streaming-restart":
+            with start(work, data, control=True) as server:
+                wait_ready(*server)
+                control(work, data, "(physical-recovery-enable-streaming)")
+        with start(work, data, control=True) as server:
+            wait_ready(*server)
+            port = server[1]
+            assert query(port, "SELECT pg_is_in_recovery()") == "t"
+            if mode == "transitioned":
+                control(work, data, "(physical-recovery-enable-streaming)")
+            writable = "nil" if mode == "static" else "t"
+            control(work, data, f"(assert (eq (output-stream-p *clog-stream*) {writable}))")
+            statement = "SELECT id FROM standby_status_rows"
+            assert query(port, statement) == "42"
+            clog = data / "pg_xact"
+            assert clog.stat().st_size > 0
+            clog.write_bytes(b"")
+            result = sql(port, statement)
+            assert result.returncode != 0 and "XX001" in result.stderr, (mode, result)
+            assert "transaction status file" in result.stderr, (mode, result)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="pg-storage-integrity-") as directory:
         work = Path(directory)
         check_storage(work)
+        check_standby_clog(work)
         check_same_second_identities(work)
     print("storage-integrity: PASS")
