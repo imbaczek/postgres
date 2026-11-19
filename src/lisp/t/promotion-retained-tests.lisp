@@ -1356,6 +1356,7 @@
     (dolist (failure '(:inventory :overlap :extent))
       (call-with-historical-segment-source
        (lambda (fixture)
+         (declare (ignore fixture))
          (let* ((pg::*wal-ready* t) (hit nil) (entered nil)
                                     (owner (pg::physical-promotion-retained-owner :primary))
                                     (reference (gethash owner pg::*physical-retained-root-references*))
@@ -1697,6 +1698,7 @@
            (ok (pg::physical-follow-pin-ready-p pin))
            (multiple-value-bind (record raw durable)
                (pg::physical-source-read-next "old_sibling" owner 96)
+             (declare (ignore raw durable))
              (ok (= size (pg::wal-record-end record))))
            (ok (= (pg::physical-store-update-digest
                    91 (concatenate '(vector (unsigned-byte 8)) filler middle-bytes last eor checkpoint))

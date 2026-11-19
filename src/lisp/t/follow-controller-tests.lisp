@@ -989,6 +989,7 @@
 (deftest cold-completed-retained-binding-starts-replay-without-contacting-source
     (call-with-retained-follow-config
      (lambda (root store config)
+       (declare (ignore root))
        (pg::physical-store-close store)
        (sb-posix:rename (namestring (pg::physical-store-directory store))
                         (namestring (pg::physical-recovery-spool-directory)))

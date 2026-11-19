@@ -428,7 +428,7 @@
                          (ok (null (getf ack :batch)))
                          (ok (equal receipt (getf ack :receipt)))))
                      :helper "/unused/helper"))))
-               
+
                (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))))))
 
 (deftest reseed-cancellation-cleaned-publication-consumes-actual-release-evidence
@@ -516,7 +516,7 @@
                          (ok (equal receipt (getf (getf cleaned :cancellation) :receipt)))
                          (ok (equal cleaned (getf (getf after :follow) :record)))))
                      :helper "/unused/helper"))))
-               
+
                (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))))))))))
 
 (deftest reseed-cancellation-cleaned-publication-failure-consumes-evidence-and-fences-owner

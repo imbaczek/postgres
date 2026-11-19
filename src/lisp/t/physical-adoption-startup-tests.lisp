@@ -132,7 +132,7 @@
             (ok (not (pg::physical-adoption-owner-active-p borrowed)))
             (ok (intake-fails-p (lambda () (pg::physical-adoption-check-owner borrowed))))
             (ok (open-stream-p pg::*postmaster-data-lock*))
-            (ok (pg::postmaster-pid-owned-p)))))) 
+            (ok (pg::postmaster-pid-owned-p))))))
      :fork-distance 0))
 
 (deftest adoption-startup-owner-rejects-unowned-and-replaced-pid-context

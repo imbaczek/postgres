@@ -1788,6 +1788,24 @@ The hook requires the same Emacs, SLIME, and inferior Lisp setup as the batch
 formatter. It reports files that need formatting; run the formatter and stage
 those files before committing.
 
+## Common Lisp linting
+
+Install [Mallet 0.9.2](https://github.com/fukamachi/mallet/releases/tag/0.9.2)
+and put `mallet` on your PATH. From the repository root, lint the tracked Lisp
+and ASDF files, excluding vendored Swank and local experiments:
+
+```sh
+git ls-files -z -- 'src/lisp/*.lisp' 'src/lisp/*.asd' ':(exclude)src/lisp/vendor/**' |
+    xargs -0 mallet --format line
+```
+
+For a focused check, run `mallet --format line src/lisp/path/to/file.lisp` from
+the repository root. Mallet reads the root `.mallet.lisp` config automatically.
+Known noisy checks in specific files are informational. Warnings cause
+a nonzero exit. Mallet analyzes source forms without
+loading the ASDF systems, so continue using `./t/compile.sh` for compiler
+diagnostics.
+
 ## SLIME debugging
 
 The launcher loads the vendored Swank server from SLIME v2.32 into the Lisp

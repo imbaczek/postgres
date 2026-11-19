@@ -607,7 +607,7 @@
         (call-with-reseed-follow-building-fixture
          kind
          (lambda (owner root workspace building)
-           (declare (ignore workspace building))
+           (declare (ignore root workspace building))
            (setf staged (pg::physical-reseed-follow-stage-configuration owner))
            (pg::call-with-physical-directory-root
             owner (lambda (fd directory)
