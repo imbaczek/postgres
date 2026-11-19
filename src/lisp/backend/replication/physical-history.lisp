@@ -227,7 +227,7 @@ at START-LSN. FPW and logical seeds are copied and folded privately while
 validating the suffix. A stateless
 parent scan can start with unknown seeds, but cannot cross EOR without a proven
 stage and XID. Return the deletion set, last terminal, and committed relation/fork
-resets. No database files are written."
+resets and the first complete CLOG reset terminal, if any. No database files are written."
   (let ((state (or *physical-recovery-state*
                    (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store)))))
     (physical-recovery-check-store-point store start-lsn (physical-store-prefix-timeline store start-lsn))
@@ -259,6 +259,7 @@ resets. No database files are written."
           (let ((*physical-history-reset-forks* (make-hash-table :test #'equal))
                 (removed (make-hash-table :test #'eql))
                 (terminal start-lsn)
+                (clog-reset nil)
                 (required-found (eql required-lsn start-lsn)))
             (physical-recovery-map-permitted-records
              store
@@ -284,8 +285,10 @@ resets. No database files are written."
                    (setf (getf *physical-recovery-state* :source-checkpoint)
                          (wal-checkpoint-record-snapshot record)))
                  (setf terminal (wal-record-end record))
+                 (when (and (not clog-reset) (= (wal-record-type record) +wal-record-clog-reset+))
+                   (setf clog-reset terminal))
                  (when (eql required-lsn terminal) (setf required-found t))))
              :start-lsn start-lsn :policy policy)
             (when (and required-lsn (not required-found))
               (error "durable WAL lost a previously applied terminal"))
-            (values removed terminal *physical-history-reset-forks*)))))))
+            (values removed terminal *physical-history-reset-forks* clog-reset)))))))

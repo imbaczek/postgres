@@ -1826,6 +1826,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   in tuple headers and the CLog (`pg_xact`, with 2 status bits per XID). Primary
   checkpoints record the durable CLOG length so restart can detect truncation.
   Control files written before this check gain the length at their next checkpoint.
+  Streaming standbys check the backup manifest or selected restartpoint for their
+  required CLOG length. Older restartpoints beyond the backup boundary gain this
+  check when the standby publishes a new restartpoint.
   Before reusing a 32-bit XID cycle, the server blocks new statements, waits for active
   transactions and snapshots to drain, freezes old tuple XIDs, and resets the
   CLog. A per-statement READ COMMITTED snapshot tracks full XIDs and `curcid`.

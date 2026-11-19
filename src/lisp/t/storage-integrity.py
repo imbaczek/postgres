@@ -249,6 +249,38 @@ def check_standby_clog(work):
             assert "transaction status file" in result.stderr, (mode, result)
 
 
+    for checkpoint in (False, True):
+        data = work / ("truncated-restartpoint-clog" if checkpoint else "truncated-base-clog")
+        shutil.copytree(base, data)
+        with start(work, data, control=True) as server:
+            wait_ready(*server)
+            control(work, data, "(physical-recovery-enable-streaming)")
+            assert query(server[1], "SELECT id FROM standby_status_rows") == "42"
+            if checkpoint:
+                query(server[1], "CHECKPOINT")
+                generations = list((data / "pg_physical_restartpoints").glob("*.rp"))
+                assert any(b":CLOG-BYTES" in path.read_bytes() for path in generations)
+            else:
+                # A clean shutdown publishes a restartpoint. Preserve the
+                # base-only state for this branch of the cold-start check.
+                server[0].kill()
+                server[0].wait(timeout=15)
+        with start(work, data) as server:
+            wait_ready(*server)
+            assert query(server[1], "SELECT id FROM standby_status_rows") == "42"
+            if not checkpoint:
+                server[0].kill()
+                server[0].wait(timeout=15)
+        assert (data / "physical-restartpoint.control").exists() == checkpoint
+        clog = data / "pg_xact"
+        assert clog.stat().st_size > 0
+        clog.write_bytes(b"")
+        with start(work, data) as (process, _, log):
+            assert process.wait(timeout=30) == 1, log.read_text()
+            assert "transaction status file pg_xact is truncated" in log.read_text()
+        assert clog.stat().st_size == 0
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="pg-storage-integrity-") as directory:
         work = Path(directory)

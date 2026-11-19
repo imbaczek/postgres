@@ -35,6 +35,25 @@
   (list (list pg::+wal-record-batch-start+ (empty-octets))
         (list type payload xid)))
 
+(deftest physical-history-short-clog-requires-a-complete-reset
+    (let ((payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (pg::wal-set-u64 payload 0 4294967299)
+      (let* ((batch (history-batch pg::+wal-record-clog-reset+ payload 4294967299))
+             (reset (nth-value 3 (history-drop-proof batch)))
+             (unfinished (nth-value 3 (history-drop-proof (butlast batch)))))
+        (ok (null unfinished))
+        (ok (= reset (+ (* 2 pg::+wal-header-size+) 8)))
+        (with-physical-store-directory (root)
+          (let* ((pg::*pgdata* root)
+                 (state (list :end 32 :files '(("pg_xact" 1 0))))
+                 (restartpoint (list :lsn 96 :clog-bytes 2)))
+            (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
+            (ok (intake-fails-p
+                 (lambda () (pg::physical-restartpoint-required-clog-reset state nil unfinished))))
+            (ok (= reset (pg::physical-restartpoint-required-clog-reset state restartpoint reset)))
+            (ok (null (pg::physical-restartpoint-required-clog-reset
+                       state (list :lsn 96 :clog-bytes 0) nil))))))))
+
 (deftest physical-history-complete-catalog-proves-drop
     (let ((removed (history-drop-proof
                     (history-batch pg::+wal-record-catalog+

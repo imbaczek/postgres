@@ -3157,6 +3157,9 @@ published separately after primary redo completes."
                #'values)))
     (wal-replay-finish-batch (lambda () apply-function))))
 
+(defvar *wal-recovery-required-clog-reset* nil
+  "First proven replacement required when startup found a short CLOG file.")
+
 (defun wal-replay-record (record)
   (when (> (wal-record-end record) *wal-checkpoint-lsn*)
     (wal-note-recovery-batch-record record)
@@ -3217,7 +3220,12 @@ published separately after primary redo completes."
        (wal-replay-finish-batch
         (lambda ()
           (lambda ()
-            (clog-set (wal-record-xid record) 1)))))
+            ;; Old statuses will be discarded by the reset. Keep a
+            ;; short file short until then so an interrupted recovery
+            ;; cannot conceal the missing bytes on its next attempt.
+            (unless (and *wal-recovery-required-clog-reset*
+                         (< (wal-record-end record) *wal-recovery-required-clog-reset*))
+              (clog-set (wal-record-xid record) 1))))))
       ((= (wal-record-type record) +wal-record-catalog+)
        (wal-recovery-validate-logical-terminal :catalog)
        (wal-replay-finish-batch

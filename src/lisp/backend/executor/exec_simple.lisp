@@ -1104,17 +1104,22 @@ Release these locks before waiting for commit or sending replies."
   (let* ((*catalog-save-error-after-durable-p* nil)
          (name (getf ast :name))
          (unique (getf ast :unique))
+         (columns (getf ast :columns))
          (if-not-exists (getf ast :if-not-exists))
          (db nil)
          (table nil)
          (existing nil)
          (skipped nil))
+    ;; Match INDEX_MAX_KEYS in pg_config_manual.h. Count positions, including
+    ;; repeated columns, before considering a duplicate relation name.
+    (when (> (length columns) 32)
+      (ereport "54011" "cannot use more than 32 columns in an index"))
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table))
             existing (relation-name-in-use-p db name))
       (when existing
-        (resolve-attnums table (getf ast :columns))))
+        (resolve-attnums table columns)))
     (when existing
       (if if-not-exists
           (progn
@@ -1133,7 +1138,7 @@ Release these locks before waiting for commit or sending replies."
         ;; acquired, then persist the reservation before creating the relfile.
         (with-write-catalog-locks
           (ensure-current-table table)
-          (let ((attnums (resolve-attnums table (getf ast :columns))))
+          (let ((attnums (resolve-attnums table columns)))
             (setf existing (relation-name-in-use-p db name))
             (when existing
               (if if-not-exists

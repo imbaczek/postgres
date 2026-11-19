@@ -191,6 +191,15 @@ def check_ddl_skip_validation(connection):
             assert commands == [(" ".join(statement.split()[:2]) + "\0").encode()]
 
 
+def check_index_column_limit(connection):
+    keys = ", ".join(["a"] * 32)
+    connection.query(f"CREATE INDEX max_keys ON index_collision({keys})")
+    for target in ("too_many_keys", "IF NOT EXISTS max_keys", "IF NOT EXISTS index_collision"):
+        assert connection.observe(
+            f"CREATE INDEX {target} ON index_collision({keys}, a)"
+        ) == ("error", "54011")
+
+
 def run():
     server = wire.OwnedLisp()
     writer = reader = None
@@ -202,6 +211,7 @@ def run():
         check_sorted_volatile_slot_projection(writer)
         check_sorted_file_projection(writer)
         check_ddl_skip_validation(writer)
+        check_index_column_limit(writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),

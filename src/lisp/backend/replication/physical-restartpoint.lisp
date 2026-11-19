@@ -294,8 +294,10 @@ Older metadata without these fields uses the base timeline."
                                           (source-xids (loop for key in metadata by #'cddr thereis (eq key :source-xids)))
                                           (resources (loop for key in metadata by #'cddr thereis (eq key :source-resource-fact)))
                                           (fpw (get-properties metadata '(:source-fpw-fact)))
-                                          (logical (get-properties metadata '(:source-logical-fact))))
-    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if resources 2 0) (if fpw 2 0) (if logical 2 0) (if target 6 0)))
+                                          (logical (get-properties metadata '(:source-logical-fact)))
+                                          (clog (get-properties metadata '(:clog-bytes))))
+    (and (= (length metadata) (+ 28 (if source-xids 2 0) (if resources 2 0) (if fpw 2 0) (if logical 2 0) (if target 6 0) (if clog 2 0)))
+         (or (not clog) (typep (getf metadata :clog-bytes) '(integer 0 1073741824)))
          (physical-recovery-selection-fields-valid-p 2 3 base replay target digest)
          (or (not target)
              (every (lambda (key) (loop for name in metadata by #'cddr thereis (eq key name)))
@@ -409,6 +411,9 @@ Omit an unknown logical fact; known OFF remains a present fact."
                   :source-reservation (copy-list (getf state :source-reservation))
                   :wal-prefix-digest (when prefix-bytes
                                        (physical-store-update-digest #xCBF29CE484222325 prefix-bytes)))))
+      (let ((extent (clog-file-extent)))
+        (when extent
+          (setf metadata (append metadata (list :clog-bytes extent)))))
       (when (getf state :source-resource-fact)
         (setf metadata (append metadata
                                (list :source-resource-fact
@@ -489,7 +494,20 @@ Omit an unknown logical fact; known OFF remains a present fact."
 ;;; membership and legacy fallback leave coverage unknown.  The restored list
 ;;; is copied so recovery owns it independently of the decoded generation.
 
-(defun physical-restartpoint-prepare-storage (store)
+(defun physical-restartpoint-required-clog-reset (state metadata reset)
+  "Reject a short durable CLOG unless startup can redo a proven replacement."
+  (let ((required (or (getf metadata :clog-bytes)
+                      (when (or (not metadata) (= (getf metadata :lsn) (getf state :end)))
+                        (second (assoc "pg_xact" (getf state :files) :test #'equal))))))
+    (when (and required (plusp required))
+      (with-open-file (stream (clog-path) :element-type '(unsigned-byte 8))
+        (when (< (file-length stream) required)
+          (unless reset
+            (error "transaction status file pg_xact is truncated (recovery requires ~d bytes)"
+                   required))
+          reset)))))
+
+(defun physical-restartpoint-prepare-storage (store &key allow-clog-reset)
   "Validate provenance, suffix and surviving forks before restoring an R catalog.
 Derive the logical seed even when no fact was persisted; a checkpoint or
 retained WAL may establish it. Validate seeds before drop proof so a bad suffix
@@ -508,7 +526,8 @@ cannot grant file exemptions. All checks precede restoration writes."
       (let ((start (if metadata (getf metadata :lsn) (getf state :end)))
             (resource-seed nil)
             (fpw-seed nil)
-            (logical-seed nil))
+            (logical-seed nil)
+            (required-clog-reset nil))
         (unless (and (<= (physical-store-floor-lsn store) start (physical-store-flushed-lsn store))
                      (or metadata (= start (physical-store-base-lsn store))))
           (error "receive floor lacks its required published restartpoint"))
@@ -523,13 +542,16 @@ cannot grant file exemptions. All checks precede restoration writes."
               fpw-seed (physical-restartpoint-fpw-seed metadata state store start))
         (setf logical-seed (physical-restartpoint-logical-seed metadata state store start))
         (multiple-value-bind (checkpoint next) (physical-restartpoint-scan-seeds metadata state)
-          (multiple-value-bind (removed terminal reset-forks)
+          (multiple-value-bind (removed terminal reset-forks clog-reset)
               (apply #'physical-recovery-proven-drops
                      store identity :start-lsn start :required-lsn (max required start)
                      :checkpoint-seed checkpoint :next-xid-seed next :fpw-seed fpw-seed
                      :policy (getf state :timeline-policy)
                      (when logical-seed (list :logical-seed logical-seed)))
             (declare (ignore terminal))
+            (setf required-clog-reset
+                  (physical-restartpoint-required-clog-reset
+                   state metadata (and allow-clog-reset clog-reset)))
             (physical-recovery-check-base-forks
              (if metadata (list :files (getf metadata :forks)) state) removed reset-forks)))
         (setf (getf *physical-recovery-state* :wal-prefix-lsn) (and metadata start)
@@ -583,7 +605,7 @@ cannot grant file exemptions. All checks precede restoration writes."
                 (getf *physical-recovery-state* :observed-next-xid)
                 (max (or (getf state :observed-next-xid) 3) *next-xid*)))
         (setf *last-replay-lsn* start *wal-checkpoint-lsn* start)
-        start))))
+        (values start required-clog-reset)))))
 
 (defun physical-restartpoint-remove-old-generations ()
   "Called only after pointer, floor and spool deletion have been synced."
