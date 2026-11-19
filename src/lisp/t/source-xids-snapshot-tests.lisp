@@ -33,7 +33,7 @@
                                           (list :next-xid 50 :running '(3 49) :complete t) 100))
                                  (pg::*physical-recovery-state* (list :phase 2 :source-xids source))
                                  (pg::*last-replay-lsn* 100) (pg::*next-xid* 50) (pg::*active-xids* nil))
-        (pg::clog-init)
+        (pg::clog-init :initialize t)
         (unwind-protect
              (let ((snapshot (pg::make-snapshot 1)))
                (pg::clog-set 3 1)
@@ -162,7 +162,7 @@
         (pg::physical-store-input store end
                                   (pg::wal-encode-record pg::+wal-record-commit+ 4 end (empty-octets)))
         (pg::physical-store-flush store)
-        (pg::clog-init)
+        (pg::clog-init :initialize t)
         (unwind-protect
              (progn
                (sb-thread:with-mutex (pg::*xid-lock*) (pg::register-active-snapshot snapshot pin))

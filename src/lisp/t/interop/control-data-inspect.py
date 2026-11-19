@@ -40,9 +40,12 @@ def run(root, expected_state=None):
     rows = {key: value.strip() for key, value in rows.items()}
     fields = (root / "global/pg_wal_control").read_bytes().split()
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
-    qualified = len(fields) in (12, 16, 18, 22)
+    qualified = fields[-2] == b"C1"
     if qualified:
         assert fields.pop(-2) == b"C1"
+    if fields[-2].startswith(b"X"):
+        assert fields[-2][1:].isdigit()
+        fields.pop(-2)
     assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     CHECK_OPTIONAL_CONTROL(fields[:-1])
     if len(fields) in (11, 15, 17, 21) and not (root / "physical-recovery.control").exists():

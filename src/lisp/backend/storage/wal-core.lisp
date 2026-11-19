@@ -687,7 +687,7 @@ short check alone cannot do so."
                 wal-recovery-accept-logical-change-chunk
                 wal-recovery-finish-logical-change-batch
                 wal-recovery-reset-logical-change-batch
-                clog-get clog-set clog-reset clog-fsync))
+                clog-get clog-set clog-reset clog-fsync clog-file-extent))
 (declaim (notinline pg-class-relfilenode pg-index-relfilenode
                     database-tables database-indexes catalog-databases))
 
@@ -3304,6 +3304,20 @@ Return the rebound evidence and current token, or the unchanged pair."
        (error "WAL recovery storage changed outside a completed CLOG reset"))
       (t (values state incarnation)))))
 
+(defun wal-verify-checkpoint-clog-extent ()
+  (let ((required (getf *wal-control-metadata* :checkpoint-clog-bytes)))
+    (when (and required (< (or (clog-file-extent) 0) required))
+      ;; An already-installed reset legitimately replaces the checkpoint's CLOG.
+      ;; Replay reconstructs all committed statuses in the new epoch.
+      (let ((reset-p nil))
+        (wal-scan (lambda (record)
+                    (when (and (> (wal-record-end record) *wal-checkpoint-lsn*)
+                               (= (wal-record-type record) +wal-record-clog-reset+))
+                      (setf reset-p t))))
+        (unless reset-p
+          (error "transaction status file pg_xact is truncated (checkpoint requires ~d bytes)"
+                 required))))))
+
 (defun wal-recover ()
   "Redo durable complete batches before loading the catalog.
 Validate logical status privately before each new terminal's redo. Carry private
@@ -3312,6 +3326,7 @@ batch; reject other storage rotations. Publish FPW and logical status only after
 the full scan and CLOG sync succeed. The caller must exclude storage lifecycle
 changes throughout. Return the greatest CLOG reset boundary replayed after
 the checkpoint, or NIL when no reset was replayed."
+  (wal-verify-checkpoint-clog-extent)
   (let* ((incarnation *wal-storage-incarnation*)
          (fpw-state (wal-fpw-state-from-checkpoint *wal-checkpoint-snapshot* incarnation))
          (logical-status (wal-logical-status-from-checkpoint *wal-checkpoint-snapshot*))
@@ -4009,13 +4024,21 @@ Refresh its modification time. Update memory only after atomic publication."
   (setf *wal-durable-lsn* lsn)
   (values))
 
-(defun wal-save-checkpoint-control (lsn &optional snapshot)
+(defun wal-save-checkpoint-control (lsn &optional snapshot clog-extent)
   (when (> lsn *wal-durable-lsn*)
     (error "WAL checkpoint LSN ~a is past durable LSN ~a" lsn *wal-durable-lsn*))
   ;; WAL-FLUSH retains the old copy. Publish a candidate only after page/CLOG sync.
-  (let ((*wal-checkpoint-snapshot* snapshot)
-        (*wal-checkpoint-timeline* (if snapshot (getf snapshot :timeline) *wal-insert-timeline*)))
-    (wal-save-control-fields lsn *wal-durable-lsn*))
+  (let ((metadata
+          (let ((*wal-checkpoint-snapshot* snapshot)
+                (*wal-checkpoint-timeline* (if snapshot (getf snapshot :timeline) *wal-insert-timeline*))
+                (*wal-control-metadata* (copy-list *wal-control-metadata*)))
+            (when *wal-control-metadata*
+              (if clog-extent
+                  (setf (getf *wal-control-metadata* :checkpoint-clog-bytes) clog-extent)
+                  (remf *wal-control-metadata* :checkpoint-clog-bytes)))
+            (wal-save-control-fields lsn *wal-durable-lsn*)
+            *wal-control-metadata*)))
+    (setf *wal-control-metadata* metadata))
   (setf *wal-checkpoint-lsn* lsn
         *wal-checkpoint-snapshot* (copy-list snapshot)
         *wal-checkpoint-timeline* (if snapshot (getf snapshot :timeline) *wal-insert-timeline*))
@@ -4235,7 +4258,7 @@ release their claims to the retained WAL."
               (fsync-directory *pgdata*)
               (fsync-directory (merge-pathnames "base/" *pgdata*))
               (fsync-directory (merge-pathnames "global/" *pgdata*))
-              (wal-save-checkpoint-control checkpoint-end snapshot)
+              (wal-save-checkpoint-control checkpoint-end snapshot (clog-file-extent))
               (wal-fpw-note-published-checkpoint snapshot)
               (wal-logical-note-published-checkpoint snapshot)
               (wal-test-pause :after-checkpoint-control)

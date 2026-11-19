@@ -238,12 +238,18 @@ def primary_committed(root):
     requires lifecycle metadata. Promote also verifies the PGDATA owner.
     """
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
-    checksum_format = len(fields) in (12, 16, 18, 20, 22, 24)
-    if ((not checksum_format and len(fields) not in (8, 11, 15, 17, 19, 21, 23))
-            or fields[0] != b"PGWAL6"):
+    if not fields or fields[0] != b"PGWAL6":
         raise ValueError("invalid native WAL control")
     if crc32c(b" ".join(fields[:-1])) != int(fields[-1], 16):
         raise ValueError("native WAL control checksum mismatch")
+    extent_index = -3 if len(fields) > 2 and fields[-2] == b"C1" else -2
+    if len(fields) >= -extent_index and fields[extent_index].startswith(b"X"):
+        extent = fields.pop(extent_index)[1:]
+        if re.fullmatch(rb"[0-9]+", extent) is None or int(extent) > 2**30:
+            raise ValueError("invalid native transaction status extent")
+    checksum_format = len(fields) in (12, 16, 18, 20, 22, 24)
+    if not checksum_format and len(fields) not in (8, 11, 15, 17, 19, 21, 23):
+        raise ValueError("invalid native WAL control")
     if checksum_format:
         if fields[-2] != b"C1":
             raise ValueError("unsupported native page checksum format")

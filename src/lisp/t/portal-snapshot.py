@@ -123,6 +123,36 @@ def check_snapshot_read_only_transition(reader, writer):
     writer.query("DROP TABLE export_transition")
 
 
+def check_sorted_volatile_slot_projection(connection):
+    rows = connection.query(
+        "SELECT pg_create_logical_replication_slot('sort_slot','pgoutput') "
+        "FROM (SELECT 2 AS k UNION ALL SELECT 1) AS source ORDER BY k LIMIT 1"
+    )
+    assert len(rows) == 1, rows
+    assert connection.query(
+        "SELECT slot_name FROM pg_replication_slots WHERE slot_name = 'sort_slot'"
+    ) == [["sort_slot"]]
+    connection.query("SELECT pg_drop_replication_slot('sort_slot')")
+
+    connection.query("CREATE TABLE slot_sort_names(k int, label text)")
+    connection.query("INSERT INTO slot_sort_names VALUES (2,'slot_discarded'),(1,'slot_retained')")
+    sql = "SELECT pg_create_logical_replication_slot(label,$1) FROM slot_sort_names ORDER BY k LIMIT 1"
+    connection.send(b"P", b"slotstmt\0" + sql.encode() + b"\0" + struct.pack("!HI", 1, 25))
+    connection.send(
+        b"B", b"slotportal\0slotstmt\0" + struct.pack("!HHI", 0, 1, 8)
+        + b"pgoutput" + struct.pack("!H", 0)
+    )
+    connection.send(b"H")
+    connection.through(b"2")
+    rows, commands, status, errors = connection.execute("slotportal")
+    assert len(rows) == 1 and not errors, (rows, commands, status, errors)
+    assert connection.query(
+        "SELECT slot_name FROM pg_replication_slots "
+        "WHERE slot_name IN ('slot_discarded','slot_retained')"
+    ) == [["slot_retained"]]
+    connection.query("SELECT pg_drop_replication_slot('slot_retained')")
+
+
 def run():
     server = wire.OwnedLisp()
     writer = reader = None
@@ -131,6 +161,7 @@ def run():
         writer, reader = Connection(server.port), Connection(server.port)
         check_dml_bind(reader, writer)
         check_snapshot_read_only_transition(reader, writer)
+        check_sorted_volatile_slot_projection(writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),

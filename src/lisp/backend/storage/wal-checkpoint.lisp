@@ -409,13 +409,16 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
       metadata)))
 
 (defun wal-control-metadata-valid-p (metadata)
-  (and (listp metadata) (member (length metadata) '(6 8 10 12 14 16 18))
+  (and (listp metadata) (member (length metadata) '(6 8 10 12 14 16 18 20))
        (let ((keys (loop for (key value) on metadata by #'cddr collect key)))
          (and (= (/ (length metadata) 2) (length (remove-duplicates keys)))
               (null (set-difference '(:system-id :db-state :state-time) keys))
               (null (set-difference keys '(:system-id :db-state :state-time :retained-reference
                                            :resource-parameters :resource-lsn :resource-timeline
-                                           :page-checksum-version :logical-slot-evidence-digest)))
+                                           :page-checksum-version :logical-slot-evidence-digest
+                                           :checkpoint-clog-bytes)))
+              (or (not (member :checkpoint-clog-bytes keys))
+                  (typep (getf metadata :checkpoint-clog-bytes) '(integer 0 1073741824)))
               (or (not (member :page-checksum-version keys))
                   (eql 1 (getf metadata :page-checksum-version)))
               (or (not (member :logical-slot-evidence-digest keys))
@@ -444,17 +447,20 @@ five integers as a list so EQUAL compares metadata without case-folding strings.
           (wal-copy-control-resource-fields metadata)
           (when (getf metadata :logical-slot-evidence-digest)
             (list :logical-slot-evidence-digest (getf metadata :logical-slot-evidence-digest)))
+          (when (getf metadata :checkpoint-clog-bytes)
+            (list :checkpoint-clog-bytes (getf metadata :checkpoint-clog-bytes)))
           (when (getf metadata :page-checksum-version)
             (list :page-checksum-version (getf metadata :page-checksum-version)))))
 
 (defun wal-control-base-metadata (metadata)
-  "Remove the local retained reference and checksum qualification from copied control.
-Return the copied metadata and whether either field was removed."
+  "Remove local-only control facts when deriving a backup or adoption image.
+Return the copied metadata and whether any field was removed."
   (let* ((copy (copy-list metadata))
          (removed-reference (remf copy :retained-reference))
          (removed-logical-evidence (remf copy :logical-slot-evidence-digest))
-         (removed-checksum (remf copy :page-checksum-version)))
-    (values copy (or removed-reference removed-logical-evidence removed-checksum))))
+         (removed-checksum (remf copy :page-checksum-version))
+         (removed-clog-extent (remf copy :checkpoint-clog-bytes)))
+    (values copy (or removed-reference removed-logical-evidence removed-checksum removed-clog-extent))))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :legacy) metadata
@@ -465,7 +471,8 @@ PGWAL6 has eight fields without metadata and eleven with lifecycle metadata.
 A retained reference adds six fields; resource metadata adds R, tuple hex, LSN
 and timeline, giving 15 fields alone or 21 with a reference. Reference values
 follow the fixed key order. Optional C1 adds one field for native checksum mode.
-The CRC covers all fields before the CRC itself."
+An optional X token records the locally fsynced CLOG byte extent. The CRC covers
+all fields before the CRC itself."
   (unless (and (typep checkpoint '(unsigned-byte 64))
                (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                (typep timeline '(integer 1 4294967295))
@@ -501,6 +508,9 @@ The CRC covers all fields before the CRC itself."
          (prefix (if (getf metadata :logical-slot-evidence-digest)
                      (format nil "~a L ~d" prefix (getf metadata :logical-slot-evidence-digest))
                      prefix))
+         (prefix (if (getf metadata :checkpoint-clog-bytes)
+                     (format nil "~a X~d" prefix (getf metadata :checkpoint-clog-bytes))
+                     prefix))
          (prefix (if (getf metadata :page-checksum-version)
                      (format nil "~a C1" prefix)
                      prefix))
@@ -513,8 +523,13 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
   (let* ((fields (and line (wal-split-fields line)))
          (version (first fields))
          (v6 (equal version "PGWAL6"))
-         (checksum-p (and v6 (member (length fields) '(12 16 18 20 22 24))))
-         (base-fields (if checksum-p (append (butlast fields 2) (last fields)) fields))
+         (extent-tail (if (equal "C1" (first (last fields 2))) 3 2))
+         (extent-token (and v6 (first (last fields extent-tail))))
+         (extent-p (and extent-token (plusp (length extent-token))
+                        (char= #\X (char extent-token 0))))
+         (shape-fields (if extent-p (append (butlast fields extent-tail) (rest (last fields extent-tail))) fields))
+         (checksum-p (and v6 (member (length shape-fields) '(12 16 18 20 22 24))))
+         (base-fields (if checksum-p (append (butlast shape-fields 2) (last shape-fields)) shape-fields))
          (logical-evidence-p (and v6 (member (length base-fields) '(19 23))))
          (metadata-fields (if logical-evidence-p
                               (append (butlast base-fields 3) (last base-fields))
@@ -530,7 +545,7 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
                         :legacy))
          (crc (handler-case-noninterrupt (parse-integer (car (last fields)) :radix 16) (condition nil))))
     (unless (and (cond (v6 (and (member (length metadata-fields) '(8 11 15 17 21))
-                                (or (not checksum-p) (equal "C1" (first (last fields 2))))
+                                (or (not checksum-p) (equal "C1" (first (last shape-fields 2))))
                                 (or (not logical-evidence-p)
                                     (equal "L" (first (last base-fields 3))))))
                        (identities (= (length fields) 7))
@@ -561,11 +576,15 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
                 (append metadata
                         (list :logical-slot-evidence-digest
                               (handler-case-noninterrupt (parse-integer (first (last base-fields 2)))
-                                                         (condition nil)))))
-          (unless (wal-control-metadata-valid-p metadata)
-            (error "invalid logical slot evidence in primary control")))
+                                                         (condition nil))))))
+        (when extent-p
+          (unless metadata (error "transaction status extent requires primary control metadata"))
+          (setf metadata (append metadata
+                                 (list :checkpoint-clog-bytes (parse-integer extent-token :start 1)))))
         (when checksum-p
           (setf metadata (append metadata (list :page-checksum-version 1))))
+        (unless (or (null metadata) (wal-control-metadata-valid-p metadata))
+          (error "invalid primary control metadata"))
         (unless (wal-control-resource-position-valid-p metadata durable timeline)
           (error "resource facts exceed durable control coordinates"))
         (values checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)))))

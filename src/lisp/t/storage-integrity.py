@@ -151,6 +151,16 @@ def check_storage(work):
         if missing != CATALOG:
             assert (data / CATALOG).read_bytes() == (seed / CATALOG).read_bytes()
 
+    data = work / "truncated-clog"
+    shutil.copytree(seed, data)
+    clog = data / "pg_xact"
+    assert clog.stat().st_size > 0
+    clog.write_bytes(b"")
+    with start(work, data) as (process, _, log):
+        assert process.wait(timeout=30) == 1, log.read_text()
+        assert "transaction status file pg_xact is truncated" in log.read_text()
+    assert clog.stat().st_size == 0
+
     data = work / "foreign-catalog"
     shutil.copytree(seed, data)
     foreign = work / "foreign"

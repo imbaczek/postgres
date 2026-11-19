@@ -347,13 +347,7 @@
                 ;; executor nor its statement snapshot and never marks a CID used.
                 (unless (recovery-in-progress-p)
                   (prepare-xid-wraparound-for-statement *backend*))
-                (multiple-value-bind (table relfilenode xid relations)
-                    (register-dml-subquery-relations prepared (get-current-reader-xid))
-                  (declare (ignore relfilenode xid))
-                  (setf *query-executor-tables*
-                        (cons table (loop for relation in relations
-                                          unless (getf relation :virtual-p)
-                                            collect (getf relation :table))))))))
+                (register-dml-subquery-relations prepared (get-current-reader-xid)))))
            (setf complete t)
            portal)
       (unless complete (extended-close-portal portal)))))

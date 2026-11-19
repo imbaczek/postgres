@@ -156,7 +156,7 @@ def run_crash_case():
         print(f'artifacts: {server.root}', flush=True)
 
 
-def run_reset_crash_case():
+def run_reset_crash_case(after_install=False):
     server = OwnedLisp()
     witness = None
     try:
@@ -164,6 +164,7 @@ def run_reset_crash_case():
         witness = Connection(server.port)
         witness.query('CREATE TABLE reset_clog_rows (id int PRIMARY KEY)')
         witness.query('INSERT INTO reset_clog_rows VALUES (1)')
+        witness.query('CHECKPOINT')
         output = server.control(
             '(defvar *clog-reset-old-xid* (1- *next-xid*)) '
             '(assert (= +clog-committed+ (clog-get *clog-reset-old-xid*))) '
@@ -174,6 +175,9 @@ def run_reset_crash_case():
         assert match, output
         old_xid = int(match.group(1))
         assert witness.query('SELECT id FROM reset_clog_rows') == [['1']]
+        install_reset = "(funcall *clog-reset-file* sync directory-sync epoch-plan)"
+        before_pause = install_reset if after_install else "(values)"
+        after_pause = "(values)" if after_install else install_reset
         server.control(
             '(defvar *clog-reset-file* (symbol-function \'clog-reset-file-under-wal-lock)) '
             '(defvar *clog-reset-boundary* nil) (defvar *clog-reset-error* nil) '
@@ -181,11 +185,13 @@ def run_reset_crash_case():
             '(lambda (sync directory-sync &optional epoch-plan) '
             '(assert (sb-thread:holding-mutex-p *wal-lock*)) '
             '(assert (clog-reset-epoch-plan-p epoch-plan)) '
+            f'{before_pause} '
             '(setf *clog-reset-boundary* *wal-durable-lsn*) '
             '(let ((deadline (+ (get-internal-real-time) (* 15 internal-time-units-per-second)))) '
             f'(loop until (probe-file #p"{server.root / "continue"}") '
             'do (when (>= (get-internal-real-time) deadline) (error "CLOG reset release timeout")) '
-            '(sleep 0.01))) (funcall *clog-reset-file* sync directory-sync epoch-plan))) '
+            '(sleep 0.01))) '
+            f'{after_pause})) '
             '(defvar *clog-reset-worker* '
             '(sb-thread:make-thread '
             '(lambda () (handler-case (with-live-operation (clog-reset)) '
@@ -200,7 +206,10 @@ def run_reset_crash_case():
         server.control(
             '(assert (not *wal-poisoned*)) '
             '(assert (= *clog-reset-boundary* *wal-durable-lsn*)) '
-            f'(assert (= +clog-committed+ (clog-get {old_xid})))')
+            f'(assert (= {"+clog-in-progress+" if after_install else "+clog-committed+"} '
+            f'(clog-get {old_xid})))')
+        if after_install:
+            assert (server.data / 'pg_xact').stat().st_size == 0
         process = server.process
         server.stop(immediate=True)
         assert process.returncode == -signal.SIGKILL, process.returncode
@@ -214,7 +223,8 @@ def run_reset_crash_case():
             f'(assert (= +clog-in-progress+ (clog-get {old_xid}))) '
             '(sb-thread:with-mutex (*clog-lock*) '
             '(assert (zerop (hash-table-count *clog-pending-commits*))))')
-        print('pending-clog: SIGKILL after reset WAL flush redid CLOG replacement PASS', flush=True)
+        boundary = "file replacement" if after_install else "reset WAL flush"
+        print(f'pending-clog: SIGKILL after {boundary} recovered CLOG replacement PASS', flush=True)
     finally:
         (server.root / 'continue').touch()
         if witness is not None:
@@ -343,7 +353,8 @@ if __name__ == '__main__':
     for after_write in (False, True):
         run_case(after_write)
     run_crash_case()
-    run_reset_crash_case()
+    for after_install in (False, True):
+        run_reset_crash_case(after_install)
     for reset_before_checkpoint in (False, True):
         run_ambiguous_feedback_checkpoint_case(reset_before_checkpoint)
     run_cross_thread_completion_case()

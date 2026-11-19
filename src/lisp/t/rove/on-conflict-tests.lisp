@@ -31,6 +31,27 @@
                 (conflict (prepare-on-conflict table (getf ast :on-conflict) nil)))
            (rove:ok (equal (second case) (getf conflict :arbiters)) (first case)))))))
 
+(rove:deftest on-conflict-inference-ignores-duplicate-index-columns
+    (call-with-on-conflict-analysis-fixture
+     (lambda (table)
+       (let* ((index (find-index-by-oid 101))
+              (valid (first (parse-statements
+                             "INSERT INTO upsert_fixture VALUES(1,2) ON CONFLICT(id) DO NOTHING")))
+              (invalid (first (parse-statements
+                               "INSERT INTO upsert_fixture VALUES(1,2) ON CONFLICT(id,value) DO NOTHING"))))
+         (setf (pg-index-columns index) '(1 1))
+         (let ((conflict (prepare-on-conflict table (getf valid :on-conflict) nil)))
+           (rove:ok (equal '(101) (getf conflict :arbiters)))
+           (refresh-on-conflict-arbiters table conflict)
+           (rove:ok (equal '(101) (getf conflict :arbiters)))
+           (setf (getf conflict :inference-columns) '(1 2))
+           (rove:ok (equal "42P10"
+                           (handler-case (refresh-on-conflict-arbiters table conflict)
+                             (pg-error (condition) (pg-error-sqlstate condition))))))
+         (rove:ok (equal "42P10"
+                         (handler-case (prepare-on-conflict table (getf invalid :on-conflict) nil)
+                           (pg-error (condition) (pg-error-sqlstate condition)))))))))
+
 (rove:deftest on-conflict-refresh-targetless-new-index
     (call-with-on-conflict-analysis-fixture
      (lambda (table)

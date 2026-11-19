@@ -1843,7 +1843,8 @@ Expressions wrapping a set result must remain in a separate projection."
                                    "pg_wal_replay_pause" "pg_wal_replay_resume"
                                    "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
                                    "pg_reload_conf" "pg_reload_code"
-                                   "pg_create_physical_replication_slot" "pg_replication_slot_advance"
+                                   "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
+                                   "pg_replication_slot_advance"
                                    "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
                                  :test #'string=)
                          (walk (third form))))

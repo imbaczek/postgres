@@ -34,6 +34,9 @@
                                   (pg::*xid-wrap-pending* nil) (pg::*xid-wrap-completed-through* nil))
           (pg::wal-ensure-directory-durable (merge-pathnames "global/" root))
           (pg::save-next-xid)
+          (let ((pg::*clog-stream* nil))
+            (pg::clog-init :initialize t)
+            (close pg::*clog-stream*))
           (unwind-protect
                (progn
                  (pg::xact-init)

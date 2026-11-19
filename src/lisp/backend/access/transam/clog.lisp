@@ -8,6 +8,8 @@
 
 (defvar *clog-lock* (sb-thread:make-mutex :name "pg clog lock"))
 (defvar *clog-stream* nil)
+(defvar *clog-stream-extents* (make-hash-table :test #'eq :weakness :key)
+  "Known byte extent of each opened status stream, owned by the CLOG lock.")
 
 (defun clog-path ()
   (merge-pathnames "pg_xact" *pgdata*))
@@ -299,18 +301,36 @@ snapshot alone cannot prevent a new stage."
     (setf *clog-stream*
           (open path :direction :io :element-type '(unsigned-byte 8)
                      :if-exists :overwrite :if-does-not-exist (if initialize :create :error)))
+    (setf (gethash *clog-stream* *clog-stream-extents*) (file-length *clog-stream*))
     (unless existed
       (fsync-stream *clog-stream*)
       (fsync-directory *pgdata*)))
   (values))
 
+(defun clog-read-byte-under-lock (position)
+  (file-position *clog-stream* position)
+  (or (read-byte *clog-stream* nil nil)
+      (if (< (min position (file-length *clog-stream*))
+             (gethash *clog-stream* *clog-stream-extents* 0))
+          (ereport "XX001" "transaction status file ~a is truncated at byte ~d"
+                   (clog-path) position)
+          0)))
+
 (defun clog-read-status-under-lock (xid)
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (if *clog-stream*
-      (progn
-        (file-position *clog-stream* (clog-byte-index xid))
-        (ldb (byte 2 (clog-bit-shift xid)) (read-byte *clog-stream* nil 0)))
+      (ldb (byte 2 (clog-bit-shift xid))
+           (clog-read-byte-under-lock (clog-byte-index xid)))
       +clog-in-progress+))
+
+(defun clog-file-extent ()
+  "Return the current byte extent, checking that known bytes are still present."
+  (sb-thread:with-mutex (*clog-lock*)
+    (when *clog-stream*
+      (let ((extent (file-length *clog-stream*)))
+        (when (< extent (gethash *clog-stream* *clog-stream-extents* 0))
+          (ereport "XX001" "transaction status file ~a is truncated" (clog-path)))
+        extent))))
 
 (defun clog-write-status-under-lock (xid status &key fsync)
   ;; Read the raw byte, not the logical overlay, so another pending slot in
@@ -318,10 +338,12 @@ snapshot alone cannot prevent a new stage."
   (assert (sb-thread:holding-mutex-p *clog-lock*))
   (unless *clog-stream* (clog-init-under-lock))
   (let ((pos (clog-byte-index xid)) (shift (clog-bit-shift xid)))
-    (file-position *clog-stream* pos)
-    (let ((old (read-byte *clog-stream* nil 0)))
+    (let ((old (clog-read-byte-under-lock pos)))
       (file-position *clog-stream* pos)
       (write-byte (dpb status (byte 2 shift) old) *clog-stream*)
+      (let ((extent (gethash *clog-stream* *clog-stream-extents* 0)))
+        (when (>= pos extent)
+          (setf (gethash *clog-stream* *clog-stream-extents*) (1+ pos))))
       (when fsync (fsync-stream *clog-stream*))))
   (values))
 

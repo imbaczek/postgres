@@ -244,15 +244,14 @@ Recheck identities after waiting and under catalog locks before changing storage
        (when created
          (remhash name (database-sequences db))))
      (lambda ()
-       (when (gethash name (database-sequences db))
+       (when (relation-name-in-use-p db name)
          (if (getf ast :if-not-exists)
              (progn
                (send-notice stream
-                            (format nil "sequence \"~a\" already exists, skipping" name))
+                            (format nil "relation \"~a\" already exists, skipping" name))
                (send-command-complete stream "CREATE SEQUENCE")
                (return-from exec-create-sequence nil))
-             (ereport "42P07" "sequence \"~a\" already exists" name)))
-       (check-new-relation-name db name)
+             (ereport "42P07" "relation \"~a\" already exists" name)))
        (multiple-value-bind (default-min default-max)
            (sequence-default-limits increment)
          (setf minimum (or minimum default-min)
@@ -1111,7 +1110,7 @@ Release these locks before waiting for commit or sending replies."
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table))
-            existing (lookup-index name)))
+            existing (relation-name-in-use-p db name)))
     (when existing
       (if if-not-exists
           (progn
@@ -1129,13 +1128,12 @@ Release these locks before waiting for commit or sending replies."
         ;; acquired, then persist the reservation before creating the relfile.
         (with-write-catalog-locks
           (ensure-current-table table)
-          (setf existing (gethash name (database-indexes db)))
+          (setf existing (relation-name-in-use-p db name))
           (when existing
             (if if-not-exists
                 (setf skipped t)
                 (ereport "42P07" "relation \"~a\" already exists" name)))
           (unless skipped
-            (check-new-relation-name db name)
             (setf idx
                   (make-index-object
                    (allocate-oid) name table
@@ -1151,7 +1149,7 @@ Release these locks before waiting for commit or sending replies."
                 (fsync-index idx)
                 (with-logical-ddl-publication (ast)
                   (ensure-current-table table)
-                  (setf existing (gethash name (database-indexes db)))
+                  (setf existing (relation-name-in-use-p db name))
                   (when existing
                     (if if-not-exists
                         (setf skipped t)

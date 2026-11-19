@@ -37,6 +37,16 @@ class PromotionControl(unittest.TestCase):
                     self.write_control(fields + reference)
                     self.assertFalse(module.primary_committed(self.root))
 
+    def test_checkpoint_transaction_status_extent(self):
+        base = ['PGWAL6', '32', '64', '2', '2', 'timeline', '-', '42', '6', '1']
+        for suffix in (['X1'], ['X0', 'C1']):
+            self.write_control(base + suffix)
+            self.assertTrue(module.primary_committed(self.root))
+        for field in ('X', 'X-1', 'X1073741825'):
+            self.write_control(base + [field])
+            with self.assertRaises(ValueError):
+                module.primary_committed(self.root)
+
     def test_legacy_control_without_lifecycle_is_not_committed(self):
         self.write_control(['PGWAL6', '32', '64', '2', '2', 'timeline', '-'])
         self.assertFalse(module.primary_committed(self.root))

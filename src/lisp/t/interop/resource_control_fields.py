@@ -155,6 +155,9 @@ def recovery_full_page_writes_fact(data):
 
 def check_optional_fields(fields):
     fields = [field.decode("ascii") if isinstance(field, bytes) else field for field in fields]
+    if fields[-1].startswith("X"):
+        assert fields[-1][1:].isdigit() and int(fields[-1][1:]) <= 2**30
+        fields.pop()
     assert fields[0] == "PGWAL6" and len(fields) in (7, 10, 14, 16, 20)
     if len(fields) == 7:
         return None

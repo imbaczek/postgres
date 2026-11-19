@@ -1823,8 +1823,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   bitmap and attribute data follow the header. Attribute lookup is a single
   left-to-right walk (no offset table) — see `afm` notes in the code.
 - Real MVCC: the allocator keeps 64-bit full XIDs and stores their low 32 bits
-  in tuple headers and the CLog (`pg_xact`, with 2 status bits per XID). Before
-  reusing a 32-bit XID cycle, the server blocks new statements, waits for active
+  in tuple headers and the CLog (`pg_xact`, with 2 status bits per XID). Primary
+  checkpoints record the durable CLOG length so restart can detect truncation.
+  Control files written before this check gain the length at their next checkpoint.
+  Before reusing a 32-bit XID cycle, the server blocks new statements, waits for active
   transactions and snapshots to drain, freezes old tuple XIDs, and resets the
   CLog. A per-statement READ COMMITTED snapshot tracks full XIDs and `curcid`.
   XIDs are handed out in

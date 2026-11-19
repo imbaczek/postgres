@@ -127,6 +127,23 @@ def run():
 
         check_scan_matrix(connection)
 
+        for phase in ("bound", "executed"):
+            connection.query("BEGIN")
+            connection.prepare_sql(
+                "INSERT INTO portal_truncate VALUES (1001)", "insert_" + phase
+            )
+            if phase == "executed":
+                assert connection.execute_limit(0) == (
+                    [], [(b"C", b"INSERT 0 1\0"), (b"Z", b"T")]
+                )
+            connection.truncate_success()
+            if phase == "bound":
+                assert connection.execute_limit(0) == (
+                    [], [(b"C", b"INSERT 0 1\0"), (b"Z", b"T")]
+                )
+            connection.query("ROLLBACK")
+
+
         connection.query("BEGIN")
         connection.prepare("portal_truncate", statement="suspended")
         rows, frames = connection.execute_limit(1)

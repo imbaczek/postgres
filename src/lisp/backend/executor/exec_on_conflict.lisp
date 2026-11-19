@@ -57,6 +57,12 @@
                        :columns (append (select-scope-columns target) (select-relation-columns excluded))
                        :width (* 2 width))))
 
+(defun on-conflict-index-matches-columns-p (index columns)
+  ;; Both sides represent attribute sets, even when the index repeats a column.
+  (let ((attributes (pg-index-columns index)))
+    (and (subsetp columns attributes :test #'=)
+         (subsetp attributes columns :test #'=))))
+
 (defun prepare-on-conflict (table raw alias)
   (when raw
     (let* ((target-scope (make-base-select-scope (pg-class-name table) alias table))
@@ -85,9 +91,7 @@
           (when simple-p
             (setf arbiters
                   (loop for index in indexes
-                        when (and (= (length columns) (length (pg-index-columns index)))
-                                  (every (lambda (attnum) (member attnum columns :test #'=))
-                                         (pg-index-columns index)))
+                        when (on-conflict-index-matches-columns-p index columns)
                           collect (pg-index-oid index)))))
         (unless arbiters
           (ereport "42P10" "there is no unique or exclusion constraint matching the ON CONFLICT specification")))
@@ -147,9 +151,7 @@
                   (list (pg-index-oid index))))
                ((getf conflict :inference-p)
                 (loop for index in indexes
-                      when (and (= (length columns) (length (pg-index-columns index)))
-                                (every (lambda (attnum) (member attnum columns :test #'=))
-                                       (pg-index-columns index)))
+                      when (on-conflict-index-matches-columns-p index columns)
                         collect (pg-index-oid index)))
                (t (mapcar #'pg-index-oid indexes)))))
       (when (and (getf conflict :inference-p) (null arbiters))

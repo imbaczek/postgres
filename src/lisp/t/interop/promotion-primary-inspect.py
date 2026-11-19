@@ -25,8 +25,11 @@ def crc(data, offset):
 
 def control(root):
     fields = (root / "global/pg_wal_control").read_bytes().split()
-    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
+    if fields[-2].startswith(b"X"):
+        assert fields[-2][1:].isdigit()
+        fields.pop(-2)
+    assert fields[0] == b"PGWAL6" and len(fields) in (8, 11, 15, 17, 21)
     CHECK_OPTIONAL_CONTROL(fields[:-1])
     return int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]), fields[5], bytes.fromhex(fields[6].decode())
 
@@ -94,6 +97,8 @@ def check_primary(target, expected_path, initial):
     expected = json.loads(pathlib.Path(expected_path).read_text())
     checkpoint, durable, child, checkpoint_child, namespace, snapshot = control(root)
     fields = (root / "global/pg_wal_control").read_bytes().split()
+    if fields[-2].startswith(b"X"):
+        fields.pop(-2)
     assert len(fields) in (17, 21), "committed child lost its retained reference"
     assert int(fields[7]) == expected["system_id"] and int(fields[8]) == 6
     assert [int(value) for value in fields[10:16]] == expected["retained_reference"]
