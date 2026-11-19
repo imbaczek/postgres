@@ -1532,8 +1532,8 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
         when (string= (pg-column-name col) name)
           return col))
 
-(defun find-index-by-oid (oid)
-  (loop for idx being the hash-values of (database-indexes (current-database))
+(defun find-index-by-oid (oid &optional db)
+  (loop for idx being the hash-values of (database-indexes (or db (current-database)))
         when (= (pg-index-oid idx) oid)
           return idx))
 
@@ -1542,9 +1542,9 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
         when (= (pg-class-oid table) oid)
           return table))
 
-(defun table-indexes (class)
+(defun table-indexes (class &optional db)
   (loop for oid in (pg-class-indexes class)
-        for idx = (find-index-by-oid oid)
+        for idx = (find-index-by-oid oid db)
         when idx collect idx))
 
 (defun unique-indexes (class)
@@ -1607,24 +1607,24 @@ The segments preserve their storage representation across B-tree page rewrites."
 
 ;;; ---- DDL helpers (caller holds the write lock) ----
 
+(defun relation-name-in-use-p (db name)
+  (or (gethash name (database-tables db))
+      (gethash name (database-indexes db))
+      (gethash name (database-sequences db))))
+
 (defun check-new-relation-name (db name)
-  (when (or (gethash name (database-tables db))
-            (gethash name (database-indexes db))
-            (gethash name (database-sequences db)))
+  (when (relation-name-in-use-p db name)
     (ereport "42P07" "relation \"~a\" already exists" name)))
 
-(defun generate-index-name (db table-name suffix)
+(defun generate-index-name (db table-name suffix &optional reserved-names)
   (let ((base (format nil "~a_~a" table-name suffix)))
-    (if (or (gethash base (database-tables db))
-            (gethash base (database-indexes db)))
-        (loop for n from 1
-              for candidate = (format nil "~a~a" base n)
-              unless (or (gethash candidate (database-tables db))
-                         (gethash candidate (database-indexes db)))
-                return candidate)
-        base)))
+    (loop for n from 0
+          for candidate = (if (zerop n) base (format nil "~a~a" base n))
+          unless (or (relation-name-in-use-p db candidate)
+                     (member candidate reserved-names :test #'string=))
+            return candidate)))
 
-(defun generate-unique-index-name (db table-name table attnums)
+(defun generate-unique-index-name (db table-name table attnums &optional reserved-names)
   "Generate PostgreSQL's default unique-constraint name for ATTNUMS."
   (generate-index-name
    db table-name
@@ -1632,7 +1632,8 @@ The segments preserve their storage representation across B-tree page rewrites."
            (mapcar (lambda (attnum)
                      (pg-column-name
                       (aref (pg-class-columns table) (1- attnum))))
-                   attnums))))
+                   attnums))
+   reserved-names))
 
 (defun make-index-object (oid name table cols
                           &key unique primary constraint nulls-not-distinct)
@@ -2261,7 +2262,7 @@ partial deletion cannot commit."
         (ereport "XX001" "TOAST chunk disappeared during deletion")))
     (values)))
 
-(defun create-table* (db name columns)
+(defun create-table* (db name columns &optional reserved-names)
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."
   (check-new-relation-name db name)
@@ -2305,7 +2306,8 @@ partial deletion cannot commit."
                       (setf (pg-index-valid-p
                              (create-index*
                               db
-                              (or (getf def :primary-name) (generate-index-name db name "pkey"))
+                              (or (getf def :primary-name)
+                                  (generate-index-name db name "pkey" reserved-names))
                               class (list (pg-column-attnum col))
                               :unique t :primary t :constraint t))
                             t))
@@ -2315,7 +2317,8 @@ partial deletion cannot commit."
                               db
                               (or (getf def :unique-name)
                                   (generate-index-name db name
-                                                       (format nil "~a_key" (pg-column-name col))))
+                                                       (format nil "~a_key" (pg-column-name col))
+                                                       reserved-names))
                               class (list (pg-column-attnum col))
                               :unique t
                               :constraint t

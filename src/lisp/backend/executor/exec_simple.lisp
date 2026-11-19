@@ -70,6 +70,9 @@ but cannot protect a retained executor in this backend from its own TRUNCATE."
   "Replace table, index and TOAST storage while retaining gates through transaction end.
 Recheck identities after waiting and under catalog locks before changing storage."
   (get-current-xid)
+  ;; TRUNCATE can replace storage covered by our retained snapshot. Give up
+  ;; export eligibility before taking the schema write side.
+  (release-backend-transaction-schema-lease *backend*)
   (let ((names nil) (oids nil) (relations nil) (tables nil))
     (with-schema-write-lock
       (let* ((captured
@@ -256,7 +259,10 @@ Recheck identities after waiting and under catalog locks before changing storage
                maximum (or maximum default-max))
          (unless (and (sequence-value-range-p minimum)
                       (sequence-value-range-p maximum)
-                      (<= minimum start maximum))
+                      (< minimum maximum))
+           (ereport "22023" "MINVALUE (~a) must be less than MAXVALUE (~a)"
+                    minimum maximum))
+         (unless (<= minimum start maximum)
            (ereport "22023" "sequence start value is out of bounds (~a..~a)"
                     minimum maximum))
          (setf (gethash name (database-sequences db))
@@ -943,7 +949,7 @@ before this removal horizon is captured."
     ;; consistent existence check before doing any work outside that lock.
     (with-write-lock
       (setf db (current-database)
-            existing (lookup-table name)))
+            existing (relation-name-in-use-p db name)))
     (when existing
       (if (getf ast :if-not-exists)
           (progn
@@ -967,7 +973,15 @@ before this removal horizon is captured."
                    name)))
       (with-logical-ddl-publication (ast)
         (let* ((*catalog-save-error-after-durable-p* nil)
-               (class (create-table* db name cols))
+               (reserved-names
+                 (remove nil
+                         (append (mapcar (lambda (c) (getf c :name)) constraints)
+                                 (loop for col in cols
+                                       append (list* (getf col :primary-name)
+                                                     (getf col :unique-name)
+                                                     (mapcar (lambda (check) (getf check :name))
+                                                             (getf col :checks)))))))
+               (class (create-table* db name cols reserved-names))
                (durable-generation *catalog-durable-generation*)
                (terminal-appended nil))
           ;; Once the terminal catalog WAL record is appended, recovery owns the
@@ -994,7 +1008,7 @@ before this removal horizon is captured."
                    (let ((idx (create-index*
                                db
                                (or (getf c :name)
-                                   (generate-index-name db name "pkey"))
+                                   (generate-index-name db name "pkey" reserved-names))
                                class attnums :unique t :primary t
                                :constraint t)))
                      (build-unique-index idx class (pg-index-name idx))
@@ -1004,7 +1018,7 @@ before this removal horizon is captured."
                                db
                                (or (getf c :name)
                                    (generate-unique-index-name
-                                    db name class attnums))
+                                    db name class attnums reserved-names))
                                class attnums :unique t
                                :constraint t
                                :nulls-not-distinct
@@ -1522,13 +1536,15 @@ Release these locks before waiting for commit or sending replies."
                                        (aref (pg-class-columns table)
                                              (1- attnum)))))
                               attnums)))
+                  (reserved-names (mapcar (lambda (check) (getf check :name))
+                                          (pg-class-checks table)))
                   (idx (create-index*
                         db
                         (or (getf ast :constraint-name)
                             (if primary
-                                (generate-index-name db name "pkey")
+                                (generate-index-name db name "pkey" reserved-names)
                                 (generate-unique-index-name
-                                 db name table attnums)))
+                                 db name table attnums reserved-names)))
                         table attnums :unique t :primary primary
                         :constraint t
                         :nulls-not-distinct

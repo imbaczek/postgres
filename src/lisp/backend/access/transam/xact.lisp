@@ -2349,8 +2349,10 @@ existing virtual owner after a write assigns a real XID."
 In recovery, enroll the virtual reader even if it has not accessed a relation."
   (when (recovery-in-progress-p)
     (ensure-recovery-reader-identity backend))
+  ;; A writable RR transaction can switch to READ ONLY after taking its
+  ;; snapshot. Keep the schema stable from the original horizon until export.
   (when (and (null (backend-transaction-snapshot backend))
-             (backend-explicit backend) (backend-read-only backend)
+             (backend-explicit backend)
              (not (backend-transaction-schema-read-lock-held-p backend)))
     (if *schema-read-lock-held*
         (sb-sys:without-interrupts
@@ -2469,16 +2471,20 @@ Portal initialization can retain the current command ID by disabling advance."
       (setf (backend-snapshot b) snap)
       snap)))
 
+(defun release-backend-transaction-schema-lease (backend)
+  (sb-sys:without-interrupts
+    (when (backend-transaction-schema-read-lock-held-p backend)
+      (setf (backend-transaction-schema-read-lock-held-p backend) nil)
+      (release-schema-read-lock))))
+
 (defun release-backend-transaction-snapshot (backend)
   (sb-sys:without-interrupts
-    (let ((registration (backend-transaction-snapshot-registration backend))
-          (schema-lease (backend-transaction-schema-read-lock-held-p backend)))
+    (let ((registration (backend-transaction-snapshot-registration backend)))
       (setf (backend-transaction-snapshot backend) nil
-            (backend-transaction-snapshot-registration backend) nil
-            (backend-transaction-schema-read-lock-held-p backend) nil)
+            (backend-transaction-snapshot-registration backend) nil)
       (unwind-protect
            (when registration (release-snapshot-registration registration))
-        (when schema-lease (release-schema-read-lock)))))
+        (release-backend-transaction-schema-lease backend))))
   (values))
 
 (defun reset-backend-transaction (b)

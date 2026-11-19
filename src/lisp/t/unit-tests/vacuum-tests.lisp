@@ -567,11 +567,11 @@
          (staged-heap-write-seen nil)
          (injected-error nil))
     (smgr-forget relfilenode :delete t)
-    (ensure-directories-exist (relation-file-path relfilenode))
     (setf (aref heap-page 100) #x11
           changed-page (copy-seq heap-page))
     (unwind-protect
          (progn
+           (smgr-create relfilenode)
            (smgr-write relfilenode heap-block heap-page)
            (visibilitymap-set-status
             relfilenode heap-block
@@ -673,6 +673,8 @@
     (clog-set 8211 +clog-committed+)
     (unwind-protect
          (progn
+           (smgr-create heap-relfilenode)
+           (smgr-create other-relfilenode)
            (heapam-insert heap-relfilenode columns #(1) 8210 0)
            ;; Keep FSM initialization out of the paused scan read.
            (heap-fsm-for-relation heap-relfilenode)
@@ -753,9 +755,10 @@
       (smgr-forget heap-relfilenode :delete t)
       (smgr-forget other-relfilenode :delete t))))
 
-(defun test-vacuum-reuses-tid-clears-index-and-vm ()
+(defun test-vacuum-reuses-tid-clears-index-and-vm (&optional rollover-p)
   (let* ((*heap-fsms* (make-hash-table :test #'eql))
          (*wal-ready* nil)
+         (*catalog* (if rollover-p (make-catalog) *catalog*))
          (heap-relfilenode 918273655)
          (index-relfilenode 918273656)
          (columns (vector (make-pg-column :name "value" :type :int4
@@ -770,6 +773,7 @@
     (clog-set 8201 +clog-committed+)
     (unwind-protect
          (progn
+           (smgr-create heap-relfilenode)
            (btree-init index-relfilenode)
            (setf old-tid
                  (multiple-value-list
@@ -783,8 +787,20 @@
                  (declare (ignore flags len))
                  (page-set-u32 page (+ tuple-off +heap-tuple-xmax-off+) 8201))
                (buf-write heap-relfilenode (first old-tid) page)))
-           (heap-vacuum-relation heap-relfilenode (list index-relfilenode)
-                                 8202 8100)
+           (if rollover-p
+               (let* ((db (make-database :name "rollover_other_db" :oid 3))
+                      (table (make-pg-class :name "wrap_rows" :oid 4
+                                            :relfilenode heap-relfilenode
+                                            :columns columns :indexes (list 5)))
+                      (index (make-pg-index :name "wrap_rows_key" :oid 5
+                                            :table-oid 4 :relfilenode index-relfilenode
+                                            :columns (list 1) :unique-p t)))
+                 (setf (gethash (database-name db) (catalog-databases *catalog*)) db
+                       (gethash (pg-class-name table) (database-tables db)) table
+                       (gethash (pg-index-name index) (database-indexes db)) index)
+                 (vacuum-all-relations-for-xid-wraparound 8202))
+               (heap-vacuum-relation heap-relfilenode (list index-relfilenode)
+                                     8202 8100))
            (check (= (visibilitymap-status heap-relfilenode (first old-tid))
                      (logior +vm-all-visible-bit+ +vm-all-frozen-bit+))
                   "VACUUM marks the reclaimed empty page all-visible and all-frozen")

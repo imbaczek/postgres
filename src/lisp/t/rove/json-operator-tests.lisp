@@ -125,10 +125,13 @@
     (rove:ok (string= "[1, 2]" (sql-jsonb-output source)))
     (rove:ok (string= "[3, 1, 2]" (sql-jsonb-output result)))))
 
-(rove:deftest test-unknown-integer-subtraction
+(rove:deftest test-unknown-integer-arithmetic
     (dolist (case '(("select '3' - 1::int2" 2 :int2)
                     ("select '3' - 1::int8" 2 :int8)
-                    ("select 3::int4 - '1'" 2 :int4)))
+                    ("select 3::int4 - '1'" 2 :int4)
+                    ("select '2' + 1::int2" 3 :int2)
+                    ("select 3::int8 * '2'" 6 :int8)
+                    ("select '6' / 2" 3 :int4)))
       (multiple-value-bind (value type) (json-test-evaluate (first case))
         (rove:ok (= value (second case)))
         (rove:ok (eq type (third case)))))
@@ -136,7 +139,10 @@
   (dolist (case '(("select '[1,2]' - 1" "22P02")
                   ("select '32768' - 1::int2" "22003")
                   ("select '32767' - (-1)::int2" "22003")
-                  ("select '{}' - 'a'" "42725")))
+                  ("select '{}' - 'a'" "42725")
+                  ("select null + true" "42883")
+                  ("select 'bad' * 2" "22P02")
+                  ("select 32767::int2 + '1'" "22003")))
     (let ((condition (handler-case (progn (json-test-evaluate (first case)) nil)
                        (pg-error (error) error))))
       (rove:ok (and condition (string= (pg-error-sqlstate condition) (second case)))))))

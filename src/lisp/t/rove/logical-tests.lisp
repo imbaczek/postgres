@@ -1942,14 +1942,28 @@
            (original-execute (symbol-function 'execute-statement))
            (original-prepare (symbol-function 'prepare-dml-subqueries))
            (original-commit (symbol-function 'commit-transaction))
-           (observed nil) (committed nil))
+           (original-wrap (symbol-function 'prepare-xid-wraparound-for-statement))
+           (original-register (symbol-function 'register-dml-subquery-relations))
+           (*recovery-reader-xids* (make-hash-table :test #'eql))
+           (prepared (list :table (make-pg-class :name "t" :relfilenode 42)))
+           (admitted nil) (observed nil) (committed nil))
       (unwind-protect
            (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
                                      :if-exists :supersede)
              (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
-                   (symbol-function 'prepare-dml-subqueries) (lambda (ast) (declare (ignore ast)) nil)
+                   (symbol-function 'prepare-dml-subqueries)
+                   (lambda (ast) (declare (ignore ast)) prepared)
+                   (symbol-function 'prepare-xid-wraparound-for-statement)
+                   (lambda (backend) (declare (ignore backend)))
+                   (symbol-function 'register-dml-subquery-relations)
+                   (lambda (plan &optional xid)
+                     (setf admitted plan)
+                     (values (getf plan :table) 42 xid nil))
                    (symbol-function 'execute-statement)
-                   (lambda (stream ast) (declare (ignore stream ast))
+                   (lambda (stream ast)
+                     (declare (ignore stream))
+                     (rove:ok (eq (car *dml-bound-preparation*) ast))
+                     (rove:ok (eq (cdr *dml-bound-preparation*) prepared))
                      (setf observed (list *query-parameter-types* *query-parameter-values*)))
                    (symbol-function 'commit-transaction)
                    (lambda () (setf committed t) (set-backend-state *backend* :idle)))
@@ -1958,6 +1972,8 @@
              (rove:ok (zerop *active-snapshots*))
              (extended-apply-operation out '(:bind "" "" (0) ((0 . 2) (2 . 5)) ())
                                        (string->bytes "42hello"))
+             (rove:ok (eq admitted prepared))
+             (rove:ok (null observed))
              (extended-apply-operation out '(:execute "" 0) #())
              (rove:ok (equalp (second observed) #(42 "hello")))
              (rove:ok (not committed))
@@ -1968,7 +1984,9 @@
         (setf (symbol-function 'statement-start) original-start
               (symbol-function 'prepare-dml-subqueries) original-prepare
               (symbol-function 'execute-statement) original-execute
-              (symbol-function 'commit-transaction) original-commit)
+              (symbol-function 'commit-transaction) original-commit
+              (symbol-function 'prepare-xid-wraparound-for-statement) original-wrap
+              (symbol-function 'register-dml-subquery-relations) original-register)
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-extended-context-sensitive-literals-fail-closed

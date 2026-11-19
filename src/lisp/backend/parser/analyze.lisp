@@ -2941,10 +2941,10 @@ candidate selection."
               (return-from analyze-binop-expression
                 (list :binop operator left right :type (if date-difference :int4 :date) :typmod -1))))
           ;; binary_oper_exact uses the known integer type for an unknown literal.
-          (when (and (string= operator "-") (in-unknown-constant-p left)
+          (when (and (in-unknown-constant-p left)
                      (member (expr-type right) '(:int2 :int4 :int8)))
             (setf left (coerce-in-constant left (expr-type right))))
-          (when (and (string= operator "-") (in-unknown-constant-p right)
+          (when (and (in-unknown-constant-p right)
                      (member (expr-type left) '(:int2 :int4 :int8)))
             (setf right (coerce-in-constant right (expr-type left))))
           (when (and (in-unknown-constant-p left) (member (expr-type right) '(:float4 :float8)))
@@ -2977,12 +2977,12 @@ candidate selection."
               (list :binop operator left right :type :numeric :typmod -1)))
           (when (or (eq (expr-type left) :pg-lsn) (eq (expr-type right) :pg-lsn))
             (ereport "0A000" "pg_lsn arithmetic is not implemented"))
-          (when (or (sql-array-element-type (expr-type left))
-                    (sql-array-element-type (expr-type right))
-                    (member (expr-type left) '(:char :int2vector :oid :bit :timestamptz))
-                    (member (expr-type right) '(:char :int2vector :oid :bit :timestamptz)))
-            (ereport "42883" "operator ~a does not exist for ~a and ~a"
-                     operator (expr-type left) (expr-type right)))
+          (unless (and (member operator '("+" "-" "*" "/" "%") :test #'string=)
+                       (member (expr-type left) '(:int2 :int4 :int8))
+                       (member (expr-type right) '(:int2 :int4 :int8)))
+            (report-operator-resolution-error operator (list left right)
+                                              (and (in-unknown-constant-p left)
+                                                   (in-unknown-constant-p right))))
           (list :binop operator left right
                 :type (cond ((or (eq (expr-type left) :int8) (eq (expr-type right) :int8)) :int8)
                             ((and (eq (expr-type left) :int2) (eq (expr-type right) :int2)) :int2)
@@ -3476,7 +3476,8 @@ candidate selection."
      (list :is-null (analyze-expr (second expr) table) (third expr)
            :type :bool :typmod -1))
     (:is-bool
-     (list :is-bool (analyze-expr (second expr) table) (third expr)
+     (list :is-bool (coerce-boolean-expression (analyze-expr (second expr) table) "IS")
+           (third expr)
            (fourth expr) :type :bool :typmod -1))
     (:func (if (raw-aggregate-kind expr)
                (progn

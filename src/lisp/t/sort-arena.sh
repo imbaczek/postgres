@@ -105,6 +105,26 @@ for output in "$TMP/sort-one.out" "$TMP/sort-two.out"; do
     awk '($0 != NR) { exit 1 } END { if (NR != 1001) exit 1 }' "$output" \
         || fail "concurrent sort returned wrong rows"
 done
+# Force the bounded heap to spill, then compare its output with the full sort.
+control <<'LISP' >/dev/null
+(defvar *ordered-limit-run-count* 0)
+(let ((original (symbol-function 'pg::write-query-sort-run)))
+  (setf (symbol-function 'pg::write-query-sort-run)
+        (lambda (items order)
+          (incf *ordered-limit-run-count*)
+          (funcall original items order))))
+LISP
+ordered='select id, label from arena_rows order by id % 11'
+run -c "$ordered limit 550" > "$TMP/top-n.out" || fail "ordered LIMIT failed"
+spill_count=$(control <<'LISP'
+(format t "~%TOP-N-SPILLED=~a~%" (plusp *ordered-limit-run-count*))
+LISP
+)
+echo "$spill_count" | grep -q 'TOP-N-SPILLED=T' || fail "ordered LIMIT exceeded work memory without spilling"
+run -c "$ordered" > "$TMP/full-sort.out" || fail "comparison sort failed"
+sed -n '1,550p' "$TMP/full-sort.out" > "$TMP/expected-top-n.out"
+cmp -s "$TMP/top-n.out" "$TMP/expected-top-n.out" || fail "ordered LIMIT changed row or tie order"
+
 spill_file=$(find "$PGDATA/pgsql_tmp" -type f -name 'pg-query-*.tmp' -print -quit)
 [ -z "$spill_file" ] || fail "arena errors or successful merges left spill files"
 

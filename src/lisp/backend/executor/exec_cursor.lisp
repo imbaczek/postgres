@@ -743,11 +743,9 @@ source itself.  Closing the result closes the sort and its source."
                (lambda (emit)
                  (flet ((source (callback) (map-sql-iterator input callback)))
                    (case (first node)
-                     (:sort (stream-select-sort #'source (second node) emit))
-                     (:top-n (dolist (row (collect-select-top-n #'source (second node) (third node) *datum-origin-capture* t))
-                               (let ((*query-row-origins* (second row))
-                                     (*query-row-presence* (third row)))
-                                 (funcall emit (first row)))))
+                     ((:sort :top-n)
+                      (stream-select-sort #'source (second node) emit
+                                          :limit (and (eq (first node) :top-n) (third node))))
                      ((:hash-aggregate :sorted-aggregate)
                       (stream-select-aggregates #'source (second node) (third node) emit))
                      (:sorted-distinct

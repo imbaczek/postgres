@@ -453,9 +453,7 @@ each publishes its own horizon after its heap pass."
         (declare (ignore table-name))
         (let ((index-provider
                 (lambda ()
-                  (loop for oid in (pg-class-indexes table)
-                        for index = (gethash oid (database-indexes database))
-                        when index collect (pg-index-relfilenode index))))
+                  (mapcar #'pg-index-relfilenode (table-indexes table database))))
               (verify-function
                 (lambda ()
                   (unless (eq table

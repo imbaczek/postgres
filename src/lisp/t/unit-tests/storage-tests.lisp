@@ -12,7 +12,7 @@
                                           :notnull nil)))
          (insert-xid (+ +xid-cycle+ 50))
          (update-xid (+ +xid-cycle+ 51)))
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (unwind-protect
          (multiple-value-bind (old-block old-offnum)
              (heapam-insert relfilenode columns (vector 10) insert-xid 0)
@@ -55,7 +55,7 @@
     (dolist (xid '(7200 7201 7202 7203))
       (clog-set xid +clog-committed+))
     (clog-set 7204 +clog-in-progress+)
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (unwind-protect
          (progn
            (let ((previous nil))
@@ -113,7 +113,7 @@
                                           :typmod -1 :attnum 1
                                           :notnull nil)))
          (*backend* (make-backend)))
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (unwind-protect
          (progn
            (dotimes (i 100)

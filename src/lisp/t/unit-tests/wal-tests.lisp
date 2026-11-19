@@ -590,7 +590,7 @@
     (wal-ensure-directory-durable (merge-pathnames "global/" *pgdata*))
     (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
     (wal-ensure-directory-durable (wal-directory))
-    (ensure-directories-exist (relation-file-path relfilenode))
+    (smgr-create relfilenode)
     (smgr-write relfilenode 0 page-before)
     (with-open-file (stream (wal-segment-path 0)
                             :direction :output

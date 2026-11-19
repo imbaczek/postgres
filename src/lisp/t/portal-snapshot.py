@@ -65,12 +65,72 @@ def snapshot_count(server):
     return int(output.split("PIN-COUNT=")[-1].splitlines()[0])
 
 
+def check_dml_bind(reader, writer):
+    writer.query("CREATE TABLE portal_dml_target(id int)")
+    writer.query("CREATE TABLE portal_dml_source(id int)")
+    writer.query("INSERT INTO portal_dml_source VALUES (5)")
+    writer.query("SET statement_timeout = '500ms'")
+    for statement, sql, tag, blocked in (
+            ("insert_rows", "INSERT INTO portal_dml_target SELECT id FROM portal_dml_source",
+             "INSERT 0 2", ("portal_dml_target", "portal_dml_source")),
+            ("update_rows", "UPDATE portal_dml_target SET id = id + 10",
+             "UPDATE 2", ("portal_dml_target",)),
+            ("delete_rows", "DELETE FROM portal_dml_target",
+             "DELETE 2", ("portal_dml_target",))):
+        reader.send(b"P", statement.encode() + b"\0" + sql.encode() + b"\0"
+                    + struct.pack("!H", 0))
+        # Sync releases Parse's transaction. Bind must establish its own protection.
+        reader.send(b"S")
+        reader.through(b"1")
+        reader.through(b"Z")
+        reader.bind(statement, "bound_dml")
+        reader.send(b"H")
+        reader.through(b"2")
+        for table in blocked:
+            assert writer.observe(f"DROP TABLE {table}") == ("error", "57014"), table
+        if statement == "insert_rows":
+            assert writer.query("SELECT id FROM portal_dml_target") == []
+            writer.query("INSERT INTO portal_dml_source VALUES (6)")
+        assert reader.execute("bound_dml") == ([], [tag], b"I", []), statement
+    writer.query("DROP TABLE portal_dml_target, portal_dml_source")
+    writer.query("RESET statement_timeout")
+
+
+def check_snapshot_read_only_transition(reader, writer):
+    writer.query("CREATE TABLE export_transition(id int)")
+    writer.query("INSERT INTO export_transition VALUES (1)")
+    reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    assert reader.query("SELECT id FROM export_transition") == [["1"]]
+    writer.query("INSERT INTO export_transition VALUES (2)")
+    writer.query("SET statement_timeout = '500ms'")
+    assert writer.observe("CREATE TABLE export_schema_guard(id int)") == ("error", "57014")
+    writer.query("RESET statement_timeout")
+    reader.query("SET TRANSACTION READ ONLY")
+    ((token,),) = reader.query("SELECT pg_export_snapshot()")
+    writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    writer.query(f"SET TRANSACTION SNAPSHOT '{token}'")
+    reader.query("ROLLBACK")
+    assert writer.query("SELECT id FROM export_transition") == [["1"]]
+    writer.query("ROLLBACK")
+    # TRUNCATE still works in a writable RR transaction with a snapshot.
+    reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    reader.query("SELECT 1")
+    reader.query("TRUNCATE export_transition")
+    reader.query("SET TRANSACTION READ ONLY")
+    assert reader.observe("SELECT pg_export_snapshot()") == ("error", "25001")
+    reader.query("ROLLBACK")
+    assert writer.query("SELECT id FROM export_transition ORDER BY id") == [["1"], ["2"]]
+    writer.query("DROP TABLE export_transition")
+
+
 def run():
     server = wire.OwnedLisp()
     writer = reader = None
     try:
         server.start()
         writer, reader = Connection(server.port), Connection(server.port)
+        check_dml_bind(reader, writer)
+        check_snapshot_read_only_transition(reader, writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),

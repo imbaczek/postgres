@@ -1,6 +1,26 @@
 ;;;; sql-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest boolean-tests-coerce-unknown-operands
+    (flet ((evaluate (sql)
+             (let* ((ast (first (parse-statements sql)))
+                    (expression (getf (first (getf ast :targets)) :expr)))
+               (eval-expr (analyze-expr expression nil) nil))))
+      (dolist (sql '("SELECT 'true' IS TRUE"
+                     "SELECT 'false' IS NOT TRUE"
+                     "SELECT NULL IS NOT FALSE"
+                     "SELECT FALSE IS FALSE"))
+        (rove:ok (eq t (evaluate sql))))
+      (dolist (sql '("SELECT 'true' IS FALSE"
+                     "SELECT 'false' IS NOT FALSE"
+                     "SELECT NULL IS TRUE"))
+        (rove:ok (null (evaluate sql))))
+      (dolist (case '(("SELECT 0 IS FALSE" "42804")
+                      ("SELECT 'garbage' IS FALSE" "22P02")))
+        (rove:ok (equal (second case)
+                        (handler-case (evaluate (first case))
+                          (pg-error (condition) (pg-error-sqlstate condition))))))))
+
 (rove:deftest record-comparisons-check-field-operators
     (flet ((record (type value)
              (make-sql-record :fields (list (list "v" type)) :values (vector value)))

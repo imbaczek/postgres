@@ -191,6 +191,7 @@
   (test-vacuum-page-retry-rebuilds-proposal)
   (test-vacuum-page-read-releases-global-write-lock)
   (test-vacuum-reuses-tid-clears-index-and-vm)
+  (test-vacuum-reuses-tid-clears-index-and-vm t)
   (test-vacuum-snapshot-horizon)
   (test-btree-relation-lock-macro)
   (test-btree-relation-lock-set-macro)

@@ -347,7 +347,13 @@
                 ;; executor nor its statement snapshot and never marks a CID used.
                 (unless (recovery-in-progress-p)
                   (prepare-xid-wraparound-for-statement *backend*))
-                (register-dml-subquery-relations prepared (get-current-reader-xid)))))
+                (multiple-value-bind (table relfilenode xid relations)
+                    (register-dml-subquery-relations prepared (get-current-reader-xid))
+                  (declare (ignore relfilenode xid))
+                  (setf *query-executor-tables*
+                        (cons table (loop for relation in relations
+                                          unless (getf relation :virtual-p)
+                                            collect (getf relation :table))))))))
            (setf complete t)
            portal)
       (unless complete (extended-close-portal portal)))))
@@ -812,7 +818,8 @@
         (let ((bound (make-extended-query-portal statement values returns-rows-p columns result-formats)))
           (cond ((extended-portal-select-p bound)
                  (extended-initialize-select-portal bound))
-                ((extended-portal-returns-rows-p bound)
+                ((member (getf (extended-statement-ast statement) :type)
+                         '(:insert :update :delete))
                  (extended-initialize-dml-portal bound)))
           (sb-sys:without-interrupts
             (setf (gethash portal (extended-query-state-portals state)) bound))
@@ -841,10 +848,22 @@
                 (t
                  (when (extended-portal-executed-p portal)
                    (ereport "55000" "portal already executed"))
-                 (let ((*statement-command-start-advance-p* nil)
-                       (*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
-                       (*query-parameter-values* (extended-portal-values portal)))
-                   (execute-statement stream (extended-statement-ast (extended-portal-statement portal))))
+                 (let* ((statement (extended-portal-statement portal))
+                        (ast (extended-statement-ast statement))
+                        (*statement-command-start-advance-p* nil))
+                   (if (eq (getf ast :type) :do)
+                       (let ((*query-parameter-types* (extended-statement-types statement))
+                             (*query-parameter-values* (extended-portal-values portal)))
+                         (execute-statement stream ast))
+                       (let ((execution (extended-dml-execution-for portal)))
+                         (unless execution
+                           (ereport "55000" "portal has no initialized DML execution"))
+                         (call-with-query-execution-owner
+                          (extended-dml-execution-owner execution)
+                          (lambda ()
+                            (let ((*dml-bound-preparation*
+                                    (cons ast (extended-dml-execution-prepared execution))))
+                              (execute-statement stream ast)))))))
                  t))))
         (setf (extended-portal-executed-p portal) t
               (extended-query-state-executed-in-cycle-p state) t)

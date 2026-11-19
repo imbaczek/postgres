@@ -904,11 +904,27 @@ if a registered TOAST index is missing."
                     (merge-query-sort-runs (car tail) (cadr tail) order)
                     (car tail))))
 
-(defun stream-select-sort (streamer order callback &key on-complete)
+(defun stream-select-sort (streamer order callback &key on-complete limit)
   "Sort a stream with bounded in-memory runs and stable external merges."
-  (call-with-query-sort-arena
-   (lambda (arena)
-     (stream-select-sort-with-arena streamer order callback arena on-complete))))
+  (when (and limit (zerop (check-select-limit limit)))
+    (return-from stream-select-sort (when on-complete (funcall on-complete))))
+  (unless limit
+    (return-from stream-select-sort
+      (call-with-query-sort-arena
+       (lambda (arena)
+         (stream-select-sort-with-arena streamer order callback arena on-complete)))))
+  (let ((remaining limit)
+        (stopped nil))
+    (call-with-query-sort-arena
+     (lambda (arena)
+       (stream-select-sort-with-arena
+        streamer order
+        (lambda (row)
+          (setf stopped (eq (funcall callback row) :stop))
+          (when (or stopped (zerop (decf remaining))) :stop))
+        arena nil limit)))
+    (cond (stopped :stop)
+          (on-complete (funcall on-complete)))))
 
 (defun grouping-rows-equal-p (keys left right)
   "Compare grouping keys in LEFT and RIGHT using SQL not-distinct semantics.
@@ -961,14 +977,24 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                 :descriptor (and (third origin) (copy-seq (third origin))))))
          origins)))
 
-(defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete)
+(defun top-n-spill-item (item)
+  (list :query-sort-item (select-top-n-item-sequence item)
+        (select-top-n-item-keys item) (select-top-n-item-row item)
+        (datum-origins-for-spill (select-top-n-item-origins item))
+        (select-top-n-item-presence item)))
+
+(defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete limit)
   "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK."
   (with-query-temp-files ()
                          (let ((buffer '())
                                (buffer-bytes 0)
                                (sequence 0)
                                (runs '())
-                               (memory-limit (max 1 *query-work-memory-bytes*)))
+                               (memory-limit (max 1 *query-work-memory-bytes*))
+                               (top-n (when limit
+                                        (make-select-top-n-collector
+                                         limit order (lambda (item)
+                                                       (query-spill-record-size (top-n-spill-item item)))))))
                            (labels ((own-run ()
                                       ;; Batch region switches: SBCL discards unused TLAB space on
                                       ;; every exit. Staging and the arena copy briefly coexist.
@@ -982,6 +1008,14 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                         (push (write-query-sort-run (nreverse buffer) order) runs)
                                         (setf buffer nil buffer-bytes 0)
                                         (reset-query-sort-arena arena)))
+                                    (buffer-item (item item-bytes)
+                                      (when (and buffer
+                                                 (> (+ buffer-bytes item-bytes) memory-limit))
+                                        (flush-run))
+                                      (push item buffer)
+                                      (incf buffer-bytes item-bytes)
+                                      (when (>= buffer-bytes memory-limit)
+                                        (flush-run)))
                                     (make-item (row)
                                       (let ((sequence-number sequence))
                                         (incf sequence)
@@ -1011,18 +1045,27 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                      streamer
                                      (lambda (row)
                                        (check-for-interrupts)
-                                       (let* ((item (make-item row))
-                                              (item-bytes (query-spill-record-size item)))
-                                         (when (and buffer
-                                                    (> (+ buffer-bytes item-bytes) memory-limit))
-                                           (flush-run))
-                                         (push item buffer)
-                                         (incf buffer-bytes item-bytes)
-                                         (when (>= buffer-bytes memory-limit)
-                                           (flush-run)))))
+                                       (cond
+                                         (top-n
+                                          (offer-select-top-n-row top-n row)
+                                          (when (>= (select-top-n-collector-bytes top-n) memory-limit)
+                                            ;; Discarded rows already rank below LIMIT candidates.
+                                            ;; Transfer the evaluated keys and original tie breakers.
+                                            (let ((heap (select-top-n-collector-heap top-n)))
+                                              (setf sequence (select-top-n-collector-next-sequence top-n)
+                                                    top-n nil)
+                                              (loop for item across heap
+                                                    do (buffer-item (top-n-spill-item item)
+                                                                    (select-top-n-item-bytes item))))))
+                                         (t
+                                          (let ((item (make-item row)))
+                                            (buffer-item item (query-spill-record-size item)))))))
+                                    (when top-n
+                                      (setf buffer (map 'list #'top-n-spill-item
+                                                        (select-top-n-collector-heap top-n))))
                                     (if (null runs)
                                         (progn
-                                          (own-run)
+                                          (unless top-n (own-run))
                                           (dolist (item
                                                    (stable-sort
                                                     (nreverse buffer)
@@ -1971,45 +2014,22 @@ ROW's source environment.  Only final target origins leave this projection."
                     (when row (funcall emit row)))))))))
 
 (defun execute-physical-order (node emit run-child)
-  (case (first node)
-    (:sort
-     (let* ((child (third node))
-            (deferred (sort-projection-deferred-slots node child))
-            (*query-sort-project* (and deferred (cons child deferred))))
-       (stream-select-sort
-        (lambda (sort-callback)
-          (funcall run-child child sort-callback))
-        (second node)
-        (lambda (row)
-          (if deferred
-              (multiple-value-bind (projected origins)
-                  (finish-sort-project-row row (second child) deferred)
-                (let ((*query-row-origins* origins))
-                  (funcall emit projected)))
-              (funcall emit row))))))
-    (:top-n
-     (let* ((order (second node))
-            (limit (third node))
-            (input (fourth node))
-            (deferred (sort-projection-deferred-slots node input))
-            (*query-sort-project* (and deferred (cons input deferred)))
-            (rows (collect-select-top-n
-                   (lambda (callback)
-                     (funcall run-child input callback))
-                   order limit *datum-origin-capture* t)))
-       (loop for stored in rows
-             for row = (first stored)
-             do (let ((*query-row-origins* (second stored))
-                      (*query-row-presence* (third stored)))
-                  (when (eq (if deferred
-                                (multiple-value-bind (projected origins)
-                                    (finish-sort-project-row row (second input) deferred)
-                                  (let ((*query-row-origins* origins))
-                                    (funcall emit projected)))
-                                (funcall emit row))
-                            :stop)
-                    (return :stop))))))
-    (otherwise (error "Unexpected ordering node ~s" node))))
+  (let* ((top-n-p (eq (first node) :top-n))
+         (child (if top-n-p (fourth node) (third node)))
+         (deferred (sort-projection-deferred-slots node child))
+         (*query-sort-project* (and deferred (cons child deferred))))
+    (stream-select-sort
+     (lambda (sort-callback)
+       (funcall run-child child sort-callback))
+     (second node)
+     (lambda (row)
+       (if deferred
+           (multiple-value-bind (projected origins)
+               (finish-sort-project-row row (second child) deferred)
+             (let ((*query-row-origins* origins))
+               (funcall emit projected)))
+           (funcall emit row)))
+     :limit (and top-n-p (third node)))))
 
 (defun execute-physical-join (node registered-relations emit run-child run-node)
   (let* ((join (second node))

@@ -939,8 +939,9 @@ row-producing portals after the requested number of rows; a later Execute
 continues them. An exact-sized fetch can suspend at the end, with completion
 reported on the next Execute. SELECT retains its Bind-time snapshot and produces
 rows as they are pulled; sorting and aggregation may first consume their inputs.
-A RETURNING command performs its mutations once on first Execute,
-then retains its buffered results for subsequent fetches. Sync ends an implicit
+Bind retains the target and source relations for INSERT, UPDATE, and DELETE.
+The first Execute starts the statement snapshot and runs the mutation. With
+RETURNING, subsequent fetches read the buffered results. Sync ends an implicit
 transaction; in an explicit transaction, portals remain available until closed
 or the transaction ends. Temporary spill space is shared across a backend's
 queries and portals. Live reload waits for retained portals to close or their
@@ -965,7 +966,10 @@ READ transaction. Another unused explicit read-only REPEATABLE READ transaction
 in the same database can import its token with `SET TRANSACTION SNAPSHOT` before
 its first snapshot. The token expires when the exporter ends, while an existing
 importer retains its own snapshot and schema lease until its transaction ends;
-the lease can delay incompatible schema changes.
+the lease can delay incompatible schema changes. Explicit REPEATABLE READ
+transactions acquire the schema lease with their first snapshot so they can
+export that same snapshot after switching to READ ONLY. Transactional TRUNCATE
+releases the lease and makes the retained snapshot ineligible for export.
 
 SELECT text DataRows preflight every field's encoded length and checksum before
 writing the frame. Text, JSON, JSONB and bytea output use bounded UTF-8 blocks;
@@ -1866,9 +1870,10 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 
 ## Known gaps (documented, not hidden)
 
-- No WAL archiving, complete PostgreSQL replication protocol, or point-in-time
-  recovery. The `pg-lisp` logical subscriber supports only the documented SQL
-  subset, source-side supported DDL and sequence state, and an explicit table
+- Native WAL archiving, streaming recovery, and promotion have the scope
+  described in [PHYSICAL-HA.md](PHYSICAL-HA.md). The complete PostgreSQL
+  replication protocol and arbitrary point-in-time recovery remain unsupported.
+  The `pg-lisp` logical subscriber supports only the documented SQL subset, source-side supported DDL and sequence state, and an explicit table
   allowlist; it does not implement publication selection or filters, replication
   origins, or conflict handling. The WAL layer supports persistent replication
   slots with restart/consistent LSNs, confirmed-flush acknowledgments, and
@@ -1941,8 +1946,6 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
 - Boolean and other unlisted table column types are unsupported. `text` and
   unbounded `varchar` are distinct supported types; `varchar(n)` accepts lengths
   from 1 through 10485760.
-- Extended query protocol (Parse/Bind/Describe/Execute/Sync) is not
-  implemented; `psql` is unaffected, other drivers are.
 - `pg_terminate_backend` (and fast/immediate shutdown) unwinds the target with
   an SBCL thread interrupt at an arbitrary point instead of PostgreSQL's
   deferred safe-point check. An interrupt during WAL I/O forces server shutdown;
@@ -2049,10 +2052,9 @@ through real psycopg2. The configuration subset supports `port`,
 `listen_addresses`, `data_directory`, `checkpoint_timeout`, `max_wal_size`,
 `max_slot_wal_keep_size`, `wal_keep_size`, `max_connections`, `max_wal_senders`,
 `reserved_connections`, `superuser_reserved_connections`, `hot_standby` and the empty
-`restore_command` default, with includes,
-auto.conf and CLI overrides. Nonempty restore commands are rejected until archive
-recovery exists. SHOW,
-current_setting and typed pg_settings rows expose the actual installed values.
+`restore_command` default, with includes, auto.conf and CLI overrides.
+See [PHYSICAL-HA.md](PHYSICAL-HA.md) for the native archive and restore settings.
+SHOW, current_setting and typed pg_settings rows expose the actual installed values.
 Unknown settings fail visibly; empty or multiple listen addresses are unsupported.
 `hot_standby` is a postmaster Boolean, defaulting to on. When off during native
 recovery, SQL and both replication startup modes receive FATAL 57P03 before

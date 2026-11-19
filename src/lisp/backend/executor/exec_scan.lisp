@@ -103,18 +103,22 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
   keys
   sequence
   origins
-  presence)
+  presence
+  (bytes 0))
 
 (defstruct (select-top-n-collector (:constructor %make-select-top-n-collector))
   limit
   order
   heap
-  next-sequence)
+  next-sequence
+  item-size-function
+  (bytes 0))
 
-(defun make-select-top-n-collector (limit order)
+(defun make-select-top-n-collector (limit order &optional item-size-function)
   (%make-select-top-n-collector
    :limit limit
    :order order
+   :item-size-function item-size-function
    :heap (make-array (min limit 32) :adjustable t :fill-pointer 0)
    :next-sequence 0))
 
@@ -177,16 +181,22 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                            order)
                 :sequence sequence)))
     (incf (select-top-n-collector-next-sequence collector))
-    (cond
-      ((< (length heap) limit)
-       (setf (select-top-n-collector-heap collector)
-             (select-top-n-push heap item limit))
-       (setf heap (select-top-n-collector-heap collector))
-       (select-top-n-sift-up heap order (1- (length heap))))
-      ((and (plusp limit)
-            (select-top-n-item-less-p item (aref heap 0) order))
-       (setf (aref heap 0) item)
-       (select-top-n-sift-down heap order 0)))))
+    (when (and (plusp limit)
+               (or (< (length heap) limit)
+                   (select-top-n-item-less-p item (aref heap 0) order)))
+      (let ((size-function (select-top-n-collector-item-size-function collector)))
+        (when size-function
+          (setf (select-top-n-item-bytes item) (funcall size-function item))
+          (incf (select-top-n-collector-bytes collector) (select-top-n-item-bytes item))))
+      (if (< (length heap) limit)
+          (let ((expanded (select-top-n-push heap item limit)))
+            (setf (select-top-n-collector-heap collector) expanded)
+            (select-top-n-sift-up expanded order (1- (length expanded))))
+          (progn
+            (decf (select-top-n-collector-bytes collector)
+                  (select-top-n-item-bytes (aref heap 0)))
+            (setf (aref heap 0) item)
+            (select-top-n-sift-down heap order 0))))))
 
 (defun select-top-n-collector-rows (collector &optional with-origins with-presence)
   (mapcar (cond
@@ -209,15 +219,6 @@ An unexecuted LIMIT does not raise these errors."
     (ereport "22003" "bigint out of range"))
   (when (minusp count) (ereport "2201W" "LIMIT must not be negative"))
   count)
-
-(defun collect-select-top-n (streamer order limit &optional with-origins with-presence)
-  "Consume STREAMER while retaining at most LIMIT rows in ORDER BY order."
-  ;; Retained rows and their origins and presence must be detached from the
-  ;; producer; subsequent projection needs the metadata paired with each row.
-  (let ((collector (make-select-top-n-collector (check-select-limit limit) order)))
-    (unless (zerop limit)
-      (funcall streamer (lambda (row) (offer-select-top-n-row collector row))))
-    (select-top-n-collector-rows collector with-origins with-presence)))
 
 (defstruct select-scan-path
   (kind :seq-scan)

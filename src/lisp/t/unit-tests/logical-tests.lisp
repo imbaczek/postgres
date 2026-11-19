@@ -419,6 +419,9 @@
                             *pgdata*))
          (*pgdata* test-pgdata)
          (*backend* nil)
+         (*catalog* nil)
+         (*catalog-identity-needs-persist-p* nil)
+         (*wal-control-metadata* nil)
          (*wal-ready* t)
          (*wal-logical-policy* nil)
          (*logical-capture-force* nil)
@@ -440,7 +443,11 @@
     (wal-ensure-directory-durable (wal-directory))
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     (unwind-protect
-         (funcall function)
+         (progn
+           (clog-init :initialize t)
+           (let ((*wal-ready* nil))
+             (catalog-init :initialize t))
+           (funcall function))
       (when *wal-output-stream*
         (ignore-errors (close *wal-output-stream*)))
       (when *clog-stream*
@@ -1259,6 +1266,9 @@
              (gethash xid *logical-capture-xid-modes*) :capture
              (gethash "postgres" (catalog-databases *catalog*)) database
              (gethash "logical_rows" (database-tables database)) table)
+       ;; Publish the fixture catalog before starting WAL for this cluster.
+       (let ((*wal-ready* nil))
+         (save-catalog))
        (logical-note-row-change :insert table :new-values #(55 4 "across boundary"))
        (logical-test-commit-boundary-batch xid)
        (multiple-value-setq (snapshot boundary-lsn restart-lsn slot)
