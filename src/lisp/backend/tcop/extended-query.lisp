@@ -340,13 +340,18 @@
            (call-with-query-execution-owner
             owner
             (lambda ()
+              (unless (recovery-in-progress-p)
+                (prepare-xid-wraparound-for-statement *backend*))
+              ;; Acquire the RR schema lease before registering relations. A
+              ;; TRUNCATE can hold the writer side while it waits for readers.
+              ;; READ COMMITTED still takes its snapshot at Execute.
+              (when (eq (backend-isolation-level *backend*) :repeatable-read)
+                (ensure-transaction-snapshot *backend* (backend-command-id *backend*)))
+              ;; Disallow isolation changes after Bind has admitted the query.
+              (setf (backend-first-snapshot-set *backend*) t)
               (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
                 (setf (extended-dml-execution-prepared execution) prepared
                       (extended-dml-execution-targets execution) (getf prepared :returning))
-                ;; Bind retains relation protection, but starts neither the
-                ;; executor nor its statement snapshot and never marks a CID used.
-                (unless (recovery-in-progress-p)
-                  (prepare-xid-wraparound-for-statement *backend*))
                 (register-dml-subquery-relations prepared (get-current-reader-xid)))))
            (setf complete t)
            portal)

@@ -892,7 +892,7 @@ Range and negative checks occur when the LIMIT executes."
       (expect-punct p #\])
       (loop while (match-punct p #\[) do (expect-punct p #\]))
       (setf type (sql-array-type type)))
-    (let ((notnull nil) (primary nil) (unique nil) (nulls-not-distinct nil)
+    (let ((notnull nil) (primary nil)
                         (default-expression nil) (default-sql nil) (checks nil) (constraint-name nil)
                         (primary-name nil) (uniques nil))
       (loop
@@ -921,24 +921,29 @@ Range and negative checks occur when the LIMIT executes."
            (setf constraint-name nil))
           ((match-kw p "references") (ereport "0A000" "foreign keys are not supported"))
           (t (when constraint-name (syntax-error p)) (return))))
-      (let ((unique-name nil)
-            (keys nil))
-        ;; Keep the existing single-column representation for simple cases.
-        ;; Normalize additional clauses to table constraints, where each key
-        ;; has its own name and NULL treatment.
-        (if (and (not primary) (null (rest uniques)) uniques)
-            (setf unique t unique-name (getf (first uniques) :name)
-                  nulls-not-distinct (getf (first uniques) :nulls-not-distinct))
-            (dolist (clause (nreverse uniques))
-              (unless (and (not (getf clause :name)) (member clause keys :test #'equal))
-                (push clause keys))))
-        (values
-         (list :name name :type type :typmod typmod
-               :notnull notnull :primary primary :unique unique :primary-name primary-name :unique-name unique-name
-               :nulls-not-distinct nulls-not-distinct
-               :default-expression default-expression :default-sql default-sql
-               :checks (nreverse checks))
-         (nreverse keys))))))
+      (let ((keys nil))
+        ;; Inline keys share the same column. Merge equivalent NULL treatment
+        ;; and keep the first explicit name, preferring the primary key.
+        (dolist (clause (nreverse uniques))
+          (let* ((distinctness (getf clause :nulls-not-distinct))
+                 (prior (find distinctness keys
+                              :key (lambda (key) (getf key :nulls-not-distinct)))))
+            (cond
+              ((and primary (not distinctness))
+               (unless primary-name (setf primary-name (getf clause :name))))
+              (prior
+               (unless (getf prior :name) (setf (getf prior :name) (getf clause :name))))
+              (t (push clause keys)))))
+        ;; Keep one ordinary UNIQUE in the column's existing representation.
+        (let ((unique (when (and (not primary) (null (rest keys))) (pop keys))))
+          (values
+           (list :name name :type type :typmod typmod
+                 :notnull notnull :primary primary :unique (not (null unique))
+                 :primary-name primary-name :unique-name (getf unique :name)
+                 :nulls-not-distinct (getf unique :nulls-not-distinct)
+                 :default-expression default-expression :default-sql default-sql
+                 :checks (nreverse checks))
+           (nreverse keys)))))))
 
 (defun parse-float-type (p)
   "Resolve SQL FLOAT precision to float4 or float8 as gram.y does."

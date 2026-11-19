@@ -96,6 +96,57 @@ def check_dml_bind(reader, writer):
     writer.query("RESET statement_timeout")
 
 
+def check_repeatable_read_dml_bind(server, reader, writer):
+    writer.query("CREATE TABLE bind_rr_target(id int)")
+    writer.query("CREATE TABLE bind_rr_source(id int)")
+    writer.query("INSERT INTO bind_rr_source VALUES (1)")
+    reader.send(b"P", b"rr_insert\0INSERT INTO bind_rr_target "
+                b"SELECT id FROM bind_rr_source\0" + struct.pack("!H", 0))
+    reader.send(b"S")
+    reader.through(b"1")
+    assert reader.through(b"Z") == b"I"
+
+    reader.query("SET statement_timeout='2s'")
+    reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    reader.bind("rr_insert", "rr_dml")
+    reader.send(b"H")
+    reader.through(b"2")
+    writer.query("INSERT INTO bind_rr_source VALUES (2)")
+    assert writer.query("SELECT id FROM bind_rr_target") == []
+
+    marker = server.root / "truncate-waiting-for-bind-schema-lease"
+    server.control("(defvar pg::*bind-test-wait* "
+                   "(symbol-function 'pg::condition-wait-with-timeout))")
+    try:
+        server.control(
+            "(setf (symbol-function 'pg::condition-wait-with-timeout) "
+            "(lambda (queue mutex) (when (eq queue pg::*schema-lock-cv*) "
+            f'(with-open-file (marker "{marker}" :direction :output '
+            ':if-exists :supersede) (write-line "waiting" marker))) '
+            "(funcall pg::*bind-test-wait* queue mutex)))")
+        writer.send(b"Q", b"TRUNCATE bind_rr_target\0")
+        wire.wait_for_file(marker, server.process)
+        assert reader.execute("rr_dml") == ([], ["INSERT 0 1"], b"T", [])
+        assert reader.query("SELECT id FROM bind_rr_target") == [["1"]]
+        reader.query("COMMIT")
+        assert writer.through(b"C") == b"TRUNCATE TABLE\0"
+        assert writer.through(b"Z") == b"I"
+    finally:
+        server.control("(setf (symbol-function 'pg::condition-wait-with-timeout) "
+                       "pg::*bind-test-wait*)")
+    reader.query("RESET statement_timeout")
+    assert writer.query("SELECT id FROM bind_rr_target") == []
+
+    reader.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    reader.bind("rr_insert", "rc_dml")
+    reader.send(b"H")
+    reader.through(b"2")
+    assert reader.observe(
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    ) == ("error", "25001")
+    reader.query("ROLLBACK")
+
+
 def check_snapshot_read_only_transition(reader, writer):
     writer.query("CREATE TABLE export_transition(id int)")
     writer.query("INSERT INTO export_transition VALUES (1)")
@@ -234,6 +285,30 @@ def check_repeated_inline_unique(connection):
         ) == ("error", "42P07")
 
 
+def check_equivalent_inline_keys(connection):
+    for table, clauses, surviving in (
+            ("pk_unique", "PRIMARY KEY UNIQUE", "pk_unique_pkey"),
+            ("named_pk", "PRIMARY KEY CONSTRAINT transferred UNIQUE", "transferred"),
+            ("preferred_pk", "CONSTRAINT redundant UNIQUE CONSTRAINT preferred PRIMARY KEY",
+             "preferred"),
+            ("named_first", "CONSTRAINT named_first_key UNIQUE UNIQUE", "named_first_key"),
+            ("named_last", "UNIQUE CONSTRAINT named_last_key UNIQUE", "named_last_key"),
+            ("repeated_name", "CONSTRAINT same_key UNIQUE CONSTRAINT same_key UNIQUE",
+             "same_key"),
+            ("different_names", "CONSTRAINT retained_key UNIQUE CONSTRAINT redundant_key UNIQUE",
+             "retained_key")):
+        connection.query(f"CREATE TABLE {table}(a int {clauses})")
+        assert connection.observe(f"INSERT INTO {table} VALUES (1), (1)") == ("error", "23505")
+        connection.query(f"ALTER TABLE {table} DROP CONSTRAINT {surviving}")
+        connection.query(f"INSERT INTO {table} VALUES (1), (1)")
+        assert connection.query(f"SELECT count(*) FROM {table}") == [["2"]]
+
+    connection.query("CREATE TABLE pk_distinct(a int PRIMARY KEY "
+                     "CONSTRAINT pk_distinct_unique UNIQUE NULLS NOT DISTINCT)")
+    connection.query("ALTER TABLE pk_distinct DROP CONSTRAINT pk_distinct_pkey")
+    assert connection.observe("INSERT INTO pk_distinct VALUES (1), (1)") == ("error", "23505")
+
+
 def run():
     server = wire.OwnedLisp()
     writer = reader = None
@@ -241,12 +316,14 @@ def run():
         server.start()
         writer, reader = Connection(server.port), Connection(server.port)
         check_dml_bind(reader, writer)
+        check_repeatable_read_dml_bind(server, reader, writer)
         check_snapshot_read_only_transition(reader, writer)
         check_sorted_volatile_slot_projection(writer)
         check_sorted_file_projection(writer)
         check_ddl_skip_validation(writer)
         check_index_column_limit(writer)
         check_repeated_inline_unique(writer)
+        check_equivalent_inline_keys(writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),
