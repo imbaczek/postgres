@@ -26,6 +26,7 @@
   (transaction-snapshot nil)
   (transaction-snapshot-registration nil)
   (transaction-schema-read-lock-held-p nil)
+  (transaction-schema-write-token nil)
   (first-snapshot-set nil)
   (dirty-relations '())
   (role-changes nil)
@@ -617,10 +618,22 @@ handoff are interrupt-free so cancellation cannot strand either state."
 (defun backend-holds-schema-read-lock-p (&optional (backend *backend*))
   (and backend (backend-transaction-schema-read-lock-held-p backend)))
 
+(defun backend-holds-schema-write-lock-p (&optional (backend *backend*))
+  (or *schema-write-lock-held*
+      (and backend (backend-transaction-schema-write-token backend))))
+
+(defun acquire-transaction-schema-write-lock (backend)
+  "Retain the schema writer admission as long as a TRUNCATE holds relation gates."
+  (unless (backend-transaction-schema-write-token backend)
+    (when (or *schema-read-lock-held* (backend-holds-schema-read-lock-p backend))
+      (ereport "25001" "schema changes cannot run inside an exported snapshot scope"))
+    (acquire-schema-write-lock
+     (lambda (token) (setf (backend-transaction-schema-write-token backend) token)))))
+
 (defmacro with-schema-read-lock (&body body)
   "Hold a schema-stable view through BODY, blocking incompatible DDL."
   (let ((acquired (gensym "SCHEMA-READ-ACQUIRED-")))
-    `(if (or *schema-write-lock-held* *schema-read-lock-held*
+    `(if (or (backend-holds-schema-write-lock-p) *schema-read-lock-held*
              (backend-holds-schema-read-lock-p))
          (progn ,@body)
          (let ((,acquired nil))
@@ -640,7 +653,7 @@ Independent schema changers may overlap; relation/catalog locks order DDL."
   (let ((token (gensym "SCHEMA-WRITE-TOKEN-"))
         (acquired (gensym "SCHEMA-WRITE-ACQUIRED-")))
     `(cond
-       (*schema-write-lock-held* (progn ,@body))
+       ((backend-holds-schema-write-lock-p) (progn ,@body))
        ((or *schema-read-lock-held* (backend-holds-schema-read-lock-p))
         (ereport "25001"
                  "schema changes cannot run inside an exported snapshot scope"))
@@ -1506,7 +1519,7 @@ reconsider deferred disable after release, without holding the XID lock."
                ;; A retained schema lease can prevent an old writer from ending.
                (when (and old-xids
                           (or (backend-holds-schema-read-lock-p)
-                              *schema-read-lock-held* *schema-write-lock-held*))
+                              *schema-read-lock-held* (backend-holds-schema-write-lock-p)))
                  (ereport "55000" "cannot wait for uncaptured transactions while holding a schema lock"))
                (when (logical-activation-relation-wait-p old-xids)
                  (ereport "55000"
@@ -2353,6 +2366,7 @@ In recovery, enroll the virtual reader even if it has not accessed a relation."
   ;; snapshot. Keep the schema stable from the original horizon until export.
   (when (and (null (backend-transaction-snapshot backend))
              (backend-explicit backend)
+             (not (backend-transaction-schema-write-token backend))
              (not (backend-transaction-schema-read-lock-held-p backend)))
     (if *schema-read-lock-held*
         (sb-sys:without-interrupts
@@ -2501,6 +2515,9 @@ so no interrupt can discard the owner of a virtual ID or its relation locks."
       (setf (backend-logical-spool b) nil))
     (discard-transaction-replacements b)
     (release-transaction-relation-locks b)
+    (when (backend-transaction-schema-write-token b)
+      (release-schema-write-lock (backend-transaction-schema-write-token b))
+      (setf (backend-transaction-schema-write-token b) nil))
     (expire-transaction-exported-snapshots b)
     (release-backend-transaction-snapshot b)
     (when (backend-virtual-reader-xid b)

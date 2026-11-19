@@ -835,7 +835,9 @@ Range and negative checks occur when the LIMIT executes."
     (loop
       (if (or (kw-p p "primary") (kw-p p "unique") (kw-p p "constraint") (kw-p p "check"))
           (push (parse-table-constraint p) constraints)
-          (push (parse-column-def p) columns))
+          (multiple-value-bind (column keys) (parse-column-def p)
+            (push column columns)
+            (dolist (key keys) (push key constraints))))
       (unless (match-punct p #\,)
         (return)))
     (expect-punct p #\))
@@ -892,7 +894,7 @@ Range and negative checks occur when the LIMIT executes."
       (setf type (sql-array-type type)))
     (let ((notnull nil) (primary nil) (unique nil) (nulls-not-distinct nil)
                         (default-expression nil) (default-sql nil) (checks nil) (constraint-name nil)
-                        (primary-name nil) (unique-name nil))
+                        (primary-name nil) (uniques nil))
       (loop
         (cond
           ((match-kw p "constraint")
@@ -902,9 +904,14 @@ Range and negative checks occur when the LIMIT executes."
            (expect-kw p "null") (setf notnull t constraint-name nil))
           ((match-kw p "null") (setf constraint-name nil))
           ((match-kw p "primary")
-           (expect-kw p "key") (setf primary t notnull t primary-name constraint-name constraint-name nil))
+           (expect-kw p "key")
+           (when primary (ereport "42P16" "multiple primary keys for one column are not allowed"))
+           (setf primary t notnull t primary-name constraint-name constraint-name nil))
           ((match-kw p "unique")
-           (setf unique t nulls-not-distinct (parse-unique-null-treatment p) unique-name constraint-name constraint-name nil))
+           (push (list :kind :unique :name constraint-name :columns (list name)
+                       :nulls-not-distinct (parse-unique-null-treatment p))
+                 uniques)
+           (setf constraint-name nil))
           ((match-kw p "default")
            (when default-expression (ereport "42601" "multiple default values specified"))
            (multiple-value-setq (default-expression default-sql) (parse-stored-expression p t))
@@ -914,11 +921,24 @@ Range and negative checks occur when the LIMIT executes."
            (setf constraint-name nil))
           ((match-kw p "references") (ereport "0A000" "foreign keys are not supported"))
           (t (when constraint-name (syntax-error p)) (return))))
-      (list :name name :type type :typmod typmod
-            :notnull notnull :primary primary :unique unique :primary-name primary-name :unique-name unique-name
-            :nulls-not-distinct nulls-not-distinct
-            :default-expression default-expression :default-sql default-sql
-            :checks (nreverse checks)))))
+      (let ((unique-name nil)
+            (keys nil))
+        ;; Keep the existing single-column representation for simple cases.
+        ;; Normalize additional clauses to table constraints, where each key
+        ;; has its own name and NULL treatment.
+        (if (and (not primary) (null (rest uniques)) uniques)
+            (setf unique t unique-name (getf (first uniques) :name)
+                  nulls-not-distinct (getf (first uniques) :nulls-not-distinct))
+            (dolist (clause (nreverse uniques))
+              (unless (and (not (getf clause :name)) (member clause keys :test #'equal))
+                (push clause keys))))
+        (values
+         (list :name name :type type :typmod typmod
+               :notnull notnull :primary primary :unique unique :primary-name primary-name :unique-name unique-name
+               :nulls-not-distinct nulls-not-distinct
+               :default-expression default-expression :default-sql default-sql
+               :checks (nreverse checks))
+         (nreverse keys))))))
 
 (defun parse-float-type (p)
   "Resolve SQL FLOAT precision to float4 or float8 as gram.y does."

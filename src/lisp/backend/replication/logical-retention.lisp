@@ -54,7 +54,7 @@ checks outside WAL are advisory."
        (not (and *physical-receive-store*
                  (sb-thread:holding-mutex-p (physical-store-mutex *physical-receive-store*))))
        (not *exported-snapshot-backend*)
-       (not *schema-read-lock-held*) (not *schema-write-lock-held*)
+       (not *schema-read-lock-held*) (not (backend-holds-schema-write-lock-p))
        (not (backend-holds-schema-read-lock-p))
        (not (eq *live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
        (not *live-operation-terminal-shutdown*)

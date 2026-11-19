@@ -1635,13 +1635,22 @@ The segments preserve their storage representation across B-tree page rewrites."
                    attnums))
    reserved-names))
 
-(defun make-index-object (oid name table cols
-                          &key unique primary constraint nulls-not-distinct)
-  "Create detached INDEX metadata with a previously reserved object ID."
+(defun check-index-key-count (columns)
+  ;; Match INDEX_MAX_KEYS in pg_config_manual.h, counting repeated positions.
+  (when (> (length columns) 32)
+    (ereport "54011" "cannot use more than 32 columns in an index")))
+
+(defun check-index-definition (table cols)
+  "Validate supported index attributes before reserving an OID or skipping a name."
+  (check-index-key-count cols)
   (when (some (lambda (attnum)
                 (member (pg-column-type (aref (pg-class-columns table) (1- attnum))) '(:json :json-array)))
               cols)
-    (ereport "42704" "data type json has no default operator class for access method btree"))
+    (ereport "42704" "data type json has no default operator class for access method btree")))
+
+(defun make-index-object (oid name table cols
+                          &key unique primary constraint nulls-not-distinct)
+  "Create detached INDEX metadata with a previously reserved object ID."
   (make-pg-index :oid oid
                  :name name
                  :relfilenode oid
@@ -1664,6 +1673,7 @@ The segments preserve their storage representation across B-tree page rewrites."
 
 (defun create-index* (db name table cols
                       &key unique primary constraint nulls-not-distinct)
+  (check-index-definition table cols)
   (when (and constraint (find name (pg-class-checks table)
                               :key (lambda (check) (getf check :name)) :test #'string=))
     (ereport "42710" "constraint ~s for relation ~s already exists" name (pg-class-name table)))

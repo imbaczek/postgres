@@ -166,12 +166,15 @@ def check_sorted_file_projection(connection):
 
 
 def check_ddl_skip_validation(connection):
-    connection.query("CREATE TABLE index_collision(a int)")
+    connection.query("CREATE TABLE index_collision(a int, j json)")
     connection.query("CREATE INDEX existing_index ON index_collision(a)")
     for name in ("index_collision", "existing_index"):
         assert connection.observe(
             f"CREATE INDEX IF NOT EXISTS {name} ON index_collision(missing)"
         ) == ("error", "42703")
+        assert connection.observe(
+            f"CREATE INDEX IF NOT EXISTS {name} ON index_collision(j)"
+        ) == ("error", "42704")
         for statement in (
             f"CREATE INDEX IF NOT EXISTS {name} ON index_collision(a)",
             f"CREATE SEQUENCE IF NOT EXISTS {name}",
@@ -202,6 +205,34 @@ def check_index_column_limit(connection):
             f"CREATE INDEX {target} ON missing_index_target({keys}, a)"
         ) == ("error", "42P01")
 
+    columns = ", ".join(f"k{i} int" for i in range(33))
+    keys = ", ".join(f"k{i}" for i in range(32))
+    connection.query(f"CREATE TABLE max_constraint({columns}, UNIQUE ({keys}))")
+    connection.query(f"CREATE TABLE constraint_target({columns})")
+    for constraint in ("UNIQUE", "PRIMARY KEY"):
+        assert connection.observe(
+            f"CREATE TABLE oversize_constraint({columns}, {constraint} ({keys}, k32))"
+        ) == ("error", "54011")
+        assert connection.observe(
+            f"ALTER TABLE constraint_target ADD {constraint} ({keys}, k32)"
+        ) == ("error", "54011")
+
+
+def check_repeated_inline_unique(connection):
+    for table, clauses in (
+            ("unnamed_inline", "UNIQUE NULLS NOT DISTINCT UNIQUE"),
+            ("named_inline", "CONSTRAINT first_unique UNIQUE NULLS NOT DISTINCT "
+             "CONSTRAINT second_unique UNIQUE")):
+        connection.query(f"CREATE TABLE {table}(a int {clauses})")
+        connection.query(f"INSERT INTO {table} VALUES (NULL)")
+        assert connection.observe(
+            f"INSERT INTO {table} VALUES (NULL)"
+        ) == ("error", "23505")
+    for name in ("first_unique", "second_unique"):
+        assert connection.observe(
+            f"CREATE INDEX {name} ON named_inline(a)"
+        ) == ("error", "42P07")
+
 
 def run():
     server = wire.OwnedLisp()
@@ -215,6 +246,7 @@ def run():
         check_sorted_file_projection(writer)
         check_ddl_skip_validation(writer)
         check_index_column_limit(writer)
+        check_repeated_inline_unique(writer)
         writer.query("CREATE TABLE portal_rows(id int)")
         for isolation, bind_first, explicit, expected in (
                 ("READ COMMITTED", True, True, []),

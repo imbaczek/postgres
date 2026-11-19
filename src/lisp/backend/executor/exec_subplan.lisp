@@ -10,7 +10,7 @@
              (zerop (getf prepared :aggregate-count 0))
              (not (getf prepared :set-functions))
              (not (getf prepared :windows))
-             (or (null (getf prepared :limit)) (plusp (getf prepared :limit))))
+             (or (null (getf prepared :limit)) (<= 1 (getf prepared :limit) +int8-max+)))
     (setf (getf prepared :targets) nil
           (getf prepared :order) nil
           (getf prepared :distinct) nil

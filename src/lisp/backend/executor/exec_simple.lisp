@@ -73,6 +73,7 @@ Recheck identities after waiting and under catalog locks before changing storage
   ;; TRUNCATE can replace storage covered by our retained snapshot. Give up
   ;; export eligibility before taking the schema write side.
   (release-backend-transaction-schema-lease *backend*)
+  (acquire-transaction-schema-write-lock *backend*)
   (let ((names nil) (oids nil) (relations nil) (tables nil))
     (with-schema-write-lock
       (let* ((captured
@@ -1113,13 +1114,11 @@ Release these locks before waiting for commit or sending replies."
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table)))
-      ;; Match INDEX_MAX_KEYS in pg_config_manual.h. Count repeated columns
-      ;; before validating column names or checking for a duplicate relation.
-      (when (> (length columns) 32)
-        (ereport "54011" "cannot use more than 32 columns in an index"))
+      (check-index-key-count columns)
       (setf existing (relation-name-in-use-p db name))
       (when existing
-        (resolve-attnums table columns)))
+        (let ((attnums (resolve-attnums table columns)))
+          (when if-not-exists (check-index-definition table attnums)))))
     (when existing
       (if if-not-exists
           (progn
@@ -1144,6 +1143,7 @@ Release these locks before waiting for commit or sending replies."
               (if if-not-exists
                   (setf skipped t)
                   (ereport "42P07" "relation \"~a\" already exists" name)))
+            (check-index-definition table attnums)
             (unless skipped
               (setf idx
                     (make-index-object

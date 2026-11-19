@@ -47,6 +47,8 @@ def check(connection, query=None):
                (source + " ORDER BY x LIMIT -0.5", "2201W"),
                ("SELECT 1 AS x,pg_get_publication_tables(VARIADIC ARRAY[]::text[]) "
                 "ORDER BY x LIMIT -0.5", "2201W")]
+    errors += [(f"SELECT EXISTS (SELECT 1 LIMIT {literal})", "22003")
+               for literal in ("9223372036854775808", "9223372036854775807.5")]
     for sql, state in errors:
         try:
             query(sql)
@@ -59,6 +61,9 @@ def check(connection, query=None):
     assert query("SELECT CASE WHEN false THEN "
                  "(SELECT 1 LIMIT 9223372036854775808) ELSE 7 END") == [["7"]]
     assert query("SELECT * FROM (SELECT 1 LIMIT -1) q LIMIT 0") == []
+    assert query("SELECT EXISTS (SELECT 1 LIMIT 9223372036854775807)") == [["t"]]
+    assert query("SELECT CASE WHEN false THEN "
+                 "EXISTS (SELECT 1 LIMIT 9223372036854775808) ELSE true END") == [["t"]]
     assert query("SELECT 1") == [["1"]]
 
 

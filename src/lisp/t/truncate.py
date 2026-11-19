@@ -63,6 +63,41 @@ def ddl_publication_race(server, truncater, builder):
     builder.query("DROP TABLE truncate_ddl")
 
 
+def repeat_truncate_with_waiting_reader(server, truncater, reader):
+    marker = server.root / "truncate-schema-reader-waiting"
+    server.control("(defvar pg::*truncate-test-wait* "
+                   "(symbol-function 'pg::condition-wait-with-timeout))")
+    truncater.query("SET statement_timeout='2s'")
+    truncater.query("BEGIN")
+    truncater.query("TRUNCATE truncate_rows")
+    reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    try:
+        server.control(
+            "(setf (symbol-function 'pg::condition-wait-with-timeout) "
+            "(lambda (queue mutex) (when (eq queue pg::*schema-lock-cv*) "
+            f'(with-open-file (marker "{marker}" :direction :output '
+            ':if-exists :supersede) (write-line "waiting" marker))) '
+            "(funcall pg::*truncate-test-wait* queue mutex)))")
+        reader.send(b"Q", b"SELECT id FROM truncate_rows\0")
+        fixture.wait_for_file(marker, server.process)
+        truncater.query("TRUNCATE truncate_rows")
+    finally:
+        server.control("(setf (symbol-function 'pg::condition-wait-with-timeout) "
+                       "pg::*truncate-test-wait*)")
+        truncater.query("ROLLBACK")
+        truncater.query("SET statement_timeout=0")
+    rows = []
+    while True:
+        kind, body = reader.receive()
+        assert kind != b"E", reader.error_fields(body)
+        if kind == b"D":
+            rows.append(reader.data_row(body))
+        elif kind == b"Z":
+            break
+    assert rows == [["9"]], rows
+    reader.query("ROLLBACK")
+
+
 def run():
     server = fixture.OwnedLisp()
     connections = []
@@ -83,15 +118,17 @@ def run():
         assert b.query("SELECT id FROM truncate_rows") == [], "retained snapshot left a row"
         ddl_publication_race(server, a, b)
 
-        # An old snapshot that had not accessed this table sees empty storage,
-        # including tuple versions deleted before TRUNCATE began.
+        # A retained snapshot keeps its schema lease on unrelated access.
         b.query("INSERT INTO truncate_rows VALUES(2,'two'),(3,'three')")
         a.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
         a.query("SELECT id FROM truncate_horizon")
         b.query("DELETE FROM truncate_rows WHERE id=2")
-        b.query("TRUNCATE truncate_rows")
-        assert a.query("SELECT id FROM truncate_rows") == []
+        b.query("SET statement_timeout='250ms'")
+        expect_timeout(b, "TRUNCATE truncate_rows")
         a.query("ROLLBACK")
+        b.query("SET statement_timeout=0")
+        b.query("TRUNCATE truncate_rows")
+        assert b.query("SELECT id FROM truncate_rows") == []
 
         payload = ''.join(random.Random(91).choices(string.ascii_letters, k=20000))
         b.query(f"INSERT INTO truncate_rows VALUES(4,'{payload}'),(5,'old')")
@@ -134,6 +171,7 @@ def run():
         a.query("COMMIT")
         assert b.query("SELECT id,payload FROM truncate_rows") == [["9", "final"]]
         assert b.query("SELECT payload FROM truncate_rows WHERE id=9") == [["final"]]
+        repeat_truncate_with_waiting_reader(server, a, b)
         b.query("VACUUM truncate_rows")
         assert b.query("SELECT payload FROM truncate_rows WHERE id=9") == [["final"]]
 
