@@ -1110,14 +1110,14 @@ Release these locks before waiting for commit or sending replies."
          (table nil)
          (existing nil)
          (skipped nil))
-    ;; Match INDEX_MAX_KEYS in pg_config_manual.h. Count positions, including
-    ;; repeated columns, before considering a duplicate relation name.
-    (when (> (length columns) 32)
-      (ereport "54011" "cannot use more than 32 columns in an index"))
     (with-write-lock
       (setf db (current-database)
-            table (resolve-table-or-error (getf ast :table))
-            existing (relation-name-in-use-p db name))
+            table (resolve-table-or-error (getf ast :table)))
+      ;; Match INDEX_MAX_KEYS in pg_config_manual.h. Count repeated columns
+      ;; before validating column names or checking for a duplicate relation.
+      (when (> (length columns) 32)
+        (ereport "54011" "cannot use more than 32 columns in an index"))
+      (setf existing (relation-name-in-use-p db name))
       (when existing
         (resolve-attnums table columns)))
     (when existing

@@ -198,6 +198,9 @@ def check_index_column_limit(connection):
         assert connection.observe(
             f"CREATE INDEX {target} ON index_collision({keys}, a)"
         ) == ("error", "54011")
+        assert connection.observe(
+            f"CREATE INDEX {target} ON missing_index_target({keys}, a)"
+        ) == ("error", "42P01")
 
 
 def run():
