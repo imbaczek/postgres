@@ -12,7 +12,6 @@
   "Only a stopped task-owned target may be passed by the shell harness."
   (let* ((*pgdata* (uiop:ensure-directory-pathname (uiop:getenv "PG_XID_MIGRATION_DATA")))
          (version (parse-integer (uiop:getenv "PG_XID_MIGRATION_VERSION")))
-         (control (physical-recovery-read-control *pgdata*))
          (capacity (load-next-xid)))
     (assert (member version '(1 2)))
     (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
@@ -21,7 +20,9 @@
         (assert metadata)
         (setf (getf metadata :version) version
               (getf metadata :next-xid) (max capacity (getf metadata :next-xid)))
-        (remf metadata :source-reservation)
+        (dolist (key '(:source-reservation :wal-prefix-digest :source-xids :clog-bytes
+                       :source-resource-fact :source-fpw-fact :source-logical-fact))
+          (remf metadata key))
         (when (= version 1) (remf metadata :source-checkpoint))
         (let* ((bytes (physical-restartpoint-encode metadata catalog-bytes))
                (hash (physical-store-update-digest #xCBF29CE484222325 bytes))
@@ -35,16 +36,7 @@
           (wal-set-u64 pointer 8 lsn)
           (wal-set-u64 pointer 16 hash)
           (wal-set-u32 pointer 24 (wal-crc32 pointer))
-          (wal-atomic-write-bytes (physical-restartpoint-pointer-path) pointer))))
-    (let ((bytes (physical-recovery-control-image
-                  2 (getf control :system-id) 1 (getf control :manifest-digest)
-                  (getf control :checkpoint) (getf control :applied)
-                  (max capacity (getf control :next-xid)))))
-      (setf (aref bytes 7) 50)
-      (wal-set-u32 bytes 68 0)
-      (wal-set-u32 bytes 68 (wal-crc32 bytes))
-      (assert (= 2 (getf (physical-recovery-decode-control bytes) :control-version)))
-      (wal-atomic-write-bytes (physical-recovery-control-path) bytes))))
+          (wal-atomic-write-bytes (physical-restartpoint-pointer-path) pointer))))))
 
 (if (equal (uiop:getenv "PG_XID_MIGRATION_ACTION") "fixture")
     (xid-test-convert-legacy-files)

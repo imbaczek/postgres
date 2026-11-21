@@ -5,77 +5,75 @@ import struct
 from crc32c_reference import crc32c
 from pathlib import Path
 
-RECOVERY_LAYOUT = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_control_layout"]
-RECOVERY_FPW = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_full_page_writes_fact"]
+RECOVERY_FIELDS = runpy.run_path(str(Path(__file__).with_name("resource_control_fields.py")))["recovery_control_fields"]
+VALIDATE_LOGICAL_FACT = runpy.run_path(str(Path(__file__).resolve().parents[2] / "bin/pg_ctl"))["validate_logical_fact"]
 
 def decode(raw):
-    legacy = len(raw) == 60
-    versions = {b'PGRSTATE': 1} if legacy else {b'PGRSTAT2': 2, b'PGRSTAT3': 3}
-    magic = bytes(raw[:8])
-    assert magic in versions, 'magic'
-    version = versions[magic]
-    if version == 3:
-        layout, resources = RECOVERY_LAYOUT(raw)
-    else:
-        assert len(raw) == (60 if legacy else 72)
-        layout, resources = len(raw), None
+    assert raw[:8] == b'PGRSTAT3', 'magic'
     crc_offset = len(raw) - 4
     expected, = struct.unpack_from('<I', raw, crc_offset)
     checked = bytearray(raw)
     struct.pack_into('<I', checked, crc_offset, 0)
     assert crc32c(checked) == expected, 'CRC'
     phase, timeline, system_id, digest, checkpoint, applied, xid = struct.unpack_from('<IIQQQQQ', raw, 8)
-    if version == 3 and phase & (1 << 31):
+    logical = None
+    if phase & (1 << 30):
+        suffix, = struct.unpack_from('<I', raw, crc_offset - 4)
+        assert suffix in (0, 16) and crc_offset >= 68 + 88 + suffix
+        logical_start = crc_offset - 88 - suffix
+        logical = raw[logical_start:crc_offset]
+        checked = checked[:logical_start] + bytes(4)
+        struct.pack_into('<I', checked, logical_start, crc32c(checked))
+        phase &= ~(1 << 30)
+    layout, resources, fpw = RECOVERY_FIELDS(checked if logical is not None else raw)
+    if phase & (1 << 31):
         assert xid == 0, 'hidden exhausted XID value'
         xid = 1 << 64
         phase &= ~(1 << 31)
     assert phase in (0, 1, 2) and 1 <= timeline < 2**32
-    assert version == 3 or timeline == 1
+    applied_timeline = timeline
     if layout == 88:
         applied_timeline, target, _ = struct.unpack_from('<IIQ', raw, 68)
         assert phase == 2 and timeline <= applied_timeline <= target and target > timeline
+    if logical is not None:
+        VALIDATE_LOGICAL_FACT(logical, applied, applied_timeline)
     assert 32 <= checkpoint <= applied and xid >= 3
     assert phase == 2 or checkpoint == applied
     assert phase != 0 or digest == 0
-    state = None if legacy else struct.unpack_from('<I', raw, 56)[0]
-    when = None if legacy else struct.unpack_from('<q', raw, 60)[0]
-    if not legacy:
-        assert state in ((0,) if phase == 0 else (2, 5)), 'DBState'
-        assert -(2**63) <= when < 2**63, 'state time'
-    result = dict(version=version, phase=phase, system_id=system_id,
+    state, when = struct.unpack_from('<Iq', raw, 56)
+    assert state in ((0,) if phase == 0 else (2, 5)), 'DBState'
+    result = dict(version=3, phase=phase, system_id=system_id,
                   applied=applied, next_xid=xid, state=state, time=when)
     if resources is not None:
         result['resource_fact'] = resources
-    if version == 3:
-        fpw = RECOVERY_FPW(raw)
-        if fpw is not None:
-            result['fpw_fact'] = fpw
+    if fpw is not None:
+        result['fpw_fact'] = fpw
     return result
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=Path)
-    parser.add_argument('expected', choices=['legacy', 'startup', 'active', 'clean'])
+    parser.add_argument('expected', choices=['startup', 'active', 'clean'])
     parser.add_argument('--applied')
-    parser.add_argument('--legacy-fixture', action='store_true',
-                        help='convert an owned, stopped test target to the legacy fixture')
+    parser.add_argument('--retired-fixture', choices=['1', '2'],
+                        help='replace an owned, stopped test target control with a retired fixture')
     args = parser.parse_args()
     raw = args.path.read_bytes()
-    decode(raw)
-    if args.legacy_fixture:
-        assert args.expected == 'legacy' and len(raw) == 72
-        assert not (struct.unpack_from('<I', raw, 8)[0] & (1 << 31)), 'legacy cannot represent exhaustion'
-        old = bytearray(raw[:56] + bytes(4))
-        old[:8] = b'PGRSTATE'
-        struct.pack_into('<I', old, 56, crc32c(old))
-        args.path.write_bytes(old)
-        raw = args.path.read_bytes()
     value = decode(raw)
-    assert value['state'] == dict(legacy=None, startup=0, active=5, clean=2)[args.expected], value
+    assert value['state'] == dict(startup=0, active=5, clean=2)[args.expected], value
     if args.applied:
         high, low = args.applied.split('/')
         assert value['applied'] == (int(high, 16) << 32) + int(low, 16), value
+    if args.retired_fixture:
+        assert args.expected == 'clean' and struct.unpack_from('<I', raw, 12)[0] == 1
+        assert value['next_xid'] < (1 << 64), 'retired controls cannot represent exhaustion'
+        version = args.retired_fixture
+        old = bytearray(raw[:(56 if version == '1' else 68)] + bytes(4))
+        old[:8] = b'PGRSTATE' if version == '1' else b'PGRSTAT2'
+        struct.pack_into('<I', old, 8, value['phase'])
+        struct.pack_into('<I', old, len(old) - 4, crc32c(old))
+        args.path.write_bytes(old)
     print('recovery-control-state:', args.expected, value, 'PASS')
 
 

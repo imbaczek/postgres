@@ -4379,10 +4379,9 @@ write authority. `recovery.required` and verified provenance remain mandatory.
 The 72-byte `PGRSTAT3` format retains existing identity/progress fields, adds
 state and a signed 64-bit diagnostic Unix-seconds update time (`pg_time_t`), and
 CRC-checks the entire record.
-Legacy 60-byte `PGRSTATE` files read as unknown state/time; v2 remains readable.
-Both migrate before mutable initialization. All new writes use v3, whose explicit
-phase-word flag represents the exhausted one-past FullXID without wrapping to zero.
-Earlier binaries cannot read v3.
+Startup rejects the retired `PGRSTATE` and `PGRSTAT2` formats before mutable
+initialization. Ordinary writes use v3, and pending promotion uses v4. Both
+use a phase-word flag for the exhausted one-past FullXID.
 This is native metadata, not C `pg_control` byte compatibility.
 
 Startup validates control/manifest/base provenance, then atomically persists
