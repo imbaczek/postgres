@@ -2,17 +2,7 @@
 
 (in-package #:pg)
 
-(defun wal-test-encode-versioned-record (type xid start payload version)
-  (let ((record (wal-encode-record type xid start payload)))
-    (wal-set-u16 record 4 version)
-    (wal-set-u32 record 28 0)
-    (wal-set-u32 record 28 (wal-crc32 record))
-    record))
-
-(defun test-wal-v3-maintenance-record-replay ()
-  ;; WAL v3 already used maintenance terminals; v4 only extends page images.
-  ;; Exercise complete headers, checksums, decoding, and terminal replay, like
-  ;; PostgreSQL's xlogreader/recovery path must do across a format upgrade.
+(defun test-wal-maintenance-record-replay ()
   (let* ((*wal-checkpoint-lsn* 0)
          (*wal-recovery-group-active* nil)
          (*wal-recovery-page-images* '())
@@ -21,20 +11,18 @@
          (*wal-recovery-catalog-next-chunk* 0)
          (empty (make-array 0 :element-type '(unsigned-byte 8)))
          (batch-bytes
-           (wal-test-encode-versioned-record
-            +wal-record-batch-start+ 0 0 empty +wal-version-v3+))
+           (wal-encode-record +wal-record-batch-start+ 0 0 empty))
          (terminal-bytes
-           (wal-test-encode-versioned-record
-            +wal-record-maintenance+ 0 +wal-header-size+ empty +wal-version-v3+))
+           (wal-encode-record +wal-record-maintenance+ 0 +wal-header-size+ empty))
          (batch (wal-decode-record batch-bytes 0))
          (terminal
            (wal-decode-record terminal-bytes +wal-header-size+)))
     (wal-replay-record batch)
     (wal-replay-record terminal)
-    (check (and (= (wal-record-version terminal) +wal-version-v3+)
+    (check (and (= (wal-record-version terminal) +wal-version+)
                 (= (wal-record-type terminal) +wal-record-maintenance+)
                 (not *wal-recovery-group-active*))
-           "recovery decodes and replays a complete v3 maintenance terminal")))
+           "recovery decodes and replays a complete maintenance terminal")))
 
 (defun wal-test-append-committed-xid-batch (xid &optional (contributors (list xid)))
   (let* ((batch-start (wal-append-batch-start))

@@ -102,7 +102,7 @@
   (test-disconnect-cleanup-drains-active-transaction)
   (test-idle-commit-waits-for-reload)
   (test-idle-active-transaction-does-not-block-reload)
-  (test-wal-v3-maintenance-record-replay)
+  (test-wal-maintenance-record-replay)
   (test-logical-keepalive-does-not-advance-progress)
   (test-logical-slot-file-failpoint-atomicity)
   (test-logical-slot-owner-publication-failure-cleans-owner)

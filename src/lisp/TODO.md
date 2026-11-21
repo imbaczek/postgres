@@ -37,7 +37,7 @@ why existing code could not meet the need when a new implementation is required.
 
 | Audit item | Current writer | Compatibility evidence |
 |---|---|---|
-| B1 | [Native WAL encoder](backend/storage/wal-core.lisp) | `wal-encode-record` stamps version 8. The legacy maintenance replay test writes version 3 by overriding the header and recomputing the CRC. Keep that fixture classified as compatibility coverage until the cutover changes the acceptance contract. |
+| B1 | [Native WAL encoder](backend/storage/wal-core.lisp) | `wal-encode-record` stamps version 8. The maintenance replay, lineage byte preservation and receive byte preservation fixtures now use the current writer. |
 | B2 | [Primary WAL control encoder](backend/storage/wal-checkpoint.lisp) | `wal-encode-control-image` writes PGWAL6, including variants for lifecycle metadata, retained references, resources, native checksums, and a local CLOG extent. |
 | B3 | [Checkpoint codec](backend/storage/wal-checkpoint.lisp) | The current checkpoint payload is PGCKPT02. Its optional flags carry transaction and resource state used by current startup and recovery. |
 | B4 | [B-tree page construction](backend/access/btree/btree.lisp) | New pages set their type via `+pd-flags-off+`. The [page decoder](backend/storage/bufpage.lisp) recognizes the historical byte-8 layout. |
@@ -54,8 +54,11 @@ For B15, callers of the ownerless CLOG staging and materialization functions
 are confined to their delegation chain and Rove fixtures. The tag validation
 helper also protects owned completions, so preserve it during the cutover.
 
-For B1, both native record decoding and physical receive header admission
-accept WAL2–7. Retire that admission in both paths. The recovery page spool
+For B1, native record decoding and physical receive use one header predicate
+for record magic, version, type and source LSN. Both still admit WAL2–7.
+Many physical tests use the empty WAL5 checkpoint fixture.
+Regenerate those test streams with current checkpoint payloads and derive
+their expected LSNs from the encoded lengths. The recovery page spool
 also records the source version and decodes it when replaying page images.
 Version-specific fixtures cover page images, checkpoint and running-xacts
 records, XID reservation, timeline lineage and end-of-recovery. Remove

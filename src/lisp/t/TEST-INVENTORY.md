@@ -714,7 +714,7 @@ limitation of Rove: concurrent and stateful tests can use Rove once isolated.
 | --- | --- | --- |
 | `test-wal-catalog-codec-and-page-checksums` | [Rove](rove/wal-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-wal-record-codec` | [Both](rove/wal-tests.lisp) | raw WAL record envelope |
-| `test-wal-v3-maintenance-record-replay` | [Legacy](unit-tests/wal-tests.lisp) | M: replay resets recovery state beyond the currently bound fields |
+| `test-wal-maintenance-record-replay` | [Legacy](unit-tests/wal-tests.lisp) | M: replay resets recovery state beyond the currently bound fields |
 | `test-wal-page-image-xid-codec-compatibility` | [Rove](rove/wal-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-wal-snapshot-boundary-retains-active-xid-pages` | [Legacy](unit-tests/wal-tests.lisp) | M: snapshot/XID release reaches global relation-ownership cleanup |
 | `test-wal-snapshot-release-race-before-pin-publication` | [Legacy](unit-tests/wal-tests.lisp) | T: concurrent actors and shared snapshot/WAL ownership |
@@ -795,7 +795,6 @@ the inline wait assertion remain in [unit-tests.lisp](unit-tests.lisp).
 | `vacuum-full-test-recover-unappended-catalog-record` | [Legacy](unit-tests/vacuum-tests.lisp) |
 | `vacuum-full-test-write-relation-marker` | [Legacy](unit-tests/vacuum-tests.lisp) |
 | `wal-test-append-committed-xid-batch` | [Legacy](unit-tests/wal-tests.lisp) |
-| `wal-test-encode-versioned-record` | [Legacy](unit-tests/wal-tests.lisp) |
 
 ## Process tests and tooling retained
 
