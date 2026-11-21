@@ -669,8 +669,8 @@ properties follows merely from passing the two logical C-peer tests.
   snapshot names. USE requires a read-only REPEATABLE READ transaction before
   its first query, matching C's walsender checks.
 - Standard slots persist a database binding, plugin, and confirmed boundary in
-  their first durable image. PGSLOT4 records the output plugin; PGSLOT1-3 load
-  as `pg_lisp`, preserving the previous private lifecycle. New extension workers
+  their first durable image. PGSLOT4 records the output plugin. The slot reader
+  rejects PGSLOT1–3. New extension workers
   explicitly request `pg_lisp` and verify the result plugin. Standard pgoutput
   START currently fails closed before entering the private handshake or sending
   private DDL/sequence/progress envelopes.

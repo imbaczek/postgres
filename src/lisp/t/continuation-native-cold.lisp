@@ -1224,7 +1224,7 @@
 (defun native-host-cold-logical-compatibility (empty)
   (let* ((old (gethash "ordinary" *wal-replication-slots*))
          (unbound (member (uiop:getenv "PG_NATIVE_COLD_PROOF")
-                          '("load-unbound-logical" "load-legacy-v2") :test #'equal))
+                          '("load-unbound-logical" "load-noncanonical-v4") :test #'equal))
          (slot (make-wal-replication-slot
                 :name "ordinary" :kind :logical
                 :database-oid (unless unbound (wal-replication-slot-database-oid old))
@@ -1237,8 +1237,8 @@
                 :invalidation-cause :none :wal-status :reserved)))
     (slot-state-update
      (wal-replication-slot-directory) "ordinary"
-     (if (equal "load-legacy-v2" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
-         (let ((prefix (format nil "PGSLOT2 ordinary ~d ~d - reserved"
+     (if (equal "load-noncanonical-v4" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+         (let ((prefix (format nil "PGSLOT4 ordinary - 0~d ~d - reserved pg_lisp"
                                (wal-replication-slot-restart-lsn slot)
                                (wal-replication-slot-consistent-lsn slot))))
            (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))))
@@ -1258,7 +1258,7 @@
              (assert (nth-value 1 (exec-simple-query output "CREATE TABLE continuation_ordinary (id int)"))))
            (create-standard-logical-slot "ordinary" :nothing)
            (when (member (uiop:getenv "PG_NATIVE_COLD_PROOF")
-                         '("load-legacy-logical" "load-unbound-logical" "load-legacy-v2") :test #'equal)
+                         '("load-legacy-logical" "load-unbound-logical" "load-noncanonical-v4") :test #'equal)
              (native-host-cold-logical-compatibility nil))
            (uiop:with-temporary-file (:stream output :direction :io :element-type '(unsigned-byte 8))
              (assert (nth-value 1 (exec-simple-query output "INSERT INTO continuation_ordinary VALUES (117)"))))
@@ -1308,8 +1308,8 @@
          (facts (physical-image-file-facts -100 (namestring path)))
          (bytes (read-bounded-regular-file path +slot-state-maximum-bytes+))
          (selected (native-host-cold-file-image)))
-    (when (equal "load-legacy-v2" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
-      (assert (string= "PGSLOT2" (bytes->string (subseq bytes 0 7))))
+    (when (equal "load-noncanonical-v4" (uiop:getenv "PG_NATIVE_COLD_PROOF"))
+      (assert (string= "PGSLOT4" (bytes->string (subseq bytes 0 7))))
       (assert (not (equalp bytes
                            (wal-encode-replication-slot (gethash "ordinary" *wal-replication-slots*))))))
     (call-with-logical-slot-continuation-native-proof
@@ -2269,7 +2269,7 @@
                          "publish-notify" "publish-before-retirement" "publish-lost-registration") :test #'equal)
                (native-host-cold-publication-failure gate ownership (uiop:getenv "PG_NATIVE_COLD_PROOF")))
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
-                       '("load-logical" "load-legacy-logical" "load-unbound-logical" "load-legacy-empty" "load-legacy-v2")
+                       '("load-logical" "load-legacy-logical" "load-unbound-logical" "load-legacy-empty" "load-noncanonical-v4")
                        :test #'equal)
                (native-host-cold-logical-publication gate ownership))
               ((equal "load-physical" (uiop:getenv "PG_NATIVE_COLD_PROOF"))

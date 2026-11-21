@@ -121,6 +121,11 @@ and existing identities still use the same system identifier projection.
 The read path no longer generates a replacement identity.
 Replay, adoption and slot checks compare stored identities directly.
 
+For B7, logical slot decode rejects PGSLOT1–3. PGSLOT4/5 remain supported
+because current writers emit them, alongside the provenance and child owner
+formats. Continuation fixtures use noncanonical PGSLOT4 values to verify
+that inventory and no-op proof paths preserve the original bytes.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The

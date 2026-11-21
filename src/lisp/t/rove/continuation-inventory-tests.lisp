@@ -25,7 +25,7 @@
 
 (defun unit-continuation-inventory-mixed-rows ()
   (let* ((p7 (second (third (multiple-value-list (unit-continuation-active-inputs)))))
-         (prefix "PGSLOT1 legacy 0000 0000")
+         (prefix "PGSLOT4 legacy - 0000 0000 - reserved pg_lisp")
          (legacy (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))))
          (physical (wal-encode-replication-slot
                     (make-wal-replication-slot :name "physical" :kind :physical :system-id 42
@@ -195,7 +195,7 @@
                                             (namestring (merge-pathnames "../inventory-saved"
                                                                          (physical-image-fd-path directory)))))
                           (:valid-rewrite
-                           (let* ((prefix "PGSLOT1 legacy 0000 0001")
+                           (let* ((prefix "PGSLOT4 legacy - 0000 0001 - reserved pg_lisp")
                                   (bytes (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))
                              (wal-decode-replication-slot bytes "legacy")
                              (with-open-file (stream state :direction :output :if-exists :overwrite
@@ -208,7 +208,7 @@
                           (sb-posix:mkdir (namestring row) #o700)
                           (with-open-file (stream state :direction :output :if-exists :error
                                                         :element-type '(unsigned-byte 8))
-                            (let ((prefix "PGSLOT1 legacy 0000 0000"))
+                            (let ((prefix "PGSLOT4 legacy - 0000 0000 - reserved pg_lisp"))
                               (write-sequence (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))) stream)))
                           (sb-posix:chmod (namestring state) #o600))))))
              (rove:ok
@@ -252,7 +252,7 @@
     (let* ((*wal-durable-lsn* 192)
            (rows (loop for i below +logical-slot-continuation-obligation-limit+
                        for name = (format nil "slot_~4,'0d" i)
-                       for prefix = (format nil "PGSLOT1 ~a 0 0" name)
+                       for prefix = (format nil "PGSLOT4 ~a - 0 0 - reserved pg_lisp" name)
                        collect (list name (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))))
       (unit-continuation-inventory-fixture
        rows
@@ -309,7 +309,7 @@
                  collect
                  (list name
                        (case (mod (+ i seed) 3)
-                         (0 (let ((prefix (format nil "PGSLOT1 ~a ~a ~a" name
+                         (0 (let ((prefix (format nil "PGSLOT4 ~a - ~a ~a - reserved pg_lisp" name
                                                   (if (oddp seed) "0000" "0") (if (oddp i) "0000" "0"))))
                               (string->bytes (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix))))))
                          (1 (let ((slot (wal-copy-replication-slot-with-profile sample)))

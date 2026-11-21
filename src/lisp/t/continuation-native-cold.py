@@ -80,7 +80,7 @@ PROOF_MARKERS = {
     'load-legacy-logical': 'NATIVE-COLD-LOGICAL',
     'load-unbound-logical': 'NATIVE-COLD-LOGICAL',
     'load-legacy-empty': 'NATIVE-COLD-LOGICAL',
-    'load-legacy-v2': 'NATIVE-COLD-LOGICAL',
+    'load-noncanonical-v4': 'NATIVE-COLD-LOGICAL',
     'load-mixed-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'load-mixed-staging-refusal': 'NATIVE-COLD-LOADER-REFUSAL',
     'publish': 'NATIVE-COLD-PUBLICATION',
@@ -131,7 +131,7 @@ COLD_RECONCILIATION_CUTS = {
     'replacement-after-directory-sync', 'stable-durable',
 }
 LOGICAL_PROOFS = {'load-empty-logical', 'load-logical', 'load-legacy-logical', 'load-unbound-logical',
-                  'load-legacy-empty', 'load-legacy-v2'}
+                  'load-legacy-empty', 'load-noncanonical-v4'}
 COLD_PUBLICATION_CUTS = {
     'completion-ready', 'before-group-pin', 'after-group-pin', 'maps-ready',
     'derived', 'prepared', 'before-commit', 'after-commit', 'before-owner-return',
