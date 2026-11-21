@@ -36,12 +36,28 @@
   "Return the supported SQL type identifier for OID, or NIL."
   (values (gethash oid *sql-type-identifiers-by-oid*)))
 
+(defun sql-varchar-typmod (length)
+  "Encode a declared varchar character count as a PostgreSQL type modifier."
+  (when (< length 1)
+    (ereport "22023" "length for type varchar must be at least 1"))
+  (when (> length 10485760)
+    (ereport "22023" "length for type varchar cannot exceed 10485760"))
+  (+ length 4))
+
+(defun constrain-varchar-value (value typmod explicit-p)
+  (let ((maximum (- typmod 4)))
+    (if (and (>= maximum 0) (or explicit-p (> (length value) maximum)))
+        (progn
+          (when (and (not explicit-p)
+                     (position-if-not (lambda (character) (char= character #\Space)) value :start maximum))
+            (ereport "22001" "value too long for type character varying(~a)" maximum))
+          (subseq value 0 (min maximum (length value))))
+        value)))
+
+(defun sql-varchar-cast-value (value typmod)
+  "Truncate an explicit cast to the varchar character limit."
+  (constrain-varchar-value value typmod t))
+
 (defun sql-varchar-assignment-value (value typmod)
   "Apply the assignment length rule, allowing only spaces beyond the limit."
-  (let ((maximum (- typmod 4)))
-    (if (and (>= typmod 4) (> (length value) maximum))
-        (progn
-          (when (position-if-not (lambda (character) (char= character #\Space)) value :start maximum)
-            (ereport "22001" "value too long for type character varying(~a)" maximum))
-          (subseq value 0 maximum))
-        value)))
+  (constrain-varchar-value value typmod nil))

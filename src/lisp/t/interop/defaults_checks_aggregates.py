@@ -7,6 +7,17 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT CAST('é漢字' AS varchar(2)), 'é漢字'::character varying(2)",
+    "SELECT 'x'::varchar(0)",
+    "SELECT 'x'::varchar(10485761)",
+    "CREATE TABLE dc_bad_varchar(v varchar(0))",
+    "CREATE TABLE dc_bad_varchar(v varchar(10485761))",
+    "CREATE TABLE dc_varchar_rules(v varchar(2))",
+    "INSERT INTO dc_varchar_rules VALUES ('é漢 ')",
+    "INSERT INTO dc_varchar_rules VALUES ('é漢字')",
+    "UPDATE dc_varchar_rules SET v = '漢字 '",
+    "UPDATE dc_varchar_rules SET v = '漢字é'",
+    "SELECT v FROM dc_varchar_rules",
     r"SELECT get_byte('\x00ff'::bytea,1),get_bit('\x0081'::bytea,8),get_bit('\x0081'::bytea,15)",
     r"SELECT set_byte('\x00ff'::bytea,0,258),set_bit('\x0081'::bytea,9,1)",
     "SELECT get_bit(B'101',0),set_bit(B'101',1,1),get_bit('101',0)",

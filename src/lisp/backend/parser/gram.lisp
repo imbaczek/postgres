@@ -1075,13 +1075,9 @@ Range and negative checks occur when the LIMIT executes."
 
 (defun parse-varchar-typmod (p)
   (if (match-punct p #\()
-      (let ((n (with-parens (p :opening-consumed t)
-                 (parse-integer-literal p))))
-        (when (< n 1)
-          (ereport "22023" "length for type varchar must be at least 1"))
-        (when (> n 10485760)
-          (ereport "22023" "length for type varchar cannot exceed 10485760"))
-        (+ n 4))
+      (sql-varchar-typmod
+       (with-parens (p :opening-consumed t)
+         (parse-integer-literal p)))
       -1))
 
 (defun parse-unique-null-treatment (p)
@@ -1606,15 +1602,6 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
                (setf left (list :binop operator left (parse-unary p)))))
     left))
 
-(defun parse-expression-varchar-typmod (p)
-  (if (match-punct p #\()
-      (with-parens (p :opening-consumed t)
-        (let ((length (parse-integer-literal p)))
-          (unless (<= 1 length 10485760)
-            (ereport "22023" "length for type varchar is out of range"))
-          (+ length 4)))
-      -1))
-
 (defun type-modifier-input-string (expression)
   "Match typenameTypeMod's constant/identifier validation before integer input."
   (cond
@@ -1721,10 +1708,10 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
       ((or (string= name "bool")
            (and (not quoted) (not qualified) (string= name "boolean")))
        (values :bool -1))
-      ((string= name "varchar") (values :varchar (parse-expression-varchar-typmod p)))
+      ((string= name "varchar") (values :varchar (parse-varchar-typmod p)))
       ((and (not quoted) (not qualified) (string= name "character")
             (match-kw p "varying"))
-       (values :varchar (parse-expression-varchar-typmod p)))
+       (values :varchar (parse-varchar-typmod p)))
       (t (ereport "0A000" "unsupported expression type \"~a\"" name)))))
 
 (defun parse-cast-type (p)
