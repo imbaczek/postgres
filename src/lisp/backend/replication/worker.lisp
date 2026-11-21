@@ -1205,38 +1205,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                           (logical-bound-query
                            (lambda (stream) (logical-write-insert stream relation tuple))))))
 
-(defun logical-pgoutput-read-insert (payload position)
-  (unless (and (< position (length payload))
-               (= (aref payload position) (char-code #\N)))
-    (error "pgoutput INSERT lacks a new tuple"))
-  (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple payload (1+ position))
-    (unless (= end (length payload)) (error "pgoutput INSERT has trailing bytes"))
-    tuple))
-
-(defun logical-apply-insert (runtime relation payload position)
-  (logical-apply-insert-tuple runtime relation
-                              (logical-pgoutput-read-insert payload position)))
-
-(defun logical-pgoutput-read-update (payload position)
-  "Read nonstreamed UPDATE tuples in C logicalrep_read_update field order."
-  (when (>= position (length payload)) (error "truncated pgoutput UPDATE"))
-  (let ((kind (code-char (aref payload position)))
-        (initial-kind (code-char (aref payload position)))
-        (old-tuple nil)
-        (new-tuple nil))
-    (when (member kind '(#\K #\O))
-      (multiple-value-setq (old-tuple position)
-        (logical-pgoutput-read-tuple payload (1+ position)))
-      (when (>= position (length payload)) (error "truncated pgoutput UPDATE"))
-      (setf kind (code-char (aref payload position))))
-    (unless (char= kind #\N)
-      (error "pgoutput UPDATE lacks a new tuple"))
-    (multiple-value-setq (new-tuple position)
-      (logical-pgoutput-read-tuple payload (1+ position)))
-    (unless (= position (length payload))
-      (error "pgoutput UPDATE has trailing bytes"))
-    (values old-tuple new-tuple initial-kind)))
-
 (defun logical-pgoutput-key-values (relation tuple)
   "Project a relation-width tuple onto its replica identity columns."
   (unless (= (length tuple) (length (pgoutput-relation-columns relation)))
@@ -1283,18 +1251,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                               (logical-write-update stream relation old-tuple new-tuple)))))))
       (logical-assert-one-row-affected tag "UPDATE"))))
 
-(defun logical-apply-update (runtime relation payload position)
-  (multiple-value-bind (old-tuple new-tuple kind)
-      (logical-pgoutput-read-update payload position)
-    (logical-apply-update-tuples runtime relation old-tuple new-tuple kind)))
-
-(defun logical-pgoutput-read-delete (payload position)
-  (when (>= position (length payload)) (error "truncated pgoutput DELETE"))
-  (let ((kind (code-char (aref payload position))))
-    (multiple-value-bind (tuple end) (logical-pgoutput-read-tuple payload (1+ position))
-      (unless (= end (length payload)) (error "pgoutput DELETE has trailing bytes"))
-      (values tuple kind))))
-
 (defun logical-apply-delete-tuple (runtime relation tuple kind)
   (when (logical-relation-selected-p runtime relation)
     (logical-validate-pgoutput-tuple relation tuple nil)
@@ -1307,10 +1263,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                            (logical-bound-query
                             (lambda (stream) (logical-write-delete stream relation tuple)))))))
       (logical-assert-one-row-affected tag "DELETE"))))
-
-(defun logical-apply-delete (runtime relation payload position)
-  (multiple-value-bind (tuple kind) (logical-pgoutput-read-delete payload position)
-    (logical-apply-delete-tuple runtime relation tuple kind)))
 
 (defun logical-progress-transaction-commit (runtime commit-lsn)
   (let* ((options (logical-subscription-runtime-options runtime))

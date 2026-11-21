@@ -1620,13 +1620,18 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
   (ok (= pg::*server-version-num* 200000))
   (ok (string= (pg::eval-func "version" nil) "PostgreSQL 20devel (pg-lisp 0.1)")))
 
+(defun decode-test-pgoutput-row (payload)
+  (pg::logical-pgoutput-read-operation
+   (pg::make-logical-subscription-runtime :transaction-open-p t)
+   payload))
+
 (deftest malformed-update
     (dolist (bytes '(#(85 0 0 0 7)
                      #(85 0 0 0 7 88)
                      #(85 0 0 0 7 75 0 0)
                      #(85 0 0 0 7 78 0 0 0)))
       (ok (handler-case
-              (progn (pg::logical-pgoutput-read-update (octets bytes) 5) nil)
+              (progn (decode-test-pgoutput-row (octets bytes)) nil)
             (simple-error () t)))))
 
 (deftest unsupported-tuple-representations
@@ -1668,14 +1673,15 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (let* ((id (pg::make-pgoutput-column :name "id" :type-oid 25 :key-p t))
            (body (pg::make-pgoutput-column :name "body" :type-oid 25))
            (relation (pg::make-pgoutput-relation :columns (list id body) :key-columns (list id)))
-           (payload (octets #(75 0 2 116 0 0 0 1 55 110 78 0 2 117 117))))
-      (multiple-value-bind (old new kind) (pg::logical-pgoutput-read-update payload 0)
+           (payload (octets #(85 0 0 0 7 75 0 2 116 0 0 0 1 55 110 78 0 2 117 117))))
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row payload)
+        (declare (ignore tag oid))
         (ok (char= kind #\K))
         (ok (equal (pg::logical-row-key-predicate
                     (pg::logical-pgoutput-key-values relation old) (list id)) "id = '7'"))
         (ok (equal (pg::logical-update-set-clause relation new) "id = id")))
       (ok (handler-case
-              (progn (pg::logical-pgoutput-read-update (subseq payload 0 14) 0) nil)
+              (progn (decode-test-pgoutput-row (subseq payload 0 19)) nil)
             (simple-error () t)))))
 
 (deftest unchanged-toast-marker-context-and-types
@@ -1685,7 +1691,8 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
            (relation (pg::make-pgoutput-relation :name "t" :columns (list id number body)
                                                  :key-columns (list id)))
            (runtime (pg::make-logical-subscription-runtime
-                     :options (pg::make-logical-subscription-options :tables '("t"))))
+                     :options (pg::make-logical-subscription-options :tables '("t"))
+                     :transaction-open-p t))
            (original (symbol-function 'pg::logical-target-query))
            (queries nil)
            (valid (octets #(75 0 3 116 0 0 0 1 55 110 110
@@ -1695,66 +1702,67 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
            (bad-fixed (octets #(75 0 3 116 0 0 0 1 55 110 110
                                 78 0 3 117 117 117))))
       (setf (gethash "t" (pg::logical-subscription-runtime-validated-relations runtime)) t)
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'pg::logical-target-query)
-                   (lambda (target query) (declare (ignore target))
-                     (push (if (pg::pg-client-query-plan-p query)
-                               (with-output-to-string (stream)
-                                 (funcall (pg::pg-client-query-plan-writer query) stream))
-                               query)
-                           queries)
-                     (values nil nil "UPDATE 1")))
-             ;; A varlena key may be unchanged when an old K tuple supplies it.
-             (pg::logical-apply-update runtime relation valid 0)
-             (let ((query (first queries)))
-               (ok (pg::pg-client-bound-query-p query))
-               (ok (equal (pg::pg-client-bound-query-sql query) "UPDATE t SET n = $1 WHERE id = $2"))
-               (ok (equal (mapcar #'car (pg::pg-client-bound-query-parameters query)) '(23 25)))
-               (ok (equal (mapcar (lambda (param)
-                                    (with-output-to-string (out) (funcall (cdr param) out)))
-                                  (pg::pg-client-bound-query-parameters query))
-                          '("1" "7"))))
-             (setf queries nil)
-             ;; Without K, the new tuple supplies the key, so a key marker is unusable.
-             (ok (handler-case
-                     (progn (pg::logical-apply-update
-                             runtime relation (octets #(78 0 3 117 116 0 0 0 1 49 117)) 0)
-                            nil)
-                   (error () t)))
-             (ok (null queries))
-             ;; Unselected relations can carry unsupported types and remain ignored.
-             (let ((excluded (pg::make-pgoutput-relation :name "excluded"
-                                                         :columns (list id number body)
-                                                         :key-columns (list id))))
-               (setf (pg::pgoutput-column-type-oid body) 999999)
-               (ok (null (pg::logical-apply-update runtime excluded bad-fixed 0)))
+      (flet ((dispatch-row (tag relation tuple-body)
+               (setf (gethash 7 (pg::logical-subscription-runtime-relations runtime)) relation)
+               (pg::logical-pgoutput-dispatch
+                runtime (octets (concatenate 'vector (vector (char-code tag) 0 0 0 7) tuple-body)))))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'pg::logical-target-query)
+                     (lambda (target query) (declare (ignore target))
+                       (push (if (pg::pg-client-query-plan-p query)
+                                 (with-output-to-string (stream)
+                                   (funcall (pg::pg-client-query-plan-writer query) stream))
+                                 query)
+                             queries)
+                       (values nil nil "UPDATE 1")))
+               ;; A varlena key may be unchanged when an old K tuple supplies it.
+               (dispatch-row #\U relation valid)
+               (let ((query (first queries)))
+                 (ok (pg::pg-client-bound-query-p query))
+                 (ok (equal (pg::pg-client-bound-query-sql query) "UPDATE t SET n = $1 WHERE id = $2"))
+                 (ok (equal (mapcar #'car (pg::pg-client-bound-query-parameters query)) '(23 25)))
+                 (ok (equal (mapcar (lambda (param)
+                                      (with-output-to-string (out) (funcall (cdr param) out)))
+                                    (pg::pg-client-bound-query-parameters query))
+                            '("1" "7"))))
+               (setf queries nil)
+               ;; Without K, the new tuple supplies the key, so a key marker is unusable.
+               (ok (handler-case
+                       (progn (dispatch-row #\U relation #(78 0 3 117 116 0 0 0 1 49 117))
+                              nil)
+                     (error () t)))
                (ok (null queries))
-               (setf (pg::pgoutput-column-type-oid body) 17))
-             (dolist (payload (list bad-old bad-fixed))
-               (ok (handler-case (progn (pg::logical-apply-update runtime relation payload 0) nil)
+               ;; Unselected relations can carry unsupported types and remain ignored.
+               (let ((excluded (pg::make-pgoutput-relation :name "excluded"
+                                                           :columns (list id number body)
+                                                           :key-columns (list id))))
+                 (setf (pg::pgoutput-column-type-oid body) 999999)
+                 (ok (null (dispatch-row #\U excluded bad-fixed)))
+                 (ok (null queries))
+                 (setf (pg::pgoutput-column-type-oid body) 17))
+               (dolist (payload (list bad-old bad-fixed))
+                 (ok (handler-case (progn (dispatch-row #\U relation payload) nil)
+                       (error () t))))
+               (ok (handler-case
+                       (progn (dispatch-row #\I relation #(78 0 3 116 0 0 0 1 55 110 117)) nil)
+                     (error () t)))
+               (ok (handler-case
+                       (progn (dispatch-row #\D relation #(75 0 3 116 0 0 0 1 55 110 117)) nil)
+                     (error () t)))
+               (ok (handler-case
+                       (progn (pg::logical-validate-pgoutput-tuple relation #("7" "1" :unchanged-toast) nil) nil)
+                     (error () t)))
+               (ok (handler-case
+                       (progn (pg::logical-validate-pgoutput-tuple relation #("7" :unchanged-toast "v") t) nil)
+                     (error () t)))
+               (ok (pg::logical-validate-pgoutput-tuple relation #(:unchanged-toast "1" :unchanged-toast) t))
+               (ok (handler-case
+                       (progn (pg::logical-row-key-predicate
+                               (pg::logical-pgoutput-key-values relation #(:unchanged-toast "1" "v"))
+                               (list id)) nil)
                      (error () t))))
-             (ok (handler-case
-                     (progn (pg::logical-apply-insert runtime relation
-                                                      (octets #(78 0 3 116 0 0 0 1 55 110 117)) 0) nil)
-                   (error () t)))
-             (ok (handler-case
-                     (progn (pg::logical-apply-delete runtime relation
-                                                      (octets #(75 0 3 116 0 0 0 1 55 110 117)) 0) nil)
-                   (error () t)))
-             (ok (handler-case
-                     (progn (pg::logical-validate-pgoutput-tuple relation #("7" "1" :unchanged-toast) nil) nil)
-                   (error () t)))
-             (ok (handler-case
-                     (progn (pg::logical-validate-pgoutput-tuple relation #("7" :unchanged-toast "v") t) nil)
-                   (error () t)))
-             (ok (pg::logical-validate-pgoutput-tuple relation #(:unchanged-toast "1" :unchanged-toast) t))
-             (ok (handler-case
-                     (progn (pg::logical-row-key-predicate
-                             (pg::logical-pgoutput-key-values relation #(:unchanged-toast "1" "v"))
-                             (list id)) nil)
-                   (error () t))))
-        (setf (symbol-function 'pg::logical-target-query) original))))
+          (setf (symbol-function 'pg::logical-target-query) original)))))
 
 (deftest invalid-message-flags
     (dolist (flags '(1 2 128))
@@ -1785,10 +1793,12 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
            (truncate (find 84 frames :key (lambda (frame) (aref frame 0)))))
       (ok (= 24 (length frames)))
       (ok (= 2 (length updates)))
-      (multiple-value-bind (old new) (pg::logical-pgoutput-read-update (first updates) 5)
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row (first updates))
+        (declare (ignore tag oid kind))
         (ok (null old))
         (ok (equalp new #("1" "3"))))
-      (multiple-value-bind (old new) (pg::logical-pgoutput-read-update (second updates) 5)
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row (second updates))
+        (declare (ignore tag oid kind))
         (ok (equalp old #("1" nil)))
         (ok (equalp new #("4" "3"))))
       (ok (equal '(24587) (pg::logical-pgoutput-read-truncate truncate)))
@@ -1818,13 +1828,15 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
 
 (deftest excluded-full-identity-update
     (let ((runtime (pg::make-logical-subscription-runtime
-                    :options (pg::make-logical-subscription-options)))
+                    :options (pg::make-logical-subscription-options)
+                    :transaction-open-p t))
           (relation (pg::make-pgoutput-relation :name "excluded")))
+      (setf (gethash 7 (pg::logical-subscription-runtime-relations runtime)) relation)
       (ok (null
-           (pg::logical-apply-update
-            runtime relation
+           (pg::logical-pgoutput-dispatch
+            runtime
             (octets #(85 0 0 0 7 79 0 1 116 0 0 0 1 49
-                      78 0 1 116 0 0 0 1 50)) 5)))))
+                      78 0 1 116 0 0 0 1 50)))))))
 
 (deftest truncate-requires-transaction
     (ok (handler-case
@@ -1857,18 +1869,20 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
 
 (deftest update-without-old-key
     ;; U, relid=7, N, two text columns: id=1 and amount=2.
-    (multiple-value-bind (old new)
-        (pg::logical-pgoutput-read-update
-         (octets #(85 0 0 0 7 78 0 2 116 0 0 0 1 49 116 0 0 0 1 50)) 5)
+    (destructuring-bind (tag oid old new kind)
+        (decode-test-pgoutput-row
+         (octets #(85 0 0 0 7 78 0 2 116 0 0 0 1 49 116 0 0 0 1 50)))
+      (declare (ignore tag oid kind))
       (ok (null old))
       (ok (equalp new #("1" "2")))))
 
 (deftest update-with-old-key
     ;; C retains relation width in K: non-key attributes are NULL.
-    (multiple-value-bind (old new)
-        (pg::logical-pgoutput-read-update
+    (destructuring-bind (tag oid old new kind)
+        (decode-test-pgoutput-row
          (octets #(85 0 0 0 7 75 0 2 116 0 0 0 1 49 110
-                   78 0 2 116 0 0 0 1 51 116 0 0 0 1 50)) 5)
+                   78 0 2 116 0 0 0 1 51 116 0 0 0 1 50)))
+      (declare (ignore tag oid kind))
       (ok (equalp old #("1" nil)))
       (ok (equalp new #("3" "2")))))
 

@@ -212,6 +212,9 @@ through the same grammar. Stream fields retain their bounded spill and cleanup
 rules. In-memory text and binary fields own their values. The independent
 INSERT fixture uses the C tuple field order and checks null, unchanged TOAST,
 UTF-8 text, and binary data after overwriting the input bytes.
+The test-only INSERT, UPDATE, and DELETE adapters and their duplicate tuple
+framing code have been retired. Malformed packet and C wire fixtures now
+exercise the shared operation decoder, and apply tests use dispatch.
 
 The startup settings registry uses named, read-only descriptors for context,
 kind, boot value, integer bounds, and units. Configuration ingestion, reload,

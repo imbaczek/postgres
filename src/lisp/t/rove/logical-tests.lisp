@@ -389,39 +389,6 @@
              (equal (unit-byte-span-outcome #'unit-byte-span-reference bytes start end)
                     (unit-byte-span-outcome #'bytes->string bytes start end))))))))
 
-(rove:deftest test-row-decoders-reject-malformed-before-apply
-    (let ((insert (symbol-function 'logical-apply-insert-tuple))
-          (update (symbol-function 'logical-apply-update-tuples))
-          (delete (symbol-function 'logical-apply-delete-tuple))
-          (calls 0))
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'logical-apply-insert-tuple)
-                   (lambda (&rest args) (declare (ignore args)) (incf calls))
-                   (symbol-function 'logical-apply-update-tuples)
-                   (lambda (&rest args) (declare (ignore args)) (incf calls))
-                   (symbol-function 'logical-apply-delete-tuple)
-                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
-             (dolist (entry (list (list #'logical-apply-insert #(78 0 0 1))
-                                  (list #'logical-apply-update #(78 0 0 1))
-                                  (list #'logical-apply-delete #(75 0 0 1))
-                                  (list #'logical-apply-insert #(78 0))
-                                  (list #'logical-apply-update #(78 0))
-                                  (list #'logical-apply-update #(75 0 0 78 0))
-                                  (list #'logical-apply-update #(75 0 0 78 0 0 1))
-                                  (list #'logical-apply-delete #(75 0))))
-               (rove:ok (handler-case
-                            (progn (funcall (first entry) nil nil (second entry) 0) nil)
-                          (error () t))))
-             (rove:ok (zerop calls))
-             (logical-apply-insert nil nil #(78 0 0) 0)
-             (logical-apply-update nil nil #(78 0 0) 0)
-             (logical-apply-delete nil nil #(75 0 0) 0)
-             (rove:ok (= calls 3)))
-        (setf (symbol-function 'logical-apply-insert-tuple) insert
-              (symbol-function 'logical-apply-update-tuples) update
-              (symbol-function 'logical-apply-delete-tuple) delete))))
-
 (rove:deftest test-pgoutput-vector-adapter-applies-only-decoded-operations
     (let* ((runtime (make-logical-subscription-runtime
                      :options (make-logical-subscription-options) :transaction-open-p t))
@@ -440,9 +407,15 @@
                               (list (list #\I 7 #()) (list #\U 7 nil #() #\N)
                                     (list #\D 7 #() #\K))))
              (setf operations nil)
-             (rove:ok (handler-case
-                          (progn (logical-pgoutput-dispatch runtime #(73 0 0 0 7 78 0 0 1)) nil)
-                        (error () t)))
+             (dolist (payload '(#(73 0 0 0 7 78 0 0 1)
+                                #(85 0 0 0 7 78 0 0 1)
+                                #(68 0 0 0 7 75 0 0 1)
+                                #(73 0 0 0 7 78 0)
+                                #(85 0 0 0 7 78 0)
+                                #(85 0 0 0 7 75 0 0 78 0)
+                                #(85 0 0 0 7 75 0 0 78 0 0 1)
+                                #(68 0 0 0 7 75 0)))
+               (rove:ok (rove:signals (logical-pgoutput-dispatch runtime payload) 'error)))
              (rove:ok (null operations)))
         (setf (symbol-function 'logical-pgoutput-apply-operation) original))))
 
@@ -1448,8 +1421,9 @@
            (payload (pgoutput-build-row-change decoded)))
       (rove:ok (= 5 (aref encoded 1)))
       (rove:ok (eq +logical-unchanged-toast+ (aref (logical-change-new-values decoded) 2)))
-      (multiple-value-bind (old new kind) (logical-pgoutput-read-update payload 5)
-        (declare (ignore old kind))
+      (destructuring-bind (tag oid old new kind)
+          (logical-pgoutput-read-operation (make-logical-subscription-runtime :transaction-open-p t) payload)
+        (declare (ignore tag oid old kind))
         (rove:ok (eq :unchanged-toast (aref new 2))))
       (let ((*logical-validation-only* t))
         (rove:ok (eq +logical-unchanged-toast+
@@ -3409,11 +3383,11 @@
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-pgoutput-binary-truncated-and-trailing-rejected
-    (dolist (payload (list #(78 0 1 98 0 0 0 2 42)
-                           #(78 0 1 98 255 255 255 254)
-                           #(78 0 1 98 0 0 0 1 42 0)))
-      (rove:ok (handler-case (progn (logical-pgoutput-read-insert payload 0) nil)
-                 (error () t)))))
+    (let ((runtime (make-logical-subscription-runtime :transaction-open-p t)))
+      (dolist (payload '(#(73 0 0 0 7 78 0 1 98 0 0 0 2 42)
+                         #(73 0 0 0 7 78 0 1 98 255 255 255 254)
+                         #(73 0 0 0 7 78 0 1 98 0 0 0 1 42 0)))
+        (rove:ok (rove:signals (logical-pgoutput-read-operation runtime payload) 'error)))))
 
 (rove:deftest test-logical-json-row-change
     (let* ((value "{ \"a\": 1, \"a\": [null, true] }")
@@ -3864,7 +3838,10 @@
                     (pgoutput-emit-row-change decoded (lambda (part)
                                                         (if (integerp part) (payload-push-byte binary part)
                                                             (payload-push binary part))))
-                    (let ((tuple (logical-pgoutput-read-insert binary 5)))
+                    (destructuring-bind (tag oid tuple)
+                        (logical-pgoutput-read-operation
+                         (make-logical-subscription-runtime :transaction-open-p t) binary)
+                      (declare (ignore tag oid))
                       (rove:ok (equalp (logical-binary-bytea-data (aref tuple 2)) bytes))))
                   (rove:ok (handler-case
                                (progn
