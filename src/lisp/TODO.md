@@ -330,6 +330,11 @@ helpers.
   adapter was removed. `t/logical-interior-ack.sh` confirmed exact transaction
   replay after the publisher crashed with an interior acknowledgment, and
   confirmed that a durable acknowledgment at transaction end suppressed replay.
+- After the test-only dispatch wrapper was removed, the combined unit suite,
+  protocol interop suite, and live `pg-interop-tests/apply` suite passed.
+  Live replay applied all six captured C transactions, checked the committed
+  progress LSNs, and verified rollback of a multi-relation TRUNCATE. Observer
+  queries on truncated relations run after transaction end releases the locks.
 
 ## Open development tasks
 
