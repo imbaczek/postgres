@@ -3194,6 +3194,9 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
           nil)
          (t (error "unsupported WAL terminal")))))))
 
+(defvar *wal-recovery-required-clog-reset* nil
+  "First proven replacement required when startup found a short CLOG file.")
+
 (defun wal-replay-terminal (record)
   (let* ((type (wal-record-type record))
          (decoded (wal-recovery-decode-terminal record)))
@@ -3215,9 +3218,6 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
             (unless (recovery-in-progress-p) (xid-restore-reservation-floor decoded))))
          (t #'values)))
      (= type +wal-record-catalog-commit+))))
-
-(defvar *wal-recovery-required-clog-reset* nil
-  "First proven replacement required when startup found a short CLOG file.")
 
 (defun wal-replay-record (record)
   (when (> (wal-record-end record) *wal-checkpoint-lsn*)
