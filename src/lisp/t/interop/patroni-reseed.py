@@ -888,7 +888,7 @@ class RewindWorkerArchiveAcceptance(RewindArchiveCliAcceptance):
             divergent = identity(self.server.port)
             assert lsn_number(divergent["position"]) >= 16 * 1024 * 1024
             wal = data / "pg_wal"
-            name = "0000000000000000.wal"
+            name = "000000010000000000000000.wal"
             receipt = wal / "archive_status" / (name + ".done")
             follow.wait_for(receipt.is_file)
             archived = self.archive / name
