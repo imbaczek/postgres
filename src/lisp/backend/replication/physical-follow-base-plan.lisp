@@ -108,7 +108,7 @@
                  (= seed (physical-store-floor-digest model) (physical-store-written-digest model)
                     (physical-store-flushed-digest model))
                  (equal before (getf binding :before))
-                 (equal (physical-store-control-tuple model) (getf binding :after))
+                 (physical-receive-control-matches-p (physical-store-control-snapshot model) (getf binding :after))
                  (equal pair (getf binding :applied)) (equal pair (getf binding :required))
                  (equal (getf base :cluster-identity) (getf (getf binding :recovery) :cluster-identity))
                  (= observed (getf base :next-xid) (getf (getf binding :recovery) :observed-next-xid))

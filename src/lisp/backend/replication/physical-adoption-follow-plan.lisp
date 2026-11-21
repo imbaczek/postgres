@@ -79,7 +79,7 @@
          (anchor (getf binding :anchor))
          (end (getf stage :end))
          (pair (getf binding :required)))
-    (unless (and (equal (physical-store-control-tuple store) (getf binding :before))
+    (unless (and (physical-receive-control-matches-p (physical-store-control-snapshot store) (getf binding :before))
                  (every (lambda (key) (equal (getf base key) (getf stage key)))
                         '(:system-id :cluster-identity :timeline :checkpoint :end :manifest-digest :logical-base-anchor))
                  (zerop (getf control :phase))

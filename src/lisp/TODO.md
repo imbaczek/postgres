@@ -86,8 +86,11 @@ helpers.
   snapshots before and after receive publication. Rewind uses the complete
   snapshot for readback before publishing in-memory state or removing the
   discarded tail. Retained WAL sealing, archive readback, promotion source
-  checks and standby slot validation also use complete snapshots. The
-  remaining persisted-witness consumers still need migration.
+  checks and standby slot validation also use complete snapshots. Follow
+  replay, adoption planning and reseed installation, activation and
+  retirement match current snapshots against the existing persisted
+  witnesses. The follow controller and logical slot copy still carry
+  positional state in memory.
 
 ## Open development tasks
 

@@ -102,7 +102,7 @@
   (funcall check)
   (physical-store-check-held-lock store)
   (physical-store-check-complete-input store)
-  (unless (equal (getf binding :after) (physical-store-control-tuple store))
+  (unless (physical-receive-control-matches-p (physical-store-control-snapshot store) (getf binding :after))
     (error "retirement receive tuple differs from the exact activated selection"))
   (physical-store-read-retained-control store (getf binding :after))
   (physical-store-validate-prefix store)
