@@ -1822,54 +1822,62 @@ Expressions wrapping a set result must remain in a separate projection."
                 (second project) (fourth child) (length (second child))))
       child)))
 
-(defun sort-projection-volatile-p (expression)
-  ;; Like the C volatility walk, inspect a SubPlan's test expression, not its
-  ;; separately planned query. Only functions in this executor's set defer.
+(defun some-local-plan-expression (predicate expression)
+  "Visit local expression nodes until PREDICATE succeeds.
+PREDICATE receives the node and the walker for explicitly resolved references.
+Subplans expose their test without entering the prepared query. Calls and
+records expose their executable inputs. Follow the operand of an outer
+reference conservatively, as it is evaluated in the outer frame. Other forms
+may still contain expression lists and are traversed structurally."
   (labels ((walk (form)
              (and (consp form)
-                  (cond
-                    ((eq (first form) :subplan)
-                     (let ((subplan (second form)))
-                       (when (sql-subplan-p subplan)
-                         (walk (sql-subplan-test subplan)))))
-                    ((eq (first form) :func)
-                     (or (member (second form)
-                                 '("nextval" "currval" "setval" "random" "setseed"
-                                   "set_config" "pg_cancel_backend" "pg_terminate_backend"
-                                   "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
-                                   "pg_export_snapshot" "pg_is_in_recovery"
-                                   "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
-                                   "pg_last_xact_replay_timestamp"
-                                   "pg_wal_replay_pause" "pg_wal_replay_resume"
-                                   "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
-                                   "pg_reload_conf" "pg_reload_code"
-                                   "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
-                                   "pg_replication_slot_advance" "pg_control_checkpoint"
-                                   "pg_read_binary_file" "pg_stat_file"
-                                   "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
-                                 :test #'string=)
-                         (walk (third form))))
-                    (t (or (walk (car form)) (walk (cdr form))))))))
+                  (or (funcall predicate form #'walk)
+                      (case (first form)
+                        ((:const :bool :scalar-array-const :col :sort-output :window-ref) nil)
+                        (:subplan
+                         (let ((subplan (second form)))
+                           (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
+                        ((:func :whole-row :outer-ref) (walk (third form)))
+                        (otherwise (or (walk (car form)) (walk (cdr form)))))))))
     (not (null (walk expression)))))
 
+(defun sort-projection-volatile-p (expression)
+  ;; Only functions in the executor's set defer.
+  (some-local-plan-expression
+   (lambda (form walk)
+     (declare (ignore walk))
+     (and (eq (first form) :func)
+          (member (second form)
+                  '("nextval" "currval" "setval" "random" "setseed"
+                    "set_config" "pg_cancel_backend" "pg_terminate_backend"
+                    "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
+                    "pg_export_snapshot" "pg_is_in_recovery"
+                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
+                    "pg_last_xact_replay_timestamp"
+                    "pg_wal_replay_pause" "pg_wal_replay_resume"
+                    "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
+                    "pg_reload_conf" "pg_reload_code"
+                    "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
+                    "pg_replication_slot_advance" "pg_control_checkpoint"
+                    "pg_read_binary_file" "pg_stat_file"
+                    "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
+                  :test #'string=)))
+   expression))
+
 (defun project-set-expression-dependent-p (expression width count targets)
-  ;; Generated slots follow WIDTH source slots. Resolve projected sort-output
-  ;; references too; an invalid reference conservatively requires expansion.
-  (labels ((walk (form)
-             (and (consp form)
-                  (case (first form)
-                    (:col (let ((slot (second form)))
-                            (and (integerp slot) (< width slot) (<= slot (+ width count)))))
-                    (:sort-output
-                     (let ((slot (second form)))
-                       (if (and (integerp slot) (<= 1 slot (length targets)))
-                           (walk (getf (nth (1- slot) targets) :expr))
-                           t)))
-                    (:subplan
-                     (let ((subplan (second form)))
-                       (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                    (otherwise (or (walk (car form)) (walk (cdr form))))))))
-    (not (null (walk expression)))))
+  ;; Generated slots follow WIDTH source slots. An invalid projected sort-output
+  ;; reference conservatively requires expansion.
+  (some-local-plan-expression
+   (lambda (form walk)
+     (case (first form)
+       (:col (let ((slot (second form)))
+               (and (integerp slot) (< width slot) (<= slot (+ width count)))))
+       (:sort-output
+        (let ((slot (second form)))
+          (if (and (integerp slot) (<= 1 slot (length targets)))
+              (funcall walk (getf (nth (1- slot) targets) :expr))
+              t)))))
+   expression))
 
 (defun sort-projection-deferred-slots (node child)
   "Choose volatile targets to evaluate after sorting in either executor.
