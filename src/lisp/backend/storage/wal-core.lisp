@@ -2770,7 +2770,7 @@ specific to the reader's input boundary."
        (= (aref bytes 1) (char-code #\G))
        (= (aref bytes 2) (char-code #\W))
        (= (aref bytes 3) (char-code #\L))
-       (<= +wal-version-v2+ version +wal-version+)
+       (= version +wal-version+)
        (= (wal-u64 bytes 12) expected-lsn)
        (wal-valid-type-p (wal-u16 bytes 6) version)))
 

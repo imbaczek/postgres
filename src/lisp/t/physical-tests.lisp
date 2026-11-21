@@ -101,6 +101,16 @@
       (ok (= 1 (length (pg::physical-wal-decode-input
                         (pg::make-physical-wal-decoder) 0 bytes))))))
 
+(deftest native-wal-readers-reject-retired-record-versions
+    (loop for version from 2 to 7
+          do (let ((bytes (pg::wal-encode-record pg::+wal-record-batch-start+ 0 0 (empty-octets)))
+                   (decoder (pg::make-physical-wal-decoder)))
+               (pg::wal-set-u16 bytes 4 version)
+               (pg::wal-set-u32 bytes 28 (pg::wal-record-crc32 bytes))
+               (ok (signals (pg::wal-decode-record bytes 0) 'error))
+               (ok (signals (pg::physical-wal-decode-input decoder 0 bytes) 'error))
+               (ok (pg::physical-wal-decoder-failed-p decoder)))))
+
 (deftest physical-input-position-and-header-validation
     (let ((bytes (pg::wal-encode-record pg::+wal-record-batch-start+ 0 0 (empty-octets))))
       (dolist (position '(1 32 16777216))

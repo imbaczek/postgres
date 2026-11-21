@@ -55,11 +55,11 @@ are confined to their delegation chain and Rove fixtures. The tag validation
 helper also protects owned completions, so preserve it during the cutover.
 
 For B1, native record decoding and physical receive use one header predicate
-for record magic, version, type and source LSN. Both still admit WAL2–7.
-Many physical tests use the empty WAL5 checkpoint fixture.
-Regenerate those test streams with current checkpoint payloads and derive
-their expected LSNs from the encoded lengths. Source retention, history
-proof, retained inventory overlap and the restartpoint suffix and seal
+for record magic, version, type and source LSN. Both require WAL8, with a
+regression covering checksummed WAL2–7 records in both readers. Physical
+test streams formerly using empty WAL5 checkpoints now use current
+checkpoint payloads and derive expected LSNs from their lengths. Source
+retention, history proof, retained inventory overlap and the restartpoint suffix and seal
 fixtures now construct WAL8 checkpoints. The source fixture binds the
 matching in-memory checkpoint snapshot and keeps its record end at a
 segment boundary. Retained extent and inventory fixtures derive their
@@ -68,6 +68,9 @@ Retained projection fixtures also use WAL8 for overlap, fork clipping,
 multi-timeline carrier selection, and metadata budget checks.
 The historical archive fixture uses WAL8 for the retained base prefix
 and parent tip, including archive-only reads and startup slot checks.
+The cold continuation proof changes a native commit timestamp and checks
+that policy and pending state remain equal while the raw transcript changes.
+The cold proof and ten targeted physical test heads passed after the cutover.
 The recovery page spool
 also records the source version and decodes it when replaying page images.
 Version-specific fixtures cover page images, checkpoint and running-xacts
