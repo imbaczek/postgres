@@ -425,6 +425,25 @@
       (rove:ok (sort-projection-volatile-p (list :subplan quantified)))
       (rove:ok (not (sort-projection-volatile-p (list :subplan nested))))))
 
+(rove:deftest test-local-plan-walk-respects-opaque-payloads
+    (let* ((generated '(:col 3))
+           (volatile '(:func "nextval" ((:const "s"))))
+           (local (list :func "coalesce" (list generated volatile)))
+           (test (make-sql-subplan :kind :any :test local))
+           (nested (make-sql-subplan :kind :scalar :prepared (list :targets (list (list :expr local))))))
+      (rove:ok (sort-projection-volatile-p (list :subplan test)))
+      (rove:ok (project-set-expression-dependent-p (list :subplan test) 2 1 nil))
+      (dolist (expression (list (list :whole-row 1 (list local)) (list :outer-ref 1 local)))
+        (rove:ok (sort-projection-volatile-p expression))
+        (rove:ok (project-set-expression-dependent-p expression 2 1 nil)))
+      (dolist (opaque (list (list :const local) (list :subplan nested)
+                            (list :whole-row 1 nil :fields local)
+                            (list :func "lower" nil :type local)))
+        (rove:ok (not (sort-projection-volatile-p opaque)))
+        (rove:ok (not (project-set-expression-dependent-p opaque 2 1 nil))))
+      (rove:ok (project-set-expression-dependent-p
+                '(:sort-output 1) 2 1 (list (list :expr local))))))
+
 (rove:deftest test-resumable-sort-defers-volatile-projection
     (let* ((*query-temp-directory* (uiop:temporary-directory))
            (*query-work-memory-bytes* 1)
