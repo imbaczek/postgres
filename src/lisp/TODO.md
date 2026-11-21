@@ -414,6 +414,10 @@ still has work outstanding.
   and cleanup recognizes references on a bind alias of the same archive.
   Thirty strict physical test heads and a real bind alias deletion test passed.
   Restart the Lisp server across the reference and hold layout change.
+  In `88058fd9a4f`, registration holds the archive directory through inventory
+  validation and rejects a changed pathname binding before installing the
+  reference. Thirty-one strict physical test heads passed, including injected
+  rebinding and cold rewind.
   Host ownership across continuation restoration still needs verification
   before opening GC. The imported-host fence stays closed.
 
