@@ -32,8 +32,7 @@ start_server() {
         rm -f "$data_dir/pg_wal/test-paused-$pause_at" \
             "$data_dir/pg_wal/test-resume-$pause_at"
         if [ "$pause_at" = after-wal-bytes-flush ]; then
-            # Prime allocation before arming this commit-specific crash point.
-            # Otherwise v7's first reservation flush pauses before the INSERT.
+            # Prime the WAL-backed XID reservation before arming the commit crash point.
             rm -f "$TMP/control.sock"
             "$BASE/pg-lisp.sh" -p "$PORT" -D "$data_dir" \
                 --control-socket "$TMP/control.sock" >> "$LOG" 2>&1 &
@@ -60,8 +59,8 @@ start_server() {
         return 1
     fi
     if [ "$pause_at" = after-wal-bytes-flush ]; then
-        psql_db -c 'SELECT id FROM wal_rows' >/dev/null
-        printf '(setf pg::*wal-test-pause-at* "after-wal-bytes-flush")\n(quit)\n' |
+        psql_db -c 'BEGIN; INSERT INTO wal_rows VALUES (-1); ROLLBACK' >/dev/null
+        printf '(progn (assert (< pg::*next-xid* pg::*xid-batch-end*)) (setf pg::*wal-test-pause-at* "after-wal-bytes-flush"))\n(quit)\n' |
             "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" \
             >"$TMP/arm-wal-bytes.log"
         if grep -q ';; error:' "$TMP/arm-wal-bytes.log"; then
@@ -554,7 +553,7 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
         if data[offset:offset + 4] != b"PGWL":
             raise SystemExit("invalid WAL while inspecting checkpoint images")
         version = struct.unpack_from("<H", data, offset + 4)[0]
-        if version not in (2, 3, 4, 5, 6, 7, 8):
+        if version != 8:
             raise SystemExit("unsupported WAL version while inspecting checkpoint images")
         record_type = struct.unpack_from("<H", data, offset + 6)[0]
         length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -565,30 +564,23 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
             group_images = {}
         elif record_type == 1 and group_images is not None:
             count = struct.unpack_from("<I", data, payload)[0]
-            image_header_size = 8 if version == 2 else 12
             item = payload + 4
             for _ in range(count):
-                if version == 2:
-                    relfilenode, block = struct.unpack_from("<II", data, item)
-                    fork_id = 0
-                else:
-                    relfilenode, fork_id, block = struct.unpack_from("<III", data, item)
-                page = item + image_header_size
+                page = item + 12
+                item = page + page_size
+                if item + 4 > offset + length:
+                    raise SystemExit("truncated page or contributor count in checkpoint WAL")
+                relfilenode, fork_id, block = struct.unpack_from("<III", data, page - 12)
                 if relfilenode == heap_relfilenode and fork_id == 0:
                     page_lsn = struct.unpack_from("<Q", data, page)[0]
                     group_images[block] = page_lsn
-                item += image_header_size + page_size
-                if version >= 4:
-                    if item + 4 > offset + length:
-                        raise SystemExit("truncated contributor count in checkpoint WAL")
-                    tagged_count = struct.unpack_from("<I", data, item)[0]
-                    flags = tagged_count >> 30
-                    if flags == 1 or (flags and version < 7):
-                        raise SystemExit("invalid page provenance flags")
-                    xid_count = tagged_count & 0x3fffffff
-                    item += 4 + xid_count * 8
-                    if item > offset + length:
-                        raise SystemExit("truncated contributors in checkpoint WAL")
+                tagged_count = struct.unpack_from("<I", data, item)[0]
+                if tagged_count >> 30 == 1:
+                    raise SystemExit("invalid page provenance flags")
+                xid_count = tagged_count & 0x3fffffff
+                item += 4 + xid_count * 8
+                if item > offset + length:
+                    raise SystemExit("truncated contributors in checkpoint WAL")
             if item != offset + length:
                 raise SystemExit("invalid page-image length in checkpoint WAL")
         elif record_type == 4 and group_images is not None:
@@ -896,9 +888,11 @@ expect_bad_wal_startup() {
 corrupt_wal_record() {
     pg_wal=$1
     mode=$2
-    python3 - "$pg_wal" "$mode" <<'PY'
+    python3 - "$pg_wal" "$mode" "$BASE/t/interop" <<'PY'
 import glob
 import os
+from pathlib import Path
+import runpy
 import struct
 import sys
 
@@ -931,15 +925,21 @@ if mode == "obsolete-length":
     struct.pack_into("<I", data, offset + 8, 0)
 elif mode in ("final-length", "final-inflated", "final-checksum",
               "final-magic", "final-version", "final-lsn", "final-type"):
-    path, _, offset, length, data = records[-1]
+    path, segment, offset, length, data = records[-1]
     record_type = struct.unpack_from("<H", data, offset + 6)[0]
     version = struct.unpack_from("<H", data, offset + 4)[0]
-    expected_lengths = (32, 40) if record_type == 2 else ((120,) if record_type == 4 and version >= 6 else (32,))
-    if length not in expected_lengths or record_type not in (2, 3, 4, 5):
+    if version != 8 or record_type not in (2, 3, 4, 5):
         raise SystemExit(f"last durable record is not a terminal record: type={record_type} version={version} length={length}")
-    if record_type == 4 and version >= 6 and data[offset + 32:offset + 40] not in (
-            (b"PGCKPT01", b"PGCKPT02") if version >= 7 else (b"PGCKPT01",)):
-        raise SystemExit("checkpoint snapshot is missing before corruption")
+    if record_type == 4:
+        helpers = Path(sys.argv[3])
+        sys.path.insert(0, str(helpers))
+        read_copy = runpy.run_path(str(helpers / "checkpoint-snapshot.py"))["read_copy"]
+        checkpoint, _ = read_copy(Path(sys.argv[1]).parent)
+        start = segment * 16 * 1024 * 1024 + offset
+        if (checkpoint["start"], checkpoint["end"]) != (start, start + length):
+            raise SystemExit("final checkpoint does not match the control snapshot")
+    elif length not in ((32, 40) if record_type == 2 else (32,)):
+        raise SystemExit("unexpected terminal length before corruption")
     if mode == "final-length":
         struct.pack_into("<I", data, offset + 8, 0)
     elif mode == "final-inflated":
