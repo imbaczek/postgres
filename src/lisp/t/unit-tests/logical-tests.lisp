@@ -1864,7 +1864,7 @@
          (when (and cleanup-thread (sb-thread:thread-alive-p cleanup-thread))
            (sb-thread:join-thread cleanup-thread :timeout 2)))))))
 
-(defun test-wal-pgslot3-database-field-validation ()
+(defun test-wal-pgslot4-database-field-validation ()
   (let* ((test-directory
            (merge-pathnames (format nil "logical-slot-file-~a/" (random 100000000))
                             *pgdata*))
@@ -1874,7 +1874,7 @@
                    :name "valid_slot" :restart-lsn 0 :consistent-lsn 0
                    :wal-status :reserved))
          (invalid-prefix
-           (format nil "PGSLOT3 invalid_slot not-an-oid 0 0 - reserved")))
+           (format nil "PGSLOT4 invalid_slot not-an-oid 0 0 - reserved pg_lisp")))
     (wal-ensure-directory-durable test-directory)
     (unwind-protect
          (progn
@@ -1885,7 +1885,7 @@
              (write-sequence (wal-encode-replication-slot unbound) stream))
            (check (null (wal-replication-slot-database-oid
                          (wal-read-replication-slot valid-path)))
-                  "PGSLOT3 preserves a valid legacy database-unbound slot")
+                  "PGSLOT4 preserves a valid database-unbound slot")
            (with-open-file (stream invalid-path :direction :output
                                                 :element-type '(unsigned-byte 8)
                                                 :if-exists :supersede
@@ -1898,7 +1898,7 @@
            (check (handler-case
                       (progn (wal-read-replication-slot invalid-path) nil)
                     (error () t))
-                  "PGSLOT3 rejects malformed database OIDs with a valid CRC"))
+                  "PGSLOT4 rejects malformed database OIDs with a valid CRC"))
       (ignore-errors
        (uiop:delete-directory-tree test-directory :validate t
                                                   :if-does-not-exist :ignore)))))

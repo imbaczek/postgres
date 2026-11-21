@@ -323,7 +323,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
        (ok (zerop pg::*active-snapshots*))
        (ok (zerop (hash-table-count pg::*wal-snapshot-retention-pins*))))))
 
-(deftest slot-plugin-codec-and-migration
+(deftest slot-plugin-codec-rejects-retired-formats
     (let* ((directory (merge-pathnames (format nil "pg-slot-format-~a/" (gensym))
                                        (uiop:temporary-directory)))
            (path (merge-pathnames "codec_slot.slot" directory))
@@ -349,9 +349,8 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                (let ((crc (pg::wal-crc32 (pg::string->bytes prefix))))
                  (with-open-file (stream path :direction :output :if-exists :supersede)
                    (format stream "~a ~8,'0X~%" prefix crc))
-                 (let ((decoded (pg::wal-read-replication-slot path)))
-                   (ok (string= "pg_lisp" (pg::wal-replication-slot-plugin decoded)))
-                   (ok (null (pg::wal-replication-slot-confirmed-flush-lsn decoded))))))
+                 (ok (handler-case (progn (pg::wal-read-replication-slot path) nil)
+                       (error () t)))))
              (dolist (prefix '("PGSLOT4 codec_slot 16384 100 200 200 reserved unknown"
                                "PGSLOT4 codec_slot 16384 100 200 - reserved pgoutput"
                                "PGSLOT4 codec_slot - 100 200 200 reserved pgoutput"))

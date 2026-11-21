@@ -131,7 +131,7 @@
   (test-logical-drop-adopts-snapshot-before-cleanup)
   (test-logical-maintenance-rediscovers-lost-slot-owners)
   (test-logical-owner-termination-revalidates-captured-slot)
-  (test-wal-pgslot3-database-field-validation)
+  (test-wal-pgslot4-database-field-validation)
   (test-wal-snapshot-boundary-retains-active-xid-pages)
   (test-wal-snapshot-release-race-before-pin-publication)
   (test-wal-snapshot-release-race-before-reuse)

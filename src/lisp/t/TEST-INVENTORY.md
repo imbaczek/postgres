@@ -575,7 +575,7 @@ limitation of Rove: concurrent and stateful tests can use Rove once isolated.
 | `test-logical-drop-adopts-snapshot-before-cleanup` | [Legacy](unit-tests/logical-tests.lisp) | D/M: WAL fixture, durable slots, snapshot publication or injected cleanup failure |
 | `test-logical-maintenance-rediscovers-lost-slot-owners` | [Legacy](unit-tests/logical-tests.lisp) | D/M: WAL fixture, durable slots, snapshot publication or injected cleanup failure |
 | `test-logical-owner-termination-revalidates-captured-slot` | [Legacy](unit-tests/logical-tests.lisp) | T: concurrent actors and shared snapshot/WAL ownership |
-| `test-wal-pgslot3-database-field-validation` | [Legacy](unit-tests/logical-tests.lisp) | F: slot/failpoint files and guard-file lifecycle |
+| `test-wal-pgslot4-database-field-validation` | [Legacy](unit-tests/logical-tests.lisp) | F: slot/failpoint files and guard-file lifecycle |
 
 ### vacuum
 
