@@ -106,37 +106,17 @@
                                                            request local stage)))))))
 
 (defun physical-reseed-attempt-image (record)
-  (let* ((text (physical-bootstrap-manifest-text (physical-reseed-attempt-copy record)))
-         (image (string->bytes (format nil "PGRESEEDATTEMPT1 ~8,'0X~%~a~%"
-                                       (wal-crc32 (string->bytes text)) text))))
-    (unless (<= (length image) +physical-reseed-attempt-maximum-bytes+)
-      (error "reseed attempt exceeds its private record bound"))
-    image))
+  (metadata-literal-envelope-image "PGRESEEDATTEMPT1" (physical-reseed-attempt-copy record)
+                                   +physical-reseed-attempt-maximum-bytes+ "reseed attempt"))
 
 ;; The checksum, literal parser, and canonical re-encoding validate structure.
 ;; They do not establish that the source is live or the control file is clean.
 
 (defun physical-reseed-attempt-decode (bytes)
-  "Decode a bounded reseed attempt from BYTES, which must remain stable.
-Check the checksum over the original UTF-8 body bytes excluding the terminal LF,
-then validate the canonical image.  Return a record detached from BYTES."
-  (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (<= (length bytes) +physical-reseed-attempt-maximum-bytes+))
-    (error "invalid reseed attempt byte vector"))
-  (let* ((text (bytes->string bytes))
-         (newline (position #\Newline text))
-         (prefix "PGRESEEDATTEMPT1 "))
-    (unless (and newline (= newline (+ (length prefix) 8)) (uiop:string-prefix-p prefix text))
-      (error "invalid reseed attempt envelope"))
-    (let* ((body (subseq text (1+ newline)))
-           (crc (parse-integer text :start (length prefix) :end newline :radix 16)))
-      (unless (and (plusp (length body)) (char= #\Newline (char body (1- (length body))))
-                   (= crc (wal-crc32 bytes (1+ newline) (1- (length bytes)))))
-        (error "reseed attempt checksum mismatch"))
-      (let ((record (physical-reseed-attempt-copy (recovery-parse-manifest-text body))))
-        (unless (equalp bytes (physical-reseed-attempt-image record))
-          (error "noncanonical reseed attempt record"))
-        record))))
+  "Decode a canonical reseed attempt without establishing live source authority."
+  (metadata-literal-envelope-decode "PGRESEEDATTEMPT1" bytes
+                                    +physical-reseed-attempt-maximum-bytes+
+                                    #'physical-reseed-attempt-copy "reseed attempt"))
 
 ;; Phases describe durable intent.  Keep all other fields fixed so a retry
 ;; cannot silently select another request, source, or local PID generation.

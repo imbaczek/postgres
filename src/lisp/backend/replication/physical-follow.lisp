@@ -1246,12 +1246,8 @@ state. An active result still requires startup validation before workers launch.
 (defun physical-follow-config-image (config)
   "Encode a checked config in the existing bounded PGPHYSICALFOLLOW1 envelope."
   (physical-follow-check-config config)
-  (let* ((text (physical-bootstrap-manifest-text config))
-         (crc (wal-crc32 (string->bytes text)))
-         (bytes (string->bytes (format nil "PGPHYSICALFOLLOW1 ~8,'0X~%~a~%" crc text))))
-    (unless (<= (length bytes) +physical-follow-config-maximum-bytes+)
-      (error "native physical follow configuration exceeds its reopen bound"))
-    bytes))
+  (metadata-literal-envelope-image "PGPHYSICALFOLLOW1" config +physical-follow-config-maximum-bytes+
+                                   "native physical follow configuration"))
 
 (defun physical-follow-save-config (config)
   "Atomically write a checked config image.
@@ -1279,18 +1275,9 @@ Optional test hooks mark fsync, rename and directory-sync cuts."
 (defun physical-follow-decode-config (bytes)
   "Check the bounded envelope and checksum, then validate its literal payload.
 Validation checks coherence, not durable state or source proof."
-  (unless (<= (length bytes) +physical-follow-config-maximum-bytes+)
-    (error "native physical follow configuration exceeds its reopen bound"))
-  (let* ((text (bytes->string bytes)) (newline (position #\Newline text))
-                                      (prefix "PGPHYSICALFOLLOW1 "))
-    (unless (and newline (= newline (+ (length prefix) 8)) (uiop:string-prefix-p prefix text))
-      (error "corrupt native physical follow envelope"))
-    (let* ((body (subseq text (1+ newline)))
-           (crc (parse-integer text :start (length prefix) :end newline :radix 16)))
-      (unless (and (plusp (length body)) (char= #\Newline (char body (1- (length body))))
-                   (= crc (wal-crc32 (string->bytes (subseq body 0 (1- (length body)))))))
-        (error "native physical follow checksum mismatch"))
-      (physical-follow-check-config (recovery-parse-manifest-text body)))))
+  (physical-follow-check-config
+   (metadata-literal-envelope-read "PGPHYSICALFOLLOW1" bytes +physical-follow-config-maximum-bytes+
+                                   "native physical follow")))
 
 (defun physical-follow-read-config ()
   "Read the whole bounded config file before decoding it."

@@ -1,0 +1,36 @@
+(in-package #:pg)
+
+(defun metadata-literal-envelope-image (magic value maximum label)
+  "Encode a canonical literal in a magic, CRC and terminal-newline envelope."
+  (let* ((body (string->bytes (physical-bootstrap-manifest-text value)))
+         (header (string->bytes (format nil "~a ~8,'0X~%" magic (wal-crc32 body)))))
+    (unless (<= (+ (length header) (length body) 1) maximum)
+      (error "~a exceeds its record bound" label))
+    (concatenate '(vector (unsigned-byte 8)) header body #(10))))
+
+(defun metadata-literal-envelope-read (magic bytes maximum label)
+  "Read a checksummed bounded literal, leaving schema and canonicality to the caller."
+  (unless (typep bytes '(vector (unsigned-byte 8)))
+    (error "~a requires an octet vector" label))
+  (unless (<= (length bytes) maximum)
+    (error "~a exceeds its record bound" label))
+  (let* ((newline (position 10 bytes))
+         (header (when newline (bytes->string bytes :end newline)))
+         (prefix (concatenate 'string magic " ")))
+    (unless (and header (= (length header) (+ (length prefix) 8))
+                 (uiop:string-prefix-p prefix header))
+      (error "invalid ~a envelope" label))
+    (let* ((start (1+ newline))
+           (end (1- (length bytes)))
+           (crc (parse-integer header :start (length prefix) :radix 16)))
+      (unless (and (<= start end) (= 10 (aref bytes end))
+                   (= crc (wal-crc32 bytes start end)))
+        (error "~a checksum mismatch" label))
+      (recovery-parse-manifest-text (bytes->string bytes :start start)))))
+
+(defun metadata-literal-envelope-decode (magic bytes maximum normalize label)
+  "Validate framing, apply NORMALIZE to the literal and require canonical bytes."
+  (let ((record (funcall normalize (metadata-literal-envelope-read magic bytes maximum label))))
+    (unless (equalp bytes (metadata-literal-envelope-image magic record maximum label))
+      (error "noncanonical ~a record" label))
+    record))

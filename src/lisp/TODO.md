@@ -62,6 +62,21 @@ live plan. Cursor execution, plan execution and DML still share
 `make-select-result-row`, and live join operators retain their streaming
 helpers.
 
+### Milestone 1 verification
+
+- A5 shares the magic, CRC and terminal newline codec across backup lease,
+  reseed attempt, adoption attempt and native follow records. Backup and
+  reseed still require canonical bytes. Adoption and follow still validate
+  their parsed records without requiring a canonical re-encoding. Sized
+  literal headers remain a separate part of A5.
+- A6 shares consecutive-step and partial-tail parsing for the adoption and
+  reseed installation journals. Each caller still validates its own plan and
+  defines its own final step. The adoption follow journal's retirement tail
+  remains a separate part of A6.
+- The strict physical selection passed 22 test heads covering exact UTF-8
+  bytes, checksum failures, canonicality, publication cuts, and journal
+  prefix recovery.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
