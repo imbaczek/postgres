@@ -157,6 +157,10 @@ change. Portal result metadata and prepared result signatures now live on
 their owners. The SELECT and DML execution registries still track executable
 portal state for cleanup and suspension.
 
+The first A1 slice shares physical row projection between the callback and
+iterator drivers. It preserves deferred sort expressions, ProjectSet
+pass-through rows, and origin capture through both entry points.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
