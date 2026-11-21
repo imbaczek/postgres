@@ -250,24 +250,6 @@
                                        xid (backend-command-id *backend*))
                   (check-heapam-write-status write-status)
                   (when deleted
-                    (let ((reuse (unchanged-tuple-toast-pointers actual (getf conflict :sets) table new protected-snapshot)))
-                      (dml-reuse-matching-external-descriptors table actual new descriptors reuse protected-snapshot)
-                      (delete-tuple-toast-values table actual xid (backend-command-id *backend*) reuse)
-                      (materialize-select-tuple table actual protected-snapshot)
-                      (let ((old-compressed (unchanged-tuple-compressed-values actual (getf conflict :sets) new)))
-                        (dotimes (i (length computed-compressed))
-                          (cond ((aref reuse i) (setf (aref computed-compressed i) nil))
-                                ((and old-compressed (null (aref computed-compressed i)))
-                                 (setf (aref computed-compressed i) (aref old-compressed i))))))
-                      (multiple-value-bind (new-block new-offnum selection)
-                          (insert-tuple-with-unique
-                           table new :exclude-tid (cons old-block old-offnum) :publication-kind :update
-                           :toast-reuse reuse :compressed-reuse computed-compressed
-                           :on-success
-                           (lambda (next-block next-offnum)
-                             (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
-                               (ereport "XX000" "could not link updated heap tuple"))))
-                        (declare (ignore new-block new-offnum))
-                        (logical-note-row-change :update table :old-values (htup-values actual)
-                                                 :new-values new :toast-reuse reuse :publication-selection selection))
-                      (return-from insert-tuple-on-conflict (values :update new (htup-values actual))))))))))))))
+                    (replace-claimed-dml-tuple table actual old-block old-offnum xid new
+                                               (getf conflict :sets) computed-compressed descriptors protected-snapshot)
+                    (return-from insert-tuple-on-conflict (values :update new (htup-values actual)))))))))))))
