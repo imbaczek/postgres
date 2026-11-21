@@ -207,6 +207,93 @@ its behavior and allocation.  The record format uses CRC32C (Castagnoli)."
     (wal-set-u32 copy 28 0)
     (wal-crc32 copy)))
 
+(defconstant +wal-catalog-chunk-header-size+ 8)
+
+(defun wal-encode-catalog-payload (bytes deletes)
+  (let* ((payload (make-array (+ 8 (* 4 (length deletes)) (length bytes))
+                              :element-type '(unsigned-byte 8)
+                              :initial-element 0))
+         (offset 0))
+    (wal-set-u32 payload offset (length deletes))
+    (incf offset 4)
+    (dolist (relfilenode deletes)
+      (wal-set-u32 payload offset relfilenode)
+      (incf offset 4))
+    (wal-set-u32 payload offset (length bytes))
+    (incf offset 4)
+    (replace payload bytes :start1 offset)
+    payload))
+
+(defun wal-decode-catalog-payload (payload &key borrow-image-p)
+  "Validate PAYLOAD and return deletion IDs and the catalog image.
+BORROW-IMAGE-P lets synchronous consumers read the immutable input without
+copying the complete image."
+  (when (< (length payload) 8)
+    (error "WAL catalog record is too short"))
+  (let* ((count (wal-u32 payload 0))
+         (offset 4))
+    (when (> (+ offset (* count 4) 4) (length payload))
+      (error "WAL catalog record has an invalid delete list"))
+    (let ((deletes '()))
+      (loop repeat count
+            do (push (wal-u32 payload offset) deletes)
+               (incf offset 4))
+      (setf deletes (nreverse deletes))
+      (let ((catalog-length (wal-u32 payload offset)))
+        (incf offset 4)
+        (unless (= (+ offset catalog-length) (length payload))
+          (error "WAL catalog record has an invalid catalog image length (offset ~a, image ~a, payload ~a)"
+                 offset catalog-length (length payload)))
+        (values deletes
+                (if borrow-image-p
+                    (make-array catalog-length :element-type '(unsigned-byte 8)
+                                               :displaced-to payload :displaced-index-offset offset)
+                    (subseq payload offset)))))))
+
+(defun wal-encode-catalog-chunk-payload (bytes index count)
+  (let ((payload (make-array (+ +wal-catalog-chunk-header-size+
+                                (length bytes))
+                             :element-type '(unsigned-byte 8)
+                             :initial-element 0)))
+    (wal-set-u32 payload 0 index)
+    (wal-set-u32 payload 4 count)
+    (replace payload bytes :start1 +wal-catalog-chunk-header-size+)
+    payload))
+
+(defun wal-decode-catalog-chunk-payload (payload)
+  (when (< (length payload) (1+ +wal-catalog-chunk-header-size+))
+    (error "WAL catalog chunk is too short"))
+  (let ((index (wal-u32 payload 0))
+        (count (wal-u32 payload 4)))
+    (unless (and (plusp count) (< index count))
+      (error "WAL catalog chunk has an invalid index or count"))
+    (values index count
+            (subseq payload +wal-catalog-chunk-header-size+))))
+
+(defun wal-catalog-chunk-count (payload)
+  (let* ((chunk-size (- +wal-segment-size+ +wal-header-size+
+                        +wal-catalog-chunk-header-size+))
+         (count (ceiling (length payload) chunk-size)))
+    (unless (<= count #xFFFFFFFF)
+      (error "WAL catalog image requires too many chunks"))
+    count))
+
+(defun wal-encode-catalog-commit-payload (payload chunk-count)
+  (let ((commit (make-array 12 :element-type '(unsigned-byte 8)
+                               :initial-element 0)))
+    (wal-set-u32 commit 0 chunk-count)
+    (wal-set-u64 commit 4 (length payload))
+    commit))
+
+(defun wal-decode-catalog-commit-payload (payload)
+  (unless (= (length payload) 12)
+    (error "WAL catalog commit record has an invalid length"))
+  (let ((count (wal-u32 payload 0))
+        (length (wal-u64 payload 4)))
+    (unless (plusp count)
+      (error "WAL catalog commit record has an invalid chunk count"))
+    (values count length)))
+
 (defun wal-encode-commit-timestamp (timestamp)
   (unless (and (integerp timestamp) (<= (- (ash 1 63)) timestamp (1- (ash 1 63))))
     (error "invalid WAL commit timestamp"))
