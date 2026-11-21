@@ -54,6 +54,14 @@ For B15, callers of the ownerless CLOG staging and materialization functions
 are confined to their delegation chain and Rove fixtures. The tag validation
 helper also protects owned completions, so preserve it during the cutover.
 
+For B1, both native record decoding and physical receive header admission
+accept WAL2–7. Retire that admission in both paths. The recovery page spool
+also records the source version and decodes it when replaying page images.
+Version-specific fixtures cover page images, checkpoint and running-xacts
+records, XID reservation, timeline lineage and end-of-recovery. Remove
+compatibility assertions alongside their reader branches and regenerate
+fixtures that exercise behavior still supported by WAL8.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The
@@ -95,6 +103,10 @@ helpers.
   restoration. Private proof images copy the snapshot and compare every
   field. Existing follow bindings and detached physical adoption and reseed
   observations retain their eleven-field value images.
+- Logical slot copy verification passed 1,590 strict unit heads, including
+  generated proof-copy and exact comparison checks. Native committed-source
+  and cold catalog tests passed, along with 54 installation staging crash
+  cuts and their retries.
 
 ## Open development tasks
 
