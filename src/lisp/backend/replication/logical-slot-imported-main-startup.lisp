@@ -92,8 +92,10 @@
      root
      (lambda (archive-fd facts)
        (declare (ignore facts))
-       (physical-promotion-restore-primary-retained
-        :expected-archive-key (physical-retained-archive-key archive-fd))))))
+       (let* ((fields (physical-promotion-restore-primary-retained
+                       :expected-archive-key (physical-retained-archive-key archive-fd)))
+              (id (getf (getf (seventh fields) :retained-reference) :root-id)))
+         (when id (list (physical-promotion-retained-owner :primary) id)))))))
 
 (defun logical-slot-imported-restore-receive-retained (root proof)
   "Restore a surviving receive selection without writing or trimming the spool."
@@ -120,7 +122,9 @@
                        :on-open (lambda (opened) (setf store opened)))
                       (physical-retained-check-archive-binding
                        (merge-pathnames "pg_physical_receive/" (physical-image-fd-path root))
-                       receive-fd))
+                       receive-fd)
+                      (let ((id (physical-store-retained-root store)))
+                        (when id (list (physical-store-retained-owner store) id))))
                  (when store (physical-store-close store)))))))))))
 
 (defun logical-slot-imported-restore-startup-retained (gate ownership proof)
@@ -132,5 +136,31 @@
       owner
       (lambda (root path)
         (declare (ignore path))
-        (logical-slot-imported-restore-primary-retained root)
-        (logical-slot-imported-restore-receive-retained root proof))))))
+        (remove nil (list (logical-slot-imported-restore-primary-retained root)
+                          (logical-slot-imported-restore-receive-retained root proof))))))))
+
+(defun logical-slot-imported-check-startup-retained (gate ownership selections)
+  "Verify primary, receive and historical root registrations after slot restoration."
+  (call-with-logical-slot-imported-host-startup-owner
+   gate ownership
+   (lambda (owner)
+     (call-with-physical-directory-root
+      owner
+      (lambda (root path)
+        (declare (ignore path))
+        (call-with-physical-image-owned-context
+         root t
+         (lambda (context)
+           (let ((origin (logical-slot-continuation-storage-startup-origin owner context)))
+             (call-with-logical-slot-imported-archive-directory
+              root
+              (lambda (archive-fd facts)
+                (declare (ignore facts))
+                (let ((archive-key (physical-retained-archive-key archive-fd)))
+                  (sb-thread:with-mutex (*wal-lock*)
+                    (logical-slot-imported-host-startup-under-lock owner)
+                    (multiple-value-bind (token reference)
+                        (logical-slot-imported-host-origin-call origin :selection)
+                      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                        (physical-retained-check-required-roots-under-lock
+                         archive-key (cons (list token (getf reference :root-id)) selections))))))))))))))))

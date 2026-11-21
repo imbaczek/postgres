@@ -527,6 +527,18 @@ retains protection until readback reconciliation or durable retirement."
               (physical-retained-fence-host-archive host-fd)
               (gethash key *physical-retained-continuation-archives*)))))))
 
+(defun physical-retained-check-required-roots-under-lock (archive-key selections)
+  "Verify that every durable owner still protects its selected root on this mount."
+  (physical-retained-root-require-lock)
+  (dolist (selection selections)
+    (destructuring-bind (owner id) selection
+      (let ((reference (gethash owner *physical-retained-root-references*)))
+        (unless (and reference
+                     (eql (physical-retained-root-reference-root-id reference) id)
+                     (equal (physical-retained-root-reference-archive-key reference) archive-key)
+                     (not (gethash owner *physical-retained-root-updates*)))
+          (error "required retained WAL root is absent, rebound, or uncertain"))))))
+
 (defun physical-retained-root-delete-unprotected (directory kind id)
   "Delete an unprotected object using a held archive directory descriptor.
 

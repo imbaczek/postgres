@@ -1003,10 +1003,12 @@ Hold the drained admission gate and borrow the real postmaster ownership."
             ;; Replay can change the state checked above. Check again before
             ;; restoring slots, which can also remove temporary slot files.
             (check-primary-storage-startup-context gate-owner ownership)
-            (when imported-startup
-              (logical-slot-imported-restore-startup-retained
-               gate-owner ownership (getf (getf imported-startup :inputs) :proof)))
-            (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
+            (let ((selections (when imported-startup
+                                (logical-slot-imported-restore-startup-retained
+                                 gate-owner ownership (getf (getf imported-startup :inputs) :proof)))))
+              (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
+              (when imported-startup
+                (logical-slot-imported-check-startup-retained gate-owner ownership selections)))
             (check-primary-feedback-after-replay reset-boundary))
           (if initialize (catalog-init :initialize t) (catalog-init))
           (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))

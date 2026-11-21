@@ -515,6 +515,26 @@
              (ok (plusp reads))
              (ok (pg::physical-retained-root-protected-p root :inventory id)))))))
 
+(deftest required-retained-roots-are-checked-together
+    (with-retained-root-registry
+        (call-with-retained-inventory
+         (lambda (root images identity history text)
+           (let* ((primary (gensym "PRIMARY"))
+                  (receive (gensym "RECEIVE"))
+                  (id (pg::physical-retained-inventory-publish root identity 2 text images))
+                  (key (pg::physical-retained-archive-path-key root))
+                  (selections (list (list primary id) (list receive id))))
+             (pg::physical-retained-root-register primary root id identity history)
+             (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+               (ok (signals (pg::physical-retained-check-required-roots-under-lock key selections) 'error)))
+             (pg::physical-retained-root-register receive root id identity history)
+             (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+               (ok (not (signals (pg::physical-retained-check-required-roots-under-lock key selections) 'error)))
+               (ok (signals
+                    (pg::physical-retained-check-required-roots-under-lock
+                     (list (first key) (second key) (1+ (third key))) selections)
+                    'error))))))))
+
 (deftest retained-root-interrupts-preserve-registration-and-handoff-atomicity
     (dolist (point '(:after-hold-registration :after-control-readback :after-reference-install))
       (with-retained-root-registry
