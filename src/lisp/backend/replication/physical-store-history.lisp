@@ -123,7 +123,8 @@ The FNV reference detects accidental corruption, not malicious changes."
      (when previous-digest
        (physical-store-load-history-selection store parent previous-digest (1+ depth))))))
 
-(declaim (ftype function physical-store-control-tuple physical-store-read-retained-control
+(declaim (ftype function physical-store-control-snapshot physical-receive-control-matches-p
+                physical-store-read-retained-control
                 physical-store-check-retained-coverage physical-store-retained-directory
                 physical-store-retained-history physical-store-check-retained-root
                 physical-retained-inventory-load physical-store-check-retained-identity))
@@ -338,13 +339,13 @@ floor gets an ancestry check only and must come from verified durable recovery."
       (error "follow frontier timeline differs from its durable prefix"))))
 
 (defun physical-store-follow-candidate (store expected applied required target history-text eor-bytes)
-  "Validate a proposed rewind against the full EXPECTED control tuple.
+  "Validate a proposed rewind against the complete EXPECTED receive control.
 Validate the entire old acknowledged prefix, including the discarded tail, and
 derive the fork digest locally. Require floor <= fork <= flush and check APPLIED
 and REQUIRED as (LSN timeline) pairs. The caller supplies verified durable
 recovery frontiers. The copied candidate owns no streams or lock; it validates
 the same retained root under the candidate history without reconciling ownership."
-  (unless (equal expected (physical-store-control-tuple store))
+  (unless (physical-receive-control-matches-p (physical-store-control-snapshot store) expected)
     (error "receive store changed since follow preparation"))
   (physical-store-read-retained-control store expected)
   (physical-store-check-complete-input store)
@@ -401,7 +402,7 @@ to determine the durable state. This operation is not pg_rewind."
               (physical-store-segment-timeline store) nil)
         (physical-store-publish-history store selection bytes)
         (physical-store-save-control store fork :digest digest :selection selection)
-        (physical-store-read-retained-control store (physical-store-control-tuple candidate))
+        (physical-store-read-retained-control store (physical-store-control-snapshot candidate))
         (physical-store-test-point :after-follow-control-readback store)
         (setf (physical-store-flushed-lsn store) fork
               (physical-store-written-lsn store) fork

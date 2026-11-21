@@ -82,8 +82,10 @@ helpers.
   monotone progress and exact readback. Persisted witnesses still use the
   eleven-field list. Seven strict physical test heads passed, including a
   regression that changes each witness field independently. The strict unit
-  run passed 1,590 Rove test heads. Pending follow and the other witness
-  consumers still need migration.
+  run passed 1,590 Rove test heads. Pending follow now also compares named
+  snapshots before and after receive publication. Rewind uses the complete
+  snapshot for readback before publishing in-memory state or removing the
+  discarded tail. The remaining witness consumers still need migration.
 
 ## Open development tasks
 
