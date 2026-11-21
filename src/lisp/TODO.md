@@ -375,7 +375,7 @@ still has work outstanding.
 | A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. Audit shared setup and retirement ownership across fault scenarios. |
 | A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. Audit legacy discovery and result reporting against the common contract. |
 | A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. Audit package boundaries and independent subsystem loading before claiming dependency enforcement. |
-| A20. Documentation drift | The test runbook was updated in `02438307f77`. Reconcile the supported-format table, startup and restart runbooks, and retained historical notes against the final cutover. |
+| A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. Update it when the remaining format cutovers land. |
 
 ## Open development tasks
 

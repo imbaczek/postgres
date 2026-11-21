@@ -3,6 +3,33 @@
 Open development audits, including cold-image/load-order correctness, are tracked
 in [TODO.md](TODO.md).
 
+## Supported native formats
+
+Use this table for startup, backup, and follow on the current `sbcl` branch.
+The milestone records below describe the formats and compatibility available
+when each recorded check ran.
+
+| Artifact | Current baseline |
+| --- | --- |
+| Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
+| Primary WAL control and checkpoint payload | `PGWAL6` and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
+| Primary WAL filenames | Fresh clusters use 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Startup and backup still honor the namespace recorded in `PGWAL6`, including 16-digit legacy TLI-1 names. The receive spool has its own naming contract. Existing primaries can use the [namespace migration operation](#timeline-qualified-native-wal-namespace). |
+| Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
+| Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
+| Physical receive control | `PGPHYS03`, with the current base, history-selection, and retained-root forms. |
+| Physical recovery control | `PGRSTAT3` for ordinary recovery and `PGRSTAT4` for pending promotion. |
+| Physical backup manifest | Version 3 with an explicit checkpoint start. |
+| Standby restartpoint | `PGRPGEN2` with metadata version 4. |
+| Catalog and relation pages | Catalog images carry a cluster identity and OIDs for stored publications. B-tree pages use the current page flags for the page type. |
+
+For development data from a retired format, initialize a fresh cluster and
+restore the data logically from a server that can read the old cluster. Create
+new physical backups and standbys from the fresh source. Keep a matching
+binary and data copy for rollback. Restart the Lisp server across changes to
+the live reload gate, backend, portal, or prepared-statement layouts. Follow
+the [format cutover inventory](TODO.md#milestone-0-producer-inventory) for
+remaining retirement prerequisites, including legacy-named ancestral WAL.
+
 ## Goal closeout check
 
 ### What the milestone demonstrated
@@ -3508,6 +3535,9 @@ No coordination or C physical compatibility is added.
 
 ### Timeline-qualified native WAL namespace
 
+This milestone records the original namespace migration. See
+[Supported native formats](#supported-native-formats) for current startup rules.
+
 Filename construction/parsing now centralizes C `XLogFileName`'s TLI/log/segment
 arithmetic (`xlog_internal.h:165–169`) while retaining the native `.wal` suffix.
 Legacy 16-hex names always identify TLI 1; qualified names contain 24 uppercase
@@ -3578,6 +3608,10 @@ Lineage-aware parent/child scanning, durable promotion completion and rejoin rem
 subsequent requirements; no coordination is introduced.
 
 ### Independent WAL control timeline identities
+
+This milestone records the initial independent-timeline implementation. See
+[Supported native formats](#supported-native-formats) for the current control
+version and compatibility rules.
 
 C's insertion timeline and latest checkpoint-record timeline can differ between
 end-of-recovery publication and the first child checkpoint. `StartupXLOG` assigns
@@ -4532,6 +4566,10 @@ remaining correctness blocker; the existing thread's model identity was not
 exposed, so this does not certify the originally requested model profiles.
 
 ### Native checkpoint snapshots and durable publication
+
+This milestone records the earlier checkpoint rollout. See
+[Supported native formats](#supported-native-formats) for accepted on-disk
+versions and peer negotiation on the current branch.
 
 The internal checkpoint snapshot codec now preserves explicit record start/end,
 native redo position, actual next FullXID, separately reserved-through FullXID,

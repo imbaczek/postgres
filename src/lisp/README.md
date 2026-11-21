@@ -1277,6 +1277,8 @@ single case and uses a `recovery_end_command` barrier with matching C libraries;
 it does not use SIGSTOP. The executor SQL mode adds test-only barriers around
 promotion and callback resumption; the common SQL contract runs without them.
 See [physical HA implementation and limits](PHYSICAL-HA.md) for validation scope.
+The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table
+lists current startup, backup, and follow requirements.
 
 The `pg-unit-tests`, `pg-interop-tests` and `pg-physical-tests` ASDF systems depend
 on Rove and `cl-spec/check-it` for executable regressions and property checks.
