@@ -285,7 +285,9 @@ grammar on both source and copy. The live bootstrap and namespace suites
 passed, including byte preservation through migration crashes and a
 legacy-base standby following a migrated primary. The namespace suite and
 restartpoint fixtures share a stopped, TLI-1 legacy conversion that checks
-the control coordinates and WAL bytes. Startup still reads the namespace in
+the control coordinates and WAL bytes. The restartpoint process suite passed
+with each source namespace, including startup refusal of an unproven pending
+promotion with its control extensions intact. Startup still reads the namespace in
 existing controls. Retiring the legacy grammar requires recreating or
 retiring remaining development data, backups, and retained ancestral WAL.
 
