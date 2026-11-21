@@ -7,19 +7,6 @@
   `(let ((*wal-recovery-page-spool-enabled* t))
      (with-wal-replay-staging () ,@body)))
 
-(defun physical-history-reset (active)
-  (wal-recovery-close-page-spool)
-  (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
-  (setf *wal-recovery-page-records-seen-p* nil
-        *wal-recovery-relation-resets* nil
-        *wal-recovery-page-images* nil
-        *wal-recovery-group-active* active
-        *wal-recovery-catalog-chunks* nil
-        *wal-recovery-catalog-chunk-count* nil
-        *wal-recovery-catalog-next-chunk* 0
-        *wal-recovery-logical-catalog-event-p* nil)
-  (wal-recovery-reset-logical-change-batch))
-
 (defun physical-history-check-plist (value required)
   "Reject ambiguous keys before using serialized catalog entries as drop proof."
   (unless (and (listp value) (evenp (length value)))
@@ -123,32 +110,6 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
       (maphash (lambda (node present) (declare (ignore present)) (remhash node removed)) live)
       (dolist (node deletes) (setf (gethash node removed) t)))))
 
-(defun physical-history-accept-chunk (record)
-  (unless *wal-recovery-group-active*
-    (error "catalog history chunk appears outside a batch"))
-  (when (or *wal-recovery-logical-catalog-event-p* *wal-recovery-logical-chunk-count*)
-    (error "catalog history chunks are mixed with logical events"))
-  (multiple-value-bind (index count bytes)
-      (wal-decode-catalog-chunk-payload (wal-record-payload record))
-    (unless (and (= index *wal-recovery-catalog-next-chunk*)
-                 (or (null *wal-recovery-catalog-chunk-count*)
-                     (= count *wal-recovery-catalog-chunk-count*)))
-      (error "catalog history chunk sequence is invalid"))
-    (setf *wal-recovery-catalog-chunk-count* count)
-    (incf *wal-recovery-catalog-next-chunk*)
-    (push bytes *wal-recovery-catalog-chunks*)))
-
-(defun physical-history-accept-logical-event (record)
-  (unless (and *wal-recovery-group-active* (zerop (wal-record-xid record))
-               (not *wal-recovery-logical-catalog-event-p*)
-               (not *wal-recovery-logical-chunk-count*))
-    (error "invalid logical catalog event in history"))
-  (let ((payload (wal-record-payload record)))
-    (unless (and (>= (length payload) 8) (plusp (wal-u32 payload 0))
-                 (= (+ 8 (wal-u32 payload 4)) (length payload)))
-      (error "invalid logical catalog event payload in history")))
-  (setf *wal-recovery-logical-catalog-event-p* t))
-
 (defun physical-history-accept-terminal (record identity removed)
   (unless *wal-recovery-group-active*
     (error "catalog history terminal appears outside a batch"))
@@ -178,7 +139,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
              ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
              ((not (and (zerop (length payload)) (zerop (wal-record-xid record))))
               (error "invalid noncatalog terminal in history"))))))
-  (physical-history-reset nil))
+  (wal-recovery-reset-batch nil))
 
 (defun physical-history-accept-record (record identity removed)
   "Validate native batch ordering and payloads without applying any storage."
@@ -187,20 +148,16 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
   (wal-note-recovery-batch-record record)
   (let ((type (wal-record-type record)))
     (cond
-      ((= type +wal-record-batch-start+) (physical-history-reset t))
+      ((= type +wal-record-batch-start+) (wal-recovery-reset-batch t))
       ((= type +wal-record-relation-reset+) (wal-recovery-stage-relation-reset record))
       ((= type +wal-record-pages+)
-       (unless (and *wal-recovery-group-active* (not *wal-recovery-catalog-chunk-count*))
-         (error "page images outside a batch or after catalog chunks in history"))
-       (setf *wal-recovery-page-records-seen-p* t)
+       (wal-recovery-note-page-record)
        (wal-decode-page-images (wal-record-payload record)
                                (wal-record-end record)))
       ((= type +wal-record-logical-changes+)
-       (when (or *wal-recovery-logical-catalog-event-p* *wal-recovery-catalog-chunk-count*)
-         (error "logical row changes after catalog metadata in history"))
-       (wal-recovery-accept-logical-change-chunk record))
-      ((= type +wal-record-logical-catalog-event+) (physical-history-accept-logical-event record))
-      ((= type +wal-record-catalog-chunk+) (physical-history-accept-chunk record))
+       (wal-recovery-stage-logical-changes record))
+      ((= type +wal-record-logical-catalog-event+) (wal-recovery-note-logical-catalog-event record))
+      ((= type +wal-record-catalog-chunk+) (wal-recovery-stage-catalog-chunk record))
       ((wal-terminal-record-type-p type)
        (physical-history-accept-terminal record identity removed))
       (t (error "unsupported record in catalog history")))))

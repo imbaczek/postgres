@@ -462,6 +462,36 @@
         (rove:ok (unit-commit-ts-error-p
                   (lambda () (wal-logical-status-next on (record snapshot) 2)))))))
 
+(rove:deftest history-and-redo-discard-incomplete-catalog-batches
+    (flet ((record (type payload)
+             (make-wal-record :version +wal-version+ :type type :xid 0
+                              :start 32 :end (+ 64 (length payload)) :payload payload))
+           (octets (contents)
+             (make-array (length contents) :element-type '(unsigned-byte 8)
+                                           :initial-contents contents)))
+      (let* ((marker (record +wal-record-batch-start+ (octets nil)))
+             (chunk (record +wal-record-catalog-chunk+
+                            (wal-encode-catalog-chunk-payload (octets '(11)) 0 2)))
+             (wrong-count (record +wal-record-catalog-chunk+
+                                  (wal-encode-catalog-chunk-payload (octets '(12)) 1 3)))
+             (pages (record +wal-record-pages+ (octets '(0 0 0 0)))))
+        (dolist (consumer (list #'wal-replay-record
+                                (lambda (record) (physical-history-accept-record record "source" nil))))
+          (let ((*wal-checkpoint-lsn* 0) (*wal-recovery-page-spool-enabled* nil))
+            (with-wal-replay-staging ()
+              (funcall consumer marker)
+              (funcall consumer chunk)
+              (rove:ok (= 1 *wal-recovery-catalog-next-chunk*))
+              (rove:ok (rove:signals (funcall consumer wrong-count) 'error))
+              (rove:ok (rove:signals (funcall consumer pages) 'error))
+              (funcall consumer marker)
+              (rove:ok *wal-recovery-reservation-batch-clean-p*)
+              (rove:ok (null *wal-recovery-catalog-chunks*))
+              (rove:ok (null *wal-recovery-catalog-chunk-count*))
+              (rove:ok (zerop *wal-recovery-catalog-next-chunk*))
+              (funcall consumer pages)
+              (rove:ok *wal-recovery-page-records-seen-p*)))))))
+
 (rove:deftest logical-status-change-shares-complete-batch-consumer-validation
     (dolist (enabled '(nil t))
       (let* ((batch (make-wal-record

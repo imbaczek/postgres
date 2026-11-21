@@ -3020,6 +3020,68 @@ src/backend/access/transam/xlogreader.c."
          (funcall function (wal-decode-page-images (subseq event 12) lsn))))))
   (values))
 
+(defun wal-recovery-reset-batch (active)
+  "Discard staged batch records. ACTIVE starts a batch after a validated marker."
+  (wal-recovery-close-page-spool)
+  (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
+  (setf *wal-recovery-group-active* active
+        *wal-recovery-page-images* nil
+        *wal-recovery-relation-resets* nil
+        *wal-recovery-page-records-seen-p* nil
+        *wal-recovery-catalog-chunks* nil
+        *wal-recovery-catalog-chunk-count* nil
+        *wal-recovery-catalog-next-chunk* 0
+        *wal-recovery-logical-catalog-event-p* nil)
+  (wal-recovery-reset-logical-change-batch)
+  (values))
+
+(defun wal-recovery-note-page-record ()
+  (unless *wal-recovery-group-active*
+    (error "WAL page images appear outside a batch"))
+  (when *wal-recovery-catalog-chunk-count*
+    (error "WAL page images follow catalog chunks in a batch"))
+  (setf *wal-recovery-page-records-seen-p* t))
+
+(defun wal-recovery-stage-logical-changes (record)
+  (when *wal-recovery-logical-catalog-event-p*
+    (error "logical row changes follow a catalog event in the same batch"))
+  (when *wal-recovery-catalog-chunk-count*
+    (error "logical WAL changes follow catalog chunks in a batch"))
+  (wal-recovery-accept-logical-change-chunk record))
+
+(defun wal-recovery-stage-catalog-chunk (record)
+  (unless *wal-recovery-group-active*
+    (error "WAL catalog chunks appear outside a batch"))
+  (when (or *wal-recovery-logical-catalog-event-p*
+            *wal-recovery-logical-chunk-count*)
+    (error "WAL catalog chunks are mixed with row or catalog events"))
+  (multiple-value-bind (index count bytes)
+      (wal-decode-catalog-chunk-payload (wal-record-payload record))
+    (unless (= index *wal-recovery-catalog-next-chunk*)
+      (error "WAL catalog chunk index ~a follows chunk ~a"
+             index *wal-recovery-catalog-next-chunk*))
+    (when (and *wal-recovery-catalog-chunk-count*
+               (/= count *wal-recovery-catalog-chunk-count*))
+      (error "WAL catalog chunk count changes within a batch"))
+    (setf *wal-recovery-catalog-chunk-count* count)
+    (push bytes *wal-recovery-catalog-chunks*)
+    (incf *wal-recovery-catalog-next-chunk*)))
+
+(defun wal-recovery-note-logical-catalog-event (record)
+  (unless *wal-recovery-group-active*
+    (error "logical catalog event appears outside a WAL batch"))
+  (unless (zerop (wal-record-xid record))
+    (error "logical catalog event must not carry a transaction ID"))
+  (when (or *wal-recovery-logical-catalog-event-p*
+            *wal-recovery-logical-chunk-count*)
+    (error "logical catalog event is mixed with other changes in a WAL batch"))
+  (let ((payload (wal-record-payload record)))
+    (unless (and (>= (length payload) 8)
+                 (plusp (wal-u32 payload 0))
+                 (= (+ 8 (wal-u32 payload 4)) (length payload)))
+      (error "logical catalog event has an invalid payload")))
+  (setf *wal-recovery-logical-catalog-event-p* t))
+
 (defun wal-replay-finish-batch (terminal-preparer &optional catalog-chunks-p)
   (unless *wal-recovery-group-active*
     (error "WAL terminal record appears outside a batch"))
@@ -3043,18 +3105,7 @@ src/backend/access/transam/xlogreader.c."
         (wal-recovery-map-page-spool #'wal-apply-page-images)
         (wal-apply-page-images (nreverse *wal-recovery-page-images*)))
     (funcall terminal-function))
-  (wal-recovery-close-page-spool)
-  (setf *wal-recovery-reservation-batch-clean-p* nil
-        *wal-recovery-group-active* nil
-        *wal-recovery-page-images* '()
-        *wal-recovery-relation-resets* nil
-        *wal-recovery-page-records-seen-p* nil
-        *wal-recovery-catalog-chunks* '()
-        *wal-recovery-catalog-chunk-count* nil
-        *wal-recovery-catalog-next-chunk* 0)
-  (wal-recovery-reset-logical-change-batch)
-  (setf *wal-recovery-logical-catalog-event-p* nil)
-  (values))
+  (wal-recovery-reset-batch nil))
 
 (defun wal-recovery-validate-logical-terminal (kind &optional xid)
   ;; A reset belongs only to a commit terminal for the same transaction.
@@ -3132,24 +3183,11 @@ published separately after primary redo completes."
       ((= (wal-record-type record) +wal-record-batch-start+)
        ;; A prior group without a terminal record is a crash tail. Ignore its
        ;; accumulated images and begin staging the next post-restart batch.
-       (wal-recovery-close-page-spool)
-       (setf *wal-recovery-group-active* t
-             *wal-recovery-page-images* '()
-             *wal-recovery-relation-resets* nil
-             *wal-recovery-page-records-seen-p* nil
-             *wal-recovery-catalog-chunks* '()
-             *wal-recovery-catalog-chunk-count* nil
-             *wal-recovery-catalog-next-chunk* 0)
-       (wal-recovery-reset-logical-change-batch)
-       (setf *wal-recovery-logical-catalog-event-p* nil))
+       (wal-recovery-reset-batch t))
       ((= (wal-record-type record) +wal-record-relation-reset+)
        (wal-recovery-stage-relation-reset record))
       ((= (wal-record-type record) +wal-record-pages+)
-       (unless *wal-recovery-group-active*
-         (error "WAL page images appear outside a batch"))
-       (when *wal-recovery-catalog-chunk-count*
-         (error "WAL page images follow catalog chunks in a batch"))
-       (setf *wal-recovery-page-records-seen-p* t)
+       (wal-recovery-note-page-record)
        (if *wal-recovery-page-spool-enabled*
            (wal-recovery-stage-page-record record)
            (setf *wal-recovery-page-images*
@@ -3158,25 +3196,9 @@ published separately after primary redo completes."
                                                  (wal-record-end record)))
                         *wal-recovery-page-images*))))
       ((= (wal-record-type record) +wal-record-logical-changes+)
-       (when *wal-recovery-logical-catalog-event-p*
-         (error "logical row changes follow a catalog event in the same batch"))
-       (when *wal-recovery-catalog-chunk-count*
-         (error "logical WAL changes follow catalog chunks in a batch"))
-       (wal-recovery-accept-logical-change-chunk record))
+       (wal-recovery-stage-logical-changes record))
       ((= (wal-record-type record) +wal-record-logical-catalog-event+)
-       (unless *wal-recovery-group-active*
-         (error "logical catalog event appears outside a WAL batch"))
-       (when (/= (wal-record-xid record) 0)
-         (error "logical catalog event must not carry a transaction ID"))
-       (when (or *wal-recovery-logical-catalog-event-p*
-                 *wal-recovery-logical-chunk-count*)
-         (error "logical catalog event is mixed with other changes in a WAL batch"))
-       (setf *wal-recovery-logical-catalog-event-p* t)
-       (let ((payload (wal-record-payload record)))
-         (unless (and (>= (length payload) 8)
-                      (plusp (wal-u32 payload 0))
-                      (= (+ 8 (wal-u32 payload 4)) (length payload)))
-           (error "logical catalog event has an invalid payload"))))
+       (wal-recovery-note-logical-catalog-event record))
       ((= (wal-record-type record) +wal-record-commit+)
        (wal-decode-commit-timestamp (wal-record-payload record))
        (wal-recovery-validate-logical-terminal
@@ -3196,22 +3218,7 @@ published separately after primary redo completes."
         (lambda ()
           (wal-prepare-catalog-record (wal-record-payload record)))))
       ((= (wal-record-type record) +wal-record-catalog-chunk+)
-       (unless *wal-recovery-group-active*
-         (error "WAL catalog chunks appear outside a batch"))
-       (when (or *wal-recovery-logical-catalog-event-p*
-                 *wal-recovery-logical-chunk-count*)
-         (error "WAL catalog chunks are mixed with row or catalog events"))
-       (multiple-value-bind (index count bytes)
-           (wal-decode-catalog-chunk-payload (wal-record-payload record))
-         (unless (= index *wal-recovery-catalog-next-chunk*)
-           (error "WAL catalog chunk index ~a follows chunk ~a"
-                  index *wal-recovery-catalog-next-chunk*))
-         (when (and *wal-recovery-catalog-chunk-count*
-                    (/= count *wal-recovery-catalog-chunk-count*))
-           (error "WAL catalog chunk count changes within a batch"))
-         (setf *wal-recovery-catalog-chunk-count* count)
-         (push bytes *wal-recovery-catalog-chunks*)
-         (incf *wal-recovery-catalog-next-chunk*)))
+       (wal-recovery-stage-catalog-chunk record))
       ((= (wal-record-type record) +wal-record-catalog-commit+)
        (wal-recovery-validate-logical-terminal :catalog)
        (multiple-value-bind (count length)

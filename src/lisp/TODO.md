@@ -224,6 +224,12 @@ field definitions to the executor and catalog views. They derive the
 Each relation lookup still builds fresh metadata with dense executor slots,
 and RowDescription translates those slots to the original attribute numbers.
 
+History and redo share batch discard and staging checks for pages, logical
+changes, logical catalog events, and catalog chunks. History still certifies
+facts from complete terminals. Redo applies resets, then page images, then
+the terminal effect. A replacement batch marker discards the prior incomplete
+batch, including its staged catalog chunks.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
