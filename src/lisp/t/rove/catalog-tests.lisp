@@ -174,6 +174,38 @@
       (rove:ok (= 101 (pg-toast-relfilenode (pg-class-toast class)))
                "rollback restores independent TOAST ownership metadata")))
 
+(rove:deftest test-catalog-mutation-rollback-preserves-object-identity
+    (let* ((*catalog* (make-catalog :next-oid 20000))
+           (*wal-pending-deletes* nil)
+           (database (make-database))
+           (table (make-pg-class :name "t" :columns
+                                 (vector (make-pg-column :default-expression (list :const 7)))
+                                 :indexes (list 51)))
+           (index (make-pg-index :name "i" :columns (list 1)))
+           (sequence (make-pg-sequence :name "s" :last-value 9))
+           (publication (make-pg-publication :name "p" :tables (list (list "t")))))
+      (setf (gethash "t" (database-tables database)) table
+            (gethash "i" (database-indexes database)) index
+            (gethash "s" (database-sequences database)) sequence
+            (gethash "p" (database-publications database)) publication)
+      (let ((snapshot (catalog-capture-mutation-snapshot database)))
+        (clrhash (database-tables database))
+        (setf (first (pg-class-indexes table)) 52
+              (second (pg-column-default-expression (aref (pg-class-columns table) 0))) 8
+              (first (pg-index-columns index)) 2
+              (pg-sequence-last-value sequence) 10
+              (caar (pg-publication-tables publication)) "other")
+        (catalog-restore-mutation-snapshot snapshot))
+      (rove:ok (eq table (gethash "t" (database-tables database))))
+      (rove:ok (eq index (gethash "i" (database-indexes database))))
+      (rove:ok (eq sequence (gethash "s" (database-sequences database))))
+      (rove:ok (eq publication (gethash "p" (database-publications database))))
+      (rove:ok (equal '(51) (pg-class-indexes table)))
+      (rove:ok (equal '(:const 7) (pg-column-default-expression (aref (pg-class-columns table) 0))))
+      (rove:ok (equal '(1) (pg-index-columns index)))
+      (rove:ok (= 9 (pg-sequence-last-value sequence)))
+      (rove:ok (equal '(("t")) (pg-publication-tables publication)))))
+
 (rove:deftest test-toast-relation-eligibility
     (flet ((column (type &optional (typmod -1))
              (make-pg-column :name "x" :type type :typmod typmod :attnum 1)))

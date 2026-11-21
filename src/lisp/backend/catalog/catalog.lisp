@@ -142,37 +142,48 @@ the original private cluster identity when loading or migrating catalogs."
 ;;; ---- serialization ----
 
 (defmacro define-catalog-codec (name constructor &body fields)
-  "Define NAME-TO-SEXP and NAME-FROM-SEXP from explicit field mappings.
+  "Define catalog serialization from explicit field mappings.
+When NAME is (NAME SHALLOW-COPY), also generate a mutation snapshot and an
+in-place restore using the same accessors. Snapshot copying is independent of
+serialization so rollback can preserve live references and catalog identity.
 
-Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE DEFAULT).
-DEFAULT applies only when the serialized key is absent, preserving explicit NIL."
-  (let ((to-sexp (intern (format nil "~a-TO-SEXP" name) *package*))
-        (from-sexp (intern (format nil "~a-FROM-SEXP" name) *package*)))
-    `(progn
-       (defun ,to-sexp (object)
-         (list
-          ,@(loop for field in fields
-                  append
-                  (destructuring-bind (key accessor constructor-key
-                                       &key encode decode default)
-                      field
-                    (declare (ignore constructor-key decode default))
-                    `(,key
-                      ,(if encode
-                           `(funcall ,encode (,accessor object))
-                           `(,accessor object)))))))
-       (defun ,from-sexp (sexp)
-         (,constructor
-          ,@(loop for field in fields
-                  append
-                  (destructuring-bind (key accessor constructor-key
-                                       &key encode decode default)
-                      field
-                    (declare (ignore accessor encode))
-                    `(,constructor-key
-                      ,(if decode
-                           `(funcall ,decode (getf sexp ,key ,default))
-                           `(getf sexp ,key ,default))))))))))
+Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE DEFAULT SNAPSHOT-COPY).
+DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
+SNAPSHOT-COPY supplies a function for a field that needs independent storage."
+  (destructuring-bind (name &optional shallow-copy) (if (consp name) name (list name))
+    (let ((to-sexp (intern (format nil "~a-TO-SEXP" name) *package*))
+          (from-sexp (intern (format nil "~a-FROM-SEXP" name) *package*))
+          (object (gensym "OBJECT"))
+          (saved (gensym "SAVED")))
+      `(progn
+         (defun ,to-sexp (,object)
+           (list
+            ,@(loop for (key accessor nil . options) in fields
+                    for encode = (getf options :encode)
+                    append `(,key
+                             ,(if encode
+                                  `(funcall ,encode (,accessor ,object))
+                                  `(,accessor ,object))))))
+         (defun ,from-sexp (sexp)
+           (,constructor
+            ,@(loop for (key nil constructor-key . options) in fields
+                    for decode = (getf options :decode)
+                    for default = (getf options :default)
+                    for value = `(getf sexp ,key ,default)
+                    append `(,constructor-key ,(if decode `(funcall ,decode ,value) value)))))
+         ,@(when shallow-copy
+             `((defun ,(intern (format nil "CATALOG-MUTATION-COPY-~a" name) *package*) (,object)
+                 (let ((,saved (,shallow-copy ,object)))
+                   ,@(loop for (nil accessor nil . options) in fields
+                           for copier = (getf options :snapshot-copy)
+                           when copier
+                             collect `(setf (,accessor ,saved)
+                                            (funcall ,copier (,accessor ,object))))
+                   ,saved))
+               (defun ,(intern (format nil "CATALOG-MUTATION-RESTORE-~a" name) *package*)
+                   (,object ,saved)
+                 ,@(loop for (nil accessor) in fields
+                         collect `(setf (,accessor ,object) (,accessor ,saved))))))))))
 
 (declaim (notinline sql-array-p sql-array-element-type-id sql-array-elements sql-array-dimensions sql-array-lower-bounds make-sql-array))
 
@@ -236,7 +247,19 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
   (:default-sql pg-column-default-sql :default-sql)
   (:storage pg-column-storage :storage))
 
-(define-catalog-codec sequence make-pg-sequence
+(defun catalog-mutation-copy-columns (columns)
+  (map 'vector
+       (lambda (column)
+         (let ((copy (copy-pg-column column)))
+           (setf (pg-column-default-expression copy)
+                 (copy-tree (pg-column-default-expression column)))
+           copy))
+       columns))
+
+(defun catalog-mutation-copy-toast (toast)
+  (when toast (copy-pg-toast toast)))
+
+(define-catalog-codec (sequence copy-pg-sequence) make-pg-sequence
   (:oid pg-sequence-oid :oid)
   (:name pg-sequence-name :name)
   (:increment pg-sequence-increment :increment)
@@ -251,12 +274,12 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
     (error "invalid or missing publication OID in catalog"))
   oid)
 
-(define-catalog-codec publication make-pg-publication
+(define-catalog-codec (publication copy-pg-publication) make-pg-publication
   (:oid pg-publication-oid :oid :decode #'catalog-decode-publication-oid)
   (:name pg-publication-name :name)
   (:all-tables pg-publication-all-tables-p :all-tables-p)
-  (:tables pg-publication-tables :tables)
-  (:sequences pg-publication-sequences :sequences)
+  (:tables pg-publication-tables :tables :snapshot-copy #'copy-tree)
+  (:sequences pg-publication-sequences :sequences :snapshot-copy #'copy-list)
   (:generation pg-publication-generation :generation)
   (:publish-actions pg-publication-publish-actions :publish-actions
                     :default '(:insert :update :delete :truncate)))
@@ -284,24 +307,24 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
   (:index-relfilenode pg-toast-index-relfilenode :index-relfilenode)
   (:relfrozenxid pg-toast-relfrozenxid :relfrozenxid))
 
-(define-catalog-codec class make-pg-class
+(define-catalog-codec (class copy-pg-class) make-pg-class
   (:oid pg-class-oid :oid)
   (:name pg-class-name :name)
   (:relfilenode pg-class-relfilenode :relfilenode)
   (:relfrozenxid pg-class-relfrozenxid :relfrozenxid
                  :decode (lambda (xid)
                            (or xid (xid-epoch-start *next-xid*))))
-  (:columns pg-class-columns :columns
-            :encode (lambda (columns)
-                      (loop for col across columns collect (column-to-sexp col)))
-            :decode (lambda (columns)
-                      (coerce (mapcar #'column-from-sexp columns) 'vector)))
-  (:indexes pg-class-indexes :indexes)
-  (:toast pg-class-toast :toast
-          :encode (lambda (toast) (and toast (toast-to-sexp toast)))
-          :decode (lambda (toast) (and toast (toast-from-sexp toast))))
-  (:checks pg-class-checks :checks
-           :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
+  (:columns pg-class-columns :columns :snapshot-copy #'catalog-mutation-copy-columns
+                                      :encode (lambda (columns)
+                                                (loop for col across columns collect (column-to-sexp col)))
+                                      :decode (lambda (columns)
+                                                (coerce (mapcar #'column-from-sexp columns) 'vector)))
+  (:indexes pg-class-indexes :indexes :snapshot-copy #'copy-list)
+  (:toast pg-class-toast :toast :snapshot-copy #'catalog-mutation-copy-toast
+                                :encode (lambda (toast) (and toast (toast-to-sexp toast)))
+                                :decode (lambda (toast) (and toast (toast-from-sexp toast))))
+  (:checks pg-class-checks :checks :snapshot-copy #'copy-tree
+                                   :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
   (:statistics pg-class-statistics :statistics
                :encode (lambda (statistics)
                          (and statistics (table-statistics-to-sexp statistics)))
@@ -309,12 +332,12 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
                          (and statistics
                               (table-statistics-from-sexp statistics)))))
 
-(define-catalog-codec index make-pg-index
+(define-catalog-codec (index copy-pg-index) make-pg-index
   (:oid pg-index-oid :oid)
   (:name pg-index-name :name)
   (:relfilenode pg-index-relfilenode :relfilenode)
   (:table-oid pg-index-table-oid :table-oid)
-  (:columns pg-index-columns :columns)
+  (:columns pg-index-columns :columns :snapshot-copy #'copy-list)
   (:unique pg-index-unique-p :unique-p)
   (:primary pg-index-primary-p :primary-p)
   (:constraint pg-index-constraint-p :constraint-p)
@@ -794,36 +817,6 @@ longer contain transaction-status references."
   (loop for key being the hash-keys of table using (hash-value value)
         collect (cons key value)))
 
-(defun catalog-mutation-copy-class (class)
-  ;; Rollback owns independent column and CHECK trees and TOAST metadata, so a
-  ;; failed pre-durable mutation cannot leave partial changes in the table.
-  (let ((copy (copy-pg-class class)))
-    (setf (pg-class-columns copy)
-          (map 'vector (lambda (column)
-                         (let ((copy (copy-pg-column column)))
-                           (setf (pg-column-default-expression copy)
-                                 (copy-tree (pg-column-default-expression column)))
-                           copy))
-               (pg-class-columns class))
-          (pg-class-toast copy) (and (pg-class-toast class)
-                                     (copy-pg-toast (pg-class-toast class)))
-          (pg-class-indexes copy) (copy-list (pg-class-indexes class))
-          (pg-class-checks copy) (copy-tree (pg-class-checks class)))
-    copy))
-
-(defun catalog-mutation-copy-index (index)
-  (let ((copy (copy-pg-index index)))
-    (setf (pg-index-columns copy) (copy-list (pg-index-columns index)))
-    copy))
-
-(defun catalog-mutation-copy-publication (publication)
-  (let ((copy (copy-pg-publication publication)))
-    (setf (pg-publication-tables copy)
-          (copy-tree (pg-publication-tables publication))
-          (pg-publication-sequences copy)
-          (copy-list (pg-publication-sequences publication)))
-    copy))
-
 (defun catalog-capture-mutation-snapshot (database)
   (let ((tables (catalog-mutation-hash-entries (database-tables database)))
         (indexes (catalog-mutation-hash-entries (database-indexes database)))
@@ -851,7 +844,7 @@ longer contain transaction-status references."
              indexes)
      :sequence-states
      (mapcar (lambda (entry)
-               (cons (cdr entry) (copy-pg-sequence (cdr entry))))
+               (cons (cdr entry) (catalog-mutation-copy-sequence (cdr entry))))
              sequences)
      :publication-states
      (mapcar (lambda (entry)
@@ -866,52 +859,6 @@ longer contain transaction-status references."
   (clrhash table)
   (dolist (entry entries)
     (setf (gethash (car entry) table) (cdr entry))))
-
-(defun catalog-mutation-restore-class (class saved)
-  (setf (pg-class-oid class) (pg-class-oid saved)
-        (pg-class-name class) (pg-class-name saved)
-        (pg-class-relfilenode class) (pg-class-relfilenode saved)
-        (pg-class-relfrozenxid class) (pg-class-relfrozenxid saved)
-        (pg-class-toast class) (pg-class-toast saved)
-        (pg-class-columns class) (pg-class-columns saved)
-        (pg-class-indexes class) (pg-class-indexes saved)
-        (pg-class-statistics class) (pg-class-statistics saved)
-        (pg-class-checks class) (pg-class-checks saved)))
-
-(defun catalog-mutation-restore-index (index saved)
-  (setf (pg-index-oid index) (pg-index-oid saved)
-        (pg-index-name index) (pg-index-name saved)
-        (pg-index-relfilenode index) (pg-index-relfilenode saved)
-        (pg-index-table-oid index) (pg-index-table-oid saved)
-        (pg-index-columns index) (pg-index-columns saved)
-        (pg-index-unique-p index) (pg-index-unique-p saved)
-        (pg-index-primary-p index) (pg-index-primary-p saved)
-        (pg-index-constraint-p index) (pg-index-constraint-p saved)
-        (pg-index-nulls-not-distinct-p index)
-        (pg-index-nulls-not-distinct-p saved)
-        (pg-index-valid-p index) (pg-index-valid-p saved)))
-
-(defun catalog-mutation-restore-sequence (sequence saved)
-  (setf (pg-sequence-oid sequence) (pg-sequence-oid saved)
-        (pg-sequence-name sequence) (pg-sequence-name saved)
-        (pg-sequence-increment sequence) (pg-sequence-increment saved)
-        (pg-sequence-start-value sequence) (pg-sequence-start-value saved)
-        (pg-sequence-min-value sequence) (pg-sequence-min-value saved)
-        (pg-sequence-max-value sequence) (pg-sequence-max-value saved)
-        (pg-sequence-last-value sequence) (pg-sequence-last-value saved)
-        (pg-sequence-called-p sequence) (pg-sequence-called-p saved)))
-
-(defun catalog-mutation-restore-publication (publication saved)
-  (setf (pg-publication-oid publication) (pg-publication-oid saved)
-        (pg-publication-name publication) (pg-publication-name saved)
-        (pg-publication-all-tables-p publication)
-        (pg-publication-all-tables-p saved)
-        (pg-publication-tables publication) (pg-publication-tables saved)
-        (pg-publication-sequences publication)
-        (pg-publication-sequences saved)
-        (pg-publication-generation publication)
-        (pg-publication-generation saved)
-        (pg-publication-publish-actions publication) (pg-publication-publish-actions saved)))
 
 (defun catalog-restore-mutation-snapshot (snapshot)
   (let ((database (catalog-mutation-snapshot-database snapshot)))
