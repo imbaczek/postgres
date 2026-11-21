@@ -71,6 +71,31 @@
                      (remhash hold pg::*physical-retained-root-holds*)
                      (setf (gethash owner pg::*physical-retained-root-references*) reference))))))))))
 
+(deftest retained-root-registration-rejects-archive-rebinding-during-validation
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (let* ((archive (merge-pathnames "archive/" root))
+              (moved (merge-pathnames "moved/" root))
+              (rebound-p nil))
+         (ensure-directories-exist archive)
+         (let ((id (pg::physical-retained-inventory-publish archive identity 2 text images)))
+           (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+             (let ((failure
+                     (handler-case
+                         (pg::physical-retained-root-load-reference
+                          archive identity id history
+                          :reader (lambda (directory kind object maximum)
+                                    (declare (ignore directory))
+                                    (unless rebound-p
+                                      (sb-posix:rename (namestring archive) (namestring moved))
+                                      (ensure-directories-exist archive)
+                                      (setf rebound-p t))
+                                    (pg::physical-retained-object-read moved kind object maximum)))
+                       (error (condition) condition))))
+               (ok rebound-p)
+               (ok (and (typep failure 'error)
+                        (search "no longer names the held directory" (princ-to-string failure)))))))))))
+
 (deftest retained-root-reader-protects-retired-control-until-unwind
     (with-retained-root-registry
         (call-with-retained-inventory

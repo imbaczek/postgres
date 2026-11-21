@@ -45,6 +45,13 @@
   (let ((facts (physical-image-file-facts fd)))
     (list (first facts) (second facts) (ninth facts))))
 
+(defun physical-retained-check-archive-binding (directory fd)
+  "Require the archive pathname to still refer to the held directory and mount."
+  (unless (wal-archive-directory-binding-p
+           (physical-image-file-facts fd)
+           (physical-image-file-facts fd (string-right-trim "/" (namestring directory))))
+    (error "retained WAL archive no longer names the held directory")))
+
 (defun physical-retained-archive-path-key (directory)
   (with-slot-state-directory (fd directory)
     (physical-retained-archive-key fd)))
@@ -69,7 +76,8 @@
                           (setf (gethash object destination) t)) source))
   destination)
 
-(defun physical-retained-root-make-reference (directory identity id entries &optional overlap)
+(defun physical-retained-root-make-reference (directory identity id entries &optional overlap
+                                                                              (archive-key (physical-retained-archive-path-key directory)))
   "Build a reference protecting the inventory, extents and optional overlap.
 
 Keep the overlap descriptor as the value of its object key."
@@ -79,7 +87,7 @@ Keep the overlap descriptor as the value of its object key."
     (when overlap (setf (gethash (cons :overlap (first overlap)) objects) (copy-tree overlap)))
     (dolist (entry entries) (setf (gethash (cons :extent (first entry)) objects) t))
     (%make-physical-retained-root-reference
-     :directory directory :archive-key (physical-retained-archive-path-key directory)
+     :directory directory :archive-key archive-key
      :identity (physical-retained-root-copy-identity identity)
      :root-id id :objects objects)))
 
@@ -97,9 +105,17 @@ Keep the overlap descriptor as the value of its object key."
   "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
   (when id
-    (let ((payload (physical-retained-inventory-load directory id identity history :reader reader)))
-      (physical-retained-root-make-reference directory identity id (getf payload :entries)
-                                             (getf payload :base-overlap)))))
+    (with-slot-state-directory (fd directory)
+      (let* ((archive-key (physical-retained-archive-key fd))
+             ;; Typed readers already hold their own anchored directory and
+             ;; receive the original name so they can check its identity.
+             (read-directory (if (eq reader 'physical-retained-object-read)
+                                 (uiop:ensure-directory-pathname (slot-state-fd-path fd))
+                                 directory))
+             (payload (physical-retained-inventory-load read-directory id identity history :reader reader)))
+        (physical-retained-check-archive-binding directory fd)
+        (physical-retained-root-make-reference directory identity id (getf payload :entries)
+                                               (getf payload :base-overlap) archive-key)))))
 
 (defun physical-retained-root-current (owner)
   "Return OWNER's process-local selected root ID, if any."
@@ -509,11 +525,7 @@ WAL locks while holding the archive mutex."
           (let* ((name (file-namestring (physical-retained-object-path directory kind id)))
                  (path (slot-state-fd-path fd name)))
             (when (wal-namespace-file-stat path t)
-              (unless (wal-archive-directory-binding-p
-                       (physical-image-file-facts fd)
-                       (physical-image-file-facts
-                        fd (string-right-trim "/" (namestring directory))))
-                (error "retained WAL archive no longer names the held directory"))
+              (physical-retained-check-archive-binding directory fd)
               (unless (zerop (port-unlinkat fd name 0))
                 (error "could not delete retained WAL object ~a: errno ~d" name (sb-alien:get-errno)))
               (sb-posix:fsync fd)
