@@ -187,6 +187,13 @@ and ProjectSet dependencies. Calls and whole rows expose executable inputs,
 subplans expose their outer test, and constants are leaves. The ProjectSet
 visitor separately resolves references to projected sort outputs.
 
+The first A13 slice shares SELECT plan admission across simple execution,
+PERFORM, COPY TO, EXPLAIN, and extended portal initialization. Admission
+registers and revalidates relation readers before reconciling the physical
+access paths. Portal initialization still owns its snapshot, table retention,
+index leases, and resumable iterator. Describe keeps its separate
+metadata-only registration path.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

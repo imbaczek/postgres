@@ -2441,6 +2441,16 @@ projection or filter forms fall back to ordinary full materialization."
     (visit (query-plan-physical plan)))
   plan)
 
+(defun call-with-admitted-select-plan (plan function)
+  "Call FUNCTION with the plan's registered relations after reconciling its access paths."
+  (declare (dynamic-extent function))
+  (let ((relations (getf (query-plan-prepared plan) :relations)))
+    (if relations
+        (with-registered-select-relations (registered relations)
+          (reconcile-query-plan-access-paths plan registered)
+          (funcall function registered))
+        (funcall function nil))))
+
 (defun physical-plan-node-label (node relations)
   (case (first node)
     (:seq-scan
@@ -2577,41 +2587,32 @@ Compare the advertised column shape, independently of result format codes."
 
 (defun exec-perform (ast)
   "Execute a SELECT for its effects and report whether it returned any rows."
-  (let* ((plan (plan-select-query ast))
-         (relations (getf (query-plan-prepared plan) :relations))
-         (found-p nil))
+  (let ((plan (plan-select-query ast))
+        (found-p nil))
     (flet ((discard-row (row)
              (declare (ignore row))
              (check-for-interrupts)
              (setf found-p t)))
-      (if relations
-          (with-registered-select-relations (registered relations)
-            (reconcile-query-plan-access-paths plan registered)
-            (execute-query-plan plan registered #'discard-row))
-          (execute-query-plan plan nil #'discard-row)))
+      (call-with-admitted-select-plan
+       plan (lambda (registered)
+              (execute-query-plan plan registered #'discard-row))))
     found-p))
 
 (defun exec-select (stream ast)
   (let* ((plan (plan-select-query ast))
-         (prepared (query-plan-prepared plan))
-         (relations (getf prepared :relations))
-         (targets (getf prepared :targets))
+         (targets (getf (query-plan-prepared plan) :targets))
          (columns (mapcar #'target->result-column targets))
          (row-count 0))
     (when *select-suppress-description*
       (check-result-column-shape columns *select-expected-result-columns*))
-    (labels ((send-row (row)
-               (send-select-row stream row targets)
-               (incf row-count)))
-      (if relations
-          (with-registered-select-relations (registered relations)
-            (reconcile-query-plan-access-paths plan registered)
-            (unless *select-suppress-description* (send-row-description stream columns))
-            (execute-query-plan plan registered #'send-row))
-          (progn
-            (unless *select-suppress-description* (send-row-description stream columns))
-            (execute-query-plan plan nil #'send-row)))
-      (send-command-complete stream (format nil "SELECT ~a" row-count)))))
+    (flet ((send-row (row)
+             (send-select-row stream row targets)
+             (incf row-count)))
+      (call-with-admitted-select-plan
+       plan (lambda (registered)
+              (unless *select-suppress-description* (send-row-description stream columns))
+              (execute-query-plan plan registered #'send-row))))
+    (send-command-complete stream (format nil "SELECT ~a" row-count))))
 
 (defun copy-write-frame (stream type payload)
   "A partially transmitted COPY frame must close rather than interleave an error."
@@ -2657,7 +2658,6 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
   "Stream a SELECT plan's snapshot rows using C's default text COPY format."
   (let* ((plan (plan-select-query (getf ast :query)))
          (prepared (query-plan-prepared plan))
-         (relations (getf prepared :relations))
          (targets (getf prepared :targets))
          (count 0))
     (labels ((send-row (row)
@@ -2671,23 +2671,16 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                   :after-copy-out-response
                   (when (sql-relation-name-p source) (sql-relation-name-name source))))
                (execute-query-plan plan registered #'send-row)))
-      (if relations
-          (with-registered-select-relations (registered relations)
-            (reconcile-query-plan-access-paths plan registered)
-            (copy-plan registered))
-          (copy-plan nil))
+      (call-with-admitted-select-plan plan #'copy-plan)
       (copy-write-frame stream #\c #())
       count)))
 
 (defun exec-explain (stream ast)
   (let* ((plan (plan-select-query (getf ast :statement)))
-         (prepared (query-plan-prepared plan))
-         (relations (getf prepared :relations))
          (analyze-p (getf ast :analyze-p))
          (description nil)
          (execution-time 0.0d0))
     (labels ((prepare-explain (registered)
-               (reconcile-query-plan-access-paths plan registered)
                (when analyze-p
                  (let ((started (get-internal-real-time)))
                    (let ((*query-plan-instrumentation-p* t))
@@ -2702,10 +2695,7 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                (setf description
                      (format-query-plan plan registered analyze-p
                                         execution-time))))
-      (if relations
-          (with-registered-select-relations (registered relations)
-            (prepare-explain registered))
-          (prepare-explain nil)))
+      (call-with-admitted-select-plan plan #'prepare-explain))
     (send-row-description
      stream
      (list (make-result-column :name "QUERY PLAN"

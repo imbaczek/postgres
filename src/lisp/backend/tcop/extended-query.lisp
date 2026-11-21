@@ -237,7 +237,6 @@
                 (setf (extended-select-execution-plan execution) plan
                       (extended-select-execution-targets execution) targets)
                 (flet ((initialize (relations)
-                         (reconcile-query-plan-access-paths plan relations)
                          (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
                                relations)
                          ;; Record scans now, including lazy children, while the portal
@@ -248,10 +247,7 @@
                           (lambda ()
                             (setf (extended-select-execution-iterator execution)
                                   (make-resumable-query-plan-iterator plan relations))))))
-                  (if (getf prepared :relations)
-                      (with-registered-select-relations (registered (getf prepared :relations))
-                        (initialize registered))
-                      (initialize nil))))))
+                  (call-with-admitted-select-plan plan #'initialize)))))
            (setf complete t)
            portal)
       (unless complete (extended-close-portal portal)))))
