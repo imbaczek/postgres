@@ -83,14 +83,14 @@ The returned semantic scan disposition does not update replay exhaustion."
    store
    (lambda ()
      (let* ((candidate (physical-follow-copy-checked-store store))
-            (tuple (physical-store-control-tuple candidate))
+            (snapshot (physical-store-control-snapshot candidate))
             (control (physical-recovery-read-control *pgdata*))
             (required (list (getf control :applied)
                             (getf control :applied-timeline (getf control :timeline)))))
-       (unless (and (= (first tuple) (getf base :system-id))
-                    (= (second tuple) (getf base :timeline))
-                    (= (third tuple) (getf base :end))
-                    (= (nth 9 tuple) (getf base :manifest-digest)))
+       (unless (and (= (physical-receive-control-system-id snapshot) (getf base :system-id))
+                    (= (physical-receive-control-timeline snapshot) (getf base :timeline))
+                    (= (physical-receive-control-base snapshot) (getf base :end))
+                    (= (physical-receive-control-manifest-digest snapshot) (getf base :manifest-digest)))
          (error "current receiver differs from its immutable base"))
        (physical-store-validate-prefix candidate)
        (physical-follow-scan-current-state
@@ -154,14 +154,15 @@ Copy the durable resource fact into the recovery witness when present."
   (let* ((base (physical-recovery-verify-base-state))
          (control (physical-recovery-read-control *pgdata*))
          (store (physical-follow-copy-checked-store *physical-receive-store*))
-         (before (physical-store-control-tuple store))
+         (before (physical-store-control-snapshot store))
+         (flush (physical-receive-control-flush before))
          (applied (list *last-replay-lsn* (physical-recovery-replay-timeline)))
          (required (list (getf control :applied)
                          (getf control :applied-timeline (getf control :timeline))))
          (limit (if (= (getf view :source) (getf view :parent))
-                    (fourth before) (getf view :fork)))
+                    flush (getf view :fork)))
          (cursor (if (eq :retained-timeline (getf view :proof-kind))
-                     (fourth before) (min (fourth before) limit)))
+                     flush (min flush limit)))
          (index (physical-follow-controller-index store))
          (coordinates nil))
     (unless (and (eql 2 (getf control :phase)) (eql 3 (getf control :control-version)))
@@ -203,23 +204,26 @@ Copy the durable resource fact into the recovery witness when present."
                                                               :restartpoint (when metadata (list (getf metadata :lsn) digest))) control)))))
 
 (defun physical-follow-controller-plan (snapshot anchor view)
-  "Build a binding; same-timeline and retained follow keep the receive tuple.
+  "Build a binding; same-timeline and retained follow keep the receive state.
 A retained binding carries no child history and cannot pass its fork."
-  (let* ((before (getf snapshot :before)) (fork (getf view :fork))
-                                          (after
-                                            (if (or (member (physical-follow-anchor-kind anchor) '(:same-timeline :retained-timeline))
-                                                    (< (fourth before) fork))
-                                                (copy-list before)
-                                                (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
-                                                  (physical-store-control-tuple
-                                                   (physical-store-follow-candidate
-                                                    *physical-receive-store* before (getf snapshot :applied) (getf snapshot :required)
-                                                    (getf view :child) (getf view :child-history)
-                                                    (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))))))))
-                                          (binding (list :version 1 :phase :pending :anchor anchor
-                                                         :child-history (getf view :child-history) :before before :after after
-                                                         :applied (getf snapshot :applied) :required (getf snapshot :required)
-                                                         :recovery (getf snapshot :recovery))))
+  (let* ((before (getf snapshot :before))
+         (fork (getf view :fork))
+         (after
+           (if (or (member (physical-follow-anchor-kind anchor) '(:same-timeline :retained-timeline))
+                   (< (physical-receive-control-flush before) fork))
+               before
+               (sb-thread:with-mutex ((physical-store-mutex *physical-receive-store*))
+                 (physical-store-control-snapshot
+                  (physical-store-follow-candidate
+                   *physical-receive-store* before (getf snapshot :applied) (getf snapshot :required)
+                   (getf view :child) (getf view :child-history)
+                   (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))))))))
+         (binding (list :version 1 :phase :pending :anchor anchor
+                        :child-history (getf view :child-history)
+                        :before (physical-receive-control-to-tuple before)
+                        :after (physical-receive-control-to-tuple after)
+                        :applied (getf snapshot :applied) :required (getf snapshot :required)
+                        :recovery (getf snapshot :recovery))))
     (physical-follow-binding-check binding)
     binding))
 
