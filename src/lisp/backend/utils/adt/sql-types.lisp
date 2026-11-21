@@ -1,6 +1,6 @@
 ;;;; SQL type identities shared by analysis, catalogs, and protocol framing.
 
-(in-package #:pg)
+(in-package #:pg.sql-types)
 
 (defparameter +sql-expression-types+
   '((:jsonb 3802 -1) (:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
