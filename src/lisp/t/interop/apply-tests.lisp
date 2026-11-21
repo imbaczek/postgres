@@ -792,10 +792,13 @@ ORDER BY 1,2"
                (pg::logical-ensure-progress-table target)
                ;; Replay six original C transactions through Commit. The following
                ;; private Message fixtures are separately covered by codec tests.
-               (loop for frame in frames
+               (loop with truncated-p = nil
+                     for frame in frames
                      for kind = (code-char (aref frame 0))
                      until (= commits 6)
-                     do (when (char= kind #\C)
+                     do (when (char= kind #\T) (setf truncated-p t))
+                        ;; TRUNCATE holds the relation lock through commit.
+                        (when (and (char= kind #\C) (not truncated-p))
                           ;; Another connection must still see the preceding commit.
                           (ok (equalp
                                (coerce (pg::logical-target-query
@@ -813,7 +816,8 @@ ORDER BY 1,2"
                           (ok (string=
                                (getf (pg::logical-read-progress observer "fixture_apply") :lsn)
                                (pg::wal-format-lsn (pg::pg-client-u64 frame 10))))
-                          (incf commits)))
+                          (incf commits)
+                          (setf truncated-p nil)))
                (ok (= commits 6))
                ;; A synthetic multi-relation native T exercises grouped dispatch,
                ;; followed by rollback to check transactional visibility.
@@ -839,8 +843,7 @@ ORDER BY 1,2"
                 (pg::logical-pgoutput-read-operation runtime (pg::pgoutput-build-truncate '(24587 24588))))
                (ok (null (pg::logical-target-query target "SELECT * FROM fixture_rows")))
                (ok (null (pg::logical-target-query target "SELECT * FROM fixture_other")))
-               (ok (equalp '(#("8" "8"))
-                           (pg::logical-target-query observer "SELECT * FROM fixture_rows")))
+               ;; Release the TRUNCATE locks before querying through the observer.
                (pg::logical-target-query target "ROLLBACK")
                (ok (equalp '(#("8" "8"))
                            (pg::logical-target-query observer "SELECT * FROM fixture_rows")))
