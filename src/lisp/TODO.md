@@ -281,9 +281,13 @@ the legacy harness or combined success line ran.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
-grammar on both source and copy. Startup still reads the existing control's
-namespace during the transition. Retiring legacy names requires recreating or
-retiring the remaining development data, backups and retained ancestral WAL.
+grammar on both source and copy. The live bootstrap and namespace suites
+passed, including byte preservation through migration crashes and a
+legacy-base standby following a migrated primary. The namespace suite and
+restartpoint fixtures share a stopped, TLI-1 legacy conversion that checks
+the control coordinates and WAL bytes. Startup still reads the namespace in
+existing controls. Retiring the legacy grammar requires recreating or
+retiring remaining development data, backups, and retained ancestral WAL.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
@@ -372,7 +376,7 @@ still has work outstanding.
 | A14. Receive-control snapshots | Named snapshots begin in `7fd971c29ed`. See Milestone 1 for exact-field witness, readback, and logical slot copy verification. |
 | A15. WAL core concentration | Recovery and record framing moved in `f1a33ccac3d` and `42c52f3357f`. Audit publication, slots, and archiving boundaries. |
 | A16. Settings metadata | Read-only descriptors in `63085c92361`. Verify startup, session, transaction-local, and reload behavior through their public entry points. |
-| A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. Audit shared setup and retirement ownership across fault scenarios. |
+| A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. WAL namespace and restartpoint process tests share a stopped-source fixture conversion. Audit shared setup and retirement ownership across the remaining fault scenarios. |
 | A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. `t/run-unit-tests.sh --list` uses Rove registration and the legacy execution declarations to list 1,596 Rove heads and 166 legacy cases without running them. The legacy listing matches the previous invocation order, including the named VACUUM failpoint variant. Normal execution still passed 1,172 legacy checks. |
 | A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. Audit package boundaries and independent subsystem loading before claiming dependency enforcement. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. Update it when the remaining format cutovers land. |

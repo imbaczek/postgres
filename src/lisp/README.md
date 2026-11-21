@@ -279,28 +279,22 @@ writing empty page images for its old blocks. Replacement pages remain private
 until commit; recovery applies the reset and replacement images only after the
 batch terminal is durable. Work includes discarding staged cache entries and
 private pages, as well as handling replaced relations and new pages. It does not
-walk old physical pages or log an image for each one. Stored WAL
-versions 2–7 with current CRC32C checksums remain readable. Both native streaming
-peers must support format 8; older peers are rejected during negotiation.
-`./t/checkpoint-snapshot.sh` covers legacy upgrade, both publication crash
-boundaries, control-copy mismatch rejection and standby restartpoint preservation.
-Version 7 additionally logs native XID reservations before allocation. Standby
-restartpoint v3 preserves their source upper bounds separately from reader
-visibility. Checkpoint v2, recovery control v3, bootstrap manifest v3 and
-restartpoint v3 preserve exhausted FullXIDs exactly. Older restartpoint generations
-require the full retained prefix to rebuild actual visibility; compacted legacy
-images require reseeding. The regression `./t/xid-reservation.sh` checks both
-control-file crash windows, reader-only allocation, checkpoint-only actual counter
-progress, and crashes during migration of real v1/v2 restartpoints. This adds no
-promotion authority, coordination or synchronous acknowledged-commit guarantee.
+walk old physical pages or log an image for each one. See the
+[supported native formats](PHYSICAL-HA.md#supported-native-formats) for
+accepted stored WAL, stream, and restartpoint versions.
+`./t/checkpoint-snapshot.sh` covers retired-format rejection, publication
+crash boundaries, control-copy mismatch rejection, and standby restartpoints.
+Native XID reservations carry the source upper bound separately from reader
+visibility. `./t/xid-reservation.sh` exercises control-file crash windows,
+reader-only allocation, checkpoint-only counter progress, and retired
+restartpoint rejection.
 
 WAL control v6 records filename namespace separately from insertion/checkpoint
-timelines. Fresh and legacy clusters retain 16-digit native names until an explicit
-primary control call `(wal-migrate-timeline-namespace)` selects 24-digit
-timeline-qualified native names. Startup reconciles interrupted migration before
-writes or recycling. `./t/wal-namespace.sh` covers multi-segment migration/startup
-crashes, continued follow and qualified replica bootstrap. Runtime timeline 1 and
-native WAL7 framing remain in use; this is not promotion or C disk compatibility.
+timelines. Fresh clusters use 24-digit timeline-qualified names. On an existing
+native primary with 16-digit legacy names, `(wal-migrate-timeline-namespace)`
+selects qualified names. Startup reconciles interrupted migration before writes
+or recycling. `./t/wal-namespace.sh` covers multi-segment migration and startup
+crashes, continued follow, and qualified replica bootstrap.
 
 ## Hot reload and control REPL
 

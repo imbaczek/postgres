@@ -87,32 +87,7 @@ sql "$PORT" CHECKPOINT
 checked source '(assert (>= (length (wal-discover-segments)) 2))' multiple-segments
 stop_source
 if [ -z "${WAL_NAMESPACE_SEED:-}" ]; then
-    # Construct a stopped legacy fixture from the newly initialized source.
-    python3 - "$BASE/t/interop" "$TMP/source" <<'PY'
-import runpy
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from crc32c_reference import crc32c
-
-root = Path(sys.argv[2])
-inspect = runpy.run_path(str(Path(sys.argv[1]) / "wal-namespace-inspect.py"))["inspect"]
-facts, namespace = inspect(root)
-assert namespace == "timeline"
-for segment in map(int, facts["files"]):
-    timeline = root / "pg_wal" / f"00000001{segment // 256:08X}{segment % 256:08X}.wal"
-    legacy = root / "pg_wal" / f"{segment:016X}.wal"
-    assert not legacy.exists()
-    timeline.rename(legacy)
-control = root / "global/pg_wal_control"
-fields = control.read_bytes().rstrip(b"\n").split(b" ")
-assert fields[5] == b"timeline"
-fields[5] = b"legacy"
-prefix = b" ".join(fields[:-1])
-control.write_bytes(prefix + f" {crc32c(prefix):08X}\n".encode("ascii"))
-assert inspect(root) == (facts, "legacy")
-PY
+    python3 "$BASE/t/interop/wal-namespace-fixture.py" "$TMP/source"
 fi
 cp -a "$TMP/source" "$TMP/baseline"
 inspect_source --namespace legacy --save "$TMP/before.json"

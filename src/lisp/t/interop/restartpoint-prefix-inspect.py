@@ -339,24 +339,25 @@ def prepare_pending(target, source, snapshot):
     lsn, digest = main(target, source)
     path = root / "physical-recovery.control"
     ordinary = path.read_bytes()
-    assert len(ordinary) == 72 and ordinary[:8] == b"PGRSTAT3"
-    checked_crc(ordinary, 68)
+    assert len(ordinary) >= 72 and ordinary[:8] == b"PGRSTAT3"
+    checked_crc(ordinary, len(ordinary) - 4)
     phase = struct.unpack_from("<I", ordinary, 8)[0]
-    assert phase & 0x7FFFFFFF == 2
+    assert phase & 0x1FFFFFFF == 2 and not phase & 0x20000000
     assert struct.unpack_from("<Q", ordinary, 40)[0] == lsn
     assert struct.unpack_from("<I", ordinary, 12)[0] == 1
     fields = (root / "global" / "pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6"
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
     source_namespace = {b"legacy": 0, b"timeline": 1}[fields[5]]
-    pending = bytearray(88)
+    pending = bytearray(len(ordinary) + 16)
     pending[:68] = ordinary[:68]
+    pending[84:-4] = ordinary[68:-4]
     pending[:8] = b"PGRSTAT4"
-    struct.pack_into("<I", pending, 8, (phase & 0x80000000) | 3)
+    struct.pack_into("<I", pending, 8, (phase & 0xC0000000) | 3)
     struct.pack_into("<I", pending, 56, 5)  # DB_IN_ARCHIVE_RECOVERY
     # Schema alone is insufficient: this fixture deliberately lacks generation ownership.
     struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest ^ 1)
-    struct.pack_into("<I", pending, 84, crc32c(pending))
+    struct.pack_into("<I", pending, len(pending) - 4, crc32c(pending))
     path.write_bytes(pending)
     pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))
     print(f"pending-control-fixture: prepared unproven fork={lsn} child=2 generation={digest ^ 1:016X}")

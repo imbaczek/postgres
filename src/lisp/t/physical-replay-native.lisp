@@ -1,6 +1,16 @@
 ;;;; Private task-owned control hooks. This file is not a network WAL protocol.
 (in-package #:pg)
 
+(defvar *physical-test-restartpoint-due-function* (symbol-function 'physical-restartpoint-due-p))
+
+(defun physical-test-restartpoint-thresholds (timeout wal-bytes)
+  "Run the normal scheduling predicate with short thresholds for the process fixture."
+  (setf (symbol-function 'physical-restartpoint-due-p)
+        (lambda (applied floor now last-time configured-timeout configured-wal-bytes)
+          (declare (ignore configured-timeout configured-wal-bytes))
+          (funcall *physical-test-restartpoint-due-function*
+                   applied floor now last-time timeout wal-bytes))))
+
 (defun physical-test-export-wal (start-lsn path)
   (sb-thread:with-mutex (*wal-lock*)
     (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
