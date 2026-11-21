@@ -1502,7 +1502,7 @@
 (deftest disabled-feature-defaults-match-c-metadata-and-context
     (let ((settings (pg::startup-default-settings "/tmp/disabled-features/")))
       (ok (equal 0 (pg::startup-setting-value settings "max_prepared_transactions")))
-      (ok (assoc "track_commit_timestamp" pg::*startup-setting-specs* :test #'equal))
+      (ok (pg::find-startup-setting "track_commit_timestamp"))
       (ok (not (pg::startup-setting-value settings "track_commit_timestamp")))
       (ok (= 262143 (pg::startup-normalize-setting "max_prepared_transactions" "262143")))
       (dolist (value '("-1" "262144"))
@@ -1852,7 +1852,7 @@
                         (list (string #\Newline) "\\x0a")))
       (destructuring-bind (input expected) case
         (ok (equal expected (pg::startup-normalize-setting "cluster_name" input)))))
-  (ok (eq :postmaster (second (assoc "cluster_name" pg::*startup-setting-specs* :test #'equal)))) )
+  (ok (eq :postmaster (pg::startup-setting-descriptor-context (pg::find-startup-setting "cluster_name")))) )
 
 (cl-spec:defproperty cluster-name-preserves-printable-ascii-within-name-bound
     ((size (range integer 0 100)) (byte (range integer 32 126)))

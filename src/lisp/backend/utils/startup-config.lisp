@@ -222,47 +222,62 @@ synchronous configuration plan against the same source and generation."
     "recovery_target_time" "recovery_target_xid")
   "Target selectors that must remain empty until targeted recovery is implemented.")
 
+(defstruct (startup-setting-descriptor
+            (:constructor make-startup-setting-descriptor
+                (name context kind boot &optional minimum maximum unit)))
+  (name nil :read-only t)
+  (context nil :read-only t)
+  (kind nil :read-only t)
+  (boot nil :read-only t)
+  (minimum nil :read-only t)
+  (maximum nil :read-only t)
+  (unit nil :read-only t))
+
 (defparameter *startup-setting-specs*
-  '(("port" :postmaster :integer "5433" 1 65535 nil)
-    ("listen_addresses" :postmaster :string "127.0.0.1")
-    ("data_directory" :postmaster :string nil)
-    ("hba_file" :postmaster :string nil)
-    ("ident_file" :postmaster :string nil)
-    ("cluster_name" :postmaster :string "")
-    ("archive_mode" :postmaster :archive-mode "off")
-    ("archive_command" :sighup :string "")
-    ("restore_command" :sighup :string "")
-    ("primary_conninfo" :sighup :conninfo "")
-    ("primary_slot_name" :sighup :slot "")
-    ("synchronous_standby_names" :sighup :standby-names "")
-    ("synchronous_commit" :user :synchronous-commit "on")
-    ("recovery_target_timeline" :postmaster :timeline "latest")
-    ("hot_standby" :postmaster :boolean "on")
-    ("hot_standby_feedback" :sighup :boolean "off")
-    ("wal_receiver_status_interval" :sighup :integer "10" 0 2147483 :seconds)
-    ("wal_level" :postmaster :wal-level "replica")
-    ("wal_log_hints" :postmaster :boolean "off")
-    ("full_page_writes" :sighup :boolean "on")
-    ("max_connections" :postmaster :integer "100" 1 262143 nil)
-    ("max_wal_senders" :postmaster :integer "10" 0 262143 nil)
-    ("max_worker_processes" :postmaster :integer "8" 0 262143 nil)
-    ("max_prepared_transactions" :postmaster :integer "0" 0 262143 nil)
-    ("track_commit_timestamp" :postmaster :boolean "off")
-    ("recovery_target" :postmaster :string "")
-    ("recovery_target_lsn" :postmaster :string "")
-    ("recovery_target_name" :postmaster :string "")
-    ("recovery_target_time" :postmaster :string "")
-    ("recovery_target_xid" :postmaster :string "")
-    ("max_locks_per_transaction" :postmaster :integer "128" 10 2147483647 nil)
-    ("reserved_connections" :postmaster :integer "0" 0 262143 nil)
-    ("superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
-    ("max_replication_slots" :postmaster :integer "10" 0 262143 nil)
-    ("wal_writer_delay" :sighup :integer "200" 1 10000 :milliseconds)
-    ("wal_writer_flush_after" :sighup :integer "128" 0 2147483647 :xblocks)
-    ("checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
-    ("max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
-    ("wal_keep_size" :sighup :integer "0" 0 2147483647 :megabytes)
-    ("max_slot_wal_keep_size" :sighup :integer "-1" -1 2147483647 :megabytes)))
+  (list
+   (make-startup-setting-descriptor "port" :postmaster :integer "5433" 1 65535 nil)
+   (make-startup-setting-descriptor "listen_addresses" :postmaster :string "127.0.0.1")
+   (make-startup-setting-descriptor "data_directory" :postmaster :string nil)
+   (make-startup-setting-descriptor "hba_file" :postmaster :string nil)
+   (make-startup-setting-descriptor "ident_file" :postmaster :string nil)
+   (make-startup-setting-descriptor "cluster_name" :postmaster :string "")
+   (make-startup-setting-descriptor "archive_mode" :postmaster :archive-mode "off")
+   (make-startup-setting-descriptor "archive_command" :sighup :string "")
+   (make-startup-setting-descriptor "restore_command" :sighup :string "")
+   (make-startup-setting-descriptor "primary_conninfo" :sighup :conninfo "")
+   (make-startup-setting-descriptor "primary_slot_name" :sighup :slot "")
+   (make-startup-setting-descriptor "synchronous_standby_names" :sighup :standby-names "")
+   (make-startup-setting-descriptor "synchronous_commit" :user :synchronous-commit "on")
+   (make-startup-setting-descriptor "recovery_target_timeline" :postmaster :timeline "latest")
+   (make-startup-setting-descriptor "hot_standby" :postmaster :boolean "on")
+   (make-startup-setting-descriptor "hot_standby_feedback" :sighup :boolean "off")
+   (make-startup-setting-descriptor "wal_receiver_status_interval" :sighup :integer "10" 0 2147483 :seconds)
+   (make-startup-setting-descriptor "wal_level" :postmaster :wal-level "replica")
+   (make-startup-setting-descriptor "wal_log_hints" :postmaster :boolean "off")
+   (make-startup-setting-descriptor "full_page_writes" :sighup :boolean "on")
+   (make-startup-setting-descriptor "max_connections" :postmaster :integer "100" 1 262143 nil)
+   (make-startup-setting-descriptor "max_wal_senders" :postmaster :integer "10" 0 262143 nil)
+   (make-startup-setting-descriptor "max_worker_processes" :postmaster :integer "8" 0 262143 nil)
+   (make-startup-setting-descriptor "max_prepared_transactions" :postmaster :integer "0" 0 262143 nil)
+   (make-startup-setting-descriptor "track_commit_timestamp" :postmaster :boolean "off")
+   (make-startup-setting-descriptor "recovery_target" :postmaster :string "")
+   (make-startup-setting-descriptor "recovery_target_lsn" :postmaster :string "")
+   (make-startup-setting-descriptor "recovery_target_name" :postmaster :string "")
+   (make-startup-setting-descriptor "recovery_target_time" :postmaster :string "")
+   (make-startup-setting-descriptor "recovery_target_xid" :postmaster :string "")
+   (make-startup-setting-descriptor "max_locks_per_transaction" :postmaster :integer "128" 10 2147483647 nil)
+   (make-startup-setting-descriptor "reserved_connections" :postmaster :integer "0" 0 262143 nil)
+   (make-startup-setting-descriptor "superuser_reserved_connections" :postmaster :integer "3" 0 262143 nil)
+   (make-startup-setting-descriptor "max_replication_slots" :postmaster :integer "10" 0 262143 nil)
+   (make-startup-setting-descriptor "wal_writer_delay" :sighup :integer "200" 1 10000 :milliseconds)
+   (make-startup-setting-descriptor "wal_writer_flush_after" :sighup :integer "128" 0 2147483647 :xblocks)
+   (make-startup-setting-descriptor "checkpoint_timeout" :sighup :integer "300" 30 86400 :seconds)
+   (make-startup-setting-descriptor "max_wal_size" :sighup :integer "1024" 2 2147483647 :megabytes)
+   (make-startup-setting-descriptor "wal_keep_size" :sighup :integer "0" 0 2147483647 :megabytes)
+   (make-startup-setting-descriptor "max_slot_wal_keep_size" :sighup :integer "-1" -1 2147483647 :megabytes)))
+
+(defun find-startup-setting (name)
+  (find name *startup-setting-specs* :key #'startup-setting-descriptor-name :test #'string=))
 
 (sb-alien:define-alien-routine ("strtol" startup-strtol) sb-alien:long
   (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
@@ -355,11 +370,11 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
           (values number (string-trim '(#\Space #\Tab #\Newline #\Return #\Page)
                                       (bytes->string bytes :start offset :end (1- (length bytes))))))))))
 
-(defun startup-parse-integer-setting (spec text)
+(defun startup-parse-integer-setting (name text minimum maximum base-unit)
   "Match parse_int rounding, including conversion via the next smaller unit."
   (multiple-value-bind (number unit) (startup-numeric-prefix text)
     (unless (zerop (length unit))
-      (let* ((table (ecase (seventh spec)
+      (let* ((table (ecase base-unit
                       (:milliseconds '(("d" 86400000d0) ("h" 3600000d0) ("min" 60000d0)
                                        ("s" 1000d0) ("ms" 1d0) ("us" 0.001d0)))
                       (:seconds '(("d" 86400d0) ("h" 3600d0) ("min" 60d0)
@@ -370,14 +385,14 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
                                     ("kB" 0.0009765625d0) ("B" 0.00000095367431640625d0)))
                       ((nil) nil)))
              (position (position unit table :key #'first :test #'string=)))
-        (unless position (error "invalid unit in configuration parameter ~a: ~s" (first spec) text))
+        (unless position (error "invalid unit in configuration parameter ~a: ~s" name text))
         (setf number (* number (second (nth position table))))
         (when (< (1+ position) (length table))
           (let ((smaller (second (nth (1+ position) table))))
             (setf number (* (round (/ number smaller)) smaller))))))
     (let ((integer (round number)))
-      (unless (<= (fifth spec) integer (sixth spec))
-        (error "configuration parameter ~a out of range: ~s" (first spec) text))
+      (unless (<= minimum integer maximum)
+        (error "configuration parameter ~a out of range: ~s" name text))
       integer)))
 
 (defun startup-parse-boolean-setting (text)
@@ -400,10 +415,11 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
 (defun startup-setting-text (name value &optional (archive-mode "off"))
   (when (and (equal name "archive_command") (equal archive-mode "off"))
     (return-from startup-setting-text "(disabled)"))
-  (case (third (assoc name *startup-setting-specs* :test #'string=))
-    (:boolean (if value "on" "off"))
-    (:conninfo (startup-render-conninfo value))
-    (t (princ-to-string value))))
+  (let ((spec (find-startup-setting name)))
+    (case (and spec (startup-setting-descriptor-kind spec))
+      (:boolean (if value "on" "off"))
+      (:conninfo (startup-render-conninfo value))
+      (t (princ-to-string value)))))
 
 (defun guc-clean-ascii-octets (octets)
   "Render printable ASCII directly and escape each other byte as hexadecimal."
@@ -438,7 +454,7 @@ even with a UTF-8 database. Conninfo retains its input octets; other settings
 decode their input as UTF-8.
 Timeline and synchronous standby names are validated while retaining their
 original spelling. Synchronous commit values use the session normalizer."
-  (let ((spec (assoc name *startup-setting-specs* :test #'string=))
+  (let ((spec (find-startup-setting name))
         (octets (startup-input-octets input)))
     (unless spec (error "unrecognized configuration parameter ~s" name))
     (when (find 0 octets) (error "NUL in configuration parameter ~a" name))
@@ -446,14 +462,17 @@ original spelling. Synchronous commit values use the session normalizer."
       ;; Postmaster GUC parsing uses SQL_ASCII, even for a UTF-8 cluster.
       (return-from startup-normalize-setting
         (guc-clean-ascii-octets (subseq octets 0 (min 63 (length octets))))))
-    (when (eq :conninfo (third spec))
+    (when (eq :conninfo (startup-setting-descriptor-kind spec))
       (return-from startup-normalize-setting octets))
     (let ((text (startup-input-text octets)))
-      (when (eq :slot (third spec))
+      (when (eq :slot (startup-setting-descriptor-kind spec))
         (physical-follow-configured-slot text)
         (return-from startup-normalize-setting text))
-      (ecase (third spec)
-        (:integer (startup-parse-integer-setting spec text))
+      (ecase (startup-setting-descriptor-kind spec)
+        (:integer (startup-parse-integer-setting
+                   name text (startup-setting-descriptor-minimum spec)
+                   (startup-setting-descriptor-maximum spec)
+                   (startup-setting-descriptor-unit spec)))
         (:wal-level (startup-parse-wal-level text))
         (:archive-mode
          (let ((value (string-downcase text)))
@@ -663,7 +682,7 @@ Follow symlinks, but reject special files without blocking the reload gate."
     (unless (and equals (plusp equals)) (error "-c requires name=value"))
     (let ((name (substitute #\_ #\- (string-downcase (subseq assignment 0 equals)))))
       (unless (or (string= name "config_file")
-                  (assoc name *startup-setting-specs* :test #'string=))
+                  (find-startup-setting name))
         (error "unrecognized configuration parameter ~s" name))
       (setf (gethash name settings) (subseq assignment (1+ equals))))))
 
@@ -723,11 +742,11 @@ A reload may record a different desired value, but does not change this goal."
 (defun startup-default-settings (directory)
   (let ((settings (make-hash-table :test #'equal)))
     (dolist (spec *startup-setting-specs*)
-      (setf (gethash (first spec) settings)
-            (list :value (cond ((string= (first spec) "data_directory") directory)
-                               ((member (first spec) '("hba_file" "ident_file") :test #'string=) nil)
-                               (t (startup-normalize-setting (first spec) (fourth spec))))
-                  :source :default)))
+      (let* ((name (startup-setting-descriptor-name spec))
+             (boot (startup-setting-descriptor-boot spec))
+             (value (cond ((string= name "data_directory") directory)
+                          (boot (startup-normalize-setting name boot)))))
+        (setf (gethash name settings) (list :value value :source :default))))
     settings))
 
 (defun startup-check-feature-support (settings)
@@ -952,8 +971,8 @@ for coherent settings."
          (defaults (startup-default-settings
                     (startup-setting-value old "data_directory"))))
     (dolist (spec *startup-setting-specs*)
-      (when (eq :postmaster (second spec))
-        (let ((name (first spec)))
+      (when (eq :postmaster (startup-setting-descriptor-context spec))
+        (let ((name (startup-setting-descriptor-name spec)))
           (unless (equal (getf (or (gethash name old) (gethash name defaults)) :value)
                          (startup-setting-value new name))
             (error "configuration parameter ~a requires restart" name))))))
@@ -1099,13 +1118,14 @@ strict runtime boundary."
              (candidate (startup-load-settings native overrides *pgdata*))
              (defaults (startup-default-settings (namestring *pgdata*))))
         (dolist (spec *startup-setting-specs*)
-          (let* ((name (first spec)) (old (or (gethash name settings) (gethash name defaults)))
-                                     (new (gethash name candidate)))
+          (let* ((name (startup-setting-descriptor-name spec))
+                 (old (or (gethash name settings) (gethash name defaults)))
+                 (new (gethash name candidate)))
             ;; SelectConfigFiles locks the resolved data path above file priority.
             (when (string= name "data_directory")
               (setf new (list :value (getf old :value) :source :override)
                     (gethash name candidate) new))
-            (when (and (eq (second spec) :postmaster)
+            (when (and (eq (startup-setting-descriptor-context spec) :postmaster)
                        (or (not (equal (getf old :value) (getf new :value)))
                            ;; C marks removal even when the file held the boot value.
                            (and (eq (getf old :source) :file)
@@ -1143,12 +1163,12 @@ This configuration path does not take live admission or the code reload lock."
 
 (defun startup-check-session-setting (name)
   "Reject SQL changes to POSTMASTER, SIGHUP and internal settings with 55P02."
-  (let ((spec (assoc name *startup-setting-specs* :test #'string=)))
-    (when (or (and spec (not (eq (second spec) :user)))
+  (let ((spec (find-startup-setting name)))
+    (when (or (and spec (not (eq (startup-setting-descriptor-context spec) :user)))
               (member name '("config_file" "effective_wal_level") :test #'string=))
       (ereport "55P02" "parameter ~s cannot be changed~a"
                name (if (or (string= name "config_file")
-                            (eq (second spec) :postmaster))
+                            (and spec (eq (startup-setting-descriptor-context spec) :postmaster)))
                         " without restarting the server" " now")))))
 
 (defun startup-effective-wal-level (&optional (configuration (startup-capture-configuration)))
@@ -1188,9 +1208,10 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 List canonical enum names for WAL level, archive mode and synchronous commit.
 CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
-  (let* ((spec (assoc name *startup-setting-specs* :test #'string=))
+  (let* ((spec (find-startup-setting name))
+         (kind (and spec (startup-setting-descriptor-kind spec)))
          (source (getf entry :source))
-         (unit (case (seventh spec) (:seconds "s") (:milliseconds "ms")
+         (unit (case (and spec (startup-setting-descriptor-unit spec)) (:seconds "s") (:milliseconds "ms")
                      (:megabytes "MB") (:xblocks "8kB") (t +null+)))
          (value (getf entry :value)))
     ;; The native byte option predates GUC support and can specify partial MB.
@@ -1208,12 +1229,15 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
                                       (startup-setting-value
                                        (startup-configuration-settings configuration) "archive_mode"))
                                  "off")) unit
-            (if spec (string-downcase (symbol-name (second spec))) "postmaster")
-            (case (third spec) (:integer "integer") (:boolean "bool") ((:wal-level :archive-mode :synchronous-commit) "enum") (t "string"))
+            (if spec (string-downcase (symbol-name (startup-setting-descriptor-context spec))) "postmaster")
+            (case kind
+              (:integer "integer") (:boolean "bool")
+              ((:wal-level :archive-mode :synchronous-commit) "enum")
+              (t "string"))
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
-            (let ((choices (case (third spec)
+            (let ((choices (case kind
                              (:wal-level (vector "minimal" "replica" "logical"))
                              (:archive-mode (vector "always" "on" "off"))
                              (:synchronous-commit (vector "local" "remote_write" "remote_apply" "on")))))
@@ -1298,7 +1322,13 @@ installing settings, taking PGDATA ownership or starting listeners."
   "Build the native registry subset in C --describe-config field order.
 As in C's zero-initialized reset fields, booleans report FALSE and integers 0;
 strings and enums use boot values. These are not runtime or -C defaults."
-  (loop for (name context kind boot minimum maximum) in *startup-setting-specs*
+  (loop for spec in *startup-setting-specs*
+        for name = (startup-setting-descriptor-name spec)
+        for context = (startup-setting-descriptor-context spec)
+        for kind = (startup-setting-descriptor-kind spec)
+        for boot = (startup-setting-descriptor-boot spec)
+        for minimum = (startup-setting-descriptor-minimum spec)
+        for maximum = (startup-setting-descriptor-maximum spec)
         for type = (case kind
                      (:integer "INTEGER") (:boolean "BOOLEAN") ((:wal-level :archive-mode :synchronous-commit) "ENUM")
                      (t "STRING"))

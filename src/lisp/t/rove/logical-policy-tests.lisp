@@ -523,7 +523,7 @@
          (let ((condition (handler-case (progn (funcall operation) nil)
                             (pg-error (condition) condition))))
            (rove:ok (and condition (string= "55P02" (pg-error-sqlstate condition))))))
-       (rove:ok (null (assoc "effective_wal_level" *startup-setting-specs* :test #'string=))))))
+       (rove:ok (null (find-startup-setting "effective_wal_level"))))))
 
 (rove:deftest effective-level-generated-recovery-contract
     (unit-check-property 'effective-level-recovery-uses-published-source))

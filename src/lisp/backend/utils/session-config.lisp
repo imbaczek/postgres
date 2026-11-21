@@ -23,8 +23,7 @@
 
 (defun session-integer-setting (name value minimum maximum unit)
   (handler-case
-      (startup-parse-integer-setting
-       (list name :user :integer "0" minimum maximum unit) (princ-to-string value))
+      (startup-parse-integer-setting name (princ-to-string value) minimum maximum unit)
     (error () (ereport "22023" "invalid value for parameter ~s: ~s" name value))))
 
 (defun session-normalize-datestyle (value)

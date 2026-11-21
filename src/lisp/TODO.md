@@ -213,6 +213,11 @@ rules. In-memory text and binary fields own their values. The independent
 INSERT fixture uses the C tuple field order and checks null, unchanged TOAST,
 UTF-8 text, and binary data after overwriting the input bytes.
 
+The startup settings registry uses named, read-only descriptors for context,
+kind, boot value, integer bounds, and units. Configuration ingestion, reload,
+SQL scope checks, `pg_settings`, and `--describe-config` read that registry.
+Session and startup integer settings share the same bounds and units parser.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
