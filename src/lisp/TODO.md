@@ -229,6 +229,9 @@ changes, logical catalog events, and catalog chunks. History still certifies
 facts from complete terminals. Redo applies resets, then page images, then
 the terminal effect. A replacement batch marker discards the prior incomplete
 batch, including its staged catalog chunks.
+Both consumers also validate complete native terminals through one decoder.
+Catalog chunks are reassembled before either consumer uses the payload.
+Selected end-of-recovery records follow their separate timeline transition.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename

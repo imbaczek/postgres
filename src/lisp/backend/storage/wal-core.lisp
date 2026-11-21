@@ -3159,19 +3159,62 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
       ((= type +wal-record-xid-reservation+) (wal-xid-reservation-record-bound record))
       (t (error "unsupported empty metadata terminal")))))
 
-(defun wal-replay-empty-metadata-terminal (record)
-  "Validate and finish an empty metadata batch.
-Primary XID reservations restore their allocation floor; parameter facts are
-published separately after primary redo completes."
-  (wal-recovery-validate-logical-terminal :other)
-  (let* ((decoded (wal-validate-empty-metadata-terminal
-                   record *wal-recovery-reservation-batch-clean-p*))
-         (apply-function
-           (if (= (wal-record-type record) +wal-record-xid-reservation+)
-               (lambda ()
-                 (unless (recovery-in-progress-p) (xid-restore-reservation-floor decoded)))
-               #'values)))
-    (wal-replay-finish-batch (lambda () apply-function))))
+(defun wal-recovery-decode-terminal (record)
+  "Validate a complete native batch terminal before history or redo effects."
+  (unless *wal-recovery-group-active*
+    (error "WAL terminal record appears outside a batch"))
+  (let ((type (wal-record-type record))
+        (payload (wal-record-payload record)))
+    (when (and *wal-recovery-catalog-chunk-count* (/= type +wal-record-catalog-commit+))
+      (error "WAL catalog chunks lack a catalog commit record"))
+    (cond
+      ((= type +wal-record-commit+)
+       (wal-decode-commit-timestamp payload)
+       (wal-recovery-validate-logical-terminal :commit (wal-record-xid record))
+       nil)
+      ((= type +wal-record-catalog+)
+       (wal-recovery-validate-logical-terminal :catalog)
+       payload)
+      ((= type +wal-record-catalog-commit+)
+       (wal-recovery-validate-logical-terminal :catalog)
+       (multiple-value-bind (count length) (wal-decode-catalog-commit-payload payload)
+         (wal-reassemble-catalog-chunks count length)))
+      (t
+       (wal-recovery-validate-logical-terminal :other)
+       (cond
+         ((wal-empty-metadata-terminal-type-p type)
+          (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
+         ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
+         ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
+         ((= type +wal-record-maintenance+)
+          (unless (zerop (wal-record-xid record))
+            (error "WAL maintenance record must not carry a transaction ID"))
+          (unless (zerop (length payload))
+            (error "WAL maintenance record has an invalid payload"))
+          nil)
+         (t (error "unsupported WAL terminal")))))))
+
+(defun wal-replay-terminal (record)
+  (let* ((type (wal-record-type record))
+         (decoded (wal-recovery-decode-terminal record)))
+    (wal-replay-finish-batch
+     (lambda ()
+       (cond
+         ((= type +wal-record-commit+)
+          (lambda ()
+            ;; Leave short CLOG files short until their proven replacement.
+            (unless (and *wal-recovery-required-clog-reset*
+                         (< (wal-record-end record) *wal-recovery-required-clog-reset*))
+              (clog-set (wal-record-xid record) 1))))
+         ((or (= type +wal-record-catalog+) (= type +wal-record-catalog-commit+))
+          (wal-prepare-catalog-record decoded))
+         ((= type +wal-record-clog-reset+)
+          (lambda () (clog-reset :wal-reset-p nil)))
+         ((= type +wal-record-xid-reservation+)
+          (lambda ()
+            (unless (recovery-in-progress-p) (xid-restore-reservation-floor decoded))))
+         (t #'values)))
+     (= type +wal-record-catalog-commit+))))
 
 (defvar *wal-recovery-required-clog-reset* nil
   "First proven replacement required when startup found a short CLOG file.")
@@ -3199,53 +3242,10 @@ published separately after primary redo completes."
        (wal-recovery-stage-logical-changes record))
       ((= (wal-record-type record) +wal-record-logical-catalog-event+)
        (wal-recovery-note-logical-catalog-event record))
-      ((= (wal-record-type record) +wal-record-commit+)
-       (wal-decode-commit-timestamp (wal-record-payload record))
-       (wal-recovery-validate-logical-terminal
-        :commit (wal-record-xid record))
-       (wal-replay-finish-batch
-        (lambda ()
-          (lambda ()
-            ;; Old statuses will be discarded by the reset. Keep a
-            ;; short file short until then so an interrupted recovery
-            ;; cannot conceal the missing bytes on its next attempt.
-            (unless (and *wal-recovery-required-clog-reset*
-                         (< (wal-record-end record) *wal-recovery-required-clog-reset*))
-              (clog-set (wal-record-xid record) 1))))))
-      ((= (wal-record-type record) +wal-record-catalog+)
-       (wal-recovery-validate-logical-terminal :catalog)
-       (wal-replay-finish-batch
-        (lambda ()
-          (wal-prepare-catalog-record (wal-record-payload record)))))
       ((= (wal-record-type record) +wal-record-catalog-chunk+)
        (wal-recovery-stage-catalog-chunk record))
-      ((= (wal-record-type record) +wal-record-catalog-commit+)
-       (wal-recovery-validate-logical-terminal :catalog)
-       (multiple-value-bind (count length)
-           (wal-decode-catalog-commit-payload (wal-record-payload record))
-         (wal-replay-finish-batch
-          (lambda ()
-            (wal-prepare-catalog-record
-             (wal-reassemble-catalog-chunks count length)))
-          t)))
-      ((= (wal-record-type record) +wal-record-checkpoint+)
-       (wal-recovery-validate-logical-terminal :other)
-       (wal-checkpoint-record-snapshot record)
-       (wal-replay-finish-batch (lambda () #'values)))
-      ((wal-empty-metadata-terminal-type-p (wal-record-type record))
-       (wal-replay-empty-metadata-terminal record))
-      ((= (wal-record-type record) +wal-record-maintenance+)
-       (wal-recovery-validate-logical-terminal :other)
-       (unless (zerop (wal-record-xid record))
-         (error "WAL maintenance record must not carry a transaction ID"))
-       (unless (zerop (length (wal-record-payload record)))
-         (error "WAL maintenance record has an invalid payload"))
-       (wal-replay-finish-batch (lambda () #'values)))
-      ((= (wal-record-type record) +wal-record-clog-reset+)
-       (wal-recovery-validate-logical-terminal :other)
-       (wal-read-u64-payload (wal-record-payload record))
-       (wal-replay-finish-batch
-        (lambda () (lambda () (clog-reset :wal-reset-p nil))))))))
+      ((wal-terminal-record-type-p (wal-record-type record))
+       (wal-replay-terminal record)))))
 
 (defmacro with-wal-replay-staging (() &body body)
   "Isolate one native batch decoder; primary redo and history share this state."

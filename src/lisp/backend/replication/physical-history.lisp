@@ -111,34 +111,15 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
       (dolist (node deletes) (setf (gethash node removed) t)))))
 
 (defun physical-history-accept-terminal (record identity removed)
-  (unless *wal-recovery-group-active*
-    (error "catalog history terminal appears outside a batch"))
   (let ((type (wal-record-type record))
-        (payload (wal-record-payload record)))
-    (when (and *wal-recovery-catalog-chunk-count* (/= type +wal-record-catalog-commit+))
-      (error "catalog history chunks lack their terminal"))
+        (decoded (wal-recovery-decode-terminal record)))
     (cond
       ((= type +wal-record-commit+)
-       (wal-decode-commit-timestamp payload)
-       (wal-recovery-validate-logical-terminal :commit (wal-record-xid record))
        (when *physical-history-reset-forks*
          (dolist (reset *wal-recovery-relation-resets*)
            (setf (gethash (copy-list (cdr reset)) *physical-history-reset-forks*) t))))
-      ((member type (list +wal-record-catalog+ +wal-record-catalog-commit+))
-       (wal-recovery-validate-logical-terminal :catalog)
-       (physical-history-accept-catalog
-        (if (= type +wal-record-catalog+) payload
-            (multiple-value-bind (count length) (wal-decode-catalog-commit-payload payload)
-              (wal-reassemble-catalog-chunks count length)))
-        identity removed))
-      (t
-       (wal-recovery-validate-logical-terminal :other)
-       (cond ((wal-empty-metadata-terminal-type-p type)
-              (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
-             ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
-             ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
-             ((not (and (zerop (length payload)) (zerop (wal-record-xid record))))
-              (error "invalid noncatalog terminal in history"))))))
+      ((or (= type +wal-record-catalog+) (= type +wal-record-catalog-commit+))
+       (physical-history-accept-catalog decoded identity removed))))
   (wal-recovery-reset-batch nil))
 
 (defun physical-history-accept-record (record identity removed)
