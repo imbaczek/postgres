@@ -132,7 +132,7 @@ Reject a forged input before granting it authority over the registered scope."
            (logical-slot-copy-committed-proof-metadata proof)
            (logical-slot-copy-committed-proof-prefix proof)
            (logical-slot-copy-committed-proof-generation proof)
-           (logical-slot-copy-committed-proof-tuple proof)
+           (logical-slot-copy-committed-proof-receive-control proof)
            (logical-slot-copy-committed-proof-observations proof)))))
 
 (defun logical-slot-copy-install-check-input-seal (owner context input record)

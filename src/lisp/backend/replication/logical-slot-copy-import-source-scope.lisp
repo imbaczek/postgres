@@ -36,7 +36,7 @@ and the held global directory's entries before changing files."
                                 state metadata prefix generation))
                        (observations (cons (logical-slot-copy-import-source-parent-observation context descriptor)
                                            observations))
-                       (tuple (copy-tree (physical-store-control-tuple store)))
+                       (receive-control (physical-store-control-snapshot store))
                        (descriptor-image (logical-slot-copy-descriptor-encode descriptor))
                        (image (logical-slot-copy-import-state-image
                                (list source state metadata prefix generation manifest control observations)))
@@ -51,7 +51,7 @@ and the held global directory's entries before changing files."
                                       (unless (and (logical-slot-copy-committed-image-equal-p
                                                     image (list source state metadata prefix generation
                                                                 manifest control observations))
-                                                   (equal tuple (physical-store-control-tuple store))
+                                                   (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
                                                    (equalp descriptor-image
                                                            (logical-slot-copy-descriptor-encode descriptor)))
                                         (error "leased import source binding was modified"))

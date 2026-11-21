@@ -11,12 +11,12 @@
 (defstruct (logical-slot-copy-import-commit-attempt
             (:constructor %make-logical-slot-copy-import-commit-attempt)
             (:print-function physical-libpq-print-private-object))
-  "Saved plan, certificate, evidence facts and receive tuple for rechecking."
+  "Saved plan, certificate, evidence facts and receive control for rechecking."
   (plan nil :read-only t)
   (certificate nil :read-only t)
   (certificate-facts nil :read-only t)
   (evidence-facts nil :read-only t)
-  (tuple nil :read-only t))
+  (receive-control nil :read-only t))
 
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-import-commit-owner))
   (call-next-method)
@@ -76,7 +76,7 @@
        +wal-segment-size+))))
 
 (defun logical-slot-copy-import-check-child-commit (owner context attempt committed)
-  "Recheck certificate, evidence, receive tuple and child artifacts by proof phase.
+  "Recheck certificate, evidence, receive control and child artifacts by proof phase.
 NIL checks pending, :STAGED checks child bytes, :FINAL repeats actual D to F
 source proof before control rename, and T checks committed control and bytes."
   (unless (and (logical-slot-copy-import-commit-owner-p owner)
@@ -95,12 +95,13 @@ source proof before control rename, and T checks committed control and bytes."
       (unless (and (equalp bytes (logical-slot-copy-import-pending-plan-evidence plan))
                    (equal facts (logical-slot-copy-import-commit-attempt-evidence-facts attempt)))
         (error "child commit permanent evidence changed")))
-    (unless (equal (logical-slot-copy-import-commit-attempt-tuple attempt)
-                   (physical-store-control-tuple (logical-slot-copy-import-owner-store owner)))
-      (error "child commit receive tuple changed"))
+    (unless (physical-receive-control-equal-p
+             (logical-slot-copy-import-commit-attempt-receive-control attempt)
+             (physical-store-control-snapshot (logical-slot-copy-import-owner-store owner)))
+      (error "child commit receive control changed"))
     (physical-store-read-retained-control
      (logical-slot-copy-import-owner-store owner)
-     (logical-slot-copy-import-commit-attempt-tuple attempt))
+     (logical-slot-copy-import-commit-attempt-receive-control attempt))
     (if (eq committed t)
         (progn
           (unless (equalp (logical-slot-copy-import-pending-plan-control plan)
@@ -155,8 +156,8 @@ no PGSLOT7 slots."
                                        :plan plan :certificate bytes :certificate-facts facts
                                        :evidence-facts
                                        (nth-value 2 (logical-slot-copy-import-read-artifact context :evidence))
-                                       :tuple (physical-store-control-tuple
-                                               (logical-slot-copy-import-owner-store owner))))
+                                       :receive-control (physical-store-control-snapshot
+                                                         (logical-slot-copy-import-owner-store owner))))
                              (*pgdata* (physical-image-context-root-path context)))
                         (physical-follow-call-with-receive-root
                          (logical-slot-copy-import-owner-store owner)

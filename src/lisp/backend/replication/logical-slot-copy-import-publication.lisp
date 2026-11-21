@@ -107,8 +107,8 @@ Rewrites are rejected even when the bytes are unchanged."
         (error "logical import publication inode changed"))))
   t)
 
-(defun logical-slot-copy-import-check-publication-plan (owner context attempt store tuple kind)
-  "Recheck source and evidence binding, receive tuple and owner before publication.
+(defun logical-slot-copy-import-check-publication-plan (owner context attempt store receive-control kind)
+  "Recheck source and evidence binding, receive control and owner before publication.
 Compare the captured selection chain with the leased store before publication.
 Certificate writes also require the pinned evidence bytes and file facts."
   (logical-slot-copy-check-import-publication owner context)
@@ -124,9 +124,9 @@ Certificate writes also require the pinned evidence bytes and file facts."
      evidence (logical-slot-copy-import-pending-plan-value attempt)
      (logical-slot-copy-import-pending-plan-descriptor attempt)
      (logical-slot-copy-import-owner-existing-proof owner)))
-  (unless (equal tuple (physical-store-control-tuple store))
-    (error "logical import receive tuple changed before publication"))
-  (physical-store-read-retained-control store tuple)
+  (unless (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
+    (error "logical import receive control changed before publication"))
+  (physical-store-read-retained-control store receive-control)
   (ecase kind
     (:evidence nil)
     (:pending (logical-slot-copy-import-check-evidence-ready owner context attempt)))
@@ -138,11 +138,11 @@ Certificate writes also require the pinned evidence bytes and file facts."
     (unless (equalp bytes actual)
       (error "logical import metadata changed during publication"))))
 
-(defun logical-slot-copy-import-sync-file (owner context attempt store tuple kind bytes)
+(defun logical-slot-copy-import-sync-file (owner context attempt store receive-control kind bytes)
   "Recheck and sync the artifact and root, then read back bytes and file identity."
   (let ((root (physical-image-context-root-fd context))
         (name (logical-slot-copy-import-file-spec kind)))
-    (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+    (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
     (logical-slot-copy-import-check-file-bytes context kind bytes)
     (call-with-physical-image-input-at
      root name
@@ -153,7 +153,7 @@ Certificate writes also require the pinned evidence bytes and file facts."
            (error "logical import metadata changed before sync"))
          (sb-posix:fsync fd)
          (logical-slot-copy-import-file-test-point kind :before-root-fsync context)
-         (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+         (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
          (sb-posix:fsync root)
          (logical-slot-copy-import-file-test-point kind :after-root-fsync context)
          (logical-slot-copy-import-check-file-bytes context kind bytes)
@@ -163,10 +163,10 @@ Certificate writes also require the pinned evidence bytes and file facts."
     (physical-slot-check-standby-receive
      store (logical-slot-copy-import-pending-plan-state attempt)
      (getf (logical-slot-copy-import-pending-plan-value attempt) :fork))
-    (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+    (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
     bytes))
 
-(defun logical-slot-copy-import-write-file (owner context attempt store tuple kind existing)
+(defun logical-slot-copy-import-write-file (owner context attempt store receive-control kind existing)
   "Publish or resync an artifact under the owned scope with exclusive rename.
 Check the plan around file and root fsync and readback; stale temporaries fail."
   (let* ((bytes (ecase kind
@@ -176,11 +176,11 @@ Check the plan around file and root fsync and readback; stale temporaries fail."
          (root (physical-image-context-root-fd context))
          (fd nil) (stream nil))
     (multiple-value-bind (name temporary) (logical-slot-copy-import-file-spec kind)
-      (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+      (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
       (when existing
         (unless (equalp bytes existing) (error "logical import retry bytes differ"))
         (return-from logical-slot-copy-import-write-file
-          (logical-slot-copy-import-sync-file owner context attempt store tuple kind bytes)))
+          (logical-slot-copy-import-sync-file owner context attempt store receive-control kind bytes)))
       (when (logical-slot-copy-import-read-artifact context kind)
         (error "logical import metadata appeared before exclusive publication"))
       (sb-sys:without-interrupts
@@ -197,11 +197,11 @@ Check the plan around file and root fsync and readback; stale temporaries fail."
                  (write-sequence bytes stream)
                  (force-output stream)
                  (logical-slot-copy-import-file-test-point kind :before-file-fsync context)
-                 (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+                 (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
                  (sb-posix:fsync fd)
                  (logical-slot-copy-import-file-test-point kind :after-file-fsync context)
                  (logical-slot-copy-import-file-test-point kind :before-rename context)
-                 (logical-slot-copy-import-check-publication-plan owner context attempt store tuple kind)
+                 (logical-slot-copy-import-check-publication-plan owner context attempt store receive-control kind)
                  (when (logical-slot-copy-import-read-artifact context kind)
                    (error "logical import metadata appeared before rename"))
                  (sb-sys:without-interrupts
@@ -210,7 +210,7 @@ Check the plan around file and root fsync and readback; stale temporaries fail."
                      (error "cannot publish exclusive logical import metadata"))
                    (setf (logical-slot-copy-import-publication-owner-pending-name owner) name))
                  (logical-slot-copy-import-file-test-point kind :after-rename context)
-                 (logical-slot-copy-import-sync-file owner context attempt store tuple kind bytes)))
+                 (logical-slot-copy-import-sync-file owner context attempt store receive-control kind bytes)))
           (unwind-protect
                (if stream (close stream) (when fd (sb-posix:close fd)))
             (setf (logical-slot-copy-import-publication-owner-pending-fd owner) nil)))))))
@@ -239,13 +239,13 @@ admission and writes no PGSLOT7 or child WAL; ordinary fences remain in place."
             (physical-follow-call-with-receive-root
              store
              (lambda ()
-               (let ((tuple (physical-store-control-tuple store)))
+               (let ((receive-control (physical-store-control-snapshot store)))
                  (physical-slot-check-standby-receive
                   store state (getf (logical-slot-copy-import-pending-plan-value attempt) :fork))
                  (logical-slot-copy-import-write-file
-                  owner context attempt store tuple :evidence old-evidence)
+                  owner context attempt store receive-control :evidence old-evidence)
                  (setf (logical-slot-copy-import-publication-owner-evidence-ready owner)
                        (nth-value 2 (logical-slot-copy-import-read-artifact context :evidence)))
                  (logical-slot-copy-import-decode
                   (logical-slot-copy-import-write-file
-                   owner context attempt store tuple :pending old-bytes))))))))))))
+                   owner context attempt store receive-control :pending old-bytes))))))))))))

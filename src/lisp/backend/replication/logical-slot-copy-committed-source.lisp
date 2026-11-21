@@ -98,19 +98,19 @@
                (equalp (getf evidence :child-history) (physical-promotion-history-image state))
                (logical-slot-copy-committed-image-equal-p plan (physical-promotion-current-checkpoint-plan state)))
     (error "committed import source history or child plan differs from actual restartpoint"))
-  (multiple-value-bind (fact history tuple state-image)
+  (multiple-value-bind (fact history receive-control state-image)
       (logical-slot-copy-import-scan store state manifest descriptor control)
     ;; Check the replayed F fact separately; do not substitute it into the
     ;; original R and C3 inputs used for the child plan.
     (logical-slot-copy-evidence-check-resolved-fact certificate descriptor control history fact)
     (let ((observations (funcall check-artifacts)))
-      (unless (and (equal tuple (physical-store-control-tuple store))
+      (unless (and (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
                    (logical-slot-copy-committed-image-equal-p state-image (logical-slot-copy-import-state-image state)))
         (error "committed import source changed during verification"))
       (logical-slot-copy-check-committed-progress state metadata prefix generation store)
       (logical-slot-copy-recheck-committed-state
        manifest control descriptor state metadata prefix generation)
-      (values fact history tuple observations))))
+      (values fact history receive-control observations))))
 
 (defun logical-slot-copy-check-committed-source
     (context certificate evidence descriptor manifest control plan state metadata prefix generation store)
@@ -129,10 +129,10 @@ slots and checking complete child files. Recheck source observations."
   (manifest nil :read-only t) (control nil :read-only t)
   (state nil :read-only t) (metadata nil :read-only t)
   (prefix nil :read-only t) (generation nil :read-only t)
-  (tuple nil :read-only t) (observations nil :read-only t))
+  (receive-control nil :read-only t) (observations nil :read-only t))
 
 (defun logical-slot-copy-committed-proof-image
-    (evidence descriptor manifest control state metadata prefix generation tuple observations)
+    (evidence descriptor manifest control state metadata prefix generation receive-control observations)
   "Copy committed source facts into an independent proof capsule."
   (%make-logical-slot-copy-committed-proof
    :evidence (logical-slot-copy-import-evidence-decode (logical-slot-copy-import-evidence-encode evidence))
@@ -142,7 +142,7 @@ slots and checking complete child files. Recheck source observations."
    :state (logical-slot-copy-import-state-image state)
    :metadata (logical-slot-copy-import-state-image metadata)
    :prefix (copy-seq prefix) :generation (logical-slot-copy-import-state-image generation)
-   :tuple (logical-slot-copy-import-state-image tuple)
+   :receive-control (copy-physical-receive-control receive-control)
    :observations (logical-slot-copy-import-state-image observations)))
 
 (defun call-with-logical-slot-copy-committed-proof
@@ -166,7 +166,7 @@ its phase-specific location checks across the callback."
          (physical-follow-call-with-receive-root
           store
           (lambda ()
-            (multiple-value-bind (fact history tuple child-observations)
+            (multiple-value-bind (fact history receive-control child-observations)
                 (logical-slot-copy-check-committed-source
                  context certificate evidence descriptor manifest control plan
                  state metadata prefix generation store)
@@ -176,9 +176,9 @@ its phase-specific location checks across the callback."
                     (funcall function owner context store certificate plan fact history
                              (when include-proof
                                (logical-slot-copy-committed-proof-image
-                                evidence descriptor manifest control state metadata prefix generation tuple
+                                evidence descriptor manifest control state metadata prefix generation receive-control
                                 (append input-observations child-observations))))
-                  (unless (and (equal tuple (physical-store-control-tuple store))
+                  (unless (and (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
                                (logical-slot-copy-committed-image-equal-p image (logical-slot-copy-import-state-image
                                                                                  (list certificate evidence manifest control
                                                                                        plan state metadata prefix fact history))))

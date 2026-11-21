@@ -215,6 +215,9 @@ String case and scalar types must match exactly."
               (equalp left right)
               (loop for a across left for b across right
                     always (logical-slot-copy-committed-image-equal-p a b)))))
+    ((physical-receive-control-p left)
+     (and (physical-receive-control-p right)
+          (physical-receive-control-equal-p left right)))
     ((timeline-history-entry-p left)
      (and (timeline-history-entry-p right)
           (eql (timeline-history-entry-timeline left) (timeline-history-entry-timeline right))
