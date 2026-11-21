@@ -46,6 +46,31 @@
          (pg::with-slot-state-directory (other-fd other)
            (ng (pg::physical-retained-root-archive-fenced-p other other-fd)))))))
 
+(deftest retained-root-protection-matches-archive-across-mounts
+    (with-retained-root-registry
+        (call-with-retained-inventory
+         (lambda (root images identity history text)
+           (let* ((id (pg::physical-retained-inventory-publish root identity 2 text images))
+                  (owner (gensym "OWNER")))
+             (pg::physical-retained-root-register owner root id identity history)
+             (sb-thread:with-mutex (pg::*physical-retained-inventory-publish-lock*)
+               (destructuring-bind (device inode mount)
+                   (pg::physical-retained-archive-path-key root)
+                 (let ((alias (list device inode (1+ mount)))
+                       (other (list device (1+ inode) mount))
+                       (reference (gethash owner pg::*physical-retained-root-references*))
+                       (hold (pg::physical-retained-root-prepare-update owner root identity id)))
+                   (ok (pg::physical-retained-root-protected-under-lock root :inventory id alias))
+                   (ng (pg::physical-retained-root-protected-under-lock root :inventory id other))
+                   (remhash owner pg::*physical-retained-root-references*)
+                   (setf (gethash hold pg::*physical-retained-root-holds*) hold)
+                   (unwind-protect
+                        (progn
+                          (ok (pg::physical-retained-root-protected-under-lock root :inventory id alias))
+                          (ng (pg::physical-retained-root-protected-under-lock root :inventory id other)))
+                     (remhash hold pg::*physical-retained-root-holds*)
+                     (setf (gethash owner pg::*physical-retained-root-references*) reference))))))))))
+
 (deftest retained-root-reader-protects-retired-control-until-unwind
     (with-retained-root-registry
         (call-with-retained-inventory

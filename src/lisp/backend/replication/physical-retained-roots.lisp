@@ -10,11 +10,11 @@
 
 (defstruct (physical-retained-root-reference (:constructor %make-physical-retained-root-reference))
   "A process-local owner's selected root and the objects it protects."
-  directory identity root-id objects)
+  directory archive-key identity root-id objects)
 
 (defstruct (physical-retained-root-hold (:constructor %make-physical-retained-root-hold))
   "Protect an update's old and candidate objects until selection is resolved."
-  owner directory identity expected-root objects candidates reference (state :preparing))
+  owner directory archive-key identity expected-root objects candidates reference (state :preparing))
 
 (defvar *physical-retained-root-references* (make-hash-table :test #'eq))
 
@@ -39,6 +39,19 @@
   (let ((path (truename directory)))
     (unless (uiop:directory-exists-p path) (error "retained WAL directory is absent"))
     path))
+
+(defun physical-retained-archive-key (fd)
+  "Capture the device, inode and mount identity of an open archive directory."
+  (let ((facts (physical-image-file-facts fd)))
+    (list (first facts) (second facts) (ninth facts))))
+
+(defun physical-retained-archive-path-key (directory)
+  (with-slot-state-directory (fd directory)
+    (physical-retained-archive-key fd)))
+
+(defun physical-retained-same-archive-p (left right)
+  "Match objects shared through different mounts of the same archive."
+  (and (= (first left) (first right)) (= (second left) (second right))))
 
 (defun physical-retained-root-copy-identity (identity)
   "Validate and copy an owner's base identity."
@@ -66,7 +79,8 @@ Keep the overlap descriptor as the value of its object key."
     (when overlap (setf (gethash (cons :overlap (first overlap)) objects) (copy-tree overlap)))
     (dolist (entry entries) (setf (gethash (cons :extent (first entry)) objects) t))
     (%make-physical-retained-root-reference
-     :directory directory :identity (physical-retained-root-copy-identity identity)
+     :directory directory :archive-key (physical-retained-archive-path-key directory)
+     :identity (physical-retained-root-copy-identity identity)
      :root-id id :objects objects)))
 
 (defun physical-retained-root-reference-overlap (reference)
@@ -97,6 +111,8 @@ Keep the overlap descriptor as the value of its object key."
   "Reject a reference belonging to another archive or base."
   (when reference
     (unless (and (equal directory (physical-retained-root-reference-directory reference))
+                 (equal (physical-retained-archive-path-key directory)
+                        (physical-retained-root-reference-archive-key reference))
                  (equal identity (physical-retained-root-reference-identity reference)))
       (error "retained WAL control owner belongs to another archive or base"))))
 
@@ -247,7 +263,8 @@ Read control outside the archive mutex and recheck the captured owner state."
       (error "retained WAL expected control root is stale"))
     (when current (physical-retained-root-add-objects objects (physical-retained-root-reference-objects current)))
     (%make-physical-retained-root-hold
-     :owner owner :directory directory :identity identity :expected-root expected
+     :owner owner :directory directory :archive-key (physical-retained-archive-path-key directory)
+     :identity identity :expected-root expected
      :objects objects :candidates (make-hash-table :test #'eql))))
 
 (defun physical-retained-root-check-hold (hold)
@@ -261,7 +278,9 @@ Read control outside the archive mutex and recheck the captured owner state."
 (defun physical-retained-root-record-candidate (hold id prepared)
   "Record a successfully published candidate and its prepared reference under archive exclusion."
   (physical-retained-root-require-lock)
-  (unless (and prepared (= id (physical-retained-root-reference-root-id prepared)))
+  (unless (and prepared (= id (physical-retained-root-reference-root-id prepared))
+               (equal (physical-retained-root-hold-archive-key hold)
+                      (physical-retained-root-reference-archive-key prepared)))
     (error "retained WAL publication did not produce its prepared reference"))
   (sb-sys:without-interrupts
     (setf (gethash id (physical-retained-root-hold-candidates hold)) t
@@ -440,17 +459,19 @@ retains protection until readback reconciliation or durable retirement."
             (if callback-started (setf (physical-retained-root-hold-state hold) :uncertain)
                 (physical-retained-root-drop-hold hold :released))))))))
 
-(defun physical-retained-root-protected-under-lock (directory kind id)
+(defun physical-retained-root-protected-under-lock (directory kind id &optional (archive-key (physical-retained-archive-path-key directory)))
   "Check references and holds for this directory, object kind and ID."
   (physical-retained-root-require-lock)
   (unless (and (member kind '(:extent :inventory :overlap)) (typep id '(unsigned-byte 64)))
     (error "invalid retained WAL protection lookup"))
   (let ((object (cons kind id)))
     (or (loop for reference being the hash-values of *physical-retained-root-references*
-                thereis (and (equal directory (physical-retained-root-reference-directory reference))
+                thereis (and (physical-retained-same-archive-p archive-key
+                                                               (physical-retained-root-reference-archive-key reference))
                              (gethash object (physical-retained-root-reference-objects reference))))
         (loop for hold being the hash-values of *physical-retained-root-holds*
-                thereis (and (equal directory (physical-retained-root-hold-directory hold))
+                thereis (and (physical-retained-same-archive-p archive-key
+                                                               (physical-retained-root-hold-archive-key hold))
                              (gethash object (physical-retained-root-hold-objects hold)))))))
 
 (defun physical-retained-root-protected-p (directory kind id)
@@ -482,7 +503,8 @@ WAL locks while holding the archive mutex."
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (with-slot-state-directory (fd directory)
-        (unless (or (physical-retained-root-protected-under-lock directory kind id)
+        (unless (or (physical-retained-root-protected-under-lock
+                     directory kind id (physical-retained-archive-key fd))
                     (physical-retained-root-archive-fenced-p directory fd))
           (let* ((name (file-namestring (physical-retained-object-path directory kind id)))
                  (path (slot-state-fd-path fd name)))
