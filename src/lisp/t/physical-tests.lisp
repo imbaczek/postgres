@@ -31,6 +31,15 @@
 (defun empty-octets ()
   (make-array 0 :element-type '(unsigned-byte 8)))
 
+(defun physical-test-checkpoint-record (start)
+  "Return a native checkpoint record and its snapshot with no optional source facts."
+  (let ((snapshot (list :version 2 :start start :end (+ start (pg::wal-checkpoint-record-size))
+                        :redo start :next-xid 3 :xid-reserved-through 2 :next-oid nil
+                        :time 0 :timeline 1 :prev-timeline 1 :oldest-active-xid 0)))
+    (values (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                   (pg::wal-encode-checkpoint-snapshot snapshot))
+            snapshot)))
+
 (defun legacy-checkpoint-record (start)
   "Explicit version-5 fixture; new writers require the version-6 payload."
   (let ((bytes (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start (empty-octets))))

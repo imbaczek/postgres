@@ -22,14 +22,15 @@
             do (with-open-file (stream (pg::wal-segment-path segment)
                                        :direction :output :element-type '(unsigned-byte 8))
                  (write-byte 0 stream)))
-      (let* ((start (- pg::*wal-checkpoint-lsn* pg::+wal-header-size+))
-             (record (legacy-checkpoint-record start)))
-        (with-open-file (stream (pg::wal-segment-path 1) :direction :io :if-exists :overwrite
-                                                         :element-type '(unsigned-byte 8))
-          (file-position stream (mod start pg::+wal-segment-size+))
-          (write-sequence record stream)
-          (pg::fsync-stream stream)))
-      (funcall function))))
+      (let ((start (- pg::*wal-checkpoint-lsn* (pg::wal-checkpoint-record-size))))
+        (multiple-value-bind (record pg::*wal-checkpoint-snapshot*)
+            (physical-test-checkpoint-record start)
+          (with-open-file (stream (pg::wal-segment-path 1) :direction :io :if-exists :overwrite
+                                                           :element-type '(unsigned-byte 8))
+            (file-position stream (mod start pg::+wal-segment-size+))
+            (write-sequence record stream)
+            (pg::fsync-stream stream))
+          (funcall function))))))
 
 (deftest primary-archive-proof-tracks-the-writer-rotation-end
     (call-with-physical-source-fixture
@@ -755,7 +756,7 @@
     (call-with-physical-source-fixture
      (lambda ()
        (let ((pin (pg::physical-source-pin-create "bootstrap")))
-         (ok (= (- (* 2 pg::+wal-segment-size+) 32) (pg::physical-source-pin-restart-lsn pin)))
+         (ok (= (- (* 2 pg::+wal-segment-size+) (pg::wal-checkpoint-record-size)) (pg::physical-source-pin-restart-lsn pin)))
          (ok (= (* 2 pg::+wal-segment-size+) (pg::physical-source-pin-consistent-lsn pin)))
          (ok (probe-file (pg::physical-source-pin-path "bootstrap"))))
        (clrhash pg::*physical-source-pins*)
@@ -806,9 +807,10 @@
        (let ((pg::*catalog* (pg::make-catalog)))
          (ok (intake-fails-p
               (lambda () (pg::physical-source-pin-read (pg::physical-source-pin-path "bootstrap"))))))
+       (ok (pg::physical-source-pin-read (pg::physical-source-pin-path "bootstrap")))
        (with-open-file (stream (pg::wal-segment-path 1) :direction :io :if-exists :overwrite
                                                         :element-type '(unsigned-byte 8))
-         (file-position stream (- pg::+wal-segment-size+ 32))
+         (file-position stream (- pg::+wal-segment-size+ (pg::wal-checkpoint-record-size)))
          (write-byte 0 stream)
          (pg::fsync-stream stream))
        (ok (intake-fails-p

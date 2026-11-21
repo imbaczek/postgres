@@ -58,7 +58,11 @@ For B1, native record decoding and physical receive use one header predicate
 for record magic, version, type and source LSN. Both still admit WAL2–7.
 Many physical tests use the empty WAL5 checkpoint fixture.
 Regenerate those test streams with current checkpoint payloads and derive
-their expected LSNs from the encoded lengths. The recovery page spool
+their expected LSNs from the encoded lengths. Source retention, history
+proof, retained inventory overlap and the restartpoint suffix and seal
+fixtures now construct WAL8 checkpoints. The source fixture binds the
+matching in-memory checkpoint snapshot and keeps its record end at a
+segment boundary. The recovery page spool
 also records the source version and decodes it when replaying page images.
 Version-specific fixtures cover page images, checkpoint and running-xacts
 records, XID reservation, timeline lineage and end-of-recovery. Remove

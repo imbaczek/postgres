@@ -6,15 +6,15 @@
           (declare (ignore root))
           (setf (pg::physical-store-retained-identity store) (pg::physical-recovery-retained-identity))
           (pg::physical-store-compact store 96 #'pg::physical-restartpoint-publish)
-          (let ((old (pg::physical-store-retained-root store))
-                (identity (pg::physical-store-retained-identity store)))
+          (let* ((old (pg::physical-store-retained-root store))
+                 (identity (pg::physical-store-retained-identity store))
+                 (end (+ 96 (length (prefix-test-append-terminal store 96)))))
             (ok (typep old '(unsigned-byte 64)))
-            (prefix-test-append-terminal store 96)
             (with-open-file (stream (pg::physical-store-segment-path store 0) :direction :io
                                                                               :element-type '(unsigned-byte 8) :if-exists :overwrite)
               (file-position stream 40) (write-byte 255 stream))
-            (setf pg::*last-replay-lsn* 160)
-            (pg::physical-store-compact store 160 #'pg::physical-restartpoint-publish)
+            (setf pg::*last-replay-lsn* end)
+            (pg::physical-store-compact store end #'pg::physical-restartpoint-publish)
             (let* ((id (pg::physical-store-retained-root store))
                    (archive (pg::physical-store-retained-directory store))
                    (history (pg::timeline-parse-history 1 ""))
@@ -23,7 +23,7 @@
               (ng (eql old id))
               (ok (= 1 (length entries)))
               (ok (= 32 (getf (third (first entries)) :start)))
-              (ok (= 160 (getf (third (first entries)) :end)))
+              (ok (= end (getf (third (first entries)) :end)))
               (multiple-value-bind (metadata bytes)
                   (pg::physical-retained-extent-decode
                    (pg::physical-retained-object-read archive :extent (first (first entries))
@@ -36,7 +36,7 @@
             (let ((reopened (pg::physical-store-open (pg::physical-store-directory store) 123 1
                                                      :retained-identity identity)))
               (unwind-protect
-                   (ok (= 160 (pg::physical-store-floor-lsn reopened)))
+                   (ok (= end (pg::physical-store-floor-lsn reopened)))
                 (pg::physical-store-close reopened)))))))
 
 (deftest receive-sealing-publication-exits-reconcile-the-durable-control
@@ -197,9 +197,10 @@
                                                                    :initial-element 0))))
         (pg::physical-store-input store start raw)
         (setf start end)))
-    (pg::physical-store-input store start (legacy-checkpoint-record start))
-    (pg::physical-store-flush store)
-    (+ start 32)))
+    (let ((record (physical-test-checkpoint-record start)))
+      (pg::physical-store-input store start record)
+      (pg::physical-store-flush store)
+      (+ start (length record)))))
 
 (deftest receive-sealing-retries-restartpoints-ahead-in-the-same-and-later-segment
     (dolist (segments '(0 1))

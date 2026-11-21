@@ -92,10 +92,11 @@
         (ok (equalp b (nth-value 1 (pg::physical-retained-extent-decode (second images))))))))
 
 (deftest retained-validator-empty-entries-return-only-the-supplied-physical-overlap
-    (let* ((bytes (legacy-checkpoint-record 0))
-           (metadata (list :version 1 :system-id 42 :base-timeline 1 :base 32 :manifest-digest 77
+    (let* ((bytes (physical-test-checkpoint-record 0))
+           (end (length bytes))
+           (metadata (list :version 1 :system-id 42 :base-timeline 1 :base end :manifest-digest 77
                            :checkpoint-start 0 :namespace :legacy
-                           :file (list "pg_wal/0000000000000000.wal" 32
+                           :file (list "pg_wal/0000000000000000.wal" end
                                        (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))))
       (multiple-value-bind (checked restored)
           (pg::physical-retained-overlap-decode (pg::physical-retained-overlap-encode metadata bytes))
