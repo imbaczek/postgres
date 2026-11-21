@@ -60,7 +60,7 @@
                         t))
                  (check)
                  (let ((inputs (logical-slot-imported-startup-inputs root #'check expected)))
-                   (unless (logical-slot-continuation-gc-fenced-p *pgdata*)
+                   (unless (logical-slot-continuation-fd-fenced-p root)
                      (error "imported startup lost its continuation fence"))
                    (check)
                    inputs)))))))))))

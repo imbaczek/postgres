@@ -38,6 +38,25 @@
              (ok (pg::logical-slot-continuation-fd-fenced-p fd))
              (ok (gethash (list device inode) pg::*logical-slot-continuation-fenced-roots*))))))))
 
+(deftest continuation-host-fence-observes-held-host-after-rebinding
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (declare (ignore images identity history text))
+       (let* ((pg::*logical-slot-continuation-fenced-roots*
+                (make-hash-table :test #'equal :synchronized t))
+              (host (merge-pathnames "host/" root))
+              (moved (merge-pathnames "moved/" root)))
+         (ensure-directories-exist host)
+         (pg::with-slot-state-directory (fd host)
+           (sb-posix:rename host moved)
+           (ensure-directories-exist host)
+           (with-open-file (marker (merge-pathnames "logical-slot-copy.source-proof" moved)
+                                   :direction :output)
+             (write-char #\x marker))
+           (ng (pg::logical-slot-continuation-gc-fenced-p host))
+           (ok (pg::logical-slot-continuation-fd-fenced-p fd))
+           (ok (pg::logical-slot-continuation-gc-fenced-p moved)))))))
+
 (deftest retained-root-fence-recognizes-held-archive-outside-host-parent
     (call-with-retained-inventory
      (lambda (root images identity history text)
