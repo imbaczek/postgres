@@ -38,23 +38,6 @@
   dimensions
   lower-bounds)
 
-(defparameter +sql-array-types+
-  '((:text . :text-array) (:bytea . :bytea-array) (:json . :json-array) (:jsonb . :jsonb-array)
-    (:int2 . :int2-array) (:int4 . :int4-array)
-    (:int8 . :int8-array) (:numeric . :numeric-array) (:float4 . :float4-array)
-    (:float8 . :float8-array) (:bool . :bool-array) (:char . :char-array)
-    (:name . :name-array) (:varchar . :varchar-array) (:oid . :oid-array)
-    (:date . :date-array) (:time . :time-array) (:timetz . :timetz-array)
-    (:timestamp . :timestamp-array) (:timestamptz . :timestamptz-array)
-    (:interval . :interval-array) (:pg-lsn . :pg-lsn-array) (:bit . :bit-array)
-    (:int2vector . :int2vector-array)))
-
-(defun sql-array-type (element-type)
-  (cdr (assoc element-type +sql-array-types+)))
-
-(defun sql-array-element-type (array-type)
-  (car (rassoc array-type +sql-array-types+)))
-
 (defconstant +max-varlena-array-elements+ (floor +max-query-message-size+ 8)
   "Limit the resident element vector for these arrays to the query frame budget.")
 
