@@ -423,7 +423,7 @@
            (ok (zerop (hash-table-count pg::*wal-snapshot-retention-pins*))))))))
 
 (deftest backup-lease-handoff-reuses-an-interrupted-base-on-a-descendant-source
-    (dolist (fork '(152 184))
+    (dolist (fork (list 152 (+ 152 (pg::wal-checkpoint-record-size))))
       (call-with-backup-lease-authority-fixture
        (lambda (root)
          (declare (ignore root))
@@ -437,7 +437,7 @@
                     (prefix (pg::read-bounded-regular-file (pg::wal-segment-path 0) 1024))
                     (parent (if (= fork 152) prefix
                                 (concatenate '(vector (unsigned-byte 8))
-                                             prefix (legacy-checkpoint-record 152))))
+                                             prefix (physical-test-checkpoint-record 152 :timeline 2))))
                     (eor (pg::wal-encode-end-of-recovery-record fork 42 3 2 1)))
                (pg::physical-source-follow-release "handoff_successor"
                                                    (pg::physical-follow-anchor-digest anchor))
