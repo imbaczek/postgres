@@ -488,7 +488,7 @@ The optional parent pair is forwarded for held-root directory preparation."
   (physical-store-check-retained-identity store)
   (physical-promotion-ensure-retained-directory parent)
   (let* ((identity (physical-store-retained-identity store))
-         (expected (physical-store-control-tuple store))
+         (expected (physical-store-control-snapshot store))
          (digest (getf metadata :prefix-digest))
          (root (physical-store-retained-root store))
          (history (physical-store-retained-history store)))
