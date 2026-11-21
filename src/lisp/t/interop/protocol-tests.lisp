@@ -1709,8 +1709,10 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
       (setf (gethash "t" (pg::logical-subscription-runtime-validated-relations runtime)) t)
       (flet ((dispatch-row (tag relation tuple-body)
                (setf (gethash 7 (pg::logical-subscription-runtime-relations runtime)) relation)
-               (pg::logical-pgoutput-dispatch
-                runtime (octets (concatenate 'vector (vector (char-code tag) 0 0 0 7) tuple-body)))))
+               (pg::logical-pgoutput-apply-operation
+                runtime
+                (pg::logical-pgoutput-read-operation
+                 runtime (octets (concatenate 'vector (vector (char-code tag) 0 0 0 7) tuple-body))))))
         (unwind-protect
              (progn
                (setf (symbol-function 'pg::logical-target-query)
@@ -1841,15 +1843,16 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
           (relation (pg::make-pgoutput-relation :name "excluded")))
       (setf (gethash 7 (pg::logical-subscription-runtime-relations runtime)) relation)
       (ok (null
-           (pg::logical-pgoutput-dispatch
+           (pg::logical-pgoutput-apply-operation
             runtime
-            (octets #(85 0 0 0 7 79 0 1 116 0 0 0 1 49
-                      78 0 1 116 0 0 0 1 50)))))))
+            (pg::logical-pgoutput-read-operation
+             runtime (octets #(85 0 0 0 7 79 0 1 116 0 0 0 1 49
+                               78 0 1 116 0 0 0 1 50))))))))
 
 (deftest truncate-requires-transaction
     (ok (handler-case
             (progn
-              (pg::logical-pgoutput-dispatch
+              (pg::logical-pgoutput-read-operation
                (pg::make-logical-subscription-runtime)
                (octets #(84 0 0 0 0 0)))
               nil)

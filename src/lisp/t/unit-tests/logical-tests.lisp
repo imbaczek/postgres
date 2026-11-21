@@ -854,8 +854,8 @@
              (lambda (stream lsn)
                (declare (ignore stream))
                (incf progress-messages)
-               (logical-pgoutput-dispatch
-                runtime (pgoutput-build-safe-progress-message lsn)))
+               (logical-pgoutput-apply-operation
+                runtime (logical-pgoutput-read-operation runtime (pgoutput-build-safe-progress-message lsn))))
              (symbol-function 'send-logical-transaction)
              (lambda (stream transaction wal-end)
                (declare (ignore stream wal-end))

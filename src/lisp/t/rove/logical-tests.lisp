@@ -389,35 +389,23 @@
              (equal (unit-byte-span-outcome #'unit-byte-span-reference bytes start end)
                     (unit-byte-span-outcome #'bytes->string bytes start end))))))))
 
-(rove:deftest test-pgoutput-vector-adapter-applies-only-decoded-operations
-    (let* ((runtime (make-logical-subscription-runtime
-                     :options (make-logical-subscription-options) :transaction-open-p t))
-           (original (symbol-function 'logical-pgoutput-apply-operation))
-           (operations nil))
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'logical-pgoutput-apply-operation)
-                   (lambda (receiver operation)
-                     (rove:ok (eq receiver runtime))
-                     (push operation operations)))
-             (logical-pgoutput-dispatch runtime #(73 0 0 0 7 78 0 0))
-             (logical-pgoutput-dispatch runtime #(85 0 0 0 7 78 0 0))
-             (logical-pgoutput-dispatch runtime #(68 0 0 0 7 75 0 0))
-             (rove:ok (equalp (nreverse operations)
-                              (list (list #\I 7 #()) (list #\U 7 nil #() #\N)
-                                    (list #\D 7 #() #\K))))
-             (setf operations nil)
-             (dolist (payload '(#(73 0 0 0 7 78 0 0 1)
-                                #(85 0 0 0 7 78 0 0 1)
-                                #(68 0 0 0 7 75 0 0 1)
-                                #(73 0 0 0 7 78 0)
-                                #(85 0 0 0 7 78 0)
-                                #(85 0 0 0 7 75 0 0 78 0)
-                                #(85 0 0 0 7 75 0 0 78 0 0 1)
-                                #(68 0 0 0 7 75 0)))
-               (rove:ok (rove:signals (logical-pgoutput-dispatch runtime payload) 'error)))
-             (rove:ok (null operations)))
-        (setf (symbol-function 'logical-pgoutput-apply-operation) original))))
+(rove:deftest test-pgoutput-vector-row-operation-boundaries
+    (let ((runtime (make-logical-subscription-runtime :transaction-open-p t)))
+      (rove:ok (equalp (logical-pgoutput-read-operation runtime #(73 0 0 0 7 78 0 0))
+                       (list #\I 7 #())))
+      (rove:ok (equalp (logical-pgoutput-read-operation runtime #(85 0 0 0 7 78 0 0))
+                       (list #\U 7 nil #() #\N)))
+      (rove:ok (equalp (logical-pgoutput-read-operation runtime #(68 0 0 0 7 75 0 0))
+                       (list #\D 7 #() #\K)))
+      (dolist (payload '(#(73 0 0 0 7 78 0 0 1)
+                         #(85 0 0 0 7 78 0 0 1)
+                         #(68 0 0 0 7 75 0 0 1)
+                         #(73 0 0 0 7 78 0)
+                         #(85 0 0 0 7 78 0)
+                         #(85 0 0 0 7 75 0 0 78 0)
+                         #(85 0 0 0 7 75 0 0 78 0 0 1)
+                         #(68 0 0 0 7 75 0)))
+        (rove:ok (rove:signals (logical-pgoutput-read-operation runtime payload) 'error)))))
 
 (rove:deftest test-pgoutput-operation-owns-vector-fields
     ;; logicalrep_write_insert and logicalrep_write_tuple field order.
@@ -1294,7 +1282,8 @@
              (dolist (payload (list #(66) #(67) #(82) #(84 0 0 0 0 0 1) #(77)
                                     (concatenate 'vector #(66) (make-array 21 :initial-element 0))
                                     (concatenate 'vector #(67) (make-array 26 :initial-element 0))))
-               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime payload) nil)
+               (rove:ok (handler-case (progn (logical-pgoutput-apply-operation
+                                              runtime (logical-pgoutput-read-operation runtime payload)) nil)
                           (error () t))))
              (rove:ok (zerop calls))
              (rove:ok (zerop (hash-table-count (logical-subscription-runtime-relations runtime))))
@@ -1318,18 +1307,22 @@
                      (lambda (&rest args) (declare (ignore args)) (incf commits))
                      (aref begin 0) (char-code #\B)
                      (aref commit 0) (char-code #\C))
-               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime begin) nil)
+               (rove:ok (handler-case (progn (logical-pgoutput-apply-operation
+                                              runtime (logical-pgoutput-read-operation runtime begin)) nil)
                           (error () t)))
                (rove:ok (zerop queries))
                (setf (aref begin 8) 100)
-               (logical-pgoutput-dispatch runtime begin)
+               (logical-pgoutput-apply-operation
+                runtime (logical-pgoutput-read-operation runtime begin))
                (rove:ok (= queries 1))
                (setf (aref commit 9) 101 (aref commit 17) 102)
-               (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime commit) nil)
+               (rove:ok (handler-case (progn (logical-pgoutput-apply-operation
+                                              runtime (logical-pgoutput-read-operation runtime commit)) nil)
                           (error () t)))
                (rove:ok (zerop commits))
                (setf (aref commit 9) 100)
-               (logical-pgoutput-dispatch runtime commit)
+               (logical-pgoutput-apply-operation
+                runtime (logical-pgoutput-read-operation runtime commit))
                (rove:ok (= commits 1)))
           (setf (symbol-function 'logical-target-query) target
                 (symbol-function 'logical-progress-transaction-commit) finish)))))
@@ -1361,10 +1354,12 @@
                    (symbol-function 'logical-apply-truncate-relations)
                    (lambda (&rest args) (declare (ignore args)) (incf calls))
                    (aref commit 0) (char-code #\C) (aref commit 9) 100)
-             (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime commit) nil)
+             (rove:ok (handler-case (progn (logical-pgoutput-apply-operation
+                                            runtime (logical-pgoutput-read-operation runtime commit)) nil)
                         (error () t)))
              (rove:ok (handler-case
-                          (progn (logical-pgoutput-dispatch runtime #(84 0 0 0 0 0 1)) nil)
+                          (progn (logical-pgoutput-apply-operation
+                                  runtime (logical-pgoutput-read-operation runtime #(84 0 0 0 0 0 1))) nil)
                         (error () t)))
              (rove:ok (zerop calls)))
         (setf (symbol-function 'logical-progress-transaction-commit) finish

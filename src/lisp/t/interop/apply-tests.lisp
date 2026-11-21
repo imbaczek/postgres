@@ -802,7 +802,8 @@ ORDER BY 1,2"
                                         observer "SELECT id, amount FROM fixture_rows ORDER BY id")
                                        'vector)
                                (if (zerop commits) #() (nth (1- commits) expected)))))
-                        (pg::logical-pgoutput-dispatch runtime frame)
+                        (pg::logical-pgoutput-apply-operation
+                         runtime (pg::logical-pgoutput-read-operation runtime frame))
                         (when (char= kind #\C)
                           (ok (equalp
                                (coerce (pg::logical-target-query
@@ -828,11 +829,14 @@ ORDER BY 1,2"
                        (pg::pgoutput-relation-oid other) 24588
                        (gethash 24588 (pg::logical-subscription-runtime-relations runtime)) other)
                  (pg::logical-validate-stream-relation runtime other))
-               (pg::logical-pgoutput-dispatch
-                runtime (pg::pgoutput-build-begin
-                         (pg::make-logical-transaction :xid 999 :commit-lsn 100)))
-               (pg::logical-pgoutput-dispatch
-                runtime (pg::pgoutput-build-truncate '(24587 24588)))
+               (pg::logical-pgoutput-apply-operation
+                runtime
+                (pg::logical-pgoutput-read-operation
+                 runtime
+                 (pg::pgoutput-build-begin (pg::make-logical-transaction :xid 999 :commit-lsn 100))))
+               (pg::logical-pgoutput-apply-operation
+                runtime
+                (pg::logical-pgoutput-read-operation runtime (pg::pgoutput-build-truncate '(24587 24588))))
                (ok (null (pg::logical-target-query target "SELECT * FROM fixture_rows")))
                (ok (null (pg::logical-target-query target "SELECT * FROM fixture_other")))
                (ok (equalp '(#("8" "8"))

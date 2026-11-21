@@ -55,7 +55,7 @@
     (let* ((options (pg::make-logical-subscription-options :mode :standard))
            (runtime (pg::make-logical-subscription-runtime :options options)))
       (ok (handler-case
-              (progn (pg::logical-pgoutput-dispatch runtime #(77)) nil)
+              (progn (pg::logical-pgoutput-read-operation runtime #(77)) nil)
             (error (condition)
               (search "does not accept extension Message" (princ-to-string condition)))))))
 
@@ -135,7 +135,7 @@
       (dolist (identity '(102 105 110 120))
         (let ((changed (copy-seq payload)))
           (setf (aref changed 17) identity)
-          (ok (handler-case (progn (pg::logical-pgoutput-dispatch runtime changed) nil)
+          (ok (handler-case (progn (pg::logical-pgoutput-read-operation runtime changed) nil)
                 (error (condition)
                   (search "default replica identity" (princ-to-string condition)))))))
       (dolist (flags '(2 3 128 255))

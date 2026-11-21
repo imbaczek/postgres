@@ -1447,9 +1447,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
        (setf (logical-subscription-runtime-final-lsn runtime) nil))
       (otherwise (error "unsupported pgoutput message ~s" kind)))))
 
-(defun logical-pgoutput-dispatch (runtime payload)
-  (logical-pgoutput-apply-operation runtime (logical-pgoutput-read-operation runtime payload)))
-
 (defun logical-wire-cstring (cursor)
   (let ((source (logical-wire-cursor-bytes cursor)))
     (if source
