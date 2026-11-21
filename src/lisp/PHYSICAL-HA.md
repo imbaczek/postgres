@@ -4556,8 +4556,8 @@ contract. WAL flushes preserve the previously published copy until page, CLOG an
 directory syncs finish. Only checkpoint control publication installs the candidate.
 
 Scanning and physical pins use explicit checkpoint starts; pin/base validation
-compares the complete record with its control copy. New bootstrap manifest v2
-persists that start, while v1 derives it only for legacy empty records. Replay
+compares the complete record with its control copy. Bootstrap requires a
+version 3 manifest with that explicit start. Replay
 preserves source checkpoint facts separately from standby read-visibility XIDs.
 Restartpoint metadata v2 retains them through receive-spool compaction and restores
 them before suffix replay. Legacy restartpoint metadata v1 remains readable with

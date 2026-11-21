@@ -517,39 +517,31 @@ Child images may include history files no newer than their selected timeline."
                       (eql timeline (wal-parse-segment-name stem :timeline))))))))
 
 (defun physical-manifest-checkpoint-start (manifest)
-  (if (member (getf manifest :version) '(2 3)) (getf manifest :checkpoint-start)
-      (- (getf manifest :checkpoint) +wal-header-size+)))
+  (getf manifest :checkpoint-start))
 
 (defun recovery-manifest-keys-valid-p (manifest)
-  "Check manifest keys and the ordered optional v3 suffix."
-  (let* ((version (getf manifest :version))
-         (keys (loop for (key value) on manifest by #'cddr collect key))
-         (legacy (if (member version '(2 3))
-                     '(:version :system-id :cluster-identity :timeline :checkpoint
-                       :checkpoint-start :end :next-xid :source-pin :files)
-                     '(:version :system-id :cluster-identity :timeline :checkpoint
-                       :end :next-xid :source-pin :files)))
+  "Check the required keys and ordered optional suffix of a version 3 manifest."
+  (let* ((keys (loop for (key value) on manifest by #'cddr collect key))
          (auth (get-properties manifest '(:auth-policy-required)))
          (anchor (get-properties manifest '(:logical-base-anchor)))
-         (copy (get-properties manifest '(:logical-slot-copy-id)))
-         (suffix (append (when auth '(:auth-policy-required))
-                         (when anchor '(:logical-base-anchor))
-                         (when copy '(:logical-slot-copy-id)))))
-    (or (equal keys legacy)
-        (and (eql version 3) suffix
-             (or (not auth) (eql 1 (getf manifest :auth-policy-required)))
-             (or (not copy)
-                 (and auth
-                      (handler-case-noninterrupt
-                       (progn (logical-slot-parse-generation (getf manifest :logical-slot-copy-id)) t)
-                       (condition nil))))
-             (equal keys (append legacy suffix))))))
+         (copy (get-properties manifest '(:logical-slot-copy-id))))
+    (and (eql 3 (getf manifest :version))
+         (or (not auth) (eql 1 (getf manifest :auth-policy-required)))
+         (or (not copy)
+             (and auth
+                  (handler-case-noninterrupt
+                   (progn (logical-slot-parse-generation (getf manifest :logical-slot-copy-id)) t)
+                   (condition nil))))
+         (equal keys (append '(:version :system-id :cluster-identity :timeline :checkpoint
+                               :checkpoint-start :end :next-xid :source-pin :files)
+                             (when auth '(:auth-policy-required))
+                             (when anchor '(:logical-base-anchor))
+                             (when copy '(:logical-slot-copy-id)))))))
 
 (defun recovery-check-manifest-schema (manifest)
-  (unless (and (listp manifest) (member (getf manifest :version) '(1 2 3))
+  (unless (and (listp manifest)
                (recovery-manifest-keys-valid-p manifest)
                (typep (getf manifest :timeline) '(integer 1 4294967295))
-               (or (eql 3 (getf manifest :version)) (eql 1 (getf manifest :timeline)))
                (typep (getf manifest :system-id) '(unsigned-byte 64))
                (stringp (getf manifest :cluster-identity))
                (plusp (length (getf manifest :cluster-identity)))
@@ -558,10 +550,7 @@ Child images may include history files no newer than their selected timeline."
                (typep (physical-manifest-checkpoint-start manifest) '(unsigned-byte 64))
                (wal-checkpoint-record-length-p
                 (- (getf manifest :checkpoint) (physical-manifest-checkpoint-start manifest)))
-               (typep (getf manifest :next-xid)
-                      (if (eql 3 (getf manifest :version))
-                          '(integer 3 18446744073709551616)
-                          '(integer 3 18446744073709551615)))
+               (typep (getf manifest :next-xid) '(integer 3 18446744073709551616))
                (wal-valid-replication-slot-name-p (getf manifest :source-pin))
                (listp (getf manifest :files)) (getf manifest :files))
     (error "unsupported or malformed physical recovery manifest"))

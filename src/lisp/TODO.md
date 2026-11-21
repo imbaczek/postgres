@@ -80,8 +80,7 @@ The full WAL crash suite passed after the fixture primed an XID reservation
 with a rolled-back insert and checked the final checkpoint against its
 control snapshot before injecting corruption.
 Checkpoint WAL validation now requires a nonempty WAL8 record, and base
-reservation seeding requires its exact source counters. The backup manifest
-schema retains its older variants for B11.
+reservation seeding requires its exact source counters.
 Source transaction replay now follows WAL8 transitions. End-of-recovery
 keeps the proven reservation bound but clears completeness until the child
 checkpoint. End-of-recovery and CLOG reset clear source membership.
@@ -139,6 +138,10 @@ For B10, startup requires PGRSTAT3 for ordinary recovery or PGRSTAT4 for
 pending promotion. The signal harness checks rejection of both retired
 formats, preservation of their bytes and recovery data, and successful restart
 with the restored current control.
+
+For B11, the backup and recovery readers require a version 3 manifest with
+an explicit checkpoint start. The schema rejects versions 1 and 2, missing
+checkpoint starts, and inconsistent checkpoint boundaries.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
