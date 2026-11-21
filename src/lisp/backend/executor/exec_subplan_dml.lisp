@@ -633,6 +633,42 @@
                    (setf (aref reuse i) pointer)))))
   reuse)
 
+(defun replace-claimed-dml-tuple (table tuple old-block old-offnum xid new assignments
+                                  compressed descriptors snapshot &key toast-demand)
+  "Replace a deleted, claimed tuple, keeping reused TOAST and publishing one logical update."
+  (let ((reuse (unchanged-tuple-toast-pointers tuple assignments table new snapshot))
+        (rel (pg-class-relfilenode table)))
+    (dml-reuse-matching-external-descriptors table tuple new descriptors reuse snapshot)
+    (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
+    (materialize-select-tuple table tuple snapshot
+                              :demand toast-demand :retain-external-p (not (null toast-demand)))
+    (let ((old-compressed (unchanged-tuple-compressed-values tuple assignments new)))
+      (dotimes (i (length compressed))
+        (cond ((aref reuse i) (setf (aref compressed i) nil))
+              ((and old-compressed (null (aref compressed i)))
+               (setf (aref compressed i) (aref old-compressed i))))))
+    (multiple-value-bind (block off publications)
+        (insert-tuple-with-unique
+         table new :exclude-tid (cons old-block old-offnum)
+         :toast-reuse reuse :compressed-reuse compressed :publication-kind :update
+         :on-success
+         (lambda (next-block next-offnum)
+           (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
+             (ereport "XX000" "could not link updated heap tuple"))))
+      (declare (ignore block off))
+      (logical-note-row-change
+       :update table :old-values (htup-values tuple) :new-values new
+       :toast-reuse reuse :publication-selection publications
+       :full-new-values
+       (when toast-demand
+         (lambda ()
+           (let ((values (copy-seq new)))
+             (loop for pointer across reuse for i from 0
+                   when (heap-external-varlena-p (aref values i))
+                     do (unless pointer (error "missing claimed TOAST reuse pointer"))
+                        (setf (aref values i) pointer))
+             (htup-values (materialize-select-tuple table (make-htup :values values) snapshot)))))))))
+
 (defun exec-update-subqueries (stream ast)
   (let* ((*datum-origin-capture* t)
          (*query-row-origins* nil)
@@ -677,46 +713,11 @@
                      nil t candidate)
                   (check-heapam-write-status status)
                   (when deleted
-                    (let ((reuse (unchanged-tuple-toast-pointers tuple sets table new *current-snapshot*)))
-                      (dml-reuse-matching-external-descriptors table tuple new descriptors reuse *current-snapshot*)
-                      (delete-tuple-toast-values table tuple xid (backend-command-id *backend*) reuse)
-                      (materialize-select-tuple table tuple *current-snapshot*
-                                                :demand toast-demand :retain-external-p (not (null toast-demand)))
-                      (multiple-value-bind (block off publications)
-                          (insert-tuple-with-unique
-                           table new :exclude-tid (cons old-block old-offnum)
-                           :toast-reuse reuse :compressed-reuse
-                           (let ((old-compressed (unchanged-tuple-compressed-values tuple sets new)))
-                             (when old-compressed
-                               (dotimes (i (length compressed))
-                                 (unless (or (aref compressed i) (aref reuse i))
-                                   (setf (aref compressed i) (aref old-compressed i)))))
-                             (dotimes (i (length compressed))
-                               (when (aref reuse i) (setf (aref compressed i) nil)))
-                             compressed)
-                           :publication-kind :update
-                           :on-success
-                           (lambda (block off)
-                             (unless (heapam-set-ctid-unlocked rel old-block old-offnum block off)
-                               (ereport "XX000" "could not link updated heap tuple"))))
-                        (declare (ignore block off))
-                        (logical-note-row-change :update table :old-values (htup-values tuple)
-                                                 :new-values new :toast-reuse reuse :publication-selection publications
-                                                 :full-new-values
-                                                 (when toast-demand
-                                                   (lambda ()
-                                                     (let ((values (copy-seq new)))
-                                                       (loop for pointer across reuse for i from 0
-                                                             when (heap-external-varlena-p (aref values i))
-                                                               do (unless pointer
-                                                                    (error "missing claimed TOAST reuse pointer"))
-                                                                  (setf (aref values i) pointer))
-                                                       (htup-values
-                                                        (materialize-select-tuple
-                                                         table (make-htup :values values) *current-snapshot*))))))
-                        (emit-dml-returning stream (getf prepared :returning) new
-                                            :old-values (htup-values tuple) :new-values new :source-values source))
-                      (incf count)))
+                    (replace-claimed-dml-tuple table tuple old-block old-offnum xid new sets
+                                               compressed descriptors *current-snapshot* :toast-demand toast-demand)
+                    (emit-dml-returning stream (getf prepared :returning) new
+                                        :old-values (htup-values tuple) :new-values new :source-values source)
+                    (incf count))
                   deleted))))
           toast-demand)
          (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count)))))))

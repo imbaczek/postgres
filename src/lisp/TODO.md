@@ -168,6 +168,12 @@ The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING
 folding read the same signature, strictness, and volatility descriptors.
 
+For A7, UPDATE and ON CONFLICT retain their own claim and expression
+evaluation paths. Once the old tuple is claimed and deleted, a shared
+replacement operation handles TOAST reuse, successor linking, and logical
+update publication. UPDATE still supplies its lazy TOAST demand and returns
+the matched source row through its own RETURNING path.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
