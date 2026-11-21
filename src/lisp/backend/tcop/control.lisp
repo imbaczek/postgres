@@ -193,29 +193,6 @@ Concurrent requests remain pending for their consumers."
             (sb-thread:release-mutex *live-operation-lock*))))))
   (values))
 
-(defun adopt-legacy-live-operation-quiescence ()
-  "Adopt a closed gate when this code is loaded by an older reload function."
-  (let ((reload-owner (sb-thread:mutex-owner *reload-run-lock*)))
-    (when reload-owner
-      (call-with-live-operation-lock
-       (lambda ()
-         (when (and (not *live-operation-admission-open*)
-                    (null *live-operation-quiescence-owner*))
-           (setf *live-operation-quiescence-owner*
-                 (gensym "LEGACY-LIVE-OPERATION-OWNER-")
-                 *live-operation-quiescence-owner-thread* reload-owner
-                 *live-operation-drain-open* nil
-                 *live-operation-drain-backends* nil
-                 *live-operation-cleanup-backends* nil))))))
-  (values))
-
-;; During the first in-place reload, the old RELOAD function may have closed
-;; admission before the ownership fields above existed. It still owns the
-;; reload mutex while ASDF loads this file, so attach that gate to its thread;
-;; its old no-argument OPEN call can then release it safely.
-(eval-when (:load-toplevel)
-  (adopt-legacy-live-operation-quiescence))
-
 (defun live-operation-admitted-p (drain-p)
   "Return the lane admitted now, evaluating DRAIN-P under the gate lock.
 The shutdown lane admits only a checked sender or its cleanup while normal
@@ -602,55 +579,49 @@ The primary finalizer separately holds reload exclusion."
            do (sb-thread:condition-wait *live-operation-cv* *live-operation-lock*))))
   (values))
 
-(defun close-live-operation-admission (&optional requested-owner)
+(defun close-live-operation-admission (owner)
   (when (plusp *live-operation-depth*)
     (error "cannot reload from inside a live operation"))
-  ;; The optional legacy call shape supports an already-running reloader whose
-  ;; compiled macro expansion predates explicit gate-owner tokens.
-  (let ((owner (or requested-owner
-                   (gensym "LIVE-OPERATION-QUIESCENCE-OWNER-"))))
-    (call-with-live-operation-lock
-     (lambda ()
-       (loop while *live-operation-quiescence-owner*
-             do (when (eq *live-operation-quiescence-owner-thread*
-                          sb-thread:*current-thread*)
-                  (error "nested live-operation quiescence is not allowed"))
-                (wait-for-reload-condition *live-operation-cv* *live-operation-lock*
-                                           *live-operation-drain-cancel-check*))
-       ;; Transaction-state setters and operation counters use this lock. Capture
-       ;; both open transactions and sessions already executing admitted work.
-       (multiple-value-bind (drain-backends cleanup-backends)
-           (snapshot-live-operation-backends)
-         (setf *live-operation-drain-backends* drain-backends
-               *live-operation-cleanup-backends* cleanup-backends))
-       (let ((finished-p nil))
-         ;; Do not allow an asynchronous interrupt between claiming the gate and
-         ;; installing the cleanup that releases it.
-         (sb-sys:without-interrupts
-           (setf *live-operation-quiescence-owner* owner
-                 *live-operation-quiescence-owner-thread* sb-thread:*current-thread*
-                 *live-operation-admission-open* nil
-                 *live-operation-drain-open* t)
-           (unwind-protect
-                (sb-sys:allow-with-interrupts
-                  (finish-live-operation-drain)
-                  (setf finished-p t))
-             ;; CONDITION-WAIT may unwind with the mutex held or released. Restore
-             ;; the gate only after reacquiring it and confirming our ownership.
-             (unless finished-p
-               (restore-live-operation-admission owner)))))))
-    (values)))
+  (unless owner (error "live-operation admission requires an owner"))
+  (call-with-live-operation-lock
+   (lambda ()
+     (loop while *live-operation-quiescence-owner*
+           do (when (eq *live-operation-quiescence-owner-thread*
+                        sb-thread:*current-thread*)
+                (error "nested live-operation quiescence is not allowed"))
+              (wait-for-reload-condition *live-operation-cv* *live-operation-lock*
+                                         *live-operation-drain-cancel-check*))
+     ;; Transaction-state setters and operation counters use this lock. Capture
+     ;; both open transactions and sessions already executing admitted work.
+     (multiple-value-bind (drain-backends cleanup-backends)
+         (snapshot-live-operation-backends)
+       (setf *live-operation-drain-backends* drain-backends
+             *live-operation-cleanup-backends* cleanup-backends))
+     (let ((finished-p nil))
+       ;; Do not allow an asynchronous interrupt between claiming the gate and
+       ;; installing the cleanup that releases it.
+       (sb-sys:without-interrupts
+         (setf *live-operation-quiescence-owner* owner
+               *live-operation-quiescence-owner-thread* sb-thread:*current-thread*
+               *live-operation-admission-open* nil
+               *live-operation-drain-open* t)
+         (unwind-protect
+              (sb-sys:allow-with-interrupts
+                (finish-live-operation-drain)
+                (setf finished-p t))
+           ;; CONDITION-WAIT may unwind with the mutex held or released. Restore
+           ;; the gate only after reacquiring it and confirming our ownership.
+           (unless finished-p
+             (restore-live-operation-admission owner)))))))
+  (values))
 
-(defun open-live-operation-admission (&optional requested-owner)
+(defun open-live-operation-admission (owner)
   (when *live-operation-before-open-hook*
     (funcall *live-operation-before-open-hook*))
   (call-with-live-operation-lock
    (lambda ()
      ;; A failed nested close must not release a different invocation's gate.
-     (when (if requested-owner
-               (eq *live-operation-quiescence-owner* requested-owner)
-               (eq *live-operation-quiescence-owner-thread*
-                   sb-thread:*current-thread*))
+     (when (and owner (eq *live-operation-quiescence-owner* owner))
        (apply-pending-live-operation-cancel-requests)
        (sb-sys:without-interrupts
          (setf *live-operation-quiescence-owner* nil
