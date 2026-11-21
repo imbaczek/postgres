@@ -32,6 +32,21 @@ remaining retirement prerequisites, including legacy-named ancestral WAL.
 
 ## Goal closeout check
 
+The architecture branch at `4679be54534` passed the following live checks
+with PostgreSQL C 20devel and pinned Patroni 4.1.5.
+
+- The C feedback reference reproduced independent data and catalog horizons,
+  catalog advancement with the data horizon pinned, and horizon persistence
+  after primary restart. The native Patroni follow test verified independent
+  publication and clearing, including slotless feedback on disconnect.
+- Patroni copied logical slots created both before and after the standby
+  base, accepted readiness, and advanced the copies. In both cases the
+  consumer crossed promotion and resumed after restart.
+- Native and C hot standby passed pre-auth rejection, reload, restart,
+  replay with hot standby disabled, and promotion.
+- Password-backed bootstrap and stock `post_bootstrap` role provisioning
+  passed, including SCRAM login and admission of the named replication role.
+
 ### What the milestone demonstrated
 
 | Goal | Evidence and limits |
