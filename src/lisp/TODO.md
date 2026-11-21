@@ -48,7 +48,7 @@ why existing code could not meet the need when a new implementation is required.
 | B9 | [Receive control codec](backend/replication/physical-store.lisp) | The writer uses PGPHYS03 at 68, 80, or 96 bytes for base control, history selection, and retained-root identity. |
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
-| B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | The current producer constructs metadata version 4 and writes PGRPGEN2. The generic codec can still emit PGRPGEN1 when called with old metadata. Inventory those inputs before removing that branch. |
+| B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | Standby publication and logical-copy source proof emit PGRPGEN2 with metadata version 4. The XID process fixture constructs retired generations independently to test startup rejection. |
 
 For B15, callers of the ownerless CLOG staging and materialization functions
 are confined to their delegation chain and Rove fixtures. The tag validation

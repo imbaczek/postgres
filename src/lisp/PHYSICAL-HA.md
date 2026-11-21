@@ -4559,9 +4559,9 @@ Scanning and physical pins use explicit checkpoint starts; pin/base validation
 compares the complete record with its control copy. Bootstrap requires a
 version 3 manifest with that explicit start. Replay
 preserves source checkpoint facts separately from standby read-visibility XIDs.
-Restartpoint metadata v2 retains them through receive-spool compaction and restores
-them before suffix replay. Legacy restartpoint metadata v1 remains readable with
-unknown source facts. The bounded literal reader now reads NIL as CL NIL, fixing
+Restartpoint metadata v4 retains them through receive-spool compaction and restores
+them before suffix replay. Startup requires the PGRPGEN2 generation format.
+The bounded literal reader now reads NIL as CL NIL, fixing
 its former interpretation as the keyword `:NIL`. New persistent formats require
 the upgraded binary; older binaries cannot read these records.
 

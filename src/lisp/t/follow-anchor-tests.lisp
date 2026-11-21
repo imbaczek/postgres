@@ -458,7 +458,7 @@
          (ok (signals (pg::physical-follow-validate-candidate-replay candidate base binding) 'error)))
        :unfinished (eq kind :unfinished))))
 
-(defun follow-replay-proof-write-restartpoint (store base lsn next &optional (version 3) (prefix-delta 0) overrides)
+(defun follow-replay-proof-write-restartpoint (store base lsn next &optional (version 4) (prefix-delta 0) overrides)
   (multiple-value-bind (deletes catalog) (pg::wal-decode-catalog-payload (history-catalog-payload nil nil))
     (declare (ignore deletes))
     (let* ((metadata (list :version version :system-id (getf base :system-id)
@@ -501,33 +501,21 @@
              (ok (= (if empty-scan 21 3) (getf result :required-next-xid)))))))))
 
 (deftest follow-replay-proof-rejects-changed-restartpoint-and-visibility-regression
-    (dolist (kind '(:pointer :visibility :prefix :legacy))
+    (dolist (kind '(:pointer :visibility :prefix))
       (call-with-follow-replay-proof
        (lambda (root store candidate base binding)
          (declare (ignore root))
          (let* ((witness (getf binding :recovery))
                 (lsn (first (getf binding :applied)))
                 (token (follow-replay-proof-write-restartpoint
-                        store base lsn 11 (if (eq kind :legacy) 2 3) (if (eq kind :prefix) 1 0))))
+                        store base lsn 11 4 (if (eq kind :prefix) 1 0))))
            (setf (getf witness :restartpoint) token)
            (ecase kind
              (:pointer (incf (second token)))
              (:visibility (setf (getf binding :required) '(64 1)
                                 (getf witness :observed-next-xid) 12))
-             (:prefix nil)
-             (:legacy (setf (getf witness :observed-next-xid) 12)))
+             (:prefix nil))
            (ok (signals (pg::physical-follow-validate-candidate-replay candidate base binding) 'error)))))))
-
-(deftest follow-replay-proof-legacy-restartpoint-falls-back-to-retained-base
-    (call-with-follow-replay-proof
-     (lambda (root store candidate base binding)
-       (declare (ignore root))
-       (setf (getf (getf binding :recovery) :restartpoint)
-             (follow-replay-proof-write-restartpoint store base (first (getf binding :applied)) 999 2))
-       (let ((result (pg::physical-follow-validate-candidate-replay candidate base binding)))
-         (ok (= 64 (getf result :start)))
-         (ok (= 11 (getf result :required-next-xid)))
-         (ok (= 21 (getf result :next-xid)))))))
 
 (deftest follow-replay-proof-crosses-selected-eor-and-restores-child-seed
     (dolist (restartpoint '(nil t))

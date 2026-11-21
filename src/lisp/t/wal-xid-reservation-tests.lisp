@@ -908,7 +908,7 @@
       (ok (= pg::+wal-version+ (pg::wal-record-version (first records))))
       (ok (equal snapshot (pg::wal-checkpoint-record-snapshot (first records))))))
 
-(deftest reservation-restartpoint-format-preserves-v3-proof-and-legacy-unknowns
+(deftest reservation-restartpoint-format-preserves-v4-proof-and-rejects-older-metadata
     (call-with-restartpoint-fixture
      (lambda (root store)
        (declare (ignore root store))
@@ -920,16 +920,11 @@
              (pg::physical-restartpoint-decode (pg::physical-restartpoint-encode metadata catalog))
            (ok (pg::physical-restartpoint-check-metadata decoded bytes pg::*physical-recovery-state*))
            (ok (equal proof (getf decoded :source-reservation))))
-         (dolist (version '(1 2))
-           (let ((legacy (copy-list metadata)))
-             (setf (getf legacy :version) version)
-             (remf legacy :source-reservation)
-             (remf legacy :wal-prefix-digest)
-             (when (= version 1) (remf legacy :source-checkpoint))
-             (multiple-value-bind (decoded bytes)
-                 (pg::physical-restartpoint-decode (pg::physical-restartpoint-encode legacy catalog))
-               (ok (pg::physical-restartpoint-check-metadata decoded bytes pg::*physical-recovery-state*))
-               (ok (null (getf decoded :source-reservation))))))
+         (dolist (version '(1 2 3))
+           (let ((retired (copy-list metadata)))
+             (setf (getf retired :version) version)
+             (ok (intake-fails-p
+                  (lambda () (pg::physical-restartpoint-encode retired catalog))))))
          (setf (getf proof :through) 97)
          (ok (intake-fails-p
               (lambda () (pg::physical-restartpoint-check-metadata metadata catalog pg::*physical-recovery-state*))))))))

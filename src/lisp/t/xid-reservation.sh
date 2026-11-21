@@ -68,48 +68,18 @@ legacy_migration() {
     for version in 1 2; do
         rm -rf "$TMP/copy"
         cp -a "$TMP/migration-$kind" "$TMP/copy"
-        PG_XID_MIGRATION_ACTION=fixture PG_XID_MIGRATION_DATA="$TMP/copy" \
+        PG_XID_MIGRATION_DATA="$TMP/copy" \
             PG_XID_MIGRATION_VERSION=$version "$SBCL" --script "$BASE/t/xid-legacy-migration.lisp" \
             >"$TMP/legacy-$kind-$version-fixture.log" 2>&1
-        barrier="$TMP/legacy-$kind-$version-dirty"
-        PG_XID_MIGRATION_BARRIER="$barrier" "$SBCL" --script "$BASE/t/xid-legacy-migration.lisp" \
-            -p "$TARGET_PORT" -D "$TMP/copy" >"$TMP/legacy-$kind-$version-crash.log" 2>&1 &
-        TARGET=$!
-        attempt=0
-        while [ ! -f "$barrier" ]; do
-            attempt=$((attempt + 1)); test "$attempt" -lt 200
-            kill -0 "$TARGET"; sleep 0.05
-        done
-        kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
-        python3 - "$BASE" "$TMP/copy" "$TMP/migration-$kind" <<'PY'
-import runpy, sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]) / 't/interop'))
-decode = runpy.run_path(str(Path(sys.argv[1]) / 't/interop/recovery-control-state.py'))['decode']
-root = Path(sys.argv[2])
-control = decode((root / 'physical-recovery.control').read_bytes())
-previous = decode((Path(sys.argv[3]) / 'physical-recovery.control').read_bytes())
-assert control['version'] == 3 and control['state'] == 5
-assert control['next_xid'] == previous['next_xid']
-assert control['applied'] == previous['applied']
-PY
-        if [ "$kind" = full ]; then
-            start_target
-            assert_target "$new_end" "legacy-$kind-$version-recovered"
-            kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
-        else
-            "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
-                >"$TMP/legacy-$kind-$version-refused.log" 2>&1 &
-            TARGET=$!
-            attempt=0
-            while kill -0 "$TARGET" 2>/dev/null; do
-                attempt=$((attempt + 1)); test "$attempt" -lt 200; sleep 0.05
-            done
-            result=0; wait "$TARGET" || result=$?; TARGET=
-            test "$result" -ne 0
-            grep -q 'legacy restartpoint lost actual XID history; reseed required' \
-                "$TMP/legacy-$kind-$version-refused.log"
-        fi
+        cp "$TMP/copy/physical-restartpoint.control" "$TMP/retired-restartpoint.control"
+        result=0
+        timeout -k 5 20 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
+            >"$TMP/legacy-$kind-$version-refused.log" 2>&1 || result=$?
+        test "$result" -eq 1
+        grep -q 'invalid physical restartpoint generation' \
+            "$TMP/legacy-$kind-$version-refused.log"
+        cmp "$TMP/migration-$kind/physical-recovery.control" "$TMP/copy/physical-recovery.control"
+        cmp "$TMP/retired-restartpoint.control" "$TMP/copy/physical-restartpoint.control"
     done
     rm -rf "$TMP/copy"
     cp -a "$TMP/migration-$kind" "$TMP/copy"
@@ -211,4 +181,4 @@ test "$(sql "$TARGET_PORT" 'SELECT count(*) FROM xid_rows')" = 1
 if sql "$TARGET_PORT" 'INSERT INTO xid_rows VALUES (2)' >"$TMP/write-guard.log" 2>&1; then exit 1; fi
 checked target '(physical-recovery-prepare-shutdown)' prepare
 checked source '(physical-source-pin-release "xid_base")' release
-echo 'xid-reservation: reservation crashes, actual visibility, restartpoints and legacy migration crash/reseed paths PASS'
+echo 'xid-reservation: reservation crashes, actual visibility and retired restartpoint rejection PASS'

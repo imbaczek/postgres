@@ -50,9 +50,8 @@ not a public GUC."
   (let* ((base (list (getf state :end) (getf state :timeline)))
          (required (list (getf state :required-applied (first base))
                          (getf state :required-timeline (second base))))
-         (usable (and metadata (>= (getf metadata :version) 3) metadata))
-         (seed (if usable
-                   (list (getf usable :lsn) (getf usable :replay-timeline (getf usable :timeline)))
+         (seed (if metadata
+                   (list (getf metadata :lsn) (getf metadata :replay-timeline (getf metadata :timeline)))
                    base))
          (history (physical-recovery-policy-history state store)))
     (dolist (pair (list base required seed))

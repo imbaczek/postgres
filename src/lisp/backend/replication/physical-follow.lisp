@@ -481,8 +481,8 @@ reconciliation; active bindings require durable-state checks before admission."
 
 (defun physical-follow-replay-seed (store base applied restartpoint)
   "Check RESTARTPOINT against the durable pointer and choose a replay seed.
-A version 3 or later generation supplies the seed; an older generation falls
-back to BASE and requires the full prefix. Check its timeline, history and
+A published generation supplies the seed. Without one, use BASE and require
+the full prefix. Check the seed's timeline, history and
 prefix digest against STORE, and require the seed not to pass APPLIED. The
 caller supplies a verified BASE and protects PGDATA and the retained root.
 Return nine values, including optional resource, FPW and logical facts."
@@ -491,8 +491,6 @@ Return nine values, including optional resource, FPW and logical facts."
     (unless (equal restartpoint
                    (when metadata (list (getf metadata :lsn) digest)))
       (error "follow restartpoint witness differs from its durable pointer"))
-    (when (and metadata (< (getf metadata :version) 3))
-      (setf metadata nil))
     (let* ((start (if metadata (getf metadata :lsn) (getf base :end)))
            (timeline (if metadata (getf metadata :replay-timeline (getf metadata :timeline))
                          (getf base :timeline)))
@@ -886,7 +884,7 @@ compaction has moved them into retained extents."
                      (or (/= (first old) (first token)) (equal old token)))
           (error "active follow restartpoint regressed or changed at its saved boundary")))
       (when (> (physical-store-floor-lsn store) (getf base :end))
-        (unless (and metadata (>= (getf metadata :version) 3)
+        (unless (and metadata
                      (<= (physical-store-floor-lsn store) (getf metadata :lsn)))
           (error "active follow compaction lacks a usable durable restartpoint")))
       (values metadata token))))
@@ -896,7 +894,7 @@ compaction has moved them into retained extents."
 The caller supplies the checked current inventory, validates the whole spool
 before this mapper runs, and keeps the root protected.
 The archived prefix can be scanned in full because its floor is at or before
-the policy-checked usable restartpoint seed; legacy fallback has floor at base.
+the policy-checked usable restartpoint seed; a base seed has floor at base.
 The store validates its whole spool before callbacks stop at a policy fence."
   (unless (= start (physical-store-base-lsn store))
     (error "active historical scan must start at the verified base"))
@@ -925,7 +923,7 @@ Return the scan disposition; it is not a numeric reconciliation success value."
   (multiple-value-bind (metadata token)
       (physical-follow-check-current-restartpoint candidate base minimum)
     (let* ((applied (max (first applied) (first required)
-                         (if (and metadata (>= (getf metadata :version) 3))
+                         (if metadata
                              (getf metadata :lsn) (getf base :end))))
            (pair (list applied (physical-store-prefix-timeline candidate applied)))
            (seed (multiple-value-list (physical-follow-replay-seed candidate base pair token))))

@@ -105,7 +105,7 @@
                    (ok (equalp suffix (pg::physical-recovery-wal-prefix-under-lock store (+ size (length suffix))))))))
           (pg::physical-store-close store)))))
 
-(deftest restartpoint-prefix-codec-distinguishes-known-empty-unavailable-and-legacy
+(deftest restartpoint-prefix-codec-distinguishes-empty-unavailable-and-retired
     (with-restartpoint-fixture (root store)
       (declare (ignore root store))
       (let* ((catalog (lineage-test-bytes (pg::catalog-path)))
@@ -115,14 +115,12 @@
         (let ((bytes (pg::physical-restartpoint-encode metadata catalog (empty-octets))))
           (ok (equalp (empty-octets) (nth-value 2 (pg::physical-restartpoint-decode bytes)))))
         (setf (getf metadata :wal-prefix-digest) nil)
-        (ok (null (nth-value 2 (pg::physical-restartpoint-decode
-                                (pg::physical-restartpoint-encode metadata catalog)))))
-        (setf (getf metadata :version) 3)
-        (remf metadata :wal-prefix-digest)
-        (multiple-value-bind (decoded ignored prefix)
-            (pg::physical-restartpoint-decode (pg::physical-restartpoint-encode metadata catalog))
-          (declare (ignore ignored))
-          (ok (= 3 (getf decoded :version))) (ok (null prefix))))))
+        (let ((bytes (pg::physical-restartpoint-encode metadata catalog)))
+          (ok (null (nth-value 2 (pg::physical-restartpoint-decode bytes))))
+          (setf (aref bytes 7) (char-code #\1))
+          (pg::wal-set-u32 bytes 24 0)
+          (pg::wal-set-u32 bytes 24 (pg::wal-crc32 bytes))
+          (ok (intake-fails-p (lambda () (pg::physical-restartpoint-decode bytes))))))))
 
 (cl-spec:defproperty restartpoint-embedded-prefix-roundtrips
     ((length (range integer 0 512)) (value (range integer 0 255)))
