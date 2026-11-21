@@ -451,11 +451,15 @@ still has work outstanding.
   fresh reader against the registered archive. All 35 strict retained-root
   test heads passed. The instrumented imported restart, proof-loss and
   physical streaming cases passed.
-  Enabling GC still requires a deletion-time ownership and retention
-  proof for the restored host and archive. Restore the current primary
-  control's root separately from the historical imported origin, account
-  for any durable receive selection, and recheck both host ownership and
-  registered protection before archive unlink.
+  In `036bab32386`, imported startup restores the current primary
+  control's root after replay under the drained startup gate and typed
+  host owner. Reconciliation checks the held archive identity before
+  loading the selected root. Instrumented startup observed the current
+  root registered under the primary owner before catalog initialization
+  on all three boots. The proof-loss refusal still kept the fence closed.
+  Five strict promotion and retained-root test heads passed.
+  Enabling GC still requires accounting for any durable receive selection
+  and rechecking host ownership and registered protection at archive unlink.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
