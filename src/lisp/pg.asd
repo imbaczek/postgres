@@ -54,6 +54,7 @@
                    (:file "wal-logical-status")
                    (:file "wal-logical-policy")
                    (:file "bufmgr")))
+     (:file "utils/adt/sql-types")
      (:file "utils/adt/pglz")
      (:file "utils/adt/json")
      (:file "utils/adt/numeric")

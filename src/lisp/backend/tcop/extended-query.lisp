@@ -502,9 +502,8 @@
     (values value end)))
 
 (defun extended-type-from-oid (oid)
-  (let ((entry (find oid +sql-expression-types+ :key #'second)))
-    (unless entry (ereport "0A000" "unsupported parameter type OID ~a" oid))
-    (first entry)))
+  (or (sql-type-from-oid oid)
+      (ereport "0A000" "unsupported parameter type OID ~a" oid)))
 
 (defun extended-parse-frame (type payload)
   "Parse the complete frame before changing prepared or portal state."

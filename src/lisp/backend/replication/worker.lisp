@@ -362,7 +362,7 @@ unchanged for standard-conforming strings."
         (/ value 1000.0)))))
 
 (defun logical-type-supported-p (type-oid)
-  (member type-oid '(17 20 21 23 25 114 199 1001 3802 3807 700 701 1043 1082 1083 1114 1184 1186 1266 1700)))
+  (member (sql-type-from-oid type-oid) +logical-replication-types+))
 
 (defun logical-validate-client-schema (table source-columns target-columns)
   (unless (= (length source-columns) (length target-columns))
@@ -553,18 +553,20 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 (defun logical-source-value-literal (type-oid value context)
   (unless (member context '(:copy :pgoutput))
     (error "unknown logical value conversion context ~s" context))
-  (cond
-    ((eq value :unchanged-toast) (error "unchanged TOAST value cannot be used here"))
-    ((null value) "NULL")
-    ((member type-oid '(20 21 23))
-     (unless (ignore-errors (parse-integer value :junk-allowed nil))
-       (if (eq context :copy)
-           (error "source returned a malformed integer value")
-           (error "pgoutput integer value is malformed")))
-     value)
-    ((member type-oid '(17 25 114 199 1001 3802 3807 700 701 1043 1082 1083 1114 1184 1186 1266 1700)) (logical-sql-literal value))
-    (t (error "unsupported ~a type OID ~a"
-              (if (eq context :copy) "logical copy" "pgoutput") type-oid))))
+  (when (eq value :unchanged-toast)
+    (error "unchanged TOAST value cannot be used here"))
+  (unless value (return-from logical-source-value-literal "NULL"))
+  (let ((type (sql-type-from-oid type-oid)))
+    (cond
+      ((member type '(:int2 :int4 :int8))
+       (unless (ignore-errors (parse-integer value :junk-allowed nil))
+         (if (eq context :copy)
+             (error "source returned a malformed integer value")
+             (error "pgoutput integer value is malformed")))
+       value)
+      ((member type +logical-replication-types+) (logical-sql-literal value))
+      (t (error "unsupported ~a type OID ~a"
+                (if (eq context :copy) "logical copy" "pgoutput") type-oid)))))
 
 (defun logical-copy-check-query-size (query)
   "Reject a Simple Query frame that the target cannot accept."
