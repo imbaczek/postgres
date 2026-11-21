@@ -14,7 +14,7 @@ checkout before marking any item complete.
 | 2. Cut over the development baseline (B1–B14, B17–B18) | Regenerate development data and fixtures by format family as retired readers are removed. Keep WAL8, PGSLOT4/5 and recovery-control 3/4 while current producers emit them. Change WAL filename producers before retiring legacy-named data, backups and ancestral WAL. Restart for obsolete image layouts. Verify fresh init, restart, backup, follow, promotion and explicit rejection of retired formats. Pair rollback code with matching data. |
 | 3A. Share query semantics (A1, A3, A7–A9, A13) | Start with projection and WindowAgg, then consolidate preparation and admission, types and builtins, scope-aware S-expression visitors and claimed-tuple replacement. Verify push/pull results and errors, row lifetimes and origins, suspension and early stop, cleanup and hot-path allocation. |
 | 3B. Share WAL grammar and replay facts (A2, A4) | Move history and redo to shared framing and batch transitions. Accumulate facts in record order and bound retained bytes. Preserve selected end-of-recovery as its own transition. Verify accepted prefixes, incomplete tails, distinct redo and primary settlement order, FIFO retirement and immutable receipts. |
-| 4. Consolidate subsystems and enforce dependencies (A10–A12, A15–A16, A19) | Extract catalog and settings descriptors, B-tree child-range selection and one production pgoutput decoder with independent expected results. Split WAL responsibilities after ownership is explicit. Add package and ASDF dependencies once both tracks exercise the interfaces. Verify strict compilation, catalog rollback identity, setting scope and B-tree lock ownership. |
+| 4. Consolidate subsystems and enforce dependencies (A10–A12, A15–A16, A19) | Share the catalog snapshot and restore field policy, catalog and settings descriptors, B-tree child-range selection, and one production pgoutput decoder with independent expected results. Split WAL responsibilities after ownership is explicit. Add package and ASDF dependencies once both tracks exercise the interfaces. Verify strict compilation, catalog rollback identity, setting scope and B-tree lock ownership. |
 | 5. Retire adapters and update verification and docs (A18, A20) | Remove adapters after their last callers move. Unify discovery and reporting for the existing legacy and Rove suites, keeping their tests in their current harnesses. Update runbooks and format support. Link every audit item to implementation and acceptance evidence. |
 
 Start with the inventory, obsolete SELECT wrappers, envelopes and progress
@@ -144,6 +144,10 @@ For B11, the backup and recovery readers require a version 3 manifest with
 an explicit checkpoint start. The schema rejects versions 1 and 2, missing
 checkpoint starts, and inconsistent checkpoint boundaries.
 
+For B12, `64002cfb17e` requires PGRPGEN2 and metadata version 4. The
+`t/xid-reservation.sh` fixture exercises startup rejection of retired
+generations and checks that their control files are unchanged.
+
 For B13, restart the Lisp server across the gate representation cutover.
 The admission gate now closes and reopens with the current quiescence owner
 token. The load-time bridge for ownerless gates has been removed.
@@ -214,7 +218,8 @@ INSERT fixture uses the C tuple field order and checks null, unchanged TOAST,
 UTF-8 text, and binary data after overwriting the input bytes.
 The test-only INSERT, UPDATE, and DELETE adapters and their duplicate tuple
 framing code have been retired. Malformed packet and C wire fixtures now
-exercise the shared operation decoder, and apply tests use dispatch.
+exercise the shared operation decoder. Apply tests pass decoded operations
+directly to the apply entry point.
 Control tests also use the shared decoder or the production CopyData reader.
 The malformed keepalive fixture verifies connection closure without advancing
 feedback. The duplicate native TRUNCATE apply adapter has no callers and was
@@ -257,7 +262,7 @@ shared record types, integer fields, and CRC32C dispatch. WAL storage declares
 the codec component as a dependency, and the standalone CRC qualification
 compiles the complete codec directly.
 
-For A20, the `pg-unit-tests/all` ASDF test operation runs the Rove and legacy
+For A18, the `pg-unit-tests/all` ASDF test operation runs the Rove and legacy
 unit harnesses in order. The coverage-aware shell wrapper delegates to that
 operation. Direct Rove head selection and its campaign receipts use the
 existing Rove-only system. The
@@ -319,7 +324,7 @@ helpers.
   and cold catalog tests passed, along with 54 installation staging crash
   cuts and their retries.
 
-### pgoutput decoder and adapter verification (A15, A18)
+### pgoutput decoder and adapter verification (A12)
 
 - Complete pgoutput messages share `logical-wire-operation` across the
   in-memory and streaming receive paths in `backend/replication/worker.lisp`.
@@ -335,6 +340,35 @@ helpers.
   Live replay applied all six captured C transactions, checked the committed
   progress LSNs, and verified rollback of a multi-relation TRUNCATE. Observer
   queries on truncated relations run after transaction end releases the locks.
+
+### Refactoring audit crosswalk
+
+The audit names below follow the North Star Architecture. Commit IDs identify
+implementation slices. A slice can have passing tests while its audit item
+still has work outstanding.
+
+| Audit item | Implementation evidence and remaining verification |
+|---|---|
+| A1. Push and pull query duplication | Projection and WindowAgg transitions are shared in `e13c164f35a` and `0529ff96c23`. The window differential exercises one-row portal resumption. Audit remaining SQL rules and verify row ownership and allocations across both drivers. |
+| A2. WAL batch grammar | Shared history and redo staging and terminal decoding in `d63521560e9` and `dd31595f1ad`. Recovery catalog spooling in `b9e448a23bd`. Verify the complete prefix, incomplete tail, and effect-order contracts. |
+| A3. Builtin dispatch and metadata | JSON and JSONB inspection descriptors in `17b2661ab5e`. Verify alias, arity, volatility, strictness, and evaluation consumers before extending the registry. |
+| A4. Physical replay fact scans | WAL8 source transaction transitions in `f393cca86ef`. Audit replay fact consumers for shared transitions with explicit seeds, coverage, and stop policies. |
+| A5. Metadata envelopes | Shared codecs in `b0a0b5b0c2d`. The Milestone 1 strict physical selection exercises exact bytes, checksum failures, and canonicality. |
+| A6. Progress journals | Shared installation prefix parsing in `b0a0b5b0c2d`. The Milestone 1 selection exercises partial tails and publication cuts. |
+| A7. Claimed-tuple replacement | Shared physical replacement tail in `5c3796e612e`. Verify TOAST, successor links, logical publication, and command-specific RETURNING. |
+| A8. Type and coercion duplication | Shared SQL identities and varchar assignment in `61c670dd78b` and `8bbad6498a0`. Audit other coercion contexts and preserve wire and heap representations. |
+| A9. Expression and plan walkers | Scope-aware traversal in `5360608bb51`. Check remaining visitors against the scope and opaque-field policy. |
+| A10. Catalog snapshot and restore | Virtual relation descriptors in `b6aa35de135` cover catalog view metadata. [Catalog mutation rollback](backend/catalog/catalog.lisp#L797) still enumerates snapshot copies and restored fields separately. Consolidate that policy and verify rollback identity. |
+| A11. B-tree equality traversal | Shared child range in `f1439ac21cd`. Separator, lease, and DROP INDEX handoff tests cover equality routing and canonical reader ownership. |
+| A12. pgoutput dual parsers | Shared decoder in `970941ce5cd` and final dispatch adapter removal in `265909bd238`. See the pgoutput verification above for independent wire fixtures and live replay. |
+| A13. Query setup duplication | Admission and result preparation in `ed467ac1ffa` and `6e51b5345a1`. Verify snapshot and reader lifetimes for normal and suspended execution. |
+| A14. Receive-control snapshots | Named snapshots begin in `7fd971c29ed`. See Milestone 1 for exact-field witness, readback, and logical slot copy verification. |
+| A15. WAL core concentration | Recovery and record framing moved in `f1a33ccac3d` and `42c52f3357f`. Audit publication, slots, and archiving boundaries. |
+| A16. Settings metadata | Read-only descriptors in `63085c92361`. Verify startup, session, transaction-local, and reload behavior through their public entry points. |
+| A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. Audit shared setup and retirement ownership across fault scenarios. |
+| A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. Audit legacy discovery and result reporting against the common contract. |
+| A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. Audit package boundaries and independent subsystem loading before claiming dependency enforcement. |
+| A20. Documentation drift | The test runbook was updated in `02438307f77`. Reconcile the supported-format table, startup and restart runbooks, and retained historical notes against the final cutover. |
 
 ## Open development tasks
 
