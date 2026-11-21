@@ -458,6 +458,22 @@
       (rove:ok (project-set-expression-dependent-p
                 '(:sort-output 1) 2 1 (list (list :expr local))))))
 
+(rove:deftest test-analyzed-walk-finds-executable-inputs-only
+    (let* ((call '(:func "nextval" ((:const "s"))))
+           (column '(:col 1))
+           (payload (list column call))
+           (test (list :subplan (make-sql-subplan :kind :any :test column)))
+           (nested (list :subplan (make-sql-subplan :kind :scalar
+                                                    :prepared (list :targets (list (list :expr column)))))))
+      (rove:ok (expression-contains-column-p (list :in '(:const 0) payload nil)))
+      (rove:ok (analyzed-expression-volatile-p (list :in '(:const 0) payload nil)))
+      (rove:ok (expression-contains-column-p test))
+      (rove:ok (not (expression-contains-column-p nested)))
+      (rove:ok (analyzed-expression-volatile-p nested))
+      (dolist (opaque (list (list :const payload) (list :func "lower" nil :type payload)))
+        (rove:ok (not (expression-contains-column-p opaque)))
+        (rove:ok (not (analyzed-expression-volatile-p opaque))))))
+
 (rove:deftest test-resumable-sort-defers-volatile-projection
     (let* ((*query-temp-directory* (uiop:temporary-directory))
            (*query-work-memory-bytes* 1)

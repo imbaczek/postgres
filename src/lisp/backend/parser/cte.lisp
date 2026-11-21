@@ -288,7 +288,7 @@
                       "pg_stat_get_wal_receiver" "pg_get_publication_tables" "pg_get_replication_slots"
                       "pg_wal_lsn_diff" "pg_walfile_name")
                     :test #'string=))
-       (analyzed-expression-volatile-p (list :func name nil))))
+       (analyzed-function-volatile-p name)))
 
 (defun cte-expression-volatile-p (form)
   ;; SQL-SUBPLAN is defined by the following parser module.

@@ -40,6 +40,25 @@
   ;; already rewritten to group output slots, avoiding a second slot rewrite.
   kind prepared plan test depths grouped-contexts)
 
+(defun some-local-plan-expression (predicate expression)
+  "Visit local expression nodes until PREDICATE succeeds.
+PREDICATE receives the node and the walker for explicitly resolved references.
+Subplans expose their test without entering the prepared query. Calls and
+records expose their executable inputs. Follow the operand of an outer
+reference conservatively, as it is evaluated in the outer frame. Other forms
+may still contain expression lists and are traversed structurally."
+  (labels ((walk (form)
+             (and (consp form)
+                  (or (funcall predicate form #'walk)
+                      (case (first form)
+                        ((:const :bool :scalar-array-const :col :sort-output :window-ref) nil)
+                        (:subplan
+                         (let ((subplan (second form)))
+                           (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
+                        ((:func :whole-row :outer-ref) (walk (third form)))
+                        (otherwise (or (walk (car form)) (walk (cdr form)))))))))
+    (not (null (walk expression)))))
+
 (defun subquery-expression-p (expression)
   (and (consp expression) (eq (first expression) :subplan)))
 

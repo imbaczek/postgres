@@ -1816,10 +1816,12 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (t (analyze-utility-function-call name args)))))
 
 (defun expression-contains-column-p (form)
-  "Detect row references through every analyzed expression, including IN lists."
-  (and (consp form)
-       (or (member (first form) '(:col :whole-row))
-           (some #'expression-contains-column-p form))))
+  "Detect row references in local executable operands, including IN lists."
+  (some-local-plan-expression
+   (lambda (node walk)
+     (declare (ignore walk))
+     (member (first node) '(:col :whole-row)))
+   form))
 
 (defun in-unknown-constant-p (expr)
   (and (eq (first expr) :const)
@@ -3881,32 +3883,36 @@ checks still apply."
                (contains-aggregate-p (car form))
                (contains-aggregate-p (cdr form))))))
 
+(defun analyzed-function-volatile-p (name)
+  "Treat unclassified calls as volatile for aggregate and CTE planning."
+  (not (or (let ((builtin (find-scalar-builtin name)))
+             (and builtin (member (scalar-builtin-volatility builtin) '(:immutable :stable))))
+           (integer-catalog-alias-p name)
+           (float-catalog-alias name)
+           (trig-function-p name)
+           (numeric-arithmetic-function-p name)
+           (numeric-helper-function-p name)
+           (member name
+                   '("version" "pg_lisp_runtime" "current_database" "current_schema"
+                     "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
+                     "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
+                     "jsonb_build_array" "jsonb_build_object" "get_bit" "set_bit"
+                     "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
+                     "chr" "array_to_string" "string_to_array" "greatest" "least"
+                     "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                     "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
+                     "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                     "scale" "min_scale" "trim_scale" "width_bucket")
+                   :test #'string=))))
+
 (defun analyzed-expression-volatile-p (form)
-  "Only known stable/immutable builtins may share an aggregate transition."
-  (and (consp form)
-       (or (eq (first form) :subplan)
-           (and (eq (first form) :func)
-                (not (or (let ((builtin (find-scalar-builtin (second form))))
-                           (and builtin (member (scalar-builtin-volatility builtin) '(:immutable :stable))))
-                         (integer-catalog-alias-p (second form))
-                         (float-catalog-alias (second form))
-                         (trig-function-p (second form))
-                         (numeric-arithmetic-function-p (second form))
-                         (numeric-helper-function-p (second form))
-                         (member (second form)
-                                 '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                                   "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
-                                   "jsonb_build_array" "jsonb_build_object" "get_bit" "set_bit"
-                                   "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
-                                   "chr" "array_to_string" "string_to_array" "greatest" "least"
-                                   "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                                   "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                                   "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
-                                   "scale" "min_scale" "trim_scale" "width_bucket")
-                                 :test #'string=))))
-           (analyzed-expression-volatile-p (car form))
-           (analyzed-expression-volatile-p (cdr form)))))
+  "Only known stable or immutable builtins may share an aggregate transition."
+  (some-local-plan-expression
+   (lambda (node walk)
+     (declare (ignore walk))
+     (or (eq (first node) :subplan)
+         (and (eq (first node) :func) (analyzed-function-volatile-p (second node)))))
+   form))
 
 (defun analyze-aggregate-input (raw scope kind)
   "Resolve supported pg_aggregate signatures before transition setup."
