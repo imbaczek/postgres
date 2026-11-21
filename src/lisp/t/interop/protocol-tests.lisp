@@ -1569,8 +1569,9 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     ;; ordinary transactional frame. We do not negotiate streamed transactions.
     (ok (handler-case
             (progn
-              (pg::logical-pgoutput-read-message
-               (pg::make-logical-subscription-runtime :transaction-open-p t :source-xid 91)
+              (pg::logical-pgoutput-read-operation
+               (pg::make-logical-subscription-runtime :options (pg::make-logical-subscription-options)
+                                                      :transaction-open-p t :source-xid 91)
                (octets #(77 0 0 0 91 1 0 0 0 0 0 0 0 42
                          112 103 95 108 105 115 112 47 100 100 108 0
                          0 0 0 1 120)))
@@ -1620,7 +1621,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
   (ok (= pg::*server-version-num* 200000))
   (ok (string= (pg::eval-func "version" nil) "PostgreSQL 20devel (pg-lisp 0.1)")))
 
-(defun decode-test-pgoutput-row (payload)
+(defun decode-test-pgoutput-in-transaction (payload)
   (pg::logical-pgoutput-read-operation
    (pg::make-logical-subscription-runtime :transaction-open-p t)
    payload))
@@ -1631,7 +1632,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                      #(85 0 0 0 7 75 0 0)
                      #(85 0 0 0 7 78 0 0 0)))
       (ok (handler-case
-              (progn (decode-test-pgoutput-row (octets bytes)) nil)
+              (progn (decode-test-pgoutput-in-transaction (octets bytes)) nil)
             (simple-error () t)))))
 
 (deftest unsupported-tuple-representations
@@ -1674,14 +1675,14 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
            (body (pg::make-pgoutput-column :name "body" :type-oid 25))
            (relation (pg::make-pgoutput-relation :columns (list id body) :key-columns (list id)))
            (payload (octets #(85 0 0 0 7 75 0 2 116 0 0 0 1 55 110 78 0 2 117 117))))
-      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row payload)
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-in-transaction payload)
         (declare (ignore tag oid))
         (ok (char= kind #\K))
         (ok (equal (pg::logical-row-key-predicate
                     (pg::logical-pgoutput-key-values relation old) (list id)) "id = '7'"))
         (ok (equal (pg::logical-update-set-clause relation new) "id = id")))
       (ok (handler-case
-              (progn (decode-test-pgoutput-row (subseq payload 0 19)) nil)
+              (progn (decode-test-pgoutput-in-transaction (subseq payload 0 19)) nil)
             (simple-error () t)))))
 
 (deftest unchanged-toast-marker-context-and-types
@@ -1768,8 +1769,8 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (dolist (flags '(1 2 128))
       (ok (handler-case
               (progn
-                (pg::logical-pgoutput-read-message
-                 (pg::make-logical-subscription-runtime)
+                (pg::logical-pgoutput-read-operation
+                 (pg::make-logical-subscription-runtime :options (pg::make-logical-subscription-options))
                  (octets (list 77 flags 0 0 0 0 0 0 0 42 120 0 0 0 0 0)))
                 nil)
             (simple-error () t)))))
@@ -1793,23 +1794,25 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
            (truncate (find 84 frames :key (lambda (frame) (aref frame 0)))))
       (ok (= 24 (length frames)))
       (ok (= 2 (length updates)))
-      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row (first updates))
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-in-transaction (first updates))
         (declare (ignore tag oid kind))
         (ok (null old))
         (ok (equalp new #("1" "3"))))
-      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-row (second updates))
+      (destructuring-bind (tag oid old new kind) (decode-test-pgoutput-in-transaction (second updates))
         (declare (ignore tag oid kind))
         (ok (equalp old #("1" nil)))
         (ok (equalp new #("4" "3"))))
-      (ok (equal '(24587) (pg::logical-pgoutput-read-truncate truncate)))
+      (ok (equal '(24587) (second (decode-test-pgoutput-in-transaction truncate))))
       (ok (equalp truncate (pg::pgoutput-build-truncate '(24587))))
       (ok (= 2 (length messages)))
       (dolist (frame messages)
         (let* ((transactional-p (= (aref frame 1) 1))
                (runtime (pg::make-logical-subscription-runtime
+                         :options (pg::make-logical-subscription-options)
                          :transaction-open-p transactional-p)))
-          (multiple-value-bind (prefix lsn content flag)
-              (pg::logical-pgoutput-read-message runtime frame)
+          (destructuring-bind (tag prefix lsn content flag)
+              (pg::logical-pgoutput-read-operation runtime frame)
+            (ok (char= tag #\M))
             (ok (string= prefix "pg_lisp/ddl"))
             (ok (string= content "x"))
             (ok (eql transactional-p flag))
@@ -1820,11 +1823,12 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                   (pg::make-logical-transaction :xid (if flag 1 0) :commit-lsn lsn)))))))))
 
 (deftest nontransactional-message-inside-transaction
-    (multiple-value-bind (prefix lsn content transactional-p)
-        (pg::logical-pgoutput-read-message
-         (pg::make-logical-subscription-runtime :transaction-open-p t)
+    (destructuring-bind (tag prefix lsn content transactional-p)
+        (pg::logical-pgoutput-read-operation
+         (pg::make-logical-subscription-runtime :options (pg::make-logical-subscription-options)
+                                                :transaction-open-p t)
          (octets #(77 0 0 0 0 0 0 0 0 42 120 0 0 0 0 0)))
-      (ok (equal (list prefix lsn content transactional-p) '("x" 42 "" nil)))))
+      (ok (equal (list tag prefix lsn content transactional-p) '(#\M "x" 42 "" nil)))))
 
 (deftest excluded-full-identity-update
     (let ((runtime (pg::make-logical-subscription-runtime
@@ -1851,26 +1855,26 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     ;; logicalrep_write_truncate: tag, uint32 count, uint8 flags, OIDs.
     (let ((expected #(84 0 0 0 2 0 0 0 0 7 0 0 0 8)))
       (ok (equalp expected (pg::pgoutput-build-truncate '(7 8))))
-      (ok (equal '(7 8) (pg::logical-pgoutput-read-truncate (octets expected))))))
+      (ok (equal '(7 8) (second (decode-test-pgoutput-in-transaction (octets expected)))))))
 
 (deftest unsupported-truncate-flags
     (dolist (flags '(1 2 3 128))
       (ok (handler-case
               (progn
-                (pg::logical-pgoutput-read-truncate (octets (list 84 0 0 0 1 flags 0 0 0 7)))
+                (decode-test-pgoutput-in-transaction (octets (list 84 0 0 0 1 flags 0 0 0 7)))
                 nil)
             (simple-error () t)))))
 
 (deftest malformed-truncate
     (dolist (bytes '(#(84) #(84 0 0 0 1 0) #(84 0 0 0 0 0 0)))
       (ok (handler-case
-              (progn (pg::logical-pgoutput-read-truncate (octets bytes)) nil)
+              (progn (decode-test-pgoutput-in-transaction (octets bytes)) nil)
             (simple-error () t)))))
 
 (deftest update-without-old-key
     ;; U, relid=7, N, two text columns: id=1 and amount=2.
     (destructuring-bind (tag oid old new kind)
-        (decode-test-pgoutput-row
+        (decode-test-pgoutput-in-transaction
          (octets #(85 0 0 0 7 78 0 2 116 0 0 0 1 49 116 0 0 0 1 50)))
       (declare (ignore tag oid kind))
       (ok (null old))
@@ -1879,7 +1883,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
 (deftest update-with-old-key
     ;; C retains relation width in K: non-key attributes are NULL.
     (destructuring-bind (tag oid old new kind)
-        (decode-test-pgoutput-row
+        (decode-test-pgoutput-in-transaction
          (octets #(85 0 0 0 7 75 0 2 116 0 0 0 1 49 110
                    78 0 2 116 0 0 0 1 51 116 0 0 0 1 50)))
       (declare (ignore tag oid kind))
@@ -1911,12 +1915,12 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                                112 103 95 108 105 115 112 47 100 100 108 0
                                0 0 0 1 120))))
       (ok (equalp expected (pg::pgoutput-build-message change transaction)))
-      (ok (equal (list "pg_lisp/ddl" 42 "x" t)
-                 (multiple-value-list
-                  (pg::logical-pgoutput-read-message
-                   (pg::make-logical-subscription-runtime
-                    :transaction-open-p t :source-xid 91)
-                   expected))))))
+      (ok (equal (list #\M "pg_lisp/ddl" 42 "x" t)
+                 (pg::logical-pgoutput-read-operation
+                  (pg::make-logical-subscription-runtime
+                   :options (pg::make-logical-subscription-options)
+                   :transaction-open-p t :source-xid 91)
+                  expected)))))
 
 (deftest standalone-message
     (let* ((change (pg::make-logical-change

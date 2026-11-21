@@ -3480,17 +3480,20 @@
                       (= (aref transactional 1) 1)
                       (= (pg-client-u64 transactional 2) lsn))
                  "ordinary transactional Message has flags and LSN without an XID")
-        (multiple-value-bind (prefix event-lsn content)
-            (logical-pgoutput-read-message
-             (make-logical-subscription-runtime) standalone)
+        (destructuring-bind (tag prefix event-lsn content transactional-p)
+            (logical-pgoutput-read-operation
+             (make-logical-subscription-runtime :options (make-logical-subscription-options)) standalone)
+          (rove:ok (and (char= tag #\M) (not transactional-p)))
           (rove:ok (and (string= prefix "pg_lisp/ddl") (= event-lsn lsn)
                         (string= content (logical-change-event-payload catalog-change)))
                    "subscriber decodes standalone v2 Message fields"))
-        (multiple-value-bind (prefix event-lsn content)
-            (logical-pgoutput-read-message
+        (destructuring-bind (tag prefix event-lsn content transactional-p)
+            (logical-pgoutput-read-operation
              (make-logical-subscription-runtime
+              :options (make-logical-subscription-options)
               :transaction-open-p t :source-xid 91)
              transactional)
+          (rove:ok (and (char= tag #\M) transactional-p))
           (rove:ok (and (string= prefix "pg_lisp/truncate") (= event-lsn lsn)
                         (string= content (logical-change-event-payload truncate)))
                    "subscriber validates ordinary transactional Message flags and content")))

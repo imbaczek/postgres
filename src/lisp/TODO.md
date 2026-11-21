@@ -219,6 +219,9 @@ Control tests also use the shared decoder or the production CopyData reader.
 The malformed keepalive fixture verifies connection closure without advancing
 feedback. The duplicate native TRUNCATE apply adapter has no callers and was
 removed.
+Independent Relation, Message, and native TRUNCATE fixtures now use the
+operation decoder with the subscriber mode and transaction state appropriate
+to each frame. Their dedicated read adapters have been removed.
 
 The startup settings registry uses named, read-only descriptors for context,
 kind, boot value, integer bounds, and units. Configuration ingestion, reload,

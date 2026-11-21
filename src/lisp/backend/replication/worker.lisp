@@ -823,14 +823,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 
 (defvar *logical-wire-field-owner* nil)
 
-(defun logical-pgoutput-read-relation (payload &optional standard-p)
-  (when (zerop (length payload)) (error "truncated pgoutput Relation message"))
-  (let* ((cursor (make-logical-wire-cursor :bytes payload :remaining (1- (length payload))))
-         (relation (logical-wire-relation cursor standard-p)))
-    (unless (zerop (logical-wire-cursor-remaining cursor))
-      (error "pgoutput Relation message has trailing bytes"))
-    relation))
-
 (defun logical-pgoutput-read-tuple (payload position)
   (unless (<= 0 position (length payload))
     (error "invalid pgoutput tuple position"))
@@ -1315,13 +1307,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
      (logical-subscription-runtime-source-client runtime)
      (logical-subscription-runtime-current-lsn runtime))))
 
-(defun logical-pgoutput-read-message (runtime payload)
-  "Decode a nonstreamed Message and return prefix, LSN, content, transactional-p."
-  (when (< (length payload) 10)
-    (error "truncated pgoutput Message header"))
-  (logical-wire-message
-   runtime (make-logical-wire-cursor :bytes payload :remaining (1- (length payload)))))
-
 (defun logical-standalone-event-key (options database-oid)
   (format nil "~a:~d:~a:~a:~d:~a"
           (logical-subscription-options-source-host options)
@@ -1356,13 +1341,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
      :after-standalone-progress-before-feedback slot lsn)
     (pg-client-send-standby-status
      (logical-subscription-runtime-source-client runtime) lsn)))
-
-(defun logical-pgoutput-read-truncate (payload)
-  "Decode native TRUNCATE; reject flags whose effects we cannot preserve."
-  (unless (and (>= (length payload) 6) (= (aref payload 0) (char-code #\T)))
-    (error "invalid pgoutput TRUNCATE header"))
-  (logical-wire-truncate
-   (make-logical-wire-cursor :bytes payload :remaining (1- (length payload)))))
 
 (defun logical-truncate-target-tables (runtime names)
   "Apply one TRUNCATE operation with shared fault boundaries for all its tables."

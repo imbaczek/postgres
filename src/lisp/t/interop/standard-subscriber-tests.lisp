@@ -125,15 +125,15 @@
 
 (deftest standard-relation-rejects-identity-and-flag-drift
     ;; Independent Relation layout from C logicalrep_write_rel/logicalrep_write_attrs.
-    (let ((payload (octets '(82 0 0 0 1 112 117 98 108 105 99 0
+    (let ((runtime (pg::make-logical-subscription-runtime
+                    :options (pg::make-logical-subscription-options :mode :standard)))
+          (payload (octets '(82 0 0 0 1 112 117 98 108 105 99 0
                              114 111 119 115 0 100 0 1 1 105 100 0
                              0 0 0 23 255 255 255 255))))
       (ok (equal "rows" (pg::pgoutput-relation-name
-                         (pg::logical-pgoutput-read-relation payload t))))
+                         (second (pg::logical-pgoutput-read-operation runtime payload)))))
       (dolist (identity '(102 105 110 120))
-        (let* ((changed (copy-seq payload))
-               (runtime (pg::make-logical-subscription-runtime
-                         :options (pg::make-logical-subscription-options :mode :standard))))
+        (let ((changed (copy-seq payload)))
           (setf (aref changed 17) identity)
           (ok (handler-case (progn (pg::logical-pgoutput-dispatch runtime changed) nil)
                 (error (condition)
@@ -141,6 +141,6 @@
       (dolist (flags '(2 3 128 255))
         (let ((changed (copy-seq payload)))
           (setf (aref changed 20) flags)
-          (ok (handler-case (progn (pg::logical-pgoutput-read-relation changed t) nil)
+          (ok (handler-case (progn (pg::logical-pgoutput-read-operation runtime changed) nil)
                 (error (condition)
                   (search "Relation column flags" (princ-to-string condition)))))))))
