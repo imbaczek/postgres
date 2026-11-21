@@ -44,6 +44,7 @@
                       bytes)))
            (unwind-protect
                 (progn (check)
-                       (multiple-value-prog1 (funcall function directory input #'read-object #'check)
+                       (multiple-value-prog1 (funcall function directory input #'read-object #'check
+                                                      (physical-retained-archive-key fd))
                          (check)))
              (setf active nil))))))))

@@ -101,7 +101,7 @@ Keep the overlap descriptor as the value of its object key."
 ;; mutex or perform live owner checks.  It supplies bounded bytes for the
 ;; requested object and must preserve content ID validation.
 
-(defun physical-retained-root-load-reference (directory identity id history &key (reader 'physical-retained-object-read))
+(defun physical-retained-root-load-reference (directory identity id history &key (reader 'physical-retained-object-read) expected-archive-key)
   "Validate the complete selected root under the archive mutex and build its reference."
   (physical-retained-root-require-lock)
   (when id
@@ -112,11 +112,13 @@ Keep the overlap descriptor as the value of its object key."
              (read-directory (if (or (eq reader 'physical-retained-object-read)
                                      (eq reader #'physical-retained-object-read))
                                  (uiop:ensure-directory-pathname (slot-state-fd-path fd))
-                                 directory))
-             (payload (physical-retained-inventory-load read-directory id identity history :reader reader)))
-        (physical-retained-check-archive-binding directory fd)
-        (physical-retained-root-make-reference directory identity id (getf payload :entries)
-                                               (getf payload :base-overlap) archive-key)))))
+                                 directory)))
+        (when (and expected-archive-key (not (equal expected-archive-key archive-key)))
+          (error "retained WAL reader and registration hold different archive directories"))
+        (let ((payload (physical-retained-inventory-load read-directory id identity history :reader reader)))
+          (physical-retained-check-archive-binding directory fd)
+          (physical-retained-root-make-reference directory identity id (getf payload :entries)
+                                                 (getf payload :base-overlap) archive-key))))))
 
 (defun physical-retained-root-current (owner)
   "Return OWNER's process-local selected root ID, if any."
@@ -211,7 +213,7 @@ that reference on every exit. Reject an active or uncertain owner update."
                (or (null hold) (eq :uncertain (physical-retained-root-hold-state hold))))
     (error "retained WAL control owner changed during control readback")))
 
-(defun physical-retained-root-reconcile (owner directory identity history read-selected &key (reader 'physical-retained-object-read))
+(defun physical-retained-root-reconcile (owner directory identity history read-selected &key (reader 'physical-retained-object-read) expected-archive-key)
   "Reconcile an uncertain update with the root read from durable control.
 
 Read control outside the archive mutex, then recheck the captured owner state
@@ -235,7 +237,9 @@ before validating and installing its reference."
           (when (and (not hold) current
                      (not (eql id (physical-retained-root-reference-root-id current))))
             (error "retained WAL control changed without a reserved update"))
-          (let ((reference (physical-retained-root-load-reference directory identity id history :reader reader)))
+          (let ((reference (physical-retained-root-load-reference
+                            directory identity id history :reader reader
+                            :expected-archive-key expected-archive-key)))
             (sb-sys:without-interrupts
               (physical-retained-root-install owner reference)
               (when hold (physical-retained-root-drop-hold hold :reconciled))))

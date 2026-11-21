@@ -69,7 +69,7 @@
      (declare (ignore ignored))
      (call-with-logical-slot-imported-archive-input
       context
-      (lambda (directory input reader anchors)
+      (lambda (directory input reader anchors archive-key)
         (let* ((binding (funcall check t))
                (facts (logical-slot-copy-check-source-proof (first binding)))
                (record (logical-slot-imported-host-origin-record owner context directory binding)))
@@ -84,6 +84,6 @@
                  (sb-thread:with-mutex (*wal-lock*)
                    (logical-slot-imported-host-origin-call record :binding observed))
                  (getf reference :root-id)))
-             :reader reader))
+             :reader reader :expected-archive-key archive-key))
           (call-with-logical-slot-imported-origin-archive
            record facts check under-lock directory input reader anchors function)))))))

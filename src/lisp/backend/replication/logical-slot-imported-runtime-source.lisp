@@ -23,10 +23,10 @@
             (lambda (facts check under-lock)
               (call-with-logical-slot-imported-archive-input
                context
-               (lambda (directory input reader anchors)
+               (lambda (directory input reader anchors archive-key)
                  (let* ((binding (funcall check t))
                         (record (logical-slot-imported-host-origin-lookup
-                                 owner context directory binding)))
+                                 owner context directory binding archive-key)))
                    (call-with-logical-slot-imported-origin-archive
                     record facts check under-lock directory input reader anchors
                     (lambda (archive)

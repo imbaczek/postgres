@@ -490,6 +490,31 @@
                  (ok (pg::physical-retained-root-delete-unprotected other :inventory other-id))
                  (ng (pg::physical-retained-root-delete-unprotected root :inventory id)))))))))
 
+(deftest retained-root-reconciliation-checks-the-readers-held-archive
+    (with-retained-root-registry
+        (call-with-retained-inventory
+         (lambda (root images identity history text)
+           (let* ((owner (gensym "CONTROL"))
+                  (id (pg::physical-retained-inventory-publish root identity 2 text images))
+                  (selected (lambda () id))
+                  (reads 0)
+                  (reader (lambda (&rest arguments)
+                            (incf reads)
+                            (apply #'pg::physical-retained-object-read arguments))))
+             (with-physical-store-directory (other)
+               (ok (signals
+                    (pg::physical-retained-root-reconcile
+                     owner root identity history selected :reader reader
+                     :expected-archive-key (pg::physical-retained-archive-path-key other))
+                    'error))
+               (ok (zerop reads))
+               (ng (pg::physical-retained-root-current owner)))
+             (ok (= id (pg::physical-retained-root-reconcile
+                        owner root identity history selected :reader reader
+                        :expected-archive-key (pg::physical-retained-archive-path-key root))))
+             (ok (plusp reads))
+             (ok (pg::physical-retained-root-protected-p root :inventory id)))))))
+
 (deftest retained-root-interrupts-preserve-registration-and-handoff-atomicity
     (dolist (point '(:after-hold-registration :after-control-readback :after-reference-install))
       (with-retained-root-registry

@@ -57,6 +57,8 @@ Once restored, protection persists after scope exit or failure."
                   (let ((current (gethash token *physical-retained-root-references*)))
                     (physical-retained-root-check-context current directory identity)
                     (unless (and current
+                                 (or (null observed)
+                                     (equal observed (physical-retained-root-reference-archive-key current)))
                                  (eql (getf reference :root-id)
                                       (physical-retained-root-reference-root-id current))
                                  (not (gethash token *physical-retained-root-updates*)))
@@ -77,7 +79,7 @@ Once restored, protection persists after scope exit or failure."
 ;; Runtime lookup never restores an origin.  It requires the already restored
 ;; record and its matching binding and directory; use still takes a fresh lease.
 
-(defun logical-slot-imported-host-origin-lookup (owner context directory binding)
+(defun logical-slot-imported-host-origin-lookup (owner context directory binding archive-key)
   (unless (logical-slot-imported-scan-owner-p owner)
     (error "runtime origin lookup requires its registered scan owner"))
   (logical-slot-imported-scan-check-owner owner)
@@ -88,7 +90,7 @@ Once restored, protection persists after scope exit or failure."
         (unless record (error "runtime imported origin has not been restored"))
         (logical-slot-imported-host-origin-call record :binding binding)
         (logical-slot-imported-host-origin-call record :directory directory)
-        (logical-slot-imported-host-origin-call record :check-root)
+        (logical-slot-imported-host-origin-call record :check-root archive-key)
         record))))
 
 (defun logical-slot-imported-host-origin-record (owner context directory binding)
