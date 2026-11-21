@@ -62,6 +62,7 @@
      (lambda (root images identity history text)
        (declare (ignore images identity history text))
        (let* ((pg::*logical-slot-continuation-fenced-roots* (make-hash-table :test #'equal))
+              (pg::*physical-retained-continuation-archives* (make-hash-table :test #'equal))
               (host (merge-pathnames "host/" root))
               (host-link (merge-pathnames "host-link" root))
               (pg::*pgdata* (uiop:ensure-directory-pathname host-link))
@@ -81,6 +82,30 @@
            (ok (pg::physical-retained-root-archive-fenced-p other archive-fd)))
          (pg::with-slot-state-directory (other-fd other)
            (ng (pg::physical-retained-root-archive-fenced-p other other-fd)))))))
+
+(deftest retained-root-fence-prevents-deletion-after-archive-moves
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (declare (ignore images identity history text))
+       (let* ((pg::*logical-slot-continuation-fenced-roots* (make-hash-table :test #'equal))
+              (pg::*physical-retained-continuation-archives* (make-hash-table :test #'equal))
+              (pg::*pgdata* (merge-pathnames "host/" root))
+              (archive (merge-pathnames "pg_physical_retained/" pg::*pgdata*))
+              (moved (merge-pathnames "moved/" root))
+              (marker (merge-pathnames "logical-slot-copy.source-proof" pg::*pgdata*))
+              (id 1))
+         (ensure-directories-exist archive)
+         (with-open-file (stream marker :direction :output)
+           (write-char #\x stream))
+         (with-open-file (stream (pg::physical-retained-object-path archive :inventory id)
+                                 :direction :output)
+           (write-char #\x stream))
+         (ng (pg::physical-retained-root-delete-unprotected archive :inventory id))
+         (delete-file marker)
+         (sb-posix:rename archive moved)
+         (ensure-directories-exist archive)
+         (ng (pg::physical-retained-root-delete-unprotected moved :inventory id))
+         (ok (probe-file (pg::physical-retained-object-path moved :inventory id)))))))
 
 (deftest retained-root-protection-matches-archive-across-mounts
     (with-retained-root-registry

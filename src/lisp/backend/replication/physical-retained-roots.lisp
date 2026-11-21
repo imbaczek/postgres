@@ -497,19 +497,31 @@ retains protection until readback reconciliation or durable retirement."
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (physical-retained-root-protected-under-lock directory kind id))))
 
+(defvar *physical-retained-continuation-archives*
+  (make-hash-table :test #'equal :synchronized t))
+
+(defun physical-retained-fence-host-archive (host-fd)
+  "Remember the held continuation host's archive for the life of this process."
+  (when (logical-slot-continuation-fd-fenced-p host-fd)
+    (with-slot-state-directory
+        (archive-fd (slot-state-fd-path host-fd "pg_physical_retained") t)
+      (when archive-fd
+        (let ((key (subseq (physical-retained-archive-key archive-fd) 0 2)))
+          (setf (gethash key *physical-retained-continuation-archives*) t))))
+    t))
+
 (defun physical-retained-root-archive-fenced-p (directory fd)
-  "Check the archive parent and a possible bind alias of the active host's archive."
-  (or (logical-slot-continuation-gc-fenced-p
-       (uiop:pathname-parent-directory-pathname directory))
-      (when (and *pgdata* (slot-state-lstat *pgdata*))
-        (with-slot-state-directory (host-fd (truename *pgdata*) t)
-          (when (and host-fd (logical-slot-continuation-fd-fenced-p host-fd))
-            (with-slot-state-directory
-                (archive-fd (slot-state-fd-path host-fd "pg_physical_retained") t)
-              (when archive-fd
-                (physical-retained-same-archive-p
-                 (physical-retained-archive-key fd)
-                 (physical-retained-archive-key archive-fd)))))))))
+  "Check the archive parent and the identity of any observed continuation archive."
+  (let ((key (subseq (physical-retained-archive-key fd) 0 2)))
+    (or (gethash key *physical-retained-continuation-archives*)
+        (when (logical-slot-continuation-gc-fenced-p
+               (uiop:pathname-parent-directory-pathname directory))
+          (setf (gethash key *physical-retained-continuation-archives*) t))
+        (when (and *pgdata* (slot-state-lstat *pgdata*))
+          (with-slot-state-directory (host-fd (truename *pgdata*) t)
+            (when host-fd
+              (physical-retained-fence-host-archive host-fd)
+              (gethash key *physical-retained-continuation-archives*)))))))
 
 (defun physical-retained-root-delete-unprotected (directory kind id)
   "Delete an unprotected object using a held archive directory descriptor.
