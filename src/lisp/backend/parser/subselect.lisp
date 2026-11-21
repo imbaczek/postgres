@@ -62,6 +62,17 @@ may still contain expression lists and are traversed structurally."
 (defun subquery-expression-p (expression)
   (and (consp expression) (eq (first expression) :subplan)))
 
+(defun map-local-expression-operands (function form)
+  "Copy FORM's local expression operands. Callers handle outer refs and subplans."
+  (case (first form)
+    ((:const :bool :scalar-array-const :col :sort-output :window-ref)
+     (copy-list form))
+    ((:func :whole-row)
+     (let ((copy (copy-list form)))
+       (setf (third copy) (funcall function (third form)))
+       copy))
+    (otherwise (mapcar function form))))
+
 (defun map-prepared-query-expressions (function prepared &optional (depth 0) query-function)
   "Visit executable expressions with nesting depth, excluding saved raw ASTs.
 Optional QUERY-FUNCTION visits each prepared query before its expressions."
@@ -77,7 +88,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
               (query (sql-subplan-prepared descriptor) (1+ level)))
             (funcall function form level))
            (t (funcall function
-                       (mapcar (lambda (part) (expression part level)) form) level))))
+                       (map-local-expression-operands
+                        (lambda (part) (expression part level)) form) level))))
        (query (state level)
          (when query-function (funcall query-function state level))
          (dolist (definition (getf state :ctes))
@@ -222,7 +234,7 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
                      (if (eq (first part) :outer-ref) (rebase part nesting) part))
                    (sql-subplan-prepared descriptor) (1+ level)))
                 form)
-               (t (mapcar (lambda (part) (rebase part level)) form)))))
+               (t (map-local-expression-operands (lambda (part) (rebase part level)) form)))))
     (rebase input 0)))
 
 (defun subquery-semantic-key (form)

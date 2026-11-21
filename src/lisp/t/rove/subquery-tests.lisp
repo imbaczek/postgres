@@ -1,6 +1,26 @@
 ;;;; subquery-tests.lisp -- query boundaries and expression subplans.
 (in-package #:pg)
 
+(rove:deftest scope-rewrites-keep-literals-and-call-metadata-opaque
+    (let* ((reference (list :outer-ref 2 '(:col 0 :type :int4) :type :int4 :typmod -1))
+           (payload (list reference))
+           (literal (list :const payload :type :record))
+           (call (list :func "test" (list reference literal) :saved payload))
+           (prepared (list :where call :order nil))
+           (rebased (rebase-aggregate-input call 1)))
+      (rove:ok (= 1 (second (first (third rebased)))))
+      (rove:ok (eq payload (second (second (third rebased)))))
+      (rove:ok (eq payload (getf (cdddr rebased) :saved)))
+      (map-prepared-query-expressions
+       (lambda (node depth)
+         (declare (ignore depth))
+         (if (eq (first node) :outer-ref) :rewritten node))
+       prepared)
+      (let ((result (getf prepared :where)))
+        (rove:ok (eq :rewritten (first (third result))))
+        (rove:ok (eq payload (second (second (third result)))))
+        (rove:ok (eq payload (getf (cdddr result) :saved))))))
+
 (rove:deftest subquery-consumer-stop-crosses-limit
     (let ((visited 0))
       (execute-physical-plan-node
