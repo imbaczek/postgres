@@ -13,7 +13,7 @@
        (let* ((id (pg::physical-retained-inventory-publish root identity 2 text images))
               (loaded (pg::physical-retained-inventory-load root id identity history)))
          (ok (= 2 (length (getf loaded :entries))))
-         (ok (= 2 (length (pg::physical-retained-inventory-plan root id identity history 32 120))))
+         (ok (= 2 (length (pg::physical-retained-inventory-plan root id identity history +retained-extent-test-start+ +retained-extent-test-end+))))
          (ok (= id (pg::physical-retained-inventory-publish root identity 2 text images)))
          (ok (= 3 (length (pg::directory-entry-names root))))))))
 
@@ -127,8 +127,8 @@
                     root identity 2 text nil :previous old :keep-ids (list (first (second entries))))))
          (ok (= 2 (length (getf (pg::physical-retained-inventory-load root old identity history) :entries))))
          (ok (= 1 (length (getf (pg::physical-retained-inventory-load root new identity history) :entries))))
-         (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history 64 120))))
-         (ok (signals (pg::physical-retained-inventory-plan root new identity history 32 120) 'error))
+         (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history +retained-extent-test-fork+ +retained-extent-test-end+))))
+         (ok (signals (pg::physical-retained-inventory-plan root new identity history +retained-extent-test-start+ +retained-extent-test-end+) 'error))
          (let ((empty (pg::physical-retained-inventory-publish
                        root identity 2 text nil :previous new :keep-ids nil)))
            (ok (null (getf (pg::physical-retained-inventory-load root empty identity history) :entries))))))))
@@ -155,7 +155,7 @@
                   (new (pg::physical-retained-inventory-publish
                         root identity 2 text (list merged) :previous old :keep-ids nil)))
              (ok (= 1 (length (getf (pg::physical-retained-inventory-load root new identity history) :entries))))
-             (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history 32 120))))
+             (ok (= 1 (length (pg::physical-retained-inventory-plan root new identity history +retained-extent-test-start+ +retained-extent-test-end+))))
              (ok (= 2 (length (getf (pg::physical-retained-inventory-load root old identity history) :entries))))))))))
 
 (deftest retained-inventory-rejects-missing-or-changed-referenced-image
@@ -302,7 +302,7 @@
                       (lambda (directory kind reference maximum)
                         (push kind reads)
                         (funcall original directory kind reference maximum)))
-                (ok (= 1 (length (pg::physical-retained-inventory-plan root id identity history 64 120))))
+                (ok (= 1 (length (pg::physical-retained-inventory-plan root id identity history +retained-extent-test-fork+ +retained-extent-test-end+))))
                 (ok (= 1 (count :extent reads)))
                 (ok (= 1 (count :inventory reads))))
            (setf (symbol-function 'pg::physical-retained-object-read) original))))))
@@ -341,7 +341,7 @@
                                      archive :extent id pg::+physical-retained-image-limit+)) 'error)))
                  (ok (signals (pg::physical-retained-inventory-load archive id identity history) 'error))))
            (let ((complete (pg::physical-retained-inventory-publish archive identity 2 text images)))
-             (ok (= 2 (length (pg::physical-retained-inventory-plan archive complete identity history 32 120))))))))))
+             (ok (= 2 (length (pg::physical-retained-inventory-plan archive complete identity history +retained-extent-test-start+ +retained-extent-test-end+))))))))))
 
 (deftest retained-inventory-sigkill-file-publication-cuts
     (dolist (kind '(:extent :inventory))
@@ -361,7 +361,7 @@
                                          archive :extent id pg::+physical-retained-image-limit+)) 'error))))
                  (ng (pg::wal-namespace-file-stat path t)))
              (let ((complete (pg::physical-retained-inventory-publish archive identity 2 text images)))
-               (ok (= 2 (length (pg::physical-retained-inventory-plan archive complete identity history 32 120)))))))))))
+               (ok (= 2 (length (pg::physical-retained-inventory-plan archive complete identity history +retained-extent-test-start+ +retained-extent-test-end+)))))))))))
 
 (deftest retained-inventory-candidate-budget-precedes-extent-file-open
     (multiple-value-bind (metadata ignored) (retained-extent-fixture)
@@ -371,8 +371,8 @@
                (text (getf metadata :history-text))
                (entries (loop for number below 5
                               collect (let ((item (copy-list metadata)))
-                                        (setf (getf item :start) (+ 128 (* number 32))
-                                              (getf item :end) (+ 160 (* number 32))
+                                        (setf (getf item :start) (+ (+ +retained-extent-test-end+ 8) (* number 32))
+                                              (getf item :end) (+ (+ +retained-extent-test-end+ 40) (* number 32))
                                               (getf item :start-digest) 123 (getf item :end-digest) 123)
                                         (list number pg::+physical-retained-image-limit+ item))))
                (payload (list :version 1 :identity identity :history-target 2 :history-text text :entries entries))
@@ -381,5 +381,5 @@
           ;; There are deliberately no extent files: opening one would fail for ENOENT.
           (ok (handler-case
                   (progn (pg::physical-retained-inventory-plan
-                          root id identity (pg::timeline-parse-history 2 text) 128 288) nil)
+                          root id identity (pg::timeline-parse-history 2 text) (+ +retained-extent-test-end+ 8) (+ +retained-extent-test-end+ 168)) nil)
                 (error (condition) (search "budget" (princ-to-string condition)))))))))
