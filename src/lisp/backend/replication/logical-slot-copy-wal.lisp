@@ -109,8 +109,7 @@
       ((= type +wal-record-logical-changes+) (wal-logical-reader-add-chunk reader record))
       ((= type +wal-record-logical-catalog-event+) (wal-logical-reader-add-catalog-event reader record))
       ((= type +wal-record-pages+)
-       (wal-decode-page-images (wal-record-payload record) (wal-record-end record)
-                               (wal-record-version record)))
+       (wal-decode-page-images (wal-record-payload record) (wal-record-end record)))
       ((wal-terminal-record-type-p type) (wal-logical-reader-finish-batch reader record nil))))
   (values))
 

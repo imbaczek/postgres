@@ -194,7 +194,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
          (error "page images outside a batch or after catalog chunks in history"))
        (setf *wal-recovery-page-records-seen-p* t)
        (wal-decode-page-images (wal-record-payload record)
-                               (wal-record-end record) (wal-record-version record)))
+                               (wal-record-end record)))
       ((= type +wal-record-logical-changes+)
        (when (or *wal-recovery-logical-catalog-event-p* *wal-recovery-catalog-chunk-count*)
          (error "logical row changes after catalog metadata in history"))

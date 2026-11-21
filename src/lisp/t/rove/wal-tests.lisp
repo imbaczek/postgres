@@ -1862,13 +1862,13 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                      (error () t))
                    (car case))))))
 
-(rove:deftest test-wal-page-image-xid-codec-compatibility
+(rove:deftest test-wal-page-image-xid-codec
     (let* ((lsn 4096)
            (page (page-init (make-page)))
            (image (make-wal-page-image :relfilenode 7310 :block 3 :page page
                                        :xids '(7201 7202)))
            (payload (wal-encode-page-images (list image) lsn))
-           (decoded (first (wal-decode-page-images payload lsn +wal-version+)))
+           (decoded (first (wal-decode-page-images payload lsn)))
            (no-xid-image (make-wal-page-image
                           :relfilenode 7311 :block 4 :page (page-init (make-page))))
            (one-xid-image (make-wal-page-image
@@ -1877,35 +1877,14 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (multi-payload
              (wal-encode-page-images (list image no-xid-image one-xid-image) lsn))
            (multi-decoded
-             (wal-decode-page-images multi-payload lsn +wal-version+))
-           (legacy-v3 (make-array (+ 4 12 +blcksz+)
-                                  :element-type '(unsigned-byte 8)
-                                  :initial-element 0))
-           (legacy-v2 (make-array (+ 4 8 +blcksz+)
-                                  :element-type '(unsigned-byte 8)
-                                  :initial-element 0)))
+             (wal-decode-page-images multi-payload lsn)))
       (rove:ok (equal (wal-page-image-xids decoded) '(7201 7202))
-               "WAL v4 page images retain transaction contributors")
+               "WAL8 page images retain transaction contributors")
       (rove:ok (= (length payload) (+ 4 12 +blcksz+ 4 (* 8 2)))
-               "WAL v4 page-image length includes variable contributor data")
+               "WAL8 page-image length includes variable contributor data")
       (rove:ok (equal (mapcar #'wal-page-image-xids multi-decoded)
                       '((7201 7202) nil (7203)))
-               "WAL v4 multi-page records retain each image's contributor list")
-      (wal-set-u32 legacy-v3 0 1)
-      (wal-set-u32 legacy-v3 4 7310)
-      (wal-set-u32 legacy-v3 8 0)
-      (wal-set-u32 legacy-v3 12 3)
-      (replace legacy-v3 page :start1 16)
-      (wal-set-u32 legacy-v2 0 1)
-      (wal-set-u32 legacy-v2 4 7310)
-      (wal-set-u32 legacy-v2 8 3)
-      (replace legacy-v2 page :start1 12)
-      (rove:ok (null (wal-page-image-xids
-                      (first (wal-decode-page-images legacy-v3 lsn +wal-version-v3+))))
-               "WAL v3 page images remain readable without contributor metadata")
-      (rove:ok (null (wal-page-image-xids
-                      (first (wal-decode-page-images legacy-v2 lsn +wal-version-v2+))))
-               "WAL v2 page images remain readable without fork metadata")))
+               "WAL8 multi-page records retain each image's contributor list")))
 
 (rove:deftest test-wal-primary-chunked-pages-match-legacy
     (let* ((directory (merge-pathnames
