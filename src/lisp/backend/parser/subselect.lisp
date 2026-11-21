@@ -43,20 +43,24 @@
 (defun some-local-plan-expression (predicate expression)
   "Visit local expression nodes until PREDICATE succeeds.
 PREDICATE receives the node and the walker for explicitly resolved references.
+Its second value can suppress descent without stopping the walk.
 Subplans expose their test without entering the prepared query. Calls and
 records expose their executable inputs. Follow the operand of an outer
 reference conservatively, as it is evaluated in the outer frame. Other forms
 may still contain expression lists and are traversed structurally."
   (labels ((walk (form)
-             (and (consp form)
-                  (or (funcall predicate form #'walk)
-                      (case (first form)
-                        ((:const :bool :scalar-array-const :col :sort-output :window-ref) nil)
-                        (:subplan
-                         (let ((subplan (second form)))
-                           (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                        ((:func :whole-row :outer-ref) (walk (third form)))
-                        (otherwise (or (walk (car form)) (walk (cdr form)))))))))
+             (when (consp form)
+               (multiple-value-bind (found skip-children-p)
+                   (funcall predicate form #'walk)
+                 (or found
+                     (unless skip-children-p
+                       (case (first form)
+                         ((:const :bool :scalar-array-const :col :sort-output :window-ref) nil)
+                         (:subplan
+                          (let ((subplan (second form)))
+                            (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
+                         ((:func :whole-row :outer-ref) (walk (third form)))
+                         (otherwise (or (walk (car form)) (walk (cdr form)))))))))))
     (not (null (walk expression)))))
 
 (defun subquery-expression-p (expression)
@@ -130,13 +134,19 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
   (let ((depths nil) (seen (make-hash-table :test #'eq)))
     (labels
         ((expression (form level)
-           (when (consp form)
-             (cond ((eq (first form) :outer-ref)
-                    (when (> (second form) level) (pushnew (- (second form) level) depths)))
-                   ((subquery-expression-p form)
-                    (expression (sql-subplan-test (second form)) level)
-                    (query (sql-subplan-prepared (second form)) (1+ level)))
-                   (t (expression (car form) level) (expression (cdr form) level)))))
+           (some-local-plan-expression
+            (lambda (node walk)
+              (case (first node)
+                (:outer-ref
+                 (when (> (second node) level)
+                   (pushnew (- (second node) level) depths))
+                 (values nil t))
+                (:subplan
+                 (let ((subplan (second node)))
+                   (funcall walk (sql-subplan-test subplan))
+                   (query (sql-subplan-prepared subplan) (1+ level)))
+                 (values nil t))))
+            form))
          (query (state level)
            (unless (member level (gethash state seen))
              (push level (gethash state seen))

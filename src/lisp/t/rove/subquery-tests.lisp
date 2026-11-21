@@ -21,6 +21,21 @@
         (rove:ok (eq payload (second (second (third result)))))
         (rove:ok (eq payload (getf (cdddr result) :saved))))))
 
+(rove:deftest outer-depths-follow-executable-references-and-referenced-ctes
+    (let* ((hidden '(:outer-ref 9 (:col 0 :type :int4)))
+           (local '(:outer-ref 1 (:col 0 :type :int4)))
+           (test '(:outer-ref 2 (:col 0 :type :int4)))
+           (nested '(:outer-ref 4 (:col 0 :type :int4)))
+           (cte (make-sql-cte :prepared (list :where '(:outer-ref 5 (:col 0 :type :int4)))))
+           (unused (make-sql-cte :prepared (list :where hidden)))
+           (subplan (make-sql-subplan :test test :prepared (list :where nested)))
+           (form (list :func "test" (list local (list :subplan subplan)
+                                          (list :const hidden :type :record))
+                       :saved hidden))
+           (prepared (list :where form :ctes (list cte unused)
+                           :relations (list (list :cte cte :cte-levelsup 0)))))
+      (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
+
 (rove:deftest subquery-consumer-stop-crosses-limit
     (let ((visited 0))
       (execute-physical-plan-node
