@@ -246,31 +246,16 @@ source, stage or control files or authorize PREPARE or installation."
 (defun physical-adoption-attempt-image (record)
   "Encode a checked attempt as a bounded CRC-protected literal.
 The record contains private credentials; hex is not encryption. Do not log it."
-  (let* ((checked (physical-adoption-attempt-copy record))
-         (text (physical-bootstrap-manifest-text checked))
-         (bytes (string->bytes text))
-         (image (string->bytes (format nil "PGADOPTIONATTEMPT1 ~8,'0X~%~a~%" (wal-crc32 bytes) text))))
-    (unless (<= (length image) +physical-adoption-attempt-maximum-bytes+)
-      (error "adoption attempt exceeds its private record bound"))
-    image))
+  (metadata-literal-envelope-image "PGADOPTIONATTEMPT1" (physical-adoption-attempt-copy record)
+                                   +physical-adoption-attempt-maximum-bytes+ "adoption attempt"))
 
 (defun physical-adoption-attempt-decode (bytes)
   "Decode a bounded CRC envelope and safe literal into a checked owned copy.
 CRC and FNV detect inconsistencies under cooperative ownership; they do not
 authenticate the record or establish fresh source or stage facts."
-  (unless (<= (length bytes) +physical-adoption-attempt-maximum-bytes+)
-    (error "adoption attempt exceeds its private record bound"))
-  (let* ((text (bytes->string bytes))
-         (newline (position #\Newline text))
-         (prefix "PGADOPTIONATTEMPT1 "))
-    (unless (and newline (= newline (+ (length prefix) 8)) (uiop:string-prefix-p prefix text))
-      (error "invalid adoption attempt envelope"))
-    (let* ((body (subseq text (1+ newline)))
-           (crc (parse-integer text :start (length prefix) :end newline :radix 16)))
-      (unless (and (plusp (length body)) (char= #\Newline (char body (1- (length body))))
-                   (= crc (wal-crc32 (string->bytes (subseq body 0 (1- (length body)))))))
-        (error "adoption attempt checksum mismatch"))
-      (physical-adoption-attempt-copy (recovery-parse-manifest-text body)))))
+  (physical-adoption-attempt-copy
+   (metadata-literal-envelope-read "PGADOPTIONATTEMPT1" bytes
+                                   +physical-adoption-attempt-maximum-bytes+ "adoption attempt")))
 
 (defun physical-adoption-attempt-check-transition (previous candidate)
   "Allow idempotent phases and forward transitions without rebinding saved facts.

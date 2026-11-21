@@ -14,6 +14,15 @@
                 (list :checkpoint-start 32 :base 152 :manifest-digest 991))
         :outcome nil :successor nil))
 
+(deftest metadata-literal-envelope-preserves-utf8-wire-bytes
+    (dolist (magic '("PGBACKUPLEASE1" "PGÉ"))
+      (let* ((value '(:label "é"))
+             (expected (pg::string->bytes (format nil "~a DCC50ACA~%(:LABEL \"é\")~%" magic)))
+             (bound (length expected)))
+        (ok (equalp expected (pg::physical-backup-lease-encode-literal magic value bound)))
+        (ok (equal value (pg::physical-backup-lease-decode-literal magic expected bound #'identity)))
+        (ok (signals (pg::physical-backup-lease-encode-literal magic value (1- bound)) 'error)))))
+
 (deftest backup-lease-rewind-seal-digest-is-published-once
     (let* ((capturing (backup-lease-test-record :capturing))
            (legacy (backup-lease-test-record :ready))

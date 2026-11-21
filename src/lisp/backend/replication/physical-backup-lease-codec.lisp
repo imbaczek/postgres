@@ -128,33 +128,11 @@
 ;; Lease and allocation files use a bounded canonical literal with a magic
 ;; header and checksum so recovery can reject damaged or ambiguous records.
 (defun physical-backup-lease-encode-literal (magic value maximum)
-  (let* ((text (physical-bootstrap-manifest-text value))
-         (bytes (string->bytes text))
-         (image (string->bytes (format nil "~a ~8,'0X~%~a~%" magic (wal-crc32 bytes) text))))
-    (unless (<= (length image) maximum)
-      (error "physical backup lease exceeds its record bound"))
-    image))
+  (metadata-literal-envelope-image magic value maximum "physical backup lease"))
 
 ;; Normalize the parsed value and re-encode it to require the canonical bytes.
 (defun physical-backup-lease-decode-literal (magic bytes maximum normalize)
-  (unless (typep bytes '(vector (unsigned-byte 8)))
-    (error "physical backup lease requires an octet vector"))
-  (unless (<= (length bytes) maximum)
-    (error "physical backup lease exceeds its record bound"))
-  (let* ((text (bytes->string bytes))
-         (newline (position #\Newline text))
-         (prefix (concatenate 'string magic " ")))
-    (unless (and newline (= newline (+ (length prefix) 8)) (uiop:string-prefix-p prefix text))
-      (error "invalid physical backup lease envelope"))
-    (let* ((body (subseq text (1+ newline)))
-           (crc (parse-integer text :start (length prefix) :end newline :radix 16)))
-      (unless (and (plusp (length body)) (char= #\Newline (char body (1- (length body))))
-                   (= crc (wal-crc32 (string->bytes (subseq body 0 (1- (length body)))))))
-        (error "physical backup lease checksum mismatch"))
-      (let ((record (funcall normalize (recovery-parse-manifest-text body))))
-        (unless (equalp bytes (physical-backup-lease-encode-literal magic record maximum))
-          (error "noncanonical physical backup lease record"))
-        record))))
+  (metadata-literal-envelope-decode magic bytes maximum normalize "physical backup lease"))
 
 (defun physical-backup-lease-image (record)
   (physical-backup-lease-encode-literal
