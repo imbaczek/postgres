@@ -82,6 +82,9 @@ control snapshot before injecting corruption.
 Checkpoint WAL validation now requires a nonempty WAL8 record, and base
 reservation seeding requires its exact source counters. The snapshot codec
 and backup manifest schema retain their older variants for B3 and B11.
+Source transaction replay now follows WAL8 transitions. End-of-recovery
+keeps the proven reservation bound but clears completeness until the child
+checkpoint. End-of-recovery and CLOG reset clear source membership.
 Version-specific fixtures still cover running-xacts records, XID reservation,
 timeline lineage and end-of-recovery. Remove
 compatibility assertions alongside their reader branches and regenerate

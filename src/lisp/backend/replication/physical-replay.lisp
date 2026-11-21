@@ -465,9 +465,7 @@ restore proof before promotion; observed next XID must stay within that bound."
     (error "source allocation history moved backwards"))
   (let ((bound (if prior (getf prior :bound) 2))
         (complete (and prior (getf prior :complete)))
-        (type (wal-record-type record))
-        (version (wal-record-version record)))
-    (when (< version 7) (setf complete nil))
+        (type (wal-record-type record)))
     (cond
       ((= type +wal-record-end-of-recovery+) (setf complete nil))
       ((= type +wal-record-xid-reservation+)
@@ -475,14 +473,10 @@ restore proof before promotion; observed next XID must stay within that bound."
          (when (< new-bound bound) (error "source XID reservation regressed"))
          (setf bound new-bound complete t)))
       ((= type +wal-record-checkpoint+)
-       (let ((snapshot (wal-checkpoint-record-snapshot record)))
-         (when snapshot
-           (let ((new-bound (1- (canonical-next-full-xid
-                                 (1+ (getf snapshot :xid-reserved-through))))))
-             (when (and (>= version 7) (< new-bound bound))
-               (error "checkpoint XID reservation regressed"))
-             (setf bound (max bound new-bound))))
-         (when (>= version 7) (setf complete t)))))
+       (let* ((snapshot (wal-checkpoint-record-snapshot record))
+              (new-bound (1- (canonical-next-full-xid (1+ (getf snapshot :xid-reserved-through))))))
+         (when (< new-bound bound) (error "checkpoint XID reservation regressed"))
+         (setf bound new-bound complete t))))
     (when (and complete (> observed-next (1+ bound)))
       (error "observed XID exceeds the source's durable allocation reservation"))
     (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
@@ -515,12 +509,9 @@ Do not consult replay CLOG: it may be ahead of this record's applied position."
       ((member type (list +wal-record-clog-reset+ +wal-record-end-of-recovery+)) nil)
       ((null prior) nil)
       (t
-       (let ((next (running-xacts-advance
-                    prior observed-next end
-                    :committed-xid (when (= type +wal-record-commit+) (wal-record-xid record)))))
-         (when (< (wal-record-version record) 7)
-           (setf (getf next :complete) nil (getf next :running) nil))
-         next)))))
+       (running-xacts-advance
+        prior observed-next end
+        :committed-xid (when (= type +wal-record-commit+) (wal-record-xid record)))))))
 
 (defun physical-replay-create-heap-forks (catalog)
   "Redo first appearances of parent and TOAST heap main forks at catalog terminals.

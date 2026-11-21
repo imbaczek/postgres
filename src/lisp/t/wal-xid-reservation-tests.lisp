@@ -39,12 +39,12 @@
                  (cl-spec:run-property 'wal-xid-reservation-preserves-canonical-inclusive-bound :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
-(deftest source-reservation-proof-is-separate-from-visibility-and-legacy-unknowns
+(deftest source-reservation-proof-is-separate-from-visibility-across-timeline-change
     (let* ((pg::*next-xid* 1003)
            (base (list :version 1 :through 32 :bound 1002 :complete t))
-           (start (pg::make-wal-record :version 7 :type pg::+wal-record-batch-start+
+           (start (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-batch-start+
                                        :start 32 :end 64 :xid 0 :payload (empty-octets)))
-           (record (pg::make-wal-record :version 7 :type pg::+wal-record-xid-reservation+
+           (record (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-xid-reservation+
                                         :start 64 :end 104 :xid 0
                                         :payload (pg::wal-encode-xid-reservation 2002)))
            (after-start (pg::physical-source-reservation-next base start 1003))
@@ -53,18 +53,34 @@
       (ok (= 1003 pg::*next-xid*))
       (ok (getf after :complete))
       (ok (= 104 (getf after :through)))
-      (setf (pg::wal-record-version start) 6
-            (pg::wal-record-start start) 104 (pg::wal-record-end start) 136)
-      (let ((unknown (pg::physical-source-reservation-next after start 1003)))
+      (let* ((wire (pg::wal-encode-end-of-recovery-record 104 42 2 1 1))
+             (eor (pg::wal-decode-record wire 104))
+             (unknown (pg::physical-source-reservation-next after eor 1003)))
         (ok (not (getf unknown :complete)))
         (ok (= 2002 (getf unknown :bound)))
-        (setf (pg::wal-record-start record) 136 (pg::wal-record-end record) 176
-              (pg::wal-record-payload record) (pg::wal-encode-xid-reservation 3002))
-        (ok (getf (pg::physical-source-reservation-next unknown record 1003) :complete))
-        (setf (pg::wal-record-payload record) (pg::wal-encode-xid-reservation 1002))
-        (ok (intake-fails-p
-             (lambda () (pg::physical-source-reservation-next unknown record 1003)))))
-      (setf (pg::wal-record-version start) 7)
+        (let* ((child-start (pg::wal-record-end eor))
+               (batch (pg::wal-decode-record
+                       (pg::wal-encode-record pg::+wal-record-batch-start+ 0 child-start (empty-octets))
+                       child-start))
+               (pending (pg::physical-source-reservation-next unknown batch 1003))
+               (start (pg::wal-record-end batch))
+               (snapshot (sample-checkpoint-snapshot
+                          :version 2 :start start :end (+ start (pg::wal-checkpoint-record-size))
+                          :redo start :timeline 2 :prev-timeline 1 :oldest-active-xid 0
+                          :next-xid 1003 :xid-reserved-through 3002))
+               (child (pg::wal-decode-record
+                       (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start
+                                              (pg::wal-encode-checkpoint-snapshot snapshot))
+                       start))
+               (restored (pg::physical-source-reservation-next pending child 1003)))
+          (ok (not (getf pending :complete)))
+          (ok (getf restored :complete))
+          (ok (= 3002 (getf restored :bound)))
+          (setf (getf snapshot :xid-reserved-through) 1002
+                (pg::wal-record-payload child) (pg::wal-encode-checkpoint-snapshot snapshot))
+          (ok (intake-fails-p
+               (lambda () (pg::physical-source-reservation-next pending child 1003))))))
+      (setf (pg::wal-record-start start) 104 (pg::wal-record-end start) 136)
       (ok (intake-fails-p
            (lambda () (pg::physical-source-reservation-next after start 3003))))))
 
