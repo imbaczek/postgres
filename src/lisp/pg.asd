@@ -53,6 +53,7 @@
                    (:file "wal-record" :depends-on ("wal-core.hot"))
                    (:file "wal" :pathname "wal-core" :depends-on ("wal-record"))
                    (:file "wal-archive" :depends-on ("wal"))
+                   (:file "wal-slot-persistence" :depends-on ("wal"))
                    (:file "wal-pressure")
                    (:file "wal-resource-parameters")
                    (:file "wal-eor")

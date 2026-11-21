@@ -207,6 +207,14 @@ its behavior and allocation.  The record format uses CRC32C (Castagnoli)."
     (wal-set-u32 copy 28 0)
     (wal-crc32 copy)))
 
+(defun wal-terminal-record-type-p (type)
+  (member type (list +wal-record-commit+ +wal-record-catalog+
+                     +wal-record-catalog-commit+ +wal-record-checkpoint+
+                     +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
+                     +wal-record-running-xacts+ +wal-record-parameter-change+
+                     +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
+          :test #'=))
+
 (defun wal-decode-record (bytes expected-lsn)
   "Validate the record header and checksum at EXPECTED-LSN and decode it.
 The returned record owns a separate payload subsequence of BYTES."
