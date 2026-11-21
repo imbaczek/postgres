@@ -1636,16 +1636,20 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
             (simple-error () t)))))
 
 (deftest unsupported-tuple-representations
-    (dolist (kind '(98)) ; binary output remains unsupported
-      (ok (handler-case
-              (progn (pg::logical-pgoutput-read-tuple (octets (list 0 1 kind)) 0) nil)
-            (simple-error () t)))))
+    (ok (handler-case
+            (progn
+              (decode-test-pgoutput-in-transaction (octets '(73 0 0 0 7 78 0 1 88)))
+              nil)
+          (simple-error (condition)
+            (search "unsupported pgoutput tuple value kind" (princ-to-string condition))))))
 
 (deftest unchanged-toast-marker-decoding
-    (multiple-value-bind (values end)
-        (pg::logical-pgoutput-read-tuple (octets '(0 3 110 117 116 0 0 0 1 120)) 0)
-      (ok (equalp values #(nil :unchanged-toast "x")))
-      (ok (= end 10)))
+    (destructuring-bind (kind oid values)
+        (decode-test-pgoutput-in-transaction
+         (octets '(73 0 0 0 7 78 0 3 110 117 116 0 0 0 1 120)))
+      (ok (char= kind #\I))
+      (ok (= oid 7))
+      (ok (equalp values #(nil :unchanged-toast "x"))))
   (ok (handler-case
           (progn (pg::logical-source-value-literal 25 :unchanged-toast :pgoutput) nil)
         (simple-error () t))))

@@ -823,14 +823,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 
 (defvar *logical-wire-field-owner* nil)
 
-(defun logical-pgoutput-read-tuple (payload position)
-  (unless (<= 0 position (length payload))
-    (error "invalid pgoutput tuple position"))
-  (let ((cursor (make-logical-wire-cursor :bytes payload :remaining (- (length payload) position)))
-        (*logical-wire-field-owner* nil))
-    (let ((tuple (logical-wire-tuple cursor)))
-      (values tuple (- (length payload) (logical-wire-cursor-remaining cursor))))))
-
 (defun logical-validate-pgoutput-tuple (relation tuple unchanged-allowed-p)
   "Check tuple width and pgoutput's external marker against column types."
   (unless (= (length tuple) (length (pgoutput-relation-columns relation)))

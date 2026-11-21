@@ -21,7 +21,9 @@ for exact comparison across publisher processes without applying or rewriting th
               (when (= (aref frame 0) (char-code #\C))
                 (setf frames (nreverse frames))
                 (assert (equal '(66 82 73 67) (mapcar (lambda (bytes) (aref bytes 0)) frames)))
-                (assert (equalp (vector expected-id) (logical-pgoutput-read-tuple (third frames) 6)))
+                (let* ((runtime (make-logical-subscription-runtime :transaction-open-p t))
+                       (operation (logical-pgoutput-read-operation runtime (third frames))))
+                  (assert (equalp (vector expected-id) (third operation))))
                 (return frames)))))))))
 
 (defun interior-ack-wait-confirmation (sql expected)
