@@ -440,62 +440,62 @@
                  (pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
                  (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
                  (pg::*max-slot-wal-keep-bytes* nil)
-                 (base (legacy-checkpoint-record 0))
+                 (base (physical-test-checkpoint-record 0))
                  (prefix (concatenate '(vector (unsigned-byte 8)) base
-                                      (legacy-checkpoint-record 32)
-                                      (pg::wal-encode-end-of-recovery-record 64 42 2 1 1)
-                                      (legacy-checkpoint-record 120)))
-                 (history (format nil "1~c0/00000040~cpromotion~%" #\Tab #\Tab))
+                                      (physical-test-checkpoint-record 120)
+                                      (pg::wal-encode-end-of-recovery-record 240 42 2 1 1)
+                                      (physical-test-checkpoint-record 296 :timeline 2)))
+                 (history (store-history-text 1 240))
                  (identity (list :system-id (pg::catalog-system-identifier)
-                                 :base-timeline 1 :base 32 :manifest-digest 77))
-                 (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 32)))
+                                 :base-timeline 1 :base 120 :manifest-digest 77))
+                 (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 120)))
                  (image (pg::physical-retained-extent-encode
                          (append (list :version 1) identity
                                  (list :history-target 2
                                        :history-digest 99
-                                       :history-text history :start 32 :end 152
+                                       :history-text history :start 120 :end 416
                                        :start-digest #xCBF29CE484222325 :end-digest digest
                                        :segment 0 :file-timeline 2
                                        :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 prefix)))
                          prefix))
-                 (overlap (overlap-test-metadata 32 base))
+                 (overlap (overlap-test-metadata 120 base :native t))
                  (directory (pg::physical-recovery-retained-directory))
                  (snapshot (sample-checkpoint-snapshot
-                            :version 2 :start 208 :end 328 :redo 208 :timeline 3 :prev-timeline 2))
-                 (pg::*wal-durable-lsn* 328))
+                            :version 2 :start 472 :end 592 :redo 472 :timeline 3 :prev-timeline 2))
+                 (pg::*wal-durable-lsn* 592))
             (setf (getf overlap :system-id) (pg::catalog-system-identifier))
             (pg::wal-ensure-directory-durable directory)
             (pg::wal-ensure-directory-durable (pg::wal-directory))
-            (pg::timeline-write-history 2 1 64 "promotion")
-            (pg::timeline-write-history 3 2 152 "promotion")
+            (pg::timeline-write-history 2 1 240 "promotion")
+            (pg::timeline-write-history 3 2 416 "promotion")
             (let* ((id (project-test-publish-source
                         directory (list image) (pg::physical-retained-overlap-encode overlap base)
                         identity 2 history))
-                   (reference (list :root-id id :base-timeline 1 :base 32 :manifest-digest 77
-                                    :end 152 :end-digest digest))
+                   (reference (list :root-id id :base-timeline 1 :base 120 :manifest-digest 77
+                                    :end 416 :end-digest digest))
                    (metadata (list :system-id (pg::catalog-system-identifier)
                                    :db-state pg::+db-in-production+ :state-time 42 :retained-reference reference))
                    (request (list :version 1 :kind :retained-timeline
                                   :system-id (pg::catalog-system-identifier)
-                                  :base-timeline 1 :base 32 :manifest-digest 88
+                                  :base-timeline 1 :base 120 :manifest-digest 88
                                   :source-timeline 3 :receive-timeline 1
-                                  :receive-lsn 32 :receive-digest 91 :overlap-start 0
+                                  :receive-lsn 120 :receive-digest 91 :overlap-start 0
                                   :overlap-digest (pg::physical-store-update-digest #xCBF29CE484222325 base))))
               (pg::wal-atomic-write-bytes
                (pg::wal-control-path)
-               (pg::wal-encode-control-image 328 328 snapshot :timeline 3 :checkpoint-timeline 3
+               (pg::wal-encode-control-image 592 592 snapshot :timeline 3 :checkpoint-timeline 3
                                                               :namespace :timeline :metadata metadata))
               (pg::physical-retained-root-register
                (pg::physical-promotion-retained-owner :primary) directory id identity
                (pg::timeline-parse-history 2 history))
               (ok (not (probe-file (pg::wal-segment-path 0))))
               (let ((pin (pg::physical-source-follow-prepare "older_parent" request)))
-                (ok (= 64 (pg::physical-follow-pin-end-lsn pin)))
+                (ok (= 240 (pg::physical-follow-pin-end-lsn pin)))
                 (sb-thread:with-mutex (pg::*wal-lock*)
-                  (let ((record (pg::physical-follow-source-read-next pin 32)))
-                    (ok (= 64 (pg::wal-record-end record))))
-                  (multiple-value-bind (record raw end) (pg::physical-follow-source-read-next pin 64)
-                    (ok (null record)) (ok (null raw)) (ok (= 64 end)))))
+                  (let ((record (pg::physical-follow-source-read-next pin 120)))
+                    (ok (= 240 (pg::wal-record-end record))))
+                  (multiple-value-bind (record raw end) (pg::physical-follow-source-read-next pin 240)
+                    (ok (null record)) (ok (null raw)) (ok (= 240 end)))))
               (ok (not (probe-file (pg::wal-segment-path 0)))))))))
 
 (defun historical-follow-request (reference prefix eor cursor)
@@ -1443,10 +1443,11 @@
                                                    :namespace :timeline :metadata metadata)))
                   (grow ()
                     (let* ((end pg::*wal-durable-lsn*)
-                           (bytes (pg::read-bounded-regular-file path pg::+wal-segment-size+)))
+                           (bytes (pg::read-bounded-regular-file path pg::+wal-segment-size+))
+                           (record (physical-test-checkpoint-record end :timeline 2)))
                       (pg::wal-atomic-write-bytes
-                       path (concatenate '(vector (unsigned-byte 8)) bytes (legacy-checkpoint-record end)))
-                      (incf pg::*wal-durable-lsn* 32)
+                       path (concatenate '(vector (unsigned-byte 8)) bytes record))
+                      (incf pg::*wal-durable-lsn* (length record))
                       (control pg::*wal-durable-lsn*))))
            (grow)
            (call-with-test-logical-wal-archive
