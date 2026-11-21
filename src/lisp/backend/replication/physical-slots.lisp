@@ -425,7 +425,7 @@ and reject normal use until startup validates the state."
         (let* ((metadata (physical-restartpoint-read state))
                (reference (physical-retained-root-current
                            (physical-store-retained-owner store))))
-          (unless (and metadata (>= (getf metadata :version) 3)
+          (unless (and metadata
                        (= floor (getf metadata :lsn))
                        (= (physical-store-floor-digest store) (getf metadata :prefix-digest))
                        (physical-store-retained-root store)

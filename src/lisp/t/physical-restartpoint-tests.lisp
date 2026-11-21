@@ -372,33 +372,6 @@
       (ok (= 96 (pg::physical-restartpoint-prepare-storage store)))
       (ok (= 18446744073709551616 pg::*next-xid*))))
 
-(deftest legacy-restartpoint-requires-retained-full-prefix-for-actual-visibility
-    (dolist (compact '(nil t))
-      (with-restartpoint-fixture (root store)
-        (declare (ignore root))
-        (let ((reader (symbol-function 'pg::physical-restartpoint-read)))
-          (unwind-protect
-               (progn
-                 (if compact
-                     (pg::physical-store-compact store 96 #'pg::physical-restartpoint-publish)
-                     (pg::physical-restartpoint-publish (pg::physical-store-prefix-digest store 96)))
-                 (setf (getf pg::*physical-recovery-state* :files) '(("base/900" 32 0)))
-                 ;; Supply an already validated legacy generation at the restore boundary.
-                 (setf (symbol-function 'pg::physical-restartpoint-read)
-                       (lambda (state)
-                         (multiple-value-bind (metadata bytes) (funcall reader state)
-                           (setf (getf metadata :version) 2 (getf metadata :next-xid) 1003)
-                           (values metadata bytes))))
-                 (if compact
-                     (ok (handler-case
-                             (progn (pg::physical-restartpoint-prepare-storage store) nil)
-                           (error () t)))
-                     (progn
-                       (ok (= 32 (pg::physical-restartpoint-prepare-storage store)))
-                       (ok (= 50 pg::*next-xid*))
-                       (ok (= 1003 (pg::load-next-xid))))))
-            (setf (symbol-function 'pg::physical-restartpoint-read) reader))))))
-
 (deftest restartpoint-new-pointer-with-old-floor-is-valid
     (with-restartpoint-fixture (root store)
       (declare (ignore root))

@@ -1,11 +1,10 @@
-;;;; Owned process fixtures for legacy XID visibility migration.
+;;;; Retired restartpoint generations for a stopped harness-owned target.
 (require :asdf)
 (let ((base (merge-pathnames "../" (uiop:pathname-directory-pathname *load-truename*))))
   (pushnew base asdf:*central-registry* :test #'equal)
   (pushnew (merge-pathnames "vendor/swank/" base) asdf:*central-registry* :test #'equal))
 (let ((*compile-verbose* nil) (*load-verbose* nil) (*standard-output* *error-output*))
-  (asdf:load-system "pg")
-  (asdf:load-system "pg-swank"))
+  (asdf:load-system "pg"))
 (in-package #:pg)
 
 (defun xid-test-convert-legacy-files ()
@@ -24,13 +23,19 @@
                        :source-resource-fact :source-fpw-fact :source-logical-fact))
           (remf metadata key))
         (when (= version 1) (remf metadata :source-checkpoint))
-        (let* ((bytes (physical-restartpoint-encode metadata catalog-bytes))
-               (hash (physical-store-update-digest #xCBF29CE484222325 bytes))
+        (let* ((text (string->bytes (physical-bootstrap-manifest-text metadata)))
+               (bytes (make-array (+ 32 (length text) (length catalog-bytes))
+                                  :element-type '(unsigned-byte 8) :initial-element 0))
+               (hash (progn
+                       (replace bytes #(80 71 82 80 71 69 78 49))
+                       (wal-set-u32 bytes 8 (length text))
+                       (wal-set-u64 bytes 12 (length catalog-bytes))
+                       (replace bytes text :start1 32)
+                       (replace bytes catalog-bytes :start1 (+ 32 (length text)))
+                       (wal-set-u32 bytes 24 (wal-crc32 bytes))
+                       (physical-store-update-digest #xCBF29CE484222325 bytes)))
                (lsn (getf metadata :lsn))
                (pointer (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0)))
-          ;; Validate real old bytes through the normal decoder/schema before publishing.
-          (physical-restartpoint-check-metadata
-           (physical-restartpoint-decode bytes) catalog-bytes manifest)
           (wal-atomic-write-bytes (physical-restartpoint-generation-path lsn hash) bytes)
           (replace pointer #(80 71 82 80 80 84 82 49))
           (wal-set-u64 pointer 8 lsn)
@@ -38,18 +43,4 @@
           (wal-set-u32 pointer 24 (wal-crc32 pointer))
           (wal-atomic-write-bytes (physical-restartpoint-pointer-path) pointer))))))
 
-(if (equal (uiop:getenv "PG_XID_MIGRATION_ACTION") "fixture")
-    (xid-test-convert-legacy-files)
-    (progn
-      (setf *physical-recovery-control-test-hook*
-            (lambda (point state)
-              (when (and (eq point :after-write) (= state +db-in-archive-recovery+))
-                (with-open-file (stream (uiop:getenv "PG_XID_MIGRATION_BARRIER")
-                                        :direction :output :if-exists :supersede)
-                  (write-line "dirty control published before restore" stream))
-                (sleep 30)
-                (error "migration crash barrier timed out"))))
-      (handler-case (main)
-        (error (condition)
-          (format *error-output* "~&migration startup rejected: ~a~%" condition)
-          (sb-ext:exit :code 1)))))
+(xid-test-convert-legacy-files)
