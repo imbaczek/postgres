@@ -215,6 +215,10 @@ UTF-8 text, and binary data after overwriting the input bytes.
 The test-only INSERT, UPDATE, and DELETE adapters and their duplicate tuple
 framing code have been retired. Malformed packet and C wire fixtures now
 exercise the shared operation decoder, and apply tests use dispatch.
+Control tests also use the shared decoder or the production CopyData reader.
+The malformed keepalive fixture verifies connection closure without advancing
+feedback. The duplicate native TRUNCATE apply adapter has no callers and was
+removed.
 
 The startup settings registry uses named, read-only descriptors for context,
 kind, boot value, integer bounds, and units. Configuration ingestion, reload,

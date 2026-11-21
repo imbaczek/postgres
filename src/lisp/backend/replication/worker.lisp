@@ -1375,20 +1375,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
     (dolist (name names)
       (logical-test-failpoint :after-row-change :truncate name))))
 
-(defun logical-apply-truncate (runtime payload)
-  "Apply native TRUNCATE inside the current durable apply transaction."
-  (unless (logical-subscription-runtime-transaction-open-p runtime)
-    (error "pgoutput TRUNCATE appeared outside a transaction"))
-  (let ((relations
-          (loop for oid in (logical-pgoutput-read-truncate payload)
-                collect (or (gethash oid (logical-subscription-runtime-relations runtime))
-                            (error "pgoutput TRUNCATE has no Relation metadata")))))
-    ;; C apply_handle_truncate collects the relations for one ExecuteTruncateGuts.
-    (logical-truncate-target-tables
-     runtime (loop for relation in relations
-                   when (logical-relation-selected-p runtime relation)
-                     collect (pgoutput-relation-name relation)))))
-
 (defun logical-apply-truncate-message (runtime payload)
   (let* ((data (logical-read-data-string payload))
          (tables (getf data :tables))
@@ -1400,16 +1386,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
               (lambda (name)
                 (member name (logical-subscription-options-tables options) :test #'string=))
               tables))))
-
-(defun logical-pgoutput-read-control (runtime payload)
-  "Decode one complete pgoutput control message without applying it."
-  (unless (and (plusp (length payload)) (find (code-char (aref payload 0)) "BCRTM"))
-    (error "unsupported pgoutput control message"))
-  (logical-pgoutput-read-operation runtime payload))
-
-(defun logical-pgoutput-read-keepalive (payload)
-  (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
-  (pg-client-u64 payload 1))
 
 (defun logical-apply-truncate-relations (runtime oids)
   (unless (logical-subscription-runtime-transaction-open-p runtime)
@@ -1503,21 +1479,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 
 (defun logical-pgoutput-dispatch (runtime payload)
   (logical-pgoutput-apply-operation runtime (logical-pgoutput-read-operation runtime payload)))
-
-(defun logical-stream-frame (runtime payload)
-  (when (zerop (length payload)) (error "empty replication CopyData payload"))
-  (case (code-char (aref payload 0))
-    (#\w
-     (when (< (length payload) 26) (error "truncated logical XLogData frame"))
-     (logical-pgoutput-dispatch
-      runtime (make-array (- (length payload) 25)
-                          :element-type '(unsigned-byte 8)
-                          :displaced-to payload :displaced-index-offset 25)))
-    (#\k
-     (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
-     (logical-progress-keepalive runtime (logical-pgoutput-read-keepalive payload)))
-    (otherwise (error "unexpected replication CopyData message ~s"
-                      (code-char (aref payload 0))))))
 
 (defun logical-wire-cstring (cursor)
   (let ((source (logical-wire-cursor-bytes cursor)))

@@ -1267,11 +1267,16 @@
                  (write-byte (char-code #\k) stream)
                  (dotimes (i 7) (write-byte 0 stream))
                  (write-byte lsn stream)
-                 (dotimes (i 9) (write-byte 0 stream))))
+                 (dotimes (i 9) (write-byte 0 stream)))
+               (write-byte (char-code #\d) stream)
+               (write-sequence (u32-to-bytes 5) stream)
+               (write-byte (char-code #\k) stream))
              (with-open-file (stream path :element-type '(unsigned-byte 8))
                (let ((client (make-pg-client :stream stream)))
                  (logical-read-stream-operation nil client)
-                 (logical-read-stream-operation nil client)))
+                 (logical-read-stream-operation nil client)
+                 (rove:ok (rove:signals (logical-read-stream-operation nil client) 'error))
+                 (rove:ok (not (open-stream-p stream)))))
              (rove:ok (equal (nreverse received) '(1 2))))
         (setf (symbol-function 'logical-progress-keepalive) original)
         (when (probe-file path) (delete-file path)))))
@@ -1281,26 +1286,20 @@
                      :options (make-logical-subscription-options)
                      :relations (make-hash-table)))
            (calls 0)
-           (original (symbol-function 'logical-target-query))
-           (keepalive (symbol-function 'logical-progress-keepalive)))
+           (original (symbol-function 'logical-target-query)))
       (unwind-protect
            (progn
              (setf (symbol-function 'logical-target-query)
-                   (lambda (&rest args) (declare (ignore args)) (incf calls))
-                   (symbol-function 'logical-progress-keepalive)
                    (lambda (&rest args) (declare (ignore args)) (incf calls)))
              (dolist (payload (list #(66) #(67) #(82) #(84 0 0 0 0 0 1) #(77)
                                     (concatenate 'vector #(66) (make-array 21 :initial-element 0))
                                     (concatenate 'vector #(67) (make-array 26 :initial-element 0))))
                (rove:ok (handler-case (progn (logical-pgoutput-dispatch runtime payload) nil)
                           (error () t))))
-             (rove:ok (handler-case (progn (logical-stream-frame runtime #(107)) nil)
-                        (error () t)))
              (rove:ok (zerop calls))
              (rove:ok (zerop (hash-table-count (logical-subscription-runtime-relations runtime))))
              (rove:ok (not (logical-subscription-runtime-transaction-open-p runtime))))
-        (setf (symbol-function 'logical-target-query) original
-              (symbol-function 'logical-progress-keepalive) keepalive))))
+        (setf (symbol-function 'logical-target-query) original))))
 
 (rove:deftest test-control-begin-commit-lsn-agreement
     (dolist (mode '(:standard :private))
@@ -1344,8 +1343,8 @@
             (aref commit 0) (char-code #\C))
       (fill begin 255 :start 9 :end 17)
       (fill commit 255 :start 18 :end 26)
-      (rove:ok (= -1 (fourth (logical-pgoutput-read-control runtime begin))))
-      (rove:ok (= -1 (fourth (logical-pgoutput-read-control runtime commit))))))
+      (rove:ok (= -1 (fourth (logical-pgoutput-read-operation runtime begin))))
+      (rove:ok (= -1 (fourth (logical-pgoutput-read-operation runtime commit))))))
 
 (rove:deftest test-malformed-open-transaction-controls-have-no-effects
     (let* ((runtime (make-logical-subscription-runtime
@@ -1861,25 +1860,16 @@
 (rove:deftest test-logical-bounded-utf8-and-frame-view
     (let* ((value (concatenate 'string (make-string 4095 :initial-element #\a)
                                (string (code-char #x1f642)) "ż"))
-           (payload (make-array 28 :element-type '(unsigned-byte 8) :initial-element 0))
-           (original (symbol-function 'logical-pgoutput-dispatch))
-           (seen nil))
+           (row #(73 0 0 0 7 78 0 1 116 0 0 0 1 65))
+           (payload (make-array (+ 25 (length row)) :element-type '(unsigned-byte 8)
+                                                    :initial-element 0))
+           (runtime (make-logical-subscription-runtime :transaction-open-p t)))
       (rove:ok (= (logical-utf8-size-bounded value) (length (string->bytes value))))
-      (setf (aref payload 0) (char-code #\w)
-            (aref payload 25) (char-code #\X)
-            (aref payload 26) 7
-            (aref payload 27) 9)
-      (unwind-protect
-           (progn
-             (setf (symbol-function 'logical-pgoutput-dispatch)
-                   (lambda (runtime view)
-                     (declare (ignore runtime))
-                     (multiple-value-bind (base offset) (array-displacement view)
-                       (setf seen (and (eq base payload) (= offset 25)
-                                       (equalp view #(88 7 9)))))))
-             (logical-stream-frame nil payload)
-             (rove:ok seen))
-        (setf (symbol-function 'logical-pgoutput-dispatch) original))))
+      (replace payload row :start1 25)
+      (let ((view (make-array (length row) :element-type '(unsigned-byte 8)
+                                           :displaced-to payload :displaced-index-offset 25)))
+        (rove:ok (equalp (logical-pgoutput-read-operation runtime view)
+                         (list #\I 7 #("A")))))))
 
 (rove:deftest test-typed-parameter-expressions
     (let* ((tokens (tokenize "$1 + $2"))
