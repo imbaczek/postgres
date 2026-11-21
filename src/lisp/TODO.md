@@ -358,7 +358,7 @@ still has work outstanding.
 |---|---|
 | A1. Push and pull query duplication | Projection and WindowAgg transitions are shared in `e13c164f35a` and `0529ff96c23`. The window differential exercises one-row portal resumption. Audit remaining SQL rules and verify row ownership and allocations across both drivers. |
 | A2. WAL batch grammar | Shared history and redo staging and terminal decoding in `d63521560e9` and `dd31595f1ad`. Recovery catalog spooling in `b9e448a23bd`. Verify the complete prefix, incomplete tail, and effect-order contracts. |
-| A3. Builtin dispatch and metadata | JSON and JSONB inspection descriptors in `17b2661ab5e`. Verify alias, arity, volatility, strictness, and evaluation consumers before extending the registry. |
+| A3. Builtin dispatch and metadata | JSON and JSONB inspection descriptors in `17b2661ab5e`. Fixed bytea indexing signatures in `b0944034dd7` share arity, argument coercion, result types, volatility, and strict evaluation. The C differential passed 1,297 comparisons, including qualified calls, smallint widening, bigint rejection, wrong arity, and byte copy-on-write. Bit overload resolution and other builtin families remain to audit. |
 | A4. Physical replay fact scans | WAL8 source transaction transitions in `f393cca86ef`. Audit replay fact consumers for shared transitions with explicit seeds, coverage, and stop policies. |
 | A5. Metadata envelopes | Shared codecs in `b0a0b5b0c2d`. The Milestone 1 strict physical selection exercises exact bytes, checksum failures, and canonicality. |
 | A6. Progress journals | Shared installation prefix parsing in `b0a0b5b0c2d`. The Milestone 1 selection exercises partial tails and publication cuts. |
