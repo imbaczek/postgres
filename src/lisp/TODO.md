@@ -403,13 +403,14 @@ still has work outstanding.
   `41774ee2b32`. Archive-backed rewind passed with the corrected fixture in
   `72cc65a1a5b`, and the SCRAM lifecycle passed rewind and read-only rejoin.
 
-- [ ] Bind retained-root deletion to checked archive and host identities before
-  permitting deletion after continuation restoration. The fence assumes the
-  fixed `PGDATA/pg_physical_retained/` parent. A separate bind-mount alias can
-  have another parent and miss that path check; generic root references also
-  use canonical directory paths. Qualify aliases with held descriptors and mount
-  identities before opening GC after continuation restoration. Current typed
-  archive inputs require the fixed child, and the imported-host fence stays closed.
+- [ ] Bind all retained-root references and deletion decisions to checked archive
+  and host identities before permitting GC after continuation restoration.
+  In `3e17f23fb17`, deletion uses a held archive descriptor and rechecks its
+  named binding before unlink. The active host's fence also covers bind aliases
+  of its fixed archive child by device and inode, even across different mount
+  IDs. A private mount namespace test verified the alias and an unrelated
+  archive. Generic references and holds still use canonical directory paths.
+  The imported-host fence stays closed.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
