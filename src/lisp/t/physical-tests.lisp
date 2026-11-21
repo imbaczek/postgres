@@ -40,14 +40,6 @@
                                    (pg::wal-encode-checkpoint-snapshot snapshot))
             snapshot)))
 
-(defun legacy-checkpoint-record (start)
-  "Explicit version-5 fixture; new writers require the version-6 payload."
-  (let ((bytes (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 start (empty-octets))))
-    (pg::wal-set-u16 bytes 4 5)
-    (pg::wal-set-u32 bytes 28 0)
-    (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
-    bytes))
-
 (defun intake-fails-p (function)
   (handler-case (progn (funcall function) nil) (error () t)))
 
