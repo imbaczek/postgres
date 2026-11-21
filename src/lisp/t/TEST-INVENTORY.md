@@ -351,16 +351,18 @@ when Quicklisp is absent it tries `QUICKLISP_HOME/setup.lisp` or `~/quicklisp/se
 The runner preserves SBCL init configuration. cl-spec must be registered with
 ASDF or installed under the active Quicklisp local-projects directory; see the
 [dependency setup](../README.md#testing), including `CL_SOURCE_REGISTRY` for an
-external checkout. The runner then runs the new ASDF suite first,
-then all deferred cases and the inline wait-helper assertion. Rove failure causes
-an ASDF error; legacy failures signal an error instead of exiting the Lisp image.
-Both propagate a nonzero status from the shell runner. Loading `pg-unit-tests`
-alone defines tests without running them or loading the legacy runner.
+external checkout. The runner invokes the `pg-unit-tests/all` ASDF test
+operation. Rove reports its results first. On success, the legacy harness runs
+its registered cases and inline wait-helper assertion and prints its check and
+failure counts. Either suite can signal an error, which produces a nonzero shell
+exit status. The combined success line appears after both suites pass. Loading
+`pg-unit-tests` defines tests for direct Rove discovery and selection.
 
 With the test dependencies installed, in a REPL with this directory registered:
 
 ```lisp
-(asdf:test-system "pg-unit-tests")
+(asdf:test-system "pg-unit-tests/all") ; both harnesses
+(asdf:test-system "pg-unit-tests")     ; Rove only
 ;; Individual cases remain selectable through Rove/cl-mcp, e.g.:
 ;; run-tests system=pg-unit-tests test=pg::test-tuple-roundtrip
 ```

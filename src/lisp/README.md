@@ -1336,7 +1336,7 @@ test run:
 
 ```sh
 PG_LISP_TEST_COVERAGE_DIR=/absolute/path/to/coverage ./t/run-system-tests.sh unit
-PG_LISP_TEST_COVERAGE_DIR=/absolute/path/to/legacy-coverage ./t/run-unit-tests.sh
+PG_LISP_TEST_COVERAGE_DIR=/absolute/path/to/combined-coverage ./t/run-unit-tests.sh
 ```
 
 Open `cover-index.html` in the report directory. Coverage uses a private
