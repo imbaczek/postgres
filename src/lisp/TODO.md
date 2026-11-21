@@ -445,8 +445,17 @@ still has work outstanding.
   confirms the object survives both attempts. All 34 strict retained-root
   test heads passed. The instrumented restart and proof-loss cases passed
   with startup recording enabled.
+  In `b6f83fb0345`, imported origin reconciliation checks the actual
+  reader's device, inode and mount against the registration descriptor
+  before reading any inventory objects. Runtime origin lookup checks its
+  fresh reader against the registered archive. All 35 strict retained-root
+  test heads passed. The instrumented imported restart, proof-loss and
+  physical streaming cases passed.
   Enabling GC still requires a deletion-time ownership and retention
-  proof for the restored host and archive.
+  proof for the restored host and archive. Restore the current primary
+  control's root separately from the historical imported origin, account
+  for any durable receive selection, and recheck both host ownership and
+  registered protection before archive unlink.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
