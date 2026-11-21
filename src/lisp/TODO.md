@@ -51,9 +51,16 @@ why existing code could not meet the need when a new implementation is required.
 | B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | Standby publication and logical-copy source proof emit PGRPGEN2 with metadata version 4. The XID process fixture constructs retired generations independently to test startup rejection. |
 | B18 | [WAL initialization](backend/storage/wal-core.lisp) | Fresh clusters select timeline-qualified filenames. A physical base copy inherits the source WAL control and namespace. |
 
-For B15, callers of the ownerless CLOG staging and materialization functions
-are confined to their delegation chain and Rove fixtures. The tag validation
-helper also protects owned completions, so preserve it during the cutover.
+For B15, `0dbafd57add` removes the ownerless CLOG staging, materialization,
+and synchronous wrapper after migrating their last Rove callers. Owned
+completions retain exact tag validation. The migrated tests cover stale
+incarnations and timelines, FullXID aliases, orphaned queue owners, and
+retry after a failed raw CLOG write. The accepted-publication property covers
+logical visibility with raw bits still in progress, including neighboring
+writes and fsync. The live `t/commit-receipts.py` and `t/async-commit.py`
+scenarios passed, including failure cleanup and restart.
+The strict CLOG selection passed seven test heads. The combined unit suite
+also passed, including 1,172 legacy checks with zero failures.
 
 For B1, native record decoding and physical receive use one header predicate
 for record magic, version, type and source LSN. Both require WAL8, with a
