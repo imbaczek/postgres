@@ -65,7 +65,7 @@ legacy_migration() {
     kind=$1
     kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
     cp -a "$TMP/copy" "$TMP/migration-$kind"
-    for version in 1 2; do
+    for version in 1 2 3; do
         rm -rf "$TMP/copy"
         cp -a "$TMP/migration-$kind" "$TMP/copy"
         PG_XID_MIGRATION_DATA="$TMP/copy" \

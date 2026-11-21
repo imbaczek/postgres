@@ -12,15 +12,17 @@
   (let* ((*pgdata* (uiop:ensure-directory-pathname (uiop:getenv "PG_XID_MIGRATION_DATA")))
          (version (parse-integer (uiop:getenv "PG_XID_MIGRATION_VERSION")))
          (capacity (load-next-xid)))
-    (assert (member version '(1 2)))
+    (assert (member version '(1 2 3)))
     (multiple-value-bind (manifest digest) (recovery-read-manifest *pgdata*)
       (setf (getf manifest :manifest-digest) digest)
       (multiple-value-bind (metadata catalog-bytes) (physical-restartpoint-read manifest)
         (assert metadata)
-        (setf (getf metadata :version) version
-              (getf metadata :next-xid) (max capacity (getf metadata :next-xid)))
-        (dolist (key '(:source-reservation :wal-prefix-digest :source-xids :clog-bytes
-                       :source-resource-fact :source-fpw-fact :source-logical-fact))
+        (setf (getf metadata :version) version)
+        (when (< version 3)
+          (setf (getf metadata :next-xid) (max capacity (getf metadata :next-xid)))
+          (remf metadata :source-reservation))
+        (dolist (key '(:wal-prefix-digest :source-xids :clog-bytes :source-resource-fact
+                       :source-fpw-fact :source-logical-fact))
           (remf metadata key))
         (when (= version 1) (remf metadata :source-checkpoint))
         (let* ((text (string->bytes (physical-bootstrap-manifest-text metadata)))
