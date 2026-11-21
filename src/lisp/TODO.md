@@ -93,6 +93,13 @@ cannot truncate them as ordinary records.
 The checkpoint process suite rejects a checksummed WAL7 checkpoint before
 exercising native crash, replay and restartpoint behavior on a separate copy.
 
+For B2, primary WAL control and the independent checkpoint reader require
+PGWAL6. The checksummed PGWAL2–5 fixtures are rejected at decode, and the
+live checkpoint suite rejects a stopped copy with PGWAL5 before exercising
+PGWAL6 crash recovery and standby restartpoints. Both segment namespaces
+and the current lifecycle, retained, resource, logical evidence, page
+checksum and CLOG extent fields retain their existing checks.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The

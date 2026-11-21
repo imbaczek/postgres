@@ -506,39 +506,30 @@ all fields before the CRC itself."
 
 (defun wal-decode-control-line (line)
   "Decode a CRC-bound control image, including the optional native C1 mode.
-The control CRC does not verify relation pages. Legacy resource facts may be unknown."
+The control CRC does not verify relation pages. Resource facts may be absent."
   (let* ((fields (and line (wal-split-fields line)))
-         (version (first fields))
-         (v6 (equal version "PGWAL6"))
          (extent-tail (if (equal "C1" (first (last fields 2))) 3 2))
-         (extent-token (and v6 (first (last fields extent-tail))))
+         (extent-token (first (last fields extent-tail)))
          (extent-p (and extent-token (plusp (length extent-token))
                         (char= #\X (char extent-token 0))))
          (shape-fields (if extent-p (append (butlast fields extent-tail) (rest (last fields extent-tail))) fields))
-         (checksum-p (and v6 (member (length shape-fields) '(12 16 18 20 22 24))))
+         (checksum-p (member (length shape-fields) '(12 16 18 20 22 24)))
          (base-fields (if checksum-p (append (butlast shape-fields 2) (last shape-fields)) shape-fields))
-         (logical-evidence-p (and v6 (member (length base-fields) '(19 23))))
+         (logical-evidence-p (member (length base-fields) '(19 23)))
          (metadata-fields (if logical-evidence-p
                               (append (butlast base-fields 3) (last base-fields))
                               base-fields))
-         (identities (member version '("PGWAL5" "PGWAL6") :test #'equal))
-         (v4 (equal version "PGWAL4"))
          (checkpoint (handler-case-noninterrupt (parse-integer (second fields)) (condition nil)))
          (durable (handler-case-noninterrupt (parse-integer (third fields)) (condition nil)))
-         (timeline (if identities (handler-case-noninterrupt (parse-integer (fourth fields)) (condition nil)) 1))
-         (checkpoint-timeline (if identities (handler-case-noninterrupt (parse-integer (fifth fields)) (condition nil)) 1))
-         (namespace (if v6 (cond ((equal (sixth fields) "legacy") :legacy)
-                                 ((equal (sixth fields) "timeline") :timeline))
-                        :legacy))
+         (timeline (handler-case-noninterrupt (parse-integer (fourth fields)) (condition nil)))
+         (checkpoint-timeline (handler-case-noninterrupt (parse-integer (fifth fields)) (condition nil)))
+         (namespace (cond ((equal (sixth fields) "legacy") :legacy)
+                          ((equal (sixth fields) "timeline") :timeline)))
          (crc (handler-case-noninterrupt (parse-integer (car (last fields)) :radix 16) (condition nil))))
-    (unless (and (cond (v6 (and (member (length metadata-fields) '(8 11 15 17 21))
-                                (or (not checksum-p) (equal "C1" (first (last shape-fields 2))))
-                                (or (not logical-evidence-p)
-                                    (equal "L" (first (last base-fields 3))))))
-                       (identities (= (length fields) 7))
-                       (v4 (= (length fields) 5))
-                       (t (and (= (length fields) 4)
-                               (member version '("PGWAL2" "PGWAL3") :test #'equal))))
+    (unless (and (equal "PGWAL6" (first fields))
+                 (member (length metadata-fields) '(8 11 15 17 21))
+                 (or (not checksum-p) (equal "C1" (first (last shape-fields 2))))
+                 (or (not logical-evidence-p) (equal "L" (first (last base-fields 3))))
                  (typep checkpoint '(unsigned-byte 64))
                  (typep durable '(unsigned-byte 64)) (<= checkpoint durable)
                  (typep timeline '(integer 1 4294967295))
@@ -546,18 +537,13 @@ The control CRC does not verify relation pages. Legacy resource facts may be unk
                  (<= checkpoint-timeline timeline) namespace
                  crc (= crc (wal-crc32 (string->bytes (format nil "~{~a~^ ~}" (butlast fields))))))
       (error "corrupt WAL control image"))
-    (let* ((payload (if v6 (seventh fields) (sixth fields)))
-           (snapshot
-             (cond ((and identities (not (equal payload "-")))
-                    (wal-checkpoint-snapshot-from-hex payload))
-                   (v4 (wal-checkpoint-snapshot-from-hex (fourth fields))))))
+    (let* ((payload (seventh fields))
+           (snapshot (unless (equal payload "-")
+                       (wal-checkpoint-snapshot-from-hex payload))))
       (when (and snapshot (or (/= checkpoint (getf snapshot :end))
                               (/= checkpoint-timeline (getf snapshot :timeline))))
         (error "checkpoint control copy names another record or timeline"))
-      (let ((metadata
-              (when v6
-                (wal-decode-control-metadata
-                 metadata-fields))))
+      (let ((metadata (wal-decode-control-metadata metadata-fields)))
         (when logical-evidence-p
           (setf metadata
                 (append metadata
