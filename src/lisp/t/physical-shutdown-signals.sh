@@ -226,12 +226,29 @@ snapshot_data >"$TMP/data-after.json"
 cmp "$TMP/data-before.json" "$TMP/data-after.json"
 control_state clean --applied "$applied"
 
-# Legacy state is unknown, never inferred clean from a valid applied position.
-STAGE=legacy-control-migration
-control_state legacy --legacy-fixture --applied "$applied"
+# Retired formats must fail before startup changes the standby's data.
+STAGE=retired-recovery-control
+cp "$TMP/copy/physical-recovery.control" "$TMP/current-recovery.control"
+for version in 1 2; do
+    control_state clean --retired-fixture "$version" --applied "$applied"
+    cp "$TMP/copy/physical-recovery.control" "$TMP/retired-recovery.control"
+    startup_status=0
+    timeout -k 5 20 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
+        >"$TMP/retired-control-$version.log" 2>&1 || startup_status=$?
+    test "$startup_status" -eq 1
+    case "$version" in
+        1) diagnostic='invalid physical recovery control length' ;;
+        2) diagnostic='corrupt or unsupported physical recovery control' ;;
+    esac
+    grep -q "$diagnostic" "$TMP/retired-control-$version.log"
+    cmp "$TMP/retired-recovery.control" "$TMP/copy/physical-recovery.control"
+    snapshot_data >"$TMP/data-after.json"
+    cmp "$TMP/data-before.json" "$TMP/data-after.json"
+    cp "$TMP/current-recovery.control" "$TMP/copy/physical-recovery.control"
+done
+STAGE=restart-current-control
 start_target
 wait_target 'SELECT count(*) FROM signal_data' 7
-checked target '(assert (null (getf *physical-recovery-state* :previous-db-state)))' legacy-unknown
 test "$(sql "$TARGET_PORT" 'SELECT pg_is_in_recovery()')" = t
 if sql "$TARGET_PORT" 'INSERT INTO signal_data VALUES (999)' >"$TMP/reject-primary-write.log" 2>&1; then exit 1; fi
 kill -INT "$TARGET"
@@ -239,4 +256,4 @@ wait_exit 0
 control_state clean --applied "$applied"
 checked source '(assert (loop repeat 100 thereis (with-wal-critical (not (gethash "signals_base" *physical-source-senders*))) do (sleep 0.05)))' sender-stopped
 checked source '(physical-source-pin-release "signals_base")' release
-echo 'physical-shutdown-signals: clean/active state, migration, startup/shutdown fsync, signals and restart PASS'
+echo 'physical-shutdown-signals: clean/active state, retired control rejection, startup/shutdown fsync, signals and restart PASS'

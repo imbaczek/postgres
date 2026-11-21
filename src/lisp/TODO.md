@@ -135,6 +135,11 @@ and digest seed. A checksummed PGPHYS02 image is rejected without rewriting
 it. PGPHYS03 still supports control with no history selection, with history
 selection, and with a retained-root identity.
 
+For B10, startup requires PGRSTAT3 for ordinary recovery or PGRSTAT4 for
+pending promotion. The signal harness checks rejection of both retired
+formats, preservation of their bytes and recovery data, and successful restart
+with the restored current control.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The

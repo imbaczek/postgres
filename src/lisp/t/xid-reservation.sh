@@ -132,7 +132,7 @@ checked source '(assert (active-xids-empty-p))' no-active
 checked source '(setf *next-xid* *xid-batch-end*)' consume-old-capacity
 old_end=$(cat "$TMP/source/global/pg_control")
 checked source "(setf *xid-reservation-test-hook* (lambda (point end) (when (eq point :after-wal-flush) (setf *xid-reservation-test-hook* nil) (with-open-file (out \"$TMP/flushed-end\" :direction :output) (format out \"~d~%\" end)) (loop repeat 400 until (probe-file \"$TMP/release\") do (sleep 0.05)) (unless (probe-file \"$TMP/release\") (error \"reservation barrier timed out\")))))" barrier
-sql "$PORT" 'BEGIN; SELECT count(*) FROM xid_rows; ROLLBACK' >"$TMP/reader.log" 2>&1 &
+sql "$PORT" 'BEGIN; SELECT txid_current(); ROLLBACK' >"$TMP/reader.log" 2>&1 &
 READER=$!
 attempt=0
 while [ ! -s "$TMP/flushed-end" ]; do
@@ -159,7 +159,7 @@ assert_target "$new_end" restored-floor
 # Reservation bytes may reach disk before pg_wal_control advances, too.
 cp "$TMP/source/global/pg_wal_control" "$TMP/old-wal-control"
 checked source '(setf *wal-test-pause-at* "after-wal-bytes-flush")' arm-reservation-bytes
-sql "$PORT" 'BEGIN; SELECT count(*) FROM xid_rows; ROLLBACK' >"$TMP/reader-bytes.log" 2>&1 &
+sql "$PORT" 'BEGIN; SELECT txid_current(); ROLLBACK' >"$TMP/reader-bytes.log" 2>&1 &
 READER=$!
 attempt=0
 while [ ! -f "$TMP/source/pg_wal/test-paused-after-wal-bytes-flush" ]; do
@@ -177,12 +177,12 @@ checked source "(assert (= *next-xid* *xid-batch-end* (load-next-xid) $new_end))
 wait_applied
 assert_target "$new_end" adopted-tail-replica
 
-# Reader transactions allocate native IDs but produce no row-change WAL.
+# Explicit XID requests allocate native IDs without producing row-change WAL.
 python3 - "$TMP/readers.sql" <<'PY'
 import sys
 with open(sys.argv[1], "w") as stream:
     for _ in range(1005):
-        stream.write("BEGIN; SELECT count(*) FROM xid_rows; ROLLBACK;\n")
+        stream.write("BEGIN; SELECT txid_current(); ROLLBACK;\n")
 PY
 PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
     -qAt -v ON_ERROR_STOP=1 -f "$TMP/readers.sql" >"$TMP/readers.log"
@@ -191,7 +191,7 @@ test "$final_end" -gt "$new_end"
 wait_applied
 assert_target "$final_end" read-only-floor
 sql "$TARGET_PORT" CHECKPOINT
-checked target "(let* ((rp (physical-restartpoint-read *physical-recovery-state*)) (state (getf rp :source-reservation))) (assert (and (= 3 (getf rp :version)) (getf state :complete) (= (getf state :bound) (1- $final_end)) (= (getf state :through) (getf rp :lsn)))))" compacted-floor
+checked target "(let* ((rp (physical-restartpoint-read *physical-recovery-state*)) (state (getf rp :source-reservation))) (assert (and (= 4 (getf rp :version)) (getf state :complete) (= (getf state :bound) (1- $final_end)) (= (getf state :through) (getf rp :lsn)))))" compacted-floor
 kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
 start_target
 assert_target "$final_end" restored-read-only-floor
