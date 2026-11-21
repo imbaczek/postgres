@@ -429,8 +429,17 @@ still has work outstanding.
   checks. The rebinding regression verifies that the held descriptor
   still sees the original host's marker after replacement of its pathname.
   All 33 strict retained-root test heads passed.
-  Host ownership across continuation restoration still needs verification
-  before opening GC. The imported-host fence stays closed.
+  In `5fa2400bbd3`, cold import reads the base reservation checkpoint
+  using the WAL namespace and checkpoint timeline from its bound copy
+  control. A fresh timeline-qualified source-proof workflow and three
+  strict namespace and reservation test heads passed.
+  An instrumented imported-main run restored both slots before catalog
+  initialization on three boots and preserved SQL writes across restarts.
+  Removing proof after PID ownership caused the pre-WAL recheck to refuse
+  startup without initializing WAL, slots, or the catalog. The continuation
+  fence remained closed and the checked storage inputs were preserved.
+  Enabling GC still requires a deletion-time ownership and retention
+  proof for the restored host and archive.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
