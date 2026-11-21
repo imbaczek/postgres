@@ -90,8 +90,11 @@ helpers.
   replay, adoption planning and reseed installation, activation and
   retirement match current snapshots against the existing persisted
   witnesses. The follow controller holds named snapshots through planning
-  and serializes them when building the binding. Logical slot copy still
-  carries positional state in memory.
+  and serializes them when building the binding. Logical slot copy carries
+  snapshots through source scans, publication, installation, and cold
+  restoration. Private proof images copy the snapshot and compare every
+  field. Existing follow bindings and detached physical adoption and reseed
+  observations retain their eleven-field value images.
 
 ## Open development tasks
 

@@ -33,7 +33,7 @@
             (logical-slot-copy-committed-proof-metadata proof)
             (logical-slot-copy-committed-proof-prefix proof)
             (logical-slot-copy-committed-proof-generation proof)
-            (logical-slot-copy-committed-proof-tuple proof)
+            (logical-slot-copy-committed-proof-receive-control proof)
             (logical-slot-copy-committed-proof-observations proof))))))
 
 (defun logical-slot-copy-install-preparation-record (owner context attempt)
@@ -49,7 +49,7 @@
 (defun logical-slot-copy-install-recheck-source (context attempt)
   "Recheck the committed source against the detached proof."
   (let ((proof (logical-slot-copy-install-preparation-proof attempt)))
-    (multiple-value-bind (fact history tuple)
+    (multiple-value-bind (fact history receive-control)
         (logical-slot-copy-check-committed-source
          context (logical-slot-copy-install-preparation-certificate attempt)
          (logical-slot-copy-committed-proof-evidence proof)
@@ -66,11 +66,11 @@
                     fact (logical-slot-copy-install-preparation-fact attempt))
                    (logical-slot-copy-committed-image-equal-p
                     history (logical-slot-copy-install-preparation-history attempt))
-                   (equal tuple (logical-slot-copy-committed-proof-tuple proof)))
+                   (physical-receive-control-equal-p receive-control (logical-slot-copy-committed-proof-receive-control proof)))
         (error "logical installation preparation source proof changed")))))
 
 (defun logical-slot-copy-install-check-preparation (owner context attempt &key source)
-  "Check the registered attempt, held input, receive tuple and capacity.
+  "Check the registered attempt, held input, receive control and capacity.
 With SOURCE, also recheck the full committed source proof."
   (let* ((record (logical-slot-copy-install-preparation-record owner context attempt))
          (proof (logical-slot-copy-install-preparation-proof attempt))
@@ -81,9 +81,9 @@ With SOURCE, also recheck the full committed source proof."
              (second record) (logical-slot-copy-install-preparation-image attempt))
       (error "logical installation preparation image changed"))
     (physical-store-check-live store)
-    (unless (equal (logical-slot-copy-committed-proof-tuple proof) (physical-store-control-tuple store))
-      (error "logical installation preparation receive tuple changed"))
-    (physical-store-read-retained-control store (logical-slot-copy-committed-proof-tuple proof))
+    (unless (physical-receive-control-equal-p (logical-slot-copy-committed-proof-receive-control proof) (physical-store-control-snapshot store))
+      (error "logical installation preparation receive control changed"))
+    (physical-store-read-retained-control store (logical-slot-copy-committed-proof-receive-control proof))
     (logical-slot-copy-input-check-observations
      owner context (logical-slot-copy-committed-proof-observations proof))
     (logical-slot-copy-import-check-capacity

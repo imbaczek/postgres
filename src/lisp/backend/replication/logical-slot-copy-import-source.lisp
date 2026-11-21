@@ -70,8 +70,8 @@ D is the copy base end; the pending source checkpoint at F is distinct."
 
 (defun logical-slot-copy-import-scan (store state manifest descriptor control)
   "Check D through durable flush and derive logical evidence at clean F.
-Capture the receive tuple and independent state image for later rechecking."
-  (let* ((tuple (physical-store-control-tuple store))
+Capture the receive control and independent state image for later rechecking."
+  (let* ((receive-control (physical-store-control-snapshot store))
          (state-image (logical-slot-copy-import-state-image state))
          (candidate (physical-follow-copy-checked-store store))
          (index (physical-follow-controller-index candidate))
@@ -91,9 +91,9 @@ Capture the receive tuple and independent state image for later rechecking."
                     t))
            (fact (getf result :applied-logical-fact))
            (history (physical-store-retained-history candidate)))
-      (unless (equal tuple (physical-store-control-tuple store))
+      (unless (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
         (error "logical import receive selection changed during source scan"))
-      (values fact history tuple state-image))))
+      (values fact history receive-control state-image))))
 
 (defun logical-slot-copy-import-recovery-plan (owner control)
   "Select the live restartpoint or the pending promotion state and metadata."
@@ -105,8 +105,9 @@ Capture the receive tuple and independent state image for later rechecking."
           (values state metadata prefix generation)))))
 
 (defun logical-slot-copy-import-state-image (value)
-  "Copy recovery lists, strings, vectors and timeline entries to detect alias changes."
+  "Copy recovery containers and records to detect alias changes."
   (typecase value
+    (physical-receive-control (copy-physical-receive-control value))
     (timeline-history-entry (copy-timeline-history-entry value))
     (cons (cons (logical-slot-copy-import-state-image (car value))
                 (logical-slot-copy-import-state-image (cdr value))))
@@ -195,8 +196,8 @@ The caller holds the receive-store scope; these detached bytes confer no authori
     (owner context store descriptor observations manifest control state metadata prefix generation
      &key (emit-test-point t))
   "Scan the retained source once and return detached classifications at F.
-Recheck the selected plan, receive tuple, input observations, and sidecars."
-  (multiple-value-bind (fact history tuple state-image)
+Recheck the selected plan, receive control, input observations, and sidecars."
+  (multiple-value-bind (fact history receive-control state-image)
       (logical-slot-copy-import-scan store state manifest descriptor control)
     (let* ((fork (getf control :applied))
            (parent (getf control :applied-timeline (getf control :timeline)))
@@ -232,7 +233,7 @@ Recheck the selected plan, receive tuple, input observations, and sidecars."
       (when emit-test-point
         (logical-slot-copy-verification-test-point :after-import-source-scan context))
       (physical-slot-check-standby-receive store state fork)
-      (unless (equal tuple (physical-store-control-tuple store))
+      (unless (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
         (error "logical import receive selection changed after source preparation"))
       (logical-slot-copy-import-recheck-plan
        owner control state state-image metadata prefix generation)

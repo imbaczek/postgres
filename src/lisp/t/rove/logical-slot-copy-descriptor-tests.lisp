@@ -33,8 +33,9 @@
          (before (logical-slot-copy-import-state-image value))
          (evidence-before (logical-slot-copy-import-evidence-encode evidence))
          (descriptor-before (logical-slot-copy-descriptor-encode descriptor))
+         (receive-control (physical-receive-control-from-fields 1 1 0 32 salt 0 0 nil nil salt nil))
          (proof (logical-slot-copy-committed-proof-image
-                 evidence descriptor value value value value prefix value value value)))
+                 evidence descriptor value value value value prefix value receive-control value)))
     (setf (char (getf value :name) 0) #\c
           (getf value :number) (float salt 1d0)
           (aref (getf value :bytes) 0) 3
@@ -46,13 +47,21 @@
          (equalp descriptor-before
                  (logical-slot-copy-descriptor-encode (logical-slot-copy-committed-proof-descriptor proof)))
          (= 2 (aref (logical-slot-copy-committed-proof-prefix proof) 0))
+         (let ((saved (logical-slot-copy-committed-proof-receive-control proof)))
+           (and (not (eq receive-control saved))
+                (physical-receive-control-equal-p receive-control saved)))
+         (logical-slot-copy-committed-image-equal-p
+          (list receive-control)
+          (list (physical-receive-control-from-fields 1 1 0 32 salt 0 0 nil nil salt nil)))
+         (not (logical-slot-copy-committed-image-equal-p
+               (list receive-control)
+               (list (physical-receive-control-from-fields 1 1 0 32 (1+ salt) 0 0 nil nil salt nil))))
          (every (lambda (image) (logical-slot-copy-committed-image-equal-p before image))
                 (list (logical-slot-copy-committed-proof-manifest proof)
                       (logical-slot-copy-committed-proof-control proof)
                       (logical-slot-copy-committed-proof-state proof)
                       (logical-slot-copy-committed-proof-metadata proof)
                       (logical-slot-copy-committed-proof-generation proof)
-                      (logical-slot-copy-committed-proof-tuple proof)
                       (logical-slot-copy-committed-proof-observations proof))))))
 
 (rove:deftest committed-source-detached-proof-generated-contract

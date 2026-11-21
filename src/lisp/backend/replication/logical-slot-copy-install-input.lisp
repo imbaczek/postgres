@@ -39,15 +39,15 @@ When requested, also check physical slot WAL coverage under the source lease."
     layout))
 
 (defun logical-slot-copy-install-check-input-observations (owner context input)
-  "Recheck the retained receive tuple and all stable input and child observations."
+  "Recheck the retained receive control and all stable input and child observations."
   (let* ((proof (logical-slot-copy-install-input-proof input))
          (store (logical-slot-copy-install-input-store input))
-         (tuple (logical-slot-copy-committed-proof-tuple proof))
+         (receive-control (logical-slot-copy-committed-proof-receive-control proof))
          (observations (logical-slot-copy-committed-proof-observations proof)))
     (physical-store-check-live store)
-    (unless (equal tuple (physical-store-control-tuple store))
-      (error "logical installation input receive tuple changed"))
-    (physical-store-read-retained-control store tuple)
+    (unless (physical-receive-control-equal-p receive-control (physical-store-control-snapshot store))
+      (error "logical installation input receive control changed"))
+    (physical-store-read-retained-control store receive-control)
     (logical-slot-copy-input-check-observations owner context observations)
     (dolist (row observations)
       (unless (equal row (logical-slot-copy-file-row context (first row)))
@@ -56,7 +56,7 @@ When requested, also check physical slot WAL coverage under the source lease."
 (defun logical-slot-copy-install-recheck-input-source (context input)
   "Reprove the actual retained source and child under the reader lease."
   (let ((proof (logical-slot-copy-install-input-proof input)))
-    (multiple-value-bind (fact history tuple)
+    (multiple-value-bind (fact history receive-control)
         (logical-slot-copy-check-committed-source
          context (logical-slot-copy-install-input-certificate input)
          (logical-slot-copy-committed-proof-evidence proof)
@@ -71,7 +71,7 @@ When requested, also check physical slot WAL coverage under the source lease."
          (logical-slot-copy-install-input-store input))
       (unless (and (logical-slot-copy-committed-image-equal-p fact (logical-slot-copy-install-input-fact input))
                    (logical-slot-copy-committed-image-equal-p history (logical-slot-copy-install-input-history input))
-                   (equal tuple (logical-slot-copy-committed-proof-tuple proof)))
+                   (physical-receive-control-equal-p receive-control (logical-slot-copy-committed-proof-receive-control proof)))
         (error "logical installation source proof changed")))))
 
 (defun logical-slot-copy-install-check-input (owner context input &key (source t))
