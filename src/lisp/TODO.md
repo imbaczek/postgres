@@ -178,6 +178,9 @@ The first A8 slice moves SQL type OIDs and lengths into
 `utils/adt/sql-types.lisp`. The analyzer, catalog, extended query protocol,
 and pgoutput paths share those identities. The pgoutput encoder and
 subscriber share their supported type set while retaining their own codecs.
+INSERT and UPDATE assignments share the varchar length rule, including
+space-only excess and SQLSTATE 22001. Explicit casts keep their own truncation
+behavior.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename

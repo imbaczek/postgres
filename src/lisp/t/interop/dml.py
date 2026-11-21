@@ -12,11 +12,16 @@ SETUP = (
     "CREATE INDEX dml_source_id ON dml_source(id)",
     "CREATE TABLE dml_target(id int PRIMARY KEY,label varchar(5) UNIQUE,v int DEFAULT nextval('dml_seq'))",
     "CREATE TABLE dml_nullable(id int UNIQUE NULLS NOT DISTINCT,v int)",
+    "CREATE TABLE dml_varchar(v varchar(2))",
     "CREATE TABLE dml_self(id int PRIMARY KEY,v int)",
     "INSERT INTO dml_self VALUES(1,10),(2,20)",
 )
 
 CASES = [
+    "INSERT INTO dml_varchar VALUES ('éλ  ') RETURNING v",
+    "UPDATE dml_varchar SET v = 'λé  ' RETURNING v",
+    "UPDATE dml_varchar SET v = 'éλx' RETURNING v",
+    "INSERT INTO dml_varchar VALUES ('éλx'::varchar(2)) RETURNING v",
     "INSERT INTO dml_target SELECT * FROM dml_source ORDER BY id RETURNING *",
     "INSERT INTO dml_target SELECT 9,'nine',90 WHERE false RETURNING id,label",
     "INSERT INTO dml_target(id) SELECT 4 RETURNING id,label,v",
