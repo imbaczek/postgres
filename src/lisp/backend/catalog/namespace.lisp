@@ -698,8 +698,7 @@ Capture policy and keep size once for every row in the snapshot."
   "Return PostgreSQL's default typstorage code for a supported TYPE."
   (cond ((member type '(:numeric :inet)) #\m)
         ((or (sql-array-element-type type)
-             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record
-                            :bytea-array :json-array :jsonb-array)))
+             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record)))
          #\x)
         (t #\p)))
 
@@ -714,12 +713,11 @@ Capture policy and keep size once for every row in the snapshot."
   "Return the native typalign code for a supported type."
   (let ((element (sql-array-element-type type)))
     (cond
-      (element (if (member element '(:int8 :float8 :time :timetz :timestamp
-                                     :timestamptz :interval :pg-lsn))
-                   #\d #\i))
+      ;; PostgreSQL promotes array alignment to at least int alignment.
+      (element (if (char= (sql-type-alignment-code element) #\d) #\d #\i))
       ((member type '(:bool :char :name)) #\c)
       ((eq type :int2) #\s)
-      ((member type '(:int8 :float8 :time :timetz :timestamp :timestamptz
+      ((member type '(:int8 :oid8 :float8 :time :timetz :timestamp :timestamptz
                       :interval :pg-lsn :record)) #\d)
       (t #\i))))
 

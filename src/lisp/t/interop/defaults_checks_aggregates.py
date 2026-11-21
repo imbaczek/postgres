@@ -7,6 +7,8 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT oid, typalign, typstorage FROM pg_catalog.pg_type "
+    "WHERE oid IN (20, 21, 1005, 1016, 6437) ORDER BY oid",
     "SELECT CAST('é漢字' AS varchar(2)), 'é漢字'::character varying(2)",
     "SELECT 'x'::varchar(0)",
     "SELECT 'x'::varchar(10485761)",
