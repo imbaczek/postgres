@@ -316,7 +316,6 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 
 (defun key< (a b) (minusp (key-compare a b)))
 (defun key= (a b) (zerop (key-compare a b)))
-(defun key<= (a b) (not (plusp (key-compare a b))))
 
 ;;; ---- entry encoding ----
 
@@ -480,47 +479,46 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 
 ;;; ---- search ----
 
-(defun btree-collect-equal (relfilenode level block key acc)
-  "Push all TIDs whose key equals KEY in the subtree at BLOCK onto ACC.
+(defun btree-equal-child-range (entries key)
+  "Return inclusive child offsets for KEY in a nonempty internal page.
+A split can leave equal keys in the child immediately before the equal run.
+INSERT uses the right endpoint, the last separator at or below KEY, with
+child zero as the fallback. The first separator may be stale after inserts
+below the previous minimum, so examine every entry."
+  (let ((equal-start nil)
+        (first 0)
+        (last 0))
+    (loop for entry in entries
+          for index from 0
+          for order = (key-compare (car entry) key)
+          do (cond
+               ((zerop order)
+                (unless equal-start
+                  (setf equal-start (max 0 (1- index))))
+                (setf first equal-start last index))
+               (t
+                (setf equal-start nil)
+                (when (minusp order)
+                  (setf first index last index)))))
+    (values first last)))
 
-Separators store the minimum key of each child.  Duplicate keys can
-straddle a leaf split, so the same key may occur in several sibling
-subtrees; visit every child that can contain KEY instead of descending
-to a single leaf."
+(defun btree-collect-equal (relfilenode level block key acc)
+  "Push all TIDs whose key equals KEY in the subtree at BLOCK onto ACC."
   (let ((page (buf-read relfilenode block)))
     (unless page
       (ereport "XX000" "index page ~a is missing" block))
     (if (zerop level)
-        (progn
-          (dolist (e (btree-page-entries page nil))
-            (when (key= (first e) key)
-              (push (cons (second e) (third e)) acc)))
-          acc)
+        (dolist (entry (btree-page-entries page nil) acc)
+          (when (key= (first entry) key)
+            (push (cons (second entry) (third entry)) acc)))
         (let ((entries (btree-page-entries page t)))
-          (when (null entries)
-            (return-from btree-collect-equal acc))
-          ;; J is the last child whose minimum key is <= KEY.
-          (let ((j 0))
-            (loop for e in entries
-                  for i from 0
-                  when (key<= (car e) key)
-                    do (setf j i))
-            ;; If separators equal KEY, the run of such separators plus the
-            ;; child immediately to its left can all contain KEY.
-            (let ((start j))
-              (when (key= (car (nth j entries)) key)
-                (loop while (and (> start 0)
-                                 (key= (car (nth (1- start) entries)) key))
-                      do (decf start))
-                (when (> start 0)
-                  (decf start)))
-              (loop for i from start to j
-                    do (setf acc
-                             (btree-collect-equal
-                              relfilenode (1- level)
-                              (cdr (nth i entries))
-                              key acc))))
-            acc)))))
+          (when entries
+            (multiple-value-bind (first last) (btree-equal-child-range entries key)
+              (loop for entry in (nthcdr first entries)
+                    for index from first to last
+                    do (setf acc (btree-collect-equal
+                                  relfilenode (1- level) (cdr entry) key acc)))))
+          acc))))
 
 (defun btree-map-prefix-entries-unlocked (relfilenode prefix function)
   "Visit matching leaf entries in index order under the caller's relation lease."
@@ -574,22 +572,6 @@ to a single leaf."
 
 (defstruct btree-equal-cursor-frame
   level entries (next 0) (end -1))
-
-(defun btree-equal-child-range (entries key)
-  "Return the first and last child that can contain KEY."
-  (let ((last-lower-bound 0))
-    (loop for entry in entries
-          for index from 0
-          when (key<= (car entry) key)
-            do (setf last-lower-bound index))
-    (let ((first-candidate last-lower-bound))
-      (when (key= (car (nth last-lower-bound entries)) key)
-        (loop while (and (> first-candidate 0)
-                         (key= (car (nth (1- first-candidate) entries)) key))
-              do (decf first-candidate))
-        (when (plusp first-candidate)
-          (decf first-candidate)))
-      (values first-candidate last-lower-bound))))
 
 (defun btree-cursor-push-node (cursor level block)
   (let ((page (buf-read (btree-equal-cursor-relfilenode cursor) block)))
@@ -727,13 +709,7 @@ Both pages must be nonempty; signal 54000 if no boundary fits."
                     (mark-dirty relfilenode)
                     (values t (first (first new-entries)) new-block))))))
         (let* ((entries (btree-page-entries page t))
-               (chosen-index
-                 (let ((idx 0))
-                   (loop for e in entries
-                         for i from 0
-                         when (key<= (car e) key)
-                           do (setf idx i))
-                   idx))
+               (chosen-index (nth-value 1 (btree-equal-child-range entries key)))
                (child (cdr (nth chosen-index entries))))
           (multiple-value-bind (split-p sep new-block)
               (btree-insert-rec relfilenode (1- level) child

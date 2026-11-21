@@ -168,6 +168,20 @@
         (setf (symbol-function 'buf-read) old-read
               (symbol-function 'buf-nblocks) old-count))))
 
+(rove:deftest test-btree-equal-child-range-with-duplicate-separators
+    (flet ((index-key (value) (encode-index-key (list value) '(:int4))))
+      (dolist (scenario '(((10 20 20 30) (5 0 0) (10 0 0) (15 0 0) (20 0 2)
+                           (25 2 2) (30 2 3) (35 3 3))
+                          ((30 10 10 20) (5 0 0) (10 0 2) (15 2 2) (20 2 3))))
+        (let ((entries (loop for value in (first scenario)
+                             for child from 1
+                             collect (cons (index-key value) child))))
+          (dolist (bounds (rest scenario))
+            (destructuring-bind (value first last) bounds
+              (rove:ok (equal (list first last)
+                              (multiple-value-list
+                               (btree-equal-child-range entries (index-key value)))))))))))
+
 (rove:deftest test-select-index-iterator-defers-heap-fetch
     (let* ((columns (vector (make-pg-column :name "s" :type :text :attnum 1)
                             (make-pg-column :name "unused" :type :bytea :attnum 2)))

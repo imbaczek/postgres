@@ -197,6 +197,12 @@ derive their result columns through the same preparation entry point. Parse
 and Bind still retain readers before returning, and statement Describe
 recomputes and checks the prepared statement's result signature.
 
+The B-tree point search, resumable equality cursor, and insert routing share
+one internal-page child range. Equality visits the preceding child and every
+child in an equal separator run. Insert uses the right endpoint. The range
+calculation examines the full page because the first separator can be stale.
+Each caller keeps its existing relation lock or read lease.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
