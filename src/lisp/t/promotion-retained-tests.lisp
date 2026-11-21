@@ -458,7 +458,7 @@
                                        :segment 0 :file-timeline 2
                                        :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 prefix)))
                          prefix))
-                 (overlap (overlap-test-metadata 120 base :native t))
+                 (overlap (overlap-test-metadata 120 base))
                  (directory (pg::physical-recovery-retained-directory))
                  (snapshot (sample-checkpoint-snapshot
                             :version 2 :start 472 :end 592 :redo 472 :timeline 3 :prev-timeline 2))
@@ -744,21 +744,23 @@
                (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
                (pg::*wal-poisoned* nil)
                (size pg::+wal-segment-size+)
-               (base-lsn (if split-first 64 96))
+               (checkpoint-size (pg::wal-checkpoint-record-size))
+               (prefix-end (* 3 checkpoint-size))
+               (base-lsn (if split-first (* 2 checkpoint-size) prefix-end))
                (gap (if base-gap (- size base-lsn) rotation-gap))
                (base (concatenate '(vector (unsigned-byte 8))
-                                  (legacy-checkpoint-record 0) (legacy-checkpoint-record 32)
-                                  (legacy-checkpoint-record 64)))
+                                  (physical-test-checkpoint-record 0) (physical-test-checkpoint-record checkpoint-size)
+                                  (physical-test-checkpoint-record (* 2 checkpoint-size))))
                (filler (if base-gap (make-array 0 :element-type '(unsigned-byte 8))
                            (pg::wal-encode-record
-                            (if cursor-records pg::+wal-record-maintenance+ pg::+wal-record-batch-start+) 0 96
-                            (make-array (- size 128 gap) :element-type '(unsigned-byte 8) :initial-element 0))))
+                            (if cursor-records pg::+wal-record-maintenance+ pg::+wal-record-batch-start+) 0 prefix-end
+                            (make-array (- size prefix-end pg::+wal-header-size+ gap) :element-type '(unsigned-byte 8) :initial-element 0))))
                (first (concatenate '(vector (unsigned-byte 8)) base filler))
                (middle-bytes (pg::wal-encode-record
                               (if cursor-records pg::+wal-record-maintenance+ pg::+wal-record-batch-start+) 0 size
-                              (make-array (- size 32) :element-type '(unsigned-byte 8) :initial-element 0)))
-               (last (legacy-checkpoint-record (* 2 size)))
-               (fork (+ (* 2 size) 32))
+                              (make-array (- size pg::+wal-header-size+) :element-type '(unsigned-byte 8) :initial-element 0)))
+               (last (physical-test-checkpoint-record (* 2 size)))
+               (fork (+ (* 2 size) (length last)))
                (eor (pg::wal-encode-end-of-recovery-record fork 42 2 1 1))
                (snapshot (sample-checkpoint-snapshot
                           :version 2 :start (+ fork 56) :end (+ fork 176) :redo (+ fork 56)
@@ -797,10 +799,10 @@
                    (small (copy-list metadata)) (large (copy-list metadata))
                    (digest (pg::physical-store-update-digest
                             #xCBF29CE484222325 (subseq base base-lsn))))
-              (setf (getf small :end) 96 (getf small :end-digest) digest
+              (setf (getf small :end) prefix-end (getf small :end-digest) digest
                     (getf small :prefix-digest)
                     (pg::physical-store-update-digest #xCBF29CE484222325 base)
-                    (getf large :start) 96 (getf large :start-digest) digest
+                    (getf large :start) prefix-end (getf large :start-digest) digest
                     images (list* (pg::physical-retained-extent-encode small base)
                                   (pg::physical-retained-extent-encode large first)
                                   (rest images)))))
@@ -814,9 +816,9 @@
                  (metadata (list :system-id (pg::catalog-system-identifier)
                                  :db-state pg::+db-in-production+ :state-time 42 :retained-reference reference))
                  (request (list :version 1 :system-id (pg::catalog-system-identifier)
-                                :base-timeline 1 :base 32 :manifest-digest 88
+                                :base-timeline 1 :base checkpoint-size :manifest-digest 88
                                 :source-timeline 2 :receive-timeline 1
-                                :receive-lsn 96 :receive-digest 91 :overlap-start 0
+                                :receive-lsn prefix-end :receive-digest 91 :overlap-start 0
                                 :overlap-digest (pg::physical-store-update-digest #xCBF29CE484222325 base)
                                 :history-text (store-history-text 1 fork) :eor-octets (coerce eor 'list))))
             (pg::wal-ensure-directory-durable (pg::wal-directory))
@@ -905,7 +907,7 @@
                 (setf (aref payload 0) 1)
                 (pg::wal-atomic-write-bytes
                  path (concatenate '(vector (unsigned-byte 8)) (getf fixture :base)
-                                   (pg::wal-encode-record pg::+wal-record-maintenance+ 0 96 payload)))))
+                                   (pg::wal-encode-record pg::+wal-record-maintenance+ 0 360 payload)))))
              (:fifo (sb-posix:mkfifo (namestring path) #o600)))
            (call-with-test-logical-wal-archive
             (lambda (archive)
@@ -918,11 +920,11 @@
                                (error "archive-only cursor opened a local shadow"))
                              (apply open candidate arguments)))
                      (pg::call-with-logical-wal-cursor
-                      (pg::logical-wal-archive-history archive) :timeline 96 pg::+wal-segment-size+
+                      (pg::logical-wal-archive-history archive) :timeline 360 pg::+wal-segment-size+
                       1 :prefix-end (lambda () t)
                       (lambda (cursor)
                         (multiple-value-bind (record raw) (pg::logical-wal-cursor-next cursor)
-                          (ok (= 96 (pg::wal-record-start record)))
+                          (ok (= 360 (pg::wal-record-start record)))
                           (ok (equalp raw (getf fixture :filler))))
                         (ok (null (pg::logical-wal-cursor-next cursor))))
                       :archive archive :archive-only t)
@@ -938,7 +940,7 @@
            (call-with-test-logical-wal-archive
             (lambda (archive)
               (pg::call-with-logical-wal-cursor
-               (pg::logical-wal-archive-history archive) :timeline 96 (* 2 pg::+wal-segment-size+)
+               (pg::logical-wal-archive-history archive) :timeline 360 (* 2 pg::+wal-segment-size+)
                1 :prefix-end (lambda () t)
                (lambda (cursor)
                  (when (eq mode :rotation)
@@ -969,12 +971,12 @@
                              (error "injected archive object read failure"))
                            (funcall reader directory kind id maximum)))
                    (pg::call-with-logical-wal-cursor
-                    (pg::logical-wal-archive-history archive) :timeline 96 pg::+wal-segment-size+
+                    (pg::logical-wal-archive-history archive) :timeline 360 pg::+wal-segment-size+
                     1 :prefix-end (lambda () t)
                     (lambda (cursor)
                       (ok (signals (pg::logical-wal-cursor-next cursor) 'error))
                       (ok (= 1 reads))
-                      (ok (= 96 (pg::logical-wal-cursor-position cursor))))
+                      (ok (= 360 (pg::logical-wal-cursor-position cursor))))
                     :archive archive :archive-only t))
               (setf (symbol-function 'pg::physical-retained-object-read) reader))))))
      :cursor-records t))
@@ -1002,29 +1004,29 @@
             (pg::logical-wal-archive-prepare archive 0 1)
             (labels ((cursor (function)
                        (pg::call-with-logical-wal-cursor
-                        (pg::logical-wal-archive-history archive) :timeline 32 64 1 :prefix-end
+                        (pg::logical-wal-archive-history archive) :timeline 120 240 1 :prefix-end
                         (lambda () t) function :archive archive)))
               (pg::wal-atomic-write-bytes path (getf fixture :first))
               (cursor
                (lambda (reader)
                  (multiple-value-bind (record raw) (pg::logical-wal-cursor-next reader)
-                   (ok (= 32 (pg::wal-record-start record)))
-                   (ok (= 64 (pg::wal-record-end record)))
-                   (ok (equalp raw (subseq (getf fixture :base) 32 64))))))
+                   (ok (= 120 (pg::wal-record-start record)))
+                   (ok (= 240 (pg::wal-record-end record)))
+                   (ok (equalp raw (subseq (getf fixture :base) 120 240))))))
               (let ((bytes (copy-seq (getf fixture :first)))
-                    (replacement (lineage-test-record 32 32 0)))
-                (pg::wal-decode-record replacement 32)
-                (replace bytes replacement :start1 32 :end1 64)
+                    (replacement (lineage-test-record 120 120 0)))
+                (pg::wal-decode-record replacement 120)
+                (replace bytes replacement :start1 120 :end1 240)
                 (pg::wal-atomic-write-bytes path bytes)
                 (ok (equalp replacement (subseq (pg::read-bounded-regular-file
-                                                 path pg::+wal-segment-size+) 32 64))))
+                                                 path pg::+wal-segment-size+) 120 240))))
               (cursor
                (lambda (reader)
                  (let ((message
                          (handler-case (progn (pg::logical-wal-cursor-next reader) nil)
                            (error (condition) (princ-to-string condition)))))
                    (ok (and message (search "record differs from certified archive" message))))
-                 (ok (= 32 (pg::logical-wal-cursor-position reader)))))
+                 (ok (= 120 (pg::logical-wal-cursor-position reader)))))
               (delete-file path)
               (ok (null (probe-file path)))
               (cursor
@@ -1033,7 +1035,7 @@
                          (handler-case (progn (pg::logical-wal-cursor-next reader) nil)
                            (error (condition) (princ-to-string condition)))))
                    (ok (and message (search "outside certified archive coverage" message))))
-                 (ok (= 32 (pg::logical-wal-cursor-position reader))))))))))
+                 (ok (= 120 (pg::logical-wal-cursor-position reader))))))))))
      :cursor-records t))
 
 (deftest logical-wal-cursor-rechecks-archive-lifetime-and-history-with-a-generic-guard
@@ -1052,13 +1054,13 @@
               (let ((message
                       (handler-case
                           (pg::call-with-logical-wal-cursor
-                           wrong :timeline 96 96 1 :prefix-end (lambda () t) #'identity :archive archive)
+                           wrong :timeline 360 360 1 :prefix-end (lambda () t) #'identity :archive archive)
                         (error (condition) (princ-to-string condition)))))
                 (ok (and message (search "differs from its archive history or namespace" message)))))))
          (let ((message
                  (handler-case
                      (pg::call-with-logical-wal-cursor
-                      history :timeline 96 96 1 :prefix-end (lambda () t) #'identity :archive escaped)
+                      history :timeline 360 360 1 :prefix-end (lambda () t) #'identity :archive escaped)
                    (error (condition) (princ-to-string condition)))))
            (ok (and message (search "outside its selected source scope" message))))))
      :cursor-records t))
@@ -1069,12 +1071,12 @@
        (declare (ignore fixture))
        (let ((pg::*wal-ready* t))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (multiple-value-bind (record raw) (pg::logical-wal-cursor-next cursor)
               (declare (ignore record))
               (let* ((cache (pg::logical-wal-archive-cache-bytes archive))
-                     (index (+ 96 pg::+wal-header-size+))
+                     (index (+ 360 pg::+wal-header-size+))
                      (old (aref cache index)))
                 (setf (aref raw pg::+wal-header-size+) (logxor 1 old))
                 (ok (= old (aref cache index)))
@@ -1088,7 +1090,7 @@
        (let ((pg::*wal-ready* t) (called nil)
                                  (decode (symbol-function 'pg::wal-decode-record)))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (pg::logical-wal-archive-prepare archive 0 1)
             (unwind-protect
@@ -1115,7 +1117,7 @@
        (let ((pg::*wal-ready* t) (called nil)
                                  (read-object (symbol-function 'pg::physical-retained-object-read)))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (declare (ignore archive))
             (unwind-protect
@@ -1133,7 +1135,7 @@
                              (error (condition) (princ-to-string condition)))))
                      (ok (and message (search "cursor changed during archive preparation" message))))
                    (ok called)
-                   (ok (= 97 (pg::logical-wal-cursor-position cursor))))
+                   (ok (= 361 (pg::logical-wal-cursor-position cursor))))
               (setf (symbol-function 'pg::physical-retained-object-read) read-object))))))
      :cursor-records t))
 
@@ -1142,7 +1144,7 @@
      (lambda (fixture)
        (let ((pg::*wal-ready* t))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (multiple-value-bind (record raw) (pg::logical-wal-cursor-next cursor)
               (ok (= pg::+wal-segment-size+ (pg::wal-record-start record)))
@@ -1157,13 +1159,13 @@
        (let ((pg::*wal-ready* t))
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 0 1 :timeline) (getf fixture :base))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (let ((message
                     (handler-case (progn (pg::logical-wal-cursor-next cursor) nil)
                       (error (condition) (princ-to-string condition)))))
               (ok (and message (search "geometry differs from certified archive" message))))
-            (ok (= 96 (pg::logical-wal-cursor-position cursor)))
+            (ok (= 360 (pg::logical-wal-cursor-position cursor)))
             (ok (null (pg::logical-wal-archive-cache-bytes archive)))))))
      :cursor-records t :rotation-gap 40))
 
@@ -1175,16 +1177,16 @@
                                     (path (pg::wal-segment-path 0 1 :timeline))
                                     (prepare (symbol-function 'pg::logical-wal-archive-prepare)))
            (ecase kind
-             (:short (pg::wal-atomic-write-bytes path (subseq (getf fixture :first) 0 110)))
+             (:short (pg::wal-atomic-write-bytes path (subseq (getf fixture :first) 0 374)))
              (:corrupt
               (let ((bytes (copy-seq (getf fixture :first))))
-                (setf (aref bytes 128) (logxor 1 (aref bytes 128)))
+                (setf (aref bytes 392) (logxor 1 (aref bytes 392)))
                 (pg::wal-atomic-write-bytes path bytes)))
              (:symlink (sb-posix:symlink (namestring (pg::wal-segment-path 2 2 :timeline)) (namestring path)))
              (:directory (ensure-directories-exist (uiop:ensure-directory-pathname path)))
              (:fifo (sb-posix:mkfifo (namestring path) #o600)))
            (call-with-test-archived-cursor
-            96
+            360
             (lambda (cursor archive)
               (declare (ignore archive))
               (unwind-protect
@@ -1193,7 +1195,7 @@
                            (lambda (&rest arguments) (incf calls) (apply prepare arguments)))
                      (ok (signals (pg::logical-wal-cursor-next cursor) 'error) (format nil "~a" kind))
                      (ok (zerop calls))
-                     (ok (= 96 (pg::logical-wal-cursor-position cursor))))
+                     (ok (= 360 (pg::logical-wal-cursor-position cursor))))
                 (setf (symbol-function 'pg::logical-wal-archive-prepare) prepare))))))
        :cursor-records t)))
 
@@ -1204,7 +1206,7 @@
          (let ((pg::*wal-ready* t) (called nil)
                                    (read-object (symbol-function 'pg::physical-retained-object-read)))
            (call-with-test-archived-cursor
-            96
+            360
             (lambda (cursor archive)
               (declare (ignore archive))
               (unwind-protect
@@ -1218,8 +1220,8 @@
                                      (let ((payload (subseq (getf fixture :filler) pg::+wal-header-size+)))
                                        (setf (aref payload 0) 1)
                                        (let ((record (pg::wal-encode-record
-                                                      pg::+wal-record-maintenance+ 0 96 payload)))
-                                         (pg::wal-decode-record record 96)
+                                                      pg::+wal-record-maintenance+ 0 360 payload)))
+                                         (pg::wal-decode-record record 360)
                                          (setf bytes (concatenate '(vector (unsigned-byte 8))
                                                                   (getf fixture :base) record)))))
                                    (pg::wal-atomic-write-bytes (pg::wal-segment-path 0 1 :timeline) bytes)
@@ -1230,7 +1232,7 @@
                                  (handler-case (progn (pg::logical-wal-cursor-next cursor) nil)
                                    (error (condition) (princ-to-string condition)))))
                            (ok (and message (search "record differs from certified archive" message)))
-                           (ok (= 96 (pg::logical-wal-cursor-position cursor))))
+                           (ok (= 360 (pg::logical-wal-cursor-position cursor))))
                          (multiple-value-bind (record raw) (pg::logical-wal-cursor-next cursor)
                            (ok (= pg::+wal-segment-size+ (pg::wal-record-end record)))
                            (ok (equalp raw (getf fixture :filler)))))
@@ -1243,7 +1245,7 @@
      (lambda (fixture)
        (let ((pg::*wal-ready* t))
          (call-with-test-archived-cursor
-          96
+          360
           (lambda (cursor archive)
             (declare (ignore archive))
             (let ((seen (cursor-test-collect cursor)))
@@ -1295,9 +1297,9 @@
        (let ((pg::*wal-ready* t))
          (ok (signals
               (call-with-test-archived-cursor
-               32 (lambda (cursor archive)
-                    (declare (ignore archive))
-                    (pg::logical-wal-cursor-next cursor)))
+               120 (lambda (cursor archive)
+                     (declare (ignore archive))
+                     (pg::logical-wal-cursor-next cursor)))
               'error))
          (delete-file (pg::wal-segment-path 2 2 :timeline))
          (ok (signals
@@ -1308,7 +1310,7 @@
                  (pg::logical-wal-cursor-next cursor)))
               'error))
          (ok (null (probe-file (pg::wal-segment-path 2 2 :timeline))))
-         (ok (= (+ (* 2 pg::+wal-segment-size+) 32) (getf fixture :fork)))))
+         (ok (= (+ (* 2 pg::+wal-segment-size+) 120) (getf fixture :fork)))))
      :cursor-records t))
 
 (deftest logical-wal-archive-custom-reader-covers-index-overlap-and-extents
@@ -1654,7 +1656,7 @@
          (declare (ignorable root size base filler first middle-bytes last fork eor snapshot checkpoint child identity digest reference request directory metadata))
          (ok (null (probe-file (pg::wal-segment-path 0))))
          (let ((slot (physical-slot-test-object
-                      :restart 33 :timeline 1
+                      :restart 121 :timeline 1
                       :system-id (pg::catalog-system-identifier)))
                (parent-path (pg::wal-segment-path 0 1 :timeline)))
            (pg::wal-atomic-write-bytes parent-path first)
@@ -1662,7 +1664,7 @@
                 (progn
                   (ok (eq slot (pg::physical-slot-check-primary-wal
                                 slot (pg::catalog-system-identifier))))
-                  (pg::wal-atomic-write-bytes parent-path (subseq first 0 95))
+                  (pg::wal-atomic-write-bytes parent-path (subseq first 0 359))
                   (ok (signals (pg::physical-slot-check-primary-wal
                                 slot (pg::catalog-system-identifier)) 'error))
                   (let ((changed (copy-seq first)))
@@ -1687,7 +1689,7 @@
            (let ((command
                    (pg::parse-replication-command
                     (format nil
-                            "START_REPLICATION PHYSICAL 0/00000060 (proof_pin 'old_sibling', native_format '~a', mode 'follow', system_id '~d', timeline '2', base_lsn '0/00000020', prefix_digest '91', manifest_digest '88')"
+                            "START_REPLICATION PHYSICAL 0/00000168 (proof_pin 'old_sibling', native_format '~a', mode 'follow', system_id '~d', timeline '2', base_lsn '0/00000078', prefix_digest '91', manifest_digest '88')"
                             pg::+physical-native-format+ (pg::catalog-system-identifier)))))
              (ok (equal "55000" (recovery-state-of (lambda () (pg::physical-source-acquire-sender command)))))
              (ok (null (gethash "old_sibling" pg::*physical-source-senders*)))
@@ -1698,17 +1700,17 @@
            (setf (gethash "old_sibling" pg::*physical-source-senders*) owner)
            (ok (pg::physical-follow-pin-ready-p pin))
            (multiple-value-bind (record raw durable)
-               (pg::physical-source-read-next "old_sibling" owner 96)
+               (pg::physical-source-read-next "old_sibling" owner 360)
              (declare (ignore raw durable))
              (ok (= size (pg::wal-record-end record))))
            (ok (= (pg::physical-store-update-digest
                    91 (concatenate '(vector (unsigned-byte 8)) filler middle-bytes last eor checkpoint))
                   (pg::physical-source-prove-range
-                   "old_sibling" owner 96 pg::*wal-durable-lsn* 91)))
+                   "old_sibling" owner 360 pg::*wal-durable-lsn* 91)))
            (let ((older (copy-tree request)))
-             (setf (getf older :receive-lsn) 32
+             (setf (getf older :receive-lsn) 120
                    (getf older :overlap-digest)
-                   (pg::physical-store-update-digest #xCBF29CE484222325 (subseq base 0 32)))
+                   (pg::physical-store-update-digest #xCBF29CE484222325 (subseq base 0 120)))
              (ok (signals (pg::physical-source-follow-ready "missing_prebase" older) 'error))
              (ok (null (gethash "missing_prebase" pg::*physical-source-pins*)))
              (pg::wal-atomic-write-bytes (pg::wal-segment-path 0) first)
@@ -1721,7 +1723,7 @@
                (pg::wal-atomic-write-bytes
                 (pg::wal-segment-path 0)
                 (concatenate '(vector (unsigned-byte 8)) base
-                             (pg::wal-encode-record pg::+wal-record-batch-start+ 0 96 payload))))
+                             (pg::wal-encode-record pg::+wal-record-batch-start+ 0 360 payload))))
              (ok (signals (pg::physical-source-follow-ready "conflicting_prebase" older) 'error))
              (ok (null (gethash "conflicting_prebase" pg::*physical-source-pins*)))))
          ))))

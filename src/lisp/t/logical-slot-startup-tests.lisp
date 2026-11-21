@@ -422,11 +422,11 @@
                                   (slot (pg::make-wal-replication-slot
                                          :name "ancestral_private" :database-oid 7 :plugin "pgoutput"
                                          :invalidation-cause :none
-                                         :restart-lsn 96 :restart-timeline 1
-                                         :consistent-lsn 96 :confirmed-flush-lsn 96 :confirmed-timeline 1
+                                         :restart-lsn 360 :restart-timeline 1
+                                         :consistent-lsn 360 :confirmed-flush-lsn 360 :confirmed-timeline 1
                                          :logical-provenance
                                          (pg::make-logical-slot-provenance
-                                          (pg::catalog-system-identifier) 1 96 1 96 1))))
+                                          (pg::catalog-system-identifier) 1 360 1 360 1))))
          (unwind-protect
               (progn
                 (ensure-directories-exist (pg::catalog-path))
