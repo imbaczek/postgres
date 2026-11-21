@@ -4,6 +4,7 @@ from pathlib import Path
 from subqueries import QueryConnection
 from dml_resources import check as check_resources
 from dml_concurrency import check as check_concurrency
+from subqueries_concurrency import control
 
 SETUP = (
     "CREATE SEQUENCE dml_seq",
@@ -15,9 +16,13 @@ SETUP = (
     "CREATE TABLE dml_varchar(v varchar(2))",
     "CREATE TABLE dml_self(id int PRIMARY KEY,v int)",
     "INSERT INTO dml_self VALUES(1,10),(2,20)",
+    "CREATE TABLE dml_successor(id int PRIMARY KEY,v int)",
+    "INSERT INTO dml_successor VALUES(1,10)",
 )
 
 CASES = [
+    "UPDATE dml_successor SET v=20 WHERE id=1 RETURNING old.v,new.v",
+    "INSERT INTO dml_successor VALUES(1,30) ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING old.v,new.v",
     "INSERT INTO dml_varchar VALUES ('éλ  ') RETURNING v",
     "UPDATE dml_varchar SET v = 'λé  ' RETURNING v",
     "UPDATE dml_varchar SET v = 'éλx' RETURNING v",
@@ -127,6 +132,34 @@ CASES = [
 ]
 
 
+def check_successor_chain(base, socket):
+    # Read heap line pointers directly so a successful index lookup cannot
+    # mask a missing link to the replacement tuple.
+    expression = """
+    (let* ((table (gethash "dml_successor" (database-tables (get-database "postgres"))))
+           (rel (pg-class-relfilenode table))
+           (columns (pg-class-columns table))
+           (versions nil))
+      (dotimes (block (smgr-nblocks rel))
+        (do-live-page-items ((buf-read rel block) offnum offset length)
+          (push (heapam-get-tuple rel block offnum columns) versions)))
+      (destructuring-bind (original updated upserted)
+          (sort versions #'< :key (lambda (tuple) (aref (htup-values tuple) 1)))
+        (assert (equal '(10 20 30)
+                       (mapcar (lambda (tuple) (aref (htup-values tuple) 1))
+                               (list original updated upserted))))
+        (flet ((points-to-p (from to)
+                 (and (= (htup-ctid-block from) (htup-block to))
+                      (= (htup-ctid-offnum from) (htup-offnum to)))))
+          (assert (points-to-p original updated))
+          (assert (= (htup-xmax original) (htup-xmin updated)))
+          (assert (points-to-p updated upserted))
+          (assert (= (htup-xmax updated) (htup-xmin upserted)))
+          (assert (points-to-p upserted upserted)))))
+    """
+    control(base, socket, " ".join(expression.splitlines()))
+
+
 def check(reference, native, base, socket):
     peers = [QueryConnection(port, "dml") for port in (reference, native)]
     try:
@@ -146,11 +179,14 @@ def check(reference, native, base, socket):
     finally:
         for peer in peers:
             peer.close()
+    check_successor_chain(base, socket)
     check_concurrency(reference, native, base, socket)
     check_resources(reference, native, base, socket)
 
 
-def check_restart(reference, native):
+def check_restart(reference, native, base, socket):
+    check_successor_chain(base, socket)
+    print("dml: UPDATE and ON CONFLICT heap successor links survive restart PASS", flush=True)
     peers = [QueryConnection(port, "dml-restart") for port in (reference, native)]
     try:
         for sql in ("SELECT id,label,v FROM dml_target ORDER BY id",
@@ -167,7 +203,7 @@ def check_restart(reference, native):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[3] == "restart":
-        check_restart(int(sys.argv[1]), int(sys.argv[2]))
+    if len(sys.argv) == 6 and sys.argv[5] == "restart":
+        check_restart(int(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
     else:
         check(int(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))

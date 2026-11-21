@@ -51,4 +51,4 @@ NATIVE=
 NATIVE=$!
 test_wait_owned_sql_server "$NATIVE" "$PORT" "${PSQL:-psql}"
 timeout --foreground --kill-after=5 30 "$PYTHON" \
-    "$BASE/t/interop/dml.py" "$REFERENCE_PORT" "$PORT" restart
+    "$BASE/t/interop/dml.py" "$REFERENCE_PORT" "$PORT" "$BASE" "$ROOT/native.sock" restart
