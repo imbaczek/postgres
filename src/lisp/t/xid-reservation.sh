@@ -81,8 +81,8 @@ legacy_migration() {
             kill -0 "$TARGET"; sleep 0.05
         done
         kill -KILL "$TARGET"; wait "$TARGET" 2>/dev/null || :; TARGET=
-        python3 - "$BASE" "$TMP/copy" "$TMP/migration-$kind" "$TMP/base-checkpoint.json" <<'PY'
-import json, runpy, sys
+        python3 - "$BASE" "$TMP/copy" "$TMP/migration-$kind" <<'PY'
+import runpy, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 't/interop'))
 decode = runpy.run_path(str(Path(sys.argv[1]) / 't/interop/recovery-control-state.py'))['decode']
@@ -90,8 +90,7 @@ root = Path(sys.argv[2])
 control = decode((root / 'physical-recovery.control').read_bytes())
 previous = decode((Path(sys.argv[3]) / 'physical-recovery.control').read_bytes())
 assert control['version'] == 3 and control['state'] == 5
-assert control['next_xid'] == json.loads(Path(sys.argv[4]).read_text())['next_xid']
-assert control['next_xid'] < int((root / 'global/pg_control').read_text())
+assert control['next_xid'] == previous['next_xid']
 assert control['applied'] == previous['applied']
 PY
         if [ "$kind" = full ]; then
