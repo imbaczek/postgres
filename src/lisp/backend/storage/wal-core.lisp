@@ -2738,29 +2738,17 @@ Follow a symlink at DIRECTORY itself. Enumeration errors are reported."
                        (when (eql candidate timeline) (list segment))))
         #'<))
 
-(defun wal-valid-type-p (type version)
-  (and (or (member type (list +wal-record-pages+ +wal-record-commit+
-                              +wal-record-catalog+ +wal-record-checkpoint+
-                              +wal-record-clog-reset+ +wal-record-batch-start+
-                              +wal-record-catalog-chunk+
-                              +wal-record-catalog-commit+
-                              +wal-record-maintenance+))
-           (and (= type +wal-record-relation-reset+) (>= version 8))
-           (and (= type +wal-record-parameter-change+) (>= version 8))
-           (and (= type +wal-record-full-page-writes-change+) (>= version 8))
-           (and (= type +wal-record-logical-decoding-status-change+) (>= version 8))
-           (and (= type +wal-record-xid-reservation+) (>= version +wal-version-v7+))
-           (and (= type +wal-record-running-xacts+) (>= version 7))
-           (and (= type +wal-record-end-of-recovery+) (>= version 7))
-           (and (= type +wal-record-logical-changes+)
-                (>= version +wal-version-v5+))
-           (and (= type +wal-record-logical-catalog-event+)
-                (>= version +wal-version-v5+)))
-       (or (/= type +wal-record-maintenance+)
-           ;; Maintenance terminals were already emitted by v3. Keep them
-           ;; readable after the v4/v5 page-image extensions, as PostgreSQL's
-           ;; version-aware xlogreader must decode WAL written by older servers.
-           (>= version +wal-version-v3+))))
+(defun wal-valid-type-p (type)
+  (member type
+          (load-time-value
+           (list +wal-record-pages+ +wal-record-commit+ +wal-record-catalog+
+                 +wal-record-checkpoint+ +wal-record-clog-reset+ +wal-record-batch-start+
+                 +wal-record-catalog-chunk+ +wal-record-catalog-commit+ +wal-record-maintenance+
+                 +wal-record-logical-changes+ +wal-record-logical-catalog-event+
+                 +wal-record-xid-reservation+ +wal-record-end-of-recovery+ +wal-record-running-xacts+
+                 +wal-record-relation-reset+ +wal-record-parameter-change+
+                 +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
+           t)))
 
 (defun wal-record-header-valid-p (bytes version expected-lsn)
   "Check native WAL header fields shared by complete and streaming readers.
@@ -2772,7 +2760,7 @@ specific to the reader's input boundary."
        (= (aref bytes 3) (char-code #\L))
        (= version +wal-version+)
        (= (wal-u64 bytes 12) expected-lsn)
-       (wal-valid-type-p (wal-u16 bytes 6) version)))
+       (wal-valid-type-p (wal-u16 bytes 6))))
 
 (defun wal-record-crc32 (bytes)
   "Return the final CRC of a WAL record with its checksum field treated as zero.

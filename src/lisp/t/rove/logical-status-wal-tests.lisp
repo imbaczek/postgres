@@ -394,20 +394,17 @@
                   (lambda () (wal-validate-empty-metadata-terminal record nil)))))))
 
 (rove:deftest logical-status-change-rejects-malformed-terminals
-    (rove:ok (wal-valid-type-p 18 8))
-  (dolist (version '(2 3 4 5 6 7))
-    (rove:ok (not (wal-valid-type-p 18 version))))
-  (dolist (enabled '(nil t))
-    (dolist (record (list (unit-logical-status-record enabled :version 7)
-                          (unit-logical-status-record enabled :xid 3)
-                          (unit-logical-status-record enabled :type 17)
-                          (unit-logical-status-record enabled :start (- +wal-segment-size+ 16))))
-      (rove:ok (unit-commit-ts-error-p
-                (lambda () (wal-logical-decoding-status-record-info record)))))
-    (let ((record (unit-logical-status-record enabled)))
-      (incf (wal-record-end record))
-      (rove:ok (unit-commit-ts-error-p
-                (lambda () (wal-logical-decoding-status-record-info record))))))
+    (dolist (enabled '(nil t))
+      (dolist (record (list (unit-logical-status-record enabled :version 7)
+                            (unit-logical-status-record enabled :xid 3)
+                            (unit-logical-status-record enabled :type 17)
+                            (unit-logical-status-record enabled :start (- +wal-segment-size+ 16))))
+        (rove:ok (unit-commit-ts-error-p
+                  (lambda () (wal-logical-decoding-status-record-info record)))))
+      (let ((record (unit-logical-status-record enabled)))
+        (incf (wal-record-end record))
+        (rove:ok (unit-commit-ts-error-p
+                  (lambda () (wal-logical-decoding-status-record-info record))))))
   (dolist (bad '(0 1 :on :off "on"))
     (rove:ok (unit-commit-ts-error-p
               (lambda () (wal-encode-logical-decoding-status-change bad)))))

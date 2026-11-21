@@ -49,20 +49,18 @@
               (lambda () (wal-encode-full-page-writes-change bad))))))
 
 (rove:deftest full-page-writes-change-requires-a-clean-supported-terminal
-    (rove:ok (wal-valid-type-p 17 8))
-  (rove:ok (not (wal-valid-type-p 17 7)))
-  (dolist (enabled '(nil t))
-    (let ((record (unit-fpw-change-record enabled)))
-      (rove:ok (eq enabled (wal-full-page-writes-change-record-info record)))
-      (rove:ok (eq enabled (wal-validate-empty-metadata-terminal record t)))
-      (rove:ok (unit-commit-ts-error-p
-                (lambda () (wal-validate-empty-metadata-terminal record nil)))))
-    (dolist (record (list (unit-fpw-change-record enabled :version 7)
-                          (unit-fpw-change-record enabled :type 16)
-                          (unit-fpw-change-record enabled :xid 3)
-                          (unit-fpw-change-record enabled :start (- +wal-segment-size+ 16))))
-      (rove:ok (unit-commit-ts-error-p
-                (lambda () (wal-full-page-writes-change-record-info record)))))))
+    (dolist (enabled '(nil t))
+      (let ((record (unit-fpw-change-record enabled)))
+        (rove:ok (eq enabled (wal-full-page-writes-change-record-info record)))
+        (rove:ok (eq enabled (wal-validate-empty-metadata-terminal record t)))
+        (rove:ok (unit-commit-ts-error-p
+                  (lambda () (wal-validate-empty-metadata-terminal record nil)))))
+      (dolist (record (list (unit-fpw-change-record enabled :version 7)
+                            (unit-fpw-change-record enabled :type 16)
+                            (unit-fpw-change-record enabled :xid 3)
+                            (unit-fpw-change-record enabled :start (- +wal-segment-size+ 16))))
+        (rove:ok (unit-commit-ts-error-p
+                  (lambda () (wal-full-page-writes-change-record-info record)))))))
 
 (rove:deftest full-page-writes-state-fold-retains-witness-and-disable-history
     (let* ((incarnation (gensym "FPW-STORE-"))
