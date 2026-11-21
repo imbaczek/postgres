@@ -458,8 +458,15 @@ still has work outstanding.
   root registered under the primary owner before catalog initialization
   on all three boots. The proof-loss refusal still kept the fence closed.
   Five strict promotion and retained-root test heads passed.
-  Enabling GC still requires accounting for any durable receive selection
-  and rechecking host ownership and registered protection at archive unlink.
+  In `63f933fc32e`, imported startup opens any surviving receive control
+  under the held host and its existing spool lock. It checks the base
+  against the verified import proof, validates the durable prefix, and
+  restores the selected root against the held archive before slot loading.
+  It skips tail cleanup and lock creation. All 35 strict retained-root test
+  heads passed. Instrumented startup observed the same receive registration
+  before catalog initialization on three boots, and proof-loss refusal passed.
+  Enabling GC still requires rechecking host ownership and all required
+  registered protection at archive unlink.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
