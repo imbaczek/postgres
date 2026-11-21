@@ -1791,8 +1791,21 @@ those files before committing.
 ## Common Lisp linting
 
 Install [Mallet 0.9.2](https://github.com/fukamachi/mallet/releases/tag/0.9.2)
-and put `mallet` on your PATH. From the repository root, lint the tracked Lisp
-and ASDF files, excluding vendored Swank and local experiments:
+by unpacking the release archive for your platform. To install it for this
+repository, run the following from the repository root with the path to the
+unpacked binary:
+
+```sh
+mallet_dir="$(git rev-parse --path-format=absolute --git-common-dir)/tools"
+mkdir -p "$mallet_dir"
+install -m 755 /path/to/unpacked/bin/mallet "$mallet_dir/mallet"
+export PATH="$mallet_dir:$PATH"
+```
+
+The pre-commit hook checks staged Lisp and ASDF files outside `src/lisp/vendor/`.
+It uses the repository-local binary first and falls back to `mallet` on PATH.
+Mallet checks the staged file contents using the staged `.mallet.lisp`.
+To lint all tracked project Lisp and ASDF files manually, run:
 
 ```sh
 git ls-files -z -- 'src/lisp/*.lisp' 'src/lisp/*.asd' ':(exclude)src/lisp/vendor/**' |

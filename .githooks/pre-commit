@@ -12,15 +12,23 @@ mapfile -d '' candidate_files < <(
 
 staged_files=()
 for staged_path in "${candidate_files[@]}"; do
-    # Keep the pinned upstream Swank source at its original formatting.
+    # Leave vendored Lisp sources to their upstream projects.
     case "$staged_path" in
-        src/lisp/vendor/swank/*) continue ;;
+        src/lisp/vendor/*) continue ;;
     esac
     staged_files+=("$staged_path")
 done
 
 if ((${#staged_files[@]} == 0)); then
     exit 0
+fi
+
+mallet="$(git rev-parse --path-format=absolute --git-common-dir)/tools/mallet"
+if [[ ! -x "$mallet" ]] && ! mallet=$(command -v mallet); then
+    printf '%s\n' \
+        'pre-commit: Mallet is required for staged Lisp files.' \
+        'Install Mallet as described in src/lisp/README.md under Common Lisp linting.' >&2
+    exit 1
 fi
 
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pg-lisp-pre-commit.XXXXXX")
@@ -40,5 +48,17 @@ if ! "$repo_root/src/lisp/t/format.sh" --check -- "${format_files[@]}"; then
         'Run the formatter on these staged paths, then stage them again:' >&2
     printf '  %s\n' "${staged_files[@]}" >&2
     printf '%s\n' '  src/lisp/t/format.sh <file...>' >&2
+    exit 1
+fi
+
+if git cat-file -e :.mallet.lisp; then
+    git show :.mallet.lisp > "$temp_dir/.mallet.lisp"
+fi
+
+if ! (
+    cd "$temp_dir"
+    "$mallet" --format line --fail-on warning "${staged_files[@]}"
+); then
+    printf '%s\n' 'pre-commit: Mallet failed on staged Lisp files.' >&2
     exit 1
 fi
