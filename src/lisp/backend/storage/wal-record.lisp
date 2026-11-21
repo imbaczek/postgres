@@ -207,6 +207,23 @@ its behavior and allocation.  The record format uses CRC32C (Castagnoli)."
     (wal-set-u32 copy 28 0)
     (wal-crc32 copy)))
 
+(defun wal-encode-commit-timestamp (timestamp)
+  (unless (and (integerp timestamp) (<= (- (ash 1 63)) timestamp (1- (ash 1 63))))
+    (error "invalid WAL commit timestamp"))
+  (let ((payload (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (index 8 payload)
+      (setf (aref payload index) (ldb (byte 8 (* index 8)) timestamp)))))
+
+(defun wal-decode-commit-timestamp (payload)
+  ;; Earlier commit records have an empty payload. An eight-byte payload adds
+  ;; signed microseconds without changing the record header or row-change codec.
+  (case (length payload)
+    (0 nil)
+    (8 (let ((value (loop for index below 8
+                          sum (ash (aref payload index) (* index 8)))))
+         (if (logbitp 63 value) (- value (ash 1 64)) value)))
+    (otherwise (error "WAL commit record has an invalid payload"))))
+
 (defun wal-terminal-record-type-p (type)
   (member type (list +wal-record-commit+ +wal-record-catalog+
                      +wal-record-catalog-commit+ +wal-record-checkpoint+
