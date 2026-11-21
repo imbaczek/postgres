@@ -62,7 +62,15 @@ cmp "$TMP/old-catalog" "$DATA/global/pg_catalog.dat"
 sed -e 's/:next-oid 30000/:next-oid 30002/' \
     -e 's/:name "legacy_a"/:oid 30000 :name "legacy_a"/' \
     -e 's/:name "legacy_b"/:oid 30001 :name "legacy_b"/' \
-    "$TMP/old-catalog" >"$DATA/global/pg_catalog.dat"
+    "$TMP/old-catalog" >"$TMP/current-catalog"
+sed 's/:cluster-identity "legacy-publication-oid-test" //' "$TMP/current-catalog" >"$TMP/missing-identity"
+cp "$TMP/missing-identity" "$DATA/global/pg_catalog.dat"
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$DATA" >"$TMP/missing-identity.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -q 'invalid or missing cluster identity in catalog' "$TMP/missing-identity.log"
+cmp "$TMP/missing-identity" "$DATA/global/pg_catalog.dat"
+cp "$TMP/current-catalog" "$DATA/global/pg_catalog.dat"
 start_server native
 expected=$(printf 'legacy_a|30000\nlegacy_b|30001')
 test "$(sql 'SELECT pubname,oid FROM pg_catalog.pg_publication ORDER BY pubname')" = "$expected"
@@ -85,4 +93,4 @@ test "$(sql "SELECT oid FROM pg_catalog.pg_publication WHERE pubname='fresh_publ
 sql 'DROP PUBLICATION fresh_publication; CREATE PUBLICATION fresh_publication FOR ALL TABLES' >/dev/null
 replacement=$(sql "SELECT oid FROM pg_catalog.pg_publication WHERE pubname='fresh_publication'")
 test "$replacement" -gt "$fresh"
-echo 'publication-oids: PASS (legacy rejection, crash recovery, restart, replacement)'
+echo 'publication-oids: PASS (missing identity rejection, crash recovery, restart, replacement)'

@@ -528,17 +528,16 @@ replacement. The caller holds the catalog writer lock through publication."
                            collect (catalog-role-to-sexp role))))))
 
 (defun catalog-from-sexp (s)
-  (unless (getf s :cluster-identity)
-    (setf *catalog-identity-needs-persist-p* t))
-  (let ((cat (make-catalog :cluster-identity
-                           (or (getf s :cluster-identity)
-                               (new-catalog-cluster-identity))
-                           :next-oid (getf s :next-oid)
-                           :roles (catalog-decode-roles (getf s :roles)))))
-    (dolist (ds (getf s :databases))
-      (let ((db (database-from-sexp ds)))
-        (setf (gethash (database-name db) (catalog-databases cat)) db)))
-    cat))
+  (let ((identity (getf s :cluster-identity)))
+    (unless (and (stringp identity) (plusp (length identity)))
+      (error "invalid or missing cluster identity in catalog"))
+    (let ((cat (make-catalog :cluster-identity identity
+                             :next-oid (getf s :next-oid)
+                             :roles (catalog-decode-roles (getf s :roles)))))
+      (dolist (ds (getf s :databases))
+        (let ((db (database-from-sexp ds)))
+          (setf (gethash (database-name db) (catalog-databases cat)) db)))
+      cat)))
 
 (defun catalog-path ()
   (pgdata-path "global/pg_catalog.dat"))
@@ -723,13 +722,8 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
     (incf (catalog-next-oid *catalog*))))
 
 (defun catalog-init (&key initialize)
-  (setf *catalog-identity-needs-persist-p* nil
-        *catalog* (if initialize (make-catalog) (load-catalog)))
+  (setf *catalog* (if initialize (make-catalog) (load-catalog)))
   (check-primary-catalog-identity *catalog* *wal-control-metadata*)
-  (when *catalog-identity-needs-persist-p*
-    ;; Persist the generated cluster identity before clients can observe it.
-    (save-catalog)
-    (setf *catalog-identity-needs-persist-p* nil))
   (unless (gethash "postgres" (catalog-databases *catalog*))
     (let ((db (make-database :name "postgres" :oid (allocate-oid))))
       (setf (gethash "postgres" (catalog-databases *catalog*)) db)

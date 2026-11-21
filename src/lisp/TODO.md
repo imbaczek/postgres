@@ -115,6 +115,11 @@ missing OIDs without rewriting the catalog. The publication process test
 checks that stored OIDs survive a crash and restart, ALTER preserves them,
 and dropping and recreating a publication allocates a new OID.
 
+For B6, catalog decode requires a stored, nonempty cluster identity.
+Fresh cluster construction still generates and persists an identity,
+and existing identities still use the same system identifier projection.
+The read path no longer generates a replacement identity.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The
