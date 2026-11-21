@@ -1,27 +1,26 @@
 (in-package #:pg-physical-tests)
 
-(defun overlap-test-metadata (base bytes &key (timeline 1) (namespace :legacy) native)
+(defun overlap-test-metadata (base bytes &key (timeline 1) (namespace :legacy))
   (list :version 1 :system-id 123 :base-timeline timeline :base base :manifest-digest 77
-        :checkpoint-start (- base (if native (pg::wal-checkpoint-record-size) pg::+wal-header-size+)) :namespace namespace
+        :checkpoint-start (- base (pg::wal-checkpoint-record-size)) :namespace namespace
         :file (list (concatenate 'string "pg_wal/"
                                  (pg::wal-segment-filename (floor (1- base) pg::+wal-segment-size+)
                                                            timeline namespace))
                     (length bytes) (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
 
-(defun overlap-test-bytes (base &key native (timeline 1))
+(defun overlap-test-bytes (base &key (timeline 1))
   (let* ((size (1+ (mod (1- base) pg::+wal-segment-size+)))
          (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
-         (length (if native (pg::wal-checkpoint-record-size) pg::+wal-header-size+))
+         (length (pg::wal-checkpoint-record-size))
          (start (- base length)))
-    (replace bytes (if native (physical-test-checkpoint-record start :timeline timeline)
-                       (legacy-checkpoint-record start))
+    (replace bytes (physical-test-checkpoint-record start :timeline timeline)
              :start1 (- size length))
     bytes))
 
 (deftest retained-base-overlap-includes-preceding-segment-at-boundary
     (dolist (base (list 184 pg::+wal-segment-size+ (+ pg::+wal-segment-size+ 184)))
-      (let* ((bytes (overlap-test-bytes base :native t))
-             (metadata (overlap-test-metadata base bytes :native t))
+      (let* ((bytes (overlap-test-bytes base))
+             (metadata (overlap-test-metadata base bytes))
              (image (pg::physical-retained-overlap-encode metadata bytes)))
         (multiple-value-bind (loaded restored) (pg::physical-retained-overlap-decode image)
           (ok (equal metadata loaded))
@@ -32,8 +31,8 @@
 (deftest retained-base-overlap-capture-needs-exact-manifest-file
     (with-physical-store-directory (root)
       (let* ((pg::*pgdata* root)
-             (base 184) (bytes (overlap-test-bytes base :native t :timeline 2))
-             (metadata (overlap-test-metadata base bytes :timeline 2 :namespace :timeline :native t))
+             (base 184) (bytes (overlap-test-bytes base :timeline 2))
+             (metadata (overlap-test-metadata base bytes :timeline 2 :namespace :timeline))
              (entry (getf metadata :file))
              (state (list :version 3 :system-id 123 :timeline 2 :checkpoint base :end base :manifest-digest 77
                           :checkpoint-start 64 :wal-namespace :timeline :files (list entry)))
@@ -49,8 +48,8 @@
         (ok (intake-fails-p (lambda () (pg::physical-retained-overlap-capture state root)))))))
 
 (deftest retained-base-overlap-rejects-invalid-metadata-and-checkpoints
-    (let* ((bytes (overlap-test-bytes 184 :native t))
-           (metadata (overlap-test-metadata 184 bytes :native t)))
+    (let* ((bytes (overlap-test-bytes 184))
+           (metadata (overlap-test-metadata 184 bytes)))
       (dolist (change '((:version 2) (:system-id -1) (:base-timeline 0) (:base 183)
                         (:manifest-digest -1) (:checkpoint-start 65) (:namespace :guessed)))
         (let ((bad (copy-tree metadata)))
@@ -68,7 +67,7 @@
         (ok (= pg::+wal-record-batch-start+ (pg::wal-record-type (pg::wal-decode-record record start))))
         (replace bad record :start1 start)
         (ok (intake-fails-p
-             (lambda () (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bad :native t) bad)))))
+             (lambda () (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bad) bad)))))
       (let ((image (pg::physical-retained-overlap-encode metadata bytes)))
         (dolist (offset '(0 8 12 16))
           (let ((bad (copy-seq image)))
@@ -78,8 +77,8 @@
 
 (deftest retained-base-overlap-capture-at-boundary-survives-base-removal
     (with-physical-store-directory (root)
-      (let* ((base pg::+wal-segment-size+) (bytes (overlap-test-bytes base :native t))
-                                           (metadata (overlap-test-metadata base bytes :native t))
+      (let* ((base pg::+wal-segment-size+) (bytes (overlap-test-bytes base))
+                                           (metadata (overlap-test-metadata base bytes))
                                            (entry (getf metadata :file))
                                            (state (list :version 3 :system-id 123 :timeline 1 :checkpoint base :end base
                                                         :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :legacy
@@ -100,7 +99,7 @@
                                           (pg::wal-encode-checkpoint-snapshot snapshot)))
            (bytes (make-array 152 :element-type '(unsigned-byte 8) :initial-element 0)))
       (replace bytes record :start1 32)
-      (let ((metadata (overlap-test-metadata 152 bytes :timeline 2 :namespace :timeline :native t)))
+      (let ((metadata (overlap-test-metadata 152 bytes :timeline 2 :namespace :timeline)))
         (ok (eq metadata (pg::physical-retained-overlap-check metadata bytes)))
         (setf (getf metadata :base-timeline) 1
               (first (getf metadata :file)) "pg_wal/000000010000000000000000.wal")
@@ -111,9 +110,9 @@
                                      (system-id (range integer 0 18446744073709551615)))
   (:about pg::physical-retained-overlap-encode)
   (:trials (:normal 200))
-  (let ((bytes (overlap-test-bytes base :native t)))
+  (let ((bytes (overlap-test-bytes base)))
     (fill bytes value :end (- base (pg::wal-checkpoint-record-size)))
-    (let ((metadata (overlap-test-metadata base bytes :native t)))
+    (let ((metadata (overlap-test-metadata base bytes)))
       (setf (getf metadata :system-id) system-id)
       (multiple-value-bind (loaded restored)
           (pg::physical-retained-overlap-decode (pg::physical-retained-overlap-encode metadata bytes))
@@ -126,8 +125,8 @@
 (deftest retained-base-overlap-root-protects-object-and-grants-no-logical-coverage
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((bytes (overlap-test-bytes 184 :native t))
-                 (metadata (overlap-test-metadata 184 bytes :native t))
+          (let* ((bytes (overlap-test-bytes 184))
+                 (metadata (overlap-test-metadata 184 bytes))
                  (image (pg::physical-retained-overlap-encode metadata bytes))
                  (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                  (history (pg::timeline-parse-history 1 ""))
@@ -195,8 +194,8 @@
 (deftest retained-base-overlap-must-match-logical-extent-prefix
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((bytes (overlap-test-bytes 184 :native t))
-                 (image (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bytes :native t) bytes))
+          (let* ((bytes (overlap-test-bytes 184))
+                 (image (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bytes) bytes))
                  (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                  (owner (gensym)) (selected nil) (bad (copy-seq bytes)))
             (setf (aref bad 0) 1)
@@ -229,8 +228,8 @@
 (deftest retained-base-overlap-publication-failure-keeps-uncertain-protection
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((bytes (overlap-test-bytes 184 :native t))
-                 (image (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bytes :native t) bytes))
+          (let* ((bytes (overlap-test-bytes 184))
+                 (image (pg::physical-retained-overlap-encode (overlap-test-metadata 184 bytes) bytes))
                  (id (pg::physical-store-update-digest #xCBF29CE484222325 image))
                  (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                  (owner (gensym))
@@ -252,8 +251,8 @@
 (deftest retained-boundary-overlap-root-reopens-without-base-and-rejects-corruption
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((base pg::+wal-segment-size+) (bytes (overlap-test-bytes base :native t))
-                                               (metadata (overlap-test-metadata base bytes :native t)) (entry (getf metadata :file))
+          (let* ((base pg::+wal-segment-size+) (bytes (overlap-test-bytes base))
+                                               (metadata (overlap-test-metadata base bytes)) (entry (getf metadata :file))
                                                (state (list :version 3 :system-id 123 :timeline 1 :checkpoint base :end base
                                                             :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :legacy
                                                             :manifest-digest 77 :files (list entry)))
@@ -291,9 +290,9 @@
 (deftest retained-root-reconciliation-uses-one-reader-for-every-object
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((prefix (overlap-test-bytes 184 :native t))
+          (let* ((prefix (overlap-test-bytes 184))
                  (overlap-image (pg::physical-retained-overlap-encode
-                                 (overlap-test-metadata 184 prefix :native t) prefix))
+                                 (overlap-test-metadata 184 prefix) prefix))
                  (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                  (history (pg::timeline-parse-history 1 ""))
                  (writer (gensym)) (owner (gensym)) (selected nil)

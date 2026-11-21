@@ -189,7 +189,7 @@
       (ok (signals (pg::physical-retained-wal-plan images identity history +retained-extent-test-start+ +retained-extent-test-end+) 'error))))
 
 (deftest retained-extent-rejects-carrier-before-its-first-segment
-    (let* ((bytes (overlap-test-bytes 184 :native t))
+    (let* ((bytes (overlap-test-bytes 184))
            (raw (physical-test-checkpoint-record 184))
            (data (concatenate '(vector (unsigned-byte 8)) bytes raw))
            (metadata (list :version 1 :system-id 123 :base-timeline 1 :base 184 :manifest-digest 77
