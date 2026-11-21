@@ -27,28 +27,24 @@ sql() {
         -qAt -v ON_ERROR_STOP=1 -c "$2"
 }
 control() {
-    printf '%s\n(quit)\n' "$2" | timeout 40 "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock"
+    test_lisp_control "$TMP/$1.sock" "$2" 40
 }
 checked() {
-    control "$1" "$2" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log" 40
 }
 start_source() {
-    rm -f "$TMP/source.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" --control-socket "$TMP/source.sock" >>"$TMP/source.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
     SOURCE=$!
     test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 }
 stop_source() { kill -KILL "$SOURCE"; wait "$SOURCE" 2>/dev/null || :; SOURCE=; }
 start_old() {
-    rm -f "$TMP/old.sock"
-    "$BASE/pg-lisp.sh" -p "$OLD_PORT" -D "$TMP/legacy-copy" --control-socket "$TMP/old.sock" >>"$TMP/old.log" 2>&1 &
+    test_launch_lisp_server "$OLD_PORT" "$TMP/legacy-copy" "$TMP/old.sock" "$TMP/old.log"
     OLD=$!
     test_wait_owned_sql_server "$OLD" "$OLD_PORT" "$PSQL"
 }
 start_new() {
-    rm -f "$TMP/new.sock"
-    "$BASE/pg-lisp.sh" -p "$NEW_PORT" -D "$TMP/qualified-copy" --control-socket "$TMP/new.sock" >>"$TMP/new.log" 2>&1 &
+    test_launch_lisp_server "$NEW_PORT" "$TMP/qualified-copy" "$TMP/new.sock" "$TMP/new.log"
     NEW=$!
     test_wait_owned_sql_server "$NEW" "$NEW_PORT" "$PSQL"
 }

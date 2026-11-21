@@ -50,11 +50,17 @@ test_launch_lisp_server() {
 }
 
 test_lisp_control() {
-    printf '%s\n(quit)\n' "$2" | "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$1"
+    TEST_CONTROL_FORM=$2
+    TEST_CONTROL_TIMEOUT=${3-}
+    set -- "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$1"
+    if [ -n "$TEST_CONTROL_TIMEOUT" ]; then
+        set -- timeout "$TEST_CONTROL_TIMEOUT" "$@"
+    fi
+    printf '%s\n(quit)\n' "$TEST_CONTROL_FORM" | "$@"
 }
 
 test_lisp_control_checked() {
-    test_lisp_control "$1" "$2" >"$3" || return
+    test_lisp_control "$1" "$2" "${4-}" >"$3" || return
     if grep -Eq ';; (read )?error:' "$3"; then
         cat "$3" >&2
         return 1
