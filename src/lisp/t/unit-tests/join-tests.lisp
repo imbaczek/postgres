@@ -186,6 +186,9 @@
       (setf (symbol-function 'eval-expr) original-eval))))
 
 (defun test-select-row-qualification-before-projection ()
+  (check (null (subquery-test-rows
+                "SELECT 1 / (pg_catalog.txid_current() * 0) WHERE false"))
+         "FROM-less SELECT filters the row before evaluating its projection")
   (let ((original-eval (symbol-function 'eval-expr))
         (projection-count 0)
         (environment (vector 7))
@@ -205,10 +208,6 @@
                   "SELECT row builder discards rows rejected by WHERE")
            (check (zerop projection-count)
                   "SELECT row builder does not project rejected rows")
-           (check (null (collect-select-no-from-rows :reject targets))
-                  "FROM-less SELECT discards rows rejected by WHERE")
-           (check (zerop projection-count)
-                  "FROM-less SELECT checks WHERE before projecting targets")
            (let ((row (make-select-result-row environment :accept targets)))
              (check (and row (equalp (car row) #(7)))
                     "SELECT row builder projects qualifying rows")
