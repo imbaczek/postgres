@@ -1665,8 +1665,14 @@
      (lambda (root store)
        (declare (ignore root))
        (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
-       (let* ((checkpoint (physical-test-checkpoint-record 184))
-              (fork (+ 184 (length checkpoint)))
+       (let* ((checkpoint-start 184)
+              (fork (+ checkpoint-start (pg::wal-checkpoint-record-size)))
+              (checkpoint (pg::wal-encode-record
+                           pg::+wal-record-checkpoint+ 0 checkpoint-start
+                           (pg::wal-encode-checkpoint-snapshot
+                            (sample-checkpoint-snapshot
+                             :version 2 :start checkpoint-start :redo checkpoint-start :end fork
+                             :next-xid 50 :oldest-active-xid 0))))
               (text (store-history-text 1 fork))
               (view (list :source 2 :parent 1 :history-text text :fork fork
                           :proof-kind :retained-timeline
@@ -1694,7 +1700,7 @@
                   store (pg::physical-recovery-verify-base-state) active))
              (pg::physical-store-input store 152
                                        (pg::wal-encode-record pg::+wal-record-batch-start+ 0 152 (empty-octets)))
-             (pg::physical-store-input store 184 checkpoint)
+             (pg::physical-store-input store checkpoint-start checkpoint)
              (pg::physical-store-flush store)
              (ok (pg::physical-follow-check-active-state
                   store (pg::physical-recovery-verify-base-state) active))
