@@ -51,20 +51,71 @@
                    (if (= target 1) "" (bytes->string (timeline-history-bytes target))))))
     (values (timeline-check-lineage (timeline-parse-history target text)) target text)))
 
-(defun physical-store-control-tuple (store &key
-                                             (floor (physical-store-floor-lsn store))
-                                             (floor-digest (physical-store-floor-digest store))
-                                             (root (physical-store-retained-root store)))
-  "Build the complete receive control tuple used for readback."
-  (list (physical-store-system-id store) (physical-store-timeline store)
-        (physical-store-base-lsn store) (physical-store-flushed-lsn store)
-        (physical-store-flushed-digest store) floor floor-digest
-        (getf (physical-store-selection store) :target)
-        (getf (physical-store-selection store) :digest)
-        (getf (physical-store-retained-identity store) :manifest-digest) root))
+(defstruct (physical-receive-control
+            (:constructor physical-receive-control-from-fields
+                (system-id timeline base flush flush-digest floor floor-digest
+                 history-target history-digest manifest-digest root)))
+  "Immutable receive-control snapshot. Convert to a list only at witness boundaries."
+  (system-id nil :read-only t)
+  (timeline nil :read-only t)
+  (base nil :read-only t)
+  (flush nil :read-only t)
+  (flush-digest nil :read-only t)
+  (floor nil :read-only t)
+  (floor-digest nil :read-only t)
+  (history-target nil :read-only t)
+  (history-digest nil :read-only t)
+  (manifest-digest nil :read-only t)
+  (root nil :read-only t))
+
+(defun physical-store-control-snapshot (store &key
+                                                (floor (physical-store-floor-lsn store))
+                                                (floor-digest (physical-store-floor-digest store))
+                                                (root (physical-store-retained-root store)))
+  "Capture all fields used to check receive-control readback."
+  (physical-receive-control-from-fields
+   (physical-store-system-id store) (physical-store-timeline store)
+   (physical-store-base-lsn store) (physical-store-flushed-lsn store)
+   (physical-store-flushed-digest store) floor floor-digest
+   (getf (physical-store-selection store) :target)
+   (getf (physical-store-selection store) :digest)
+   (getf (physical-store-retained-identity store) :manifest-digest) root))
+
+(defun physical-receive-control-to-tuple (control)
+  "Serialize CONTROL in the persisted receive witness field order."
+  (list (physical-receive-control-system-id control) (physical-receive-control-timeline control)
+        (physical-receive-control-base control) (physical-receive-control-flush control)
+        (physical-receive-control-flush-digest control) (physical-receive-control-floor control)
+        (physical-receive-control-floor-digest control) (physical-receive-control-history-target control)
+        (physical-receive-control-history-digest control) (physical-receive-control-manifest-digest control)
+        (physical-receive-control-root control)))
+
+(defun physical-receive-control-same-identity-p (left right)
+  (and (eql (physical-receive-control-system-id left) (physical-receive-control-system-id right))
+       (eql (physical-receive-control-timeline left) (physical-receive-control-timeline right))
+       (eql (physical-receive-control-base left) (physical-receive-control-base right))
+       (eql (physical-receive-control-history-target left) (physical-receive-control-history-target right))
+       (eql (physical-receive-control-history-digest left) (physical-receive-control-history-digest right))
+       (eql (physical-receive-control-manifest-digest left) (physical-receive-control-manifest-digest right))))
+
+(defun physical-receive-control-same-progress-p (left right)
+  (and (eql (physical-receive-control-flush left) (physical-receive-control-flush right))
+       (eql (physical-receive-control-flush-digest left) (physical-receive-control-flush-digest right))
+       (eql (physical-receive-control-floor left) (physical-receive-control-floor right))
+       (eql (physical-receive-control-floor-digest left) (physical-receive-control-floor-digest right))
+       (eql (physical-receive-control-root left) (physical-receive-control-root right))))
+
+(defun physical-receive-control-equal-p (left right)
+  (and (physical-receive-control-same-identity-p left right)
+       (physical-receive-control-same-progress-p left right)))
+
+(defun physical-store-control-tuple (store &rest options)
+  "Build the persisted receive witness list for STORE."
+  (physical-receive-control-to-tuple (apply #'physical-store-control-snapshot store options)))
 
 (defun physical-store-read-retained-control (store expected)
-  "Read control under the store owner and require the complete expected tuple.
+  "Read control under the store owner and check every field in EXPECTED.
+EXPECTED can be a snapshot or a persisted witness list.
 
 The root update calls this outside the archive mutex."
   (let ((probe (%make-physical-store :directory (physical-store-directory store)
@@ -73,8 +124,11 @@ The root update calls this outside the archive mutex."
                                      :retained-identity (physical-store-retained-identity store)
                                      :retained-directory-value (physical-store-retained-directory store))))
     (physical-store-load-control probe)
-    (unless (equal expected (physical-store-control-tuple probe))
-      (error "receive control readback differs from its complete expected tuple"))
+    (let ((current (physical-store-control-snapshot probe)))
+      (unless (if (physical-receive-control-p expected)
+                  (physical-receive-control-equal-p expected current)
+                  (equal expected (physical-receive-control-to-tuple current)))
+        (error "receive control readback differs from its complete expected tuple")))
     (values (physical-store-retained-root probe) (physical-store-selection probe))))
 
 (defun physical-store-restore-retained-reference (store)
@@ -84,7 +138,7 @@ The root update calls this outside the archive mutex."
     (physical-retained-root-reconcile
      (physical-store-retained-owner store) (physical-store-retained-directory store)
      (physical-store-retained-identity store) (physical-store-retained-history store)
-     (lambda () (physical-store-read-retained-control store (physical-store-control-tuple store))))))
+     (lambda () (physical-store-read-retained-control store (physical-store-control-snapshot store))))))
 
 (defun physical-store-check-retained-root (store)
   "Validate the referenced inventory and every image against the selected history.
