@@ -44,7 +44,7 @@ why existing code could not meet the need when a new implementation is required.
 | B5 | [CREATE PUBLICATION](backend/executor/exec_simple.lisp) and the [catalog codec](backend/catalog/catalog.lisp) | Creation allocates the OID before catalog publication. `catalog-init` separately backfills missing legacy OIDs. |
 | B6 | [Catalog codec](backend/catalog/catalog.lisp) | `catalog-to-sexp` always emits the cluster identity. `catalog-from-sexp` synthesizes it when absent and flags the catalog for persistence. Fresh catalogs also use the identity allocator. |
 | B7 | [Slot encoder](backend/storage/wal-core.lisp) and [logical slot state codec](backend/replication/logical-slot-state.lisp) | The current producer can emit PGSLOT4 or PGSLOT5. Provenance and explicit loss causes use PGSLOT6, and child ownership uses PGSLOT7. |
-| B8 | [Source pin encoder](backend/replication/physical-source.lisp) | Ordinary source pins use PGPHYSPIN2. Follow pins have a separate encoder. PGPHYSPIN1 appears in the reader. |
+| B8 | [Source pin encoder](backend/replication/physical-source.lisp) | Ordinary source pins use PGPHYSPIN2. Follow pins have a separate encoder. |
 | B9 | [Receive control codec](backend/replication/physical-store.lisp) | The writer uses PGPHYS03 at 68, 80, or 96 bytes for base control, history selection, and retained-root identity. The 52-byte PGPHYS02 reader supplies a default floor and seed. |
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
@@ -125,6 +125,10 @@ For B7, logical slot decode rejects PGSLOT1–3. PGSLOT4/5 remain supported
 because current writers emit them, alongside the provenance and child owner
 formats. Continuation fixtures use noncanonical PGSLOT4 values to verify
 that inventory and no-op proof paths preserve the original bytes.
+
+For B8, the bootstrap pin reader requires PGPHYSPIN2 and rejects a
+checksummed PGPHYSPIN1 pin without rewriting it. PGPHYSPIN2 keeps both
+manifest-bound and unbound encodings. Follow pins use their own codec.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which

@@ -574,7 +574,7 @@
                       (pg::read-bounded-regular-file receipt pg::+wal-archive-segment-proof-size+)
                       (pg::catalog-system-identifier) 1 0 :legacy prefix)))))))
 
-(deftest physical-source-legacy-pin-is-readable-before-handoff
+(deftest physical-source-pin-reader-rejects-retired-format
     (call-with-physical-source-fixture
      (lambda ()
        (let* ((pin (pg::physical-source-pin-create "legacy"))
@@ -582,14 +582,12 @@
                               (pg::physical-source-pin-system-id pin)
                               (pg::physical-source-pin-restart-lsn pin)
                               (pg::physical-source-pin-consistent-lsn pin)))
-              (crc (pg::wal-crc32 (pg::string->bytes prefix))))
-         (pg::wal-atomic-write-bytes
-          (pg::physical-source-pin-path "legacy")
-          (pg::string->bytes (format nil "~a ~8,'0X~%" prefix crc)))
-         (let ((loaded (pg::physical-source-pin-read (pg::physical-source-pin-path "legacy"))))
-           (ok (null (pg::physical-source-pin-confirmed-lsn loaded)))
-           (ok (= #xCBF29CE484222325 (pg::physical-source-pin-prefix-digest loaded)))
-           (ok (not (pg::physical-source-pin-lost-p loaded))))))))
+              (crc (pg::wal-crc32 (pg::string->bytes prefix)))
+              (bytes (pg::string->bytes (format nil "~a ~8,'0X~%" prefix crc)))
+              (path (pg::physical-source-pin-path "legacy")))
+         (pg::wal-atomic-write-bytes path bytes)
+         (ok (signals (pg::physical-source-pin-read-raw path) 'error))
+         (ok (equalp bytes (pg::read-bounded-regular-file path 1024)))))))
 
 (deftest physical-source-confirmation-persists-before-recycling
     (call-with-physical-source-fixture
