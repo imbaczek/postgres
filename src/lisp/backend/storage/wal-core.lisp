@@ -4031,7 +4031,7 @@ the checkpoint or scanned WAL contains a policy witness."
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
     (wal-replace-storage-incarnation)
     (setf *wal-control-metadata* metadata
-          *wal-segment-namespace* (or namespace :legacy)
+          *wal-segment-namespace* (or namespace :timeline)
           *wal-insert-timeline* (or insertion 1)
           *wal-checkpoint-timeline* (or checkpoint-timeline 1)
           *wal-prev-timeline* (getf snapshot :prev-timeline (or insertion 1)))

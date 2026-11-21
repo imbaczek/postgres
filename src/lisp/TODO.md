@@ -49,6 +49,7 @@ why existing code could not meet the need when a new implementation is required.
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
 | B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | Standby publication and logical-copy source proof emit PGRPGEN2 with metadata version 4. The XID process fixture constructs retired generations independently to test startup rejection. |
+| B18 | [WAL initialization](backend/storage/wal-core.lisp) | Fresh clusters select timeline-qualified filenames. A physical base copy inherits the source WAL control and namespace. |
 
 For B15, callers of the ownerless CLOG staging and materialization functions
 are confined to their delegation chain and Rove fixtures. The tag validation
@@ -142,6 +143,12 @@ with the restored current control.
 For B11, the backup and recovery readers require a version 3 manifest with
 an explicit checkpoint start. The schema rejects versions 1 and 2, missing
 checkpoint starts, and inconsistent checkpoint boundaries.
+
+For B18, new clusters and backups of those clusters use timeline-qualified
+WAL files. The bootstrap harness checks the control namespace and filename
+grammar on both source and copy. Startup still reads the existing control's
+namespace during the transition. Retiring legacy names requires recreating or
+retiring the remaining development data, backups and retained ancestral WAL.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which

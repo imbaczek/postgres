@@ -88,6 +88,10 @@ test -f "$TMP/copy/recovery.required"
 test -f "$TMP/copy/physical-backup.manifest"
 "$SBCL" --script "$BASE/t/physical-bootstrap-verify.lisp" "$TMP/copy/" >"$TMP/verify.log" 2>&1
 grep -q 'physical-bootstrap-verify: PASS' "$TMP/verify.log"
+for data in source copy; do
+    python3 "$BASE/t/interop/wal-namespace-inspect.py" "$TMP/$data" --namespace timeline
+    test -z "$(find "$TMP/$data/pg_wal" -maxdepth 1 -name '????????????????.wal' -print)"
+done
 "$SBCL" --script "$BASE/t/physical-bootstrap-rows.lisp" "$TMP/copy/" "$TMP/rows.copy" >"$TMP/rows.log" 2>&1
 diff -u "$TMP/rows.expected" "$TMP/rows.copy"
 test "$(sql 'SELECT count(*) FROM bootstrap_data;')" = 3
