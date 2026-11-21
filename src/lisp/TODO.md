@@ -418,12 +418,17 @@ still has work outstanding.
   validation and rejects a changed pathname binding before installing the
   reference. Thirty-one strict physical test heads passed, including injected
   rebinding and cold rewind.
-    In `a38f5b39b6d`, the fence reads continuation markers and opens the
-    active host's archive child through the same held host directory.
-    A private mount namespace check verified that the fence follows a host
-    bind alias after marker removal and leaves an unrelated directory eligible.
-    All 32 strict retained-root test heads passed, including symlinked PGDATA
-    and cold rewind.
+  In `a38f5b39b6d`, the fence reads continuation markers and opens the
+  active host's archive child through the same held host directory.
+  A private mount namespace check verified that the fence follows a host
+  bind alias after marker removal and leaves an unrelated directory eligible.
+  All 32 strict retained-root test heads passed, including symlinked PGDATA
+  and cold rewind.
+  In `3eaa74a20d5`, owned imported startup checks continuation evidence
+  through the same host descriptor used for the source proof and ownership
+  checks. The rebinding regression verifies that the held descriptor
+  still sees the original host's marker after replacement of its pathname.
+  All 33 strict retained-root test heads passed.
   Host ownership across continuation restoration still needs verification
   before opening GC. The imported-host fence stays closed.
 
