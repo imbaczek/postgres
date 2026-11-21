@@ -721,7 +721,7 @@ The saved required fact is checked at the witnessed recovery boundary."
         (getf verified-base :required-logical-fact)
         (physical-logical-copy-fact (getf (getf binding :recovery) :logical-fact)))
   (physical-follow-check-source-history candidate (nth-value 0 (physical-follow-anchor-check (getf binding :anchor))))
-  (unless (and (equal (physical-store-control-tuple candidate) (getf binding :after))
+  (unless (and (physical-receive-control-matches-p (physical-store-control-snapshot candidate) (getf binding :after))
                (eql (getf verified-base :system-id) (physical-store-system-id candidate))
                (eql (getf verified-base :timeline) (physical-store-timeline candidate))
                (eql (getf verified-base :end) (physical-store-base-lsn candidate))

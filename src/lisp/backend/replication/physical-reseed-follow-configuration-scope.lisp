@@ -99,7 +99,7 @@
          (maximum (length (physical-reseed-follow-configuration-moves record binding))))
     (physical-store-check-held-lock store)
     (physical-store-check-complete-input store)
-    (unless (equal (physical-store-control-tuple store) (getf binding :after))
+    (unless (physical-receive-control-matches-p (physical-store-control-snapshot store) (getf binding :after))
       (error "installation receive store differs from the exact derived tuple"))
     (physical-store-read-retained-control store (getf binding :after))
     (physical-store-validate-prefix store)
@@ -140,8 +140,9 @@
           (declare (ignore control row))
           (unless (and (equalp base (physical-reseed-follow-installation-context-base context))
                        (equal binding actual-binding) (equalp images actual-images)
-                       (equal (physical-store-control-tuple model)
-                              (physical-store-control-tuple (physical-reseed-follow-installation-context-model context))))
+                       (physical-receive-control-equal-p
+                        (physical-store-control-snapshot model)
+                        (physical-store-control-snapshot (physical-reseed-follow-installation-context-model context))))
             (error "mapped installation base facts changed")))
         (physical-reseed-follow-installation-check-receive context #'guard)
         (unless (equal layout (physical-reseed-follow-installation-layout-state
