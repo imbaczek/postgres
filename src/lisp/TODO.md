@@ -148,6 +148,10 @@ For B13, restart the Lisp server across the gate representation cutover.
 The admission gate now closes and reopens with the current quiescence owner
 token. The load-time bridge for ownerless gates has been removed.
 
+For B14, restart the Lisp server across the backend layout change. Commit
+preflights logical row changes through the transaction spool, and the
+snapshot-handoff and rollback tests check that transaction cleanup releases it.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

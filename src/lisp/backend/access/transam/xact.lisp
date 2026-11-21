@@ -32,7 +32,6 @@
   (role-changes nil)
   ;; Per-transaction durable boundaries; reset detaches this context.
   (wal-obligation nil)
-  (logical-changes '())
   (logical-spool nil)
   (logical-change-bytes 0)
   (sequence-currvals (make-hash-table :test #'eql))
@@ -135,7 +134,6 @@ The published context retains it for both XID and no-XID completion."
 Dirty relations, logical changes, replacements and recorded durable boundaries
 count; an XID alone, shared cache pages and an empty context do not."
   (or (backend-dirty-relations backend)
-      (backend-logical-changes backend)
       (plusp (backend-logical-change-bytes backend))
       (let ((context (backend-wal-obligation backend)))
         (and context (or (transaction-wal-obligation-catalog-end context)
@@ -2211,7 +2209,6 @@ A failed copy can leave the named slot for the caller to remove."
                              (backend-transaction-snapshot-registration backend) nil
                              (backend-first-snapshot-set backend) nil
                              (backend-dirty-relations backend) '()
-                             (backend-logical-changes backend) '()
                              (backend-logical-change-bytes backend) 0))
                      (set-backend-state backend :in-progress)
                      (multiple-value-bind (captured-snapshot captured-boundary
@@ -2535,7 +2532,6 @@ so no interrupt can discard the owner of a virtual ID or its relation locks."
           (backend-dirty-relations b) '()
           (backend-role-changes b) nil
           (backend-wal-obligation b) nil
-          (backend-logical-changes b) '()
           (backend-logical-change-bytes b) 0)
     (set-backend-state b :idle))
   (values))
@@ -2737,17 +2733,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (return-from commit-transaction (commit-role-only-transaction b)))
     (if (backend-xid b)
         (let ((changes
-                (when *wal-ready*
-                  (if (backend-logical-changes b)
-                      ;; Compatibility for internal callers that supply the old list.
-                      (let ((events (append (reverse (backend-logical-changes b))
-                                            (when (backend-logical-spool b)
-                                              (logical-spool-seal (backend-logical-spool b))
-                                              (logical-spool-events-in-order (backend-logical-spool b))))))
-                        (logical-preflight-event-fragments events)
-                        events)
-                      (when (backend-logical-spool b)
-                        (logical-preflight-spool (backend-logical-spool b)))))))
+                (when (and *wal-ready* (backend-logical-spool b))
+                  (logical-preflight-spool (backend-logical-spool b)))))
           ;; Validate the spool before publishing any WAL batch. Subsequent I/O
           ;; failure during WAL insertion follows the normal critical-failure path.
           ;; Keep the XID through acceptance or local storage apply. Mask interrupts

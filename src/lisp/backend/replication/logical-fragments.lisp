@@ -85,14 +85,6 @@ Reject oversized transactions before any WAL record is published."
       (error "invalid logical WAL fragment payload"))
     (values index count total offset (logical-read-octets cursor size))))
 
-(defun logical-preflight-event-fragments (events)
-  "Check the whole transaction before its first WAL batch record is written."
-  (logical-plan-event-fragments events
-                                (- +wal-segment-size+ +wal-header-size+
-                                   +logical-fragment-header-size+)
-                                +max-logical-wal-transaction-bytes+)
-  (values))
-
 (defstruct (logical-fragment-assembler
             (:constructor make-logical-fragment-assembler (limit)))
   limit (bytes 0) buffer (received 0))
