@@ -39,7 +39,7 @@
              (progn
                (pg::physical-store-input store 32 (sample-physical-record 32))
                (pg::physical-store-input store 64
-                                         (legacy-checkpoint-record 64))
+                                         (pg::wal-encode-record pg::+wal-record-maintenance+ 0 64 (empty-octets)))
                (pg::physical-store-flush store)
                (let ((pg::*physical-receive-store* store)) (funcall function root store)))
           (pg::physical-store-close store))))))

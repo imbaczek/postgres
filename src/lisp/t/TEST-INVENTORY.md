@@ -27,7 +27,7 @@ two process-test files; the 229 named-case split remains 68 moved / 161 deferred
 
 | Upstream addition | Disposition |
 | --- | --- |
-| `wal-test-legacy-checkpoint-record` in [unit-tests/wal-tests.lisp](unit-tests/wal-tests.lisp) | Retain helper: constructs a checksummed empty v5 checkpoint for compatibility/recovery fixtures. |
+| `wal-test-checkpoint-record` in [unit-tests/wal-tests.lisp](unit-tests/wal-tests.lisp) | Constructs a native checkpoint and its snapshot for recovery scan fixtures. |
 | [checkpoint-snapshot.sh](checkpoint-snapshot.sh) | Retain process test: native checkpoint durability and source/standby metadata across crash/restart boundaries. |
 | [interop/checkpoint-snapshot.py](interop/checkpoint-snapshot.py) | Retain independent native control/WAL decoder and stopped-server fixture conversion used by the shell harness. |
 
