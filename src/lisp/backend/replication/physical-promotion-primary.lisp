@@ -91,7 +91,6 @@ Do not open its selected generation or receive spool."
   (let ((path (physical-recovery-control-path)))
     (when (wal-namespace-file-stat path t)
       (let* ((control (physical-recovery-read-control *pgdata*))
-             (*catalog-identity-needs-persist-p* nil)
              (catalog (unless system-id (load-catalog))))
         (unless (equal (getf control :retained-reference)
                        (getf (nth-value 6 (wal-read-control-fields)) :retained-reference))

@@ -204,10 +204,7 @@ active timeline goal before recovery preparation or redo."
 (defun physical-backup-cleanup-stages ()
   (sb-thread:with-mutex (*physical-backup-stage-lock*)
     (when (probe-file (catalog-path))
-      (let* ((*catalog-identity-needs-persist-p* nil)
-             (catalog (load-catalog)))
-        (when *catalog-identity-needs-persist-p*
-          (return-from physical-backup-cleanup-stages nil))
+      (let ((catalog (load-catalog)))
         (multiple-value-bind (fd root) (physical-backup-open-stage-container catalog)
           (declare (ignore root))
           (when fd

@@ -658,7 +658,6 @@ unknown, even if the copied control has known resource metadata."
 (defun recovery-check-image-metadata-facts (manifest directory)
   "Bind catalog identity, declared file inventory, WAL checkpoint and XID reservation."
   (let* ((*pgdata* directory)
-         (*catalog-identity-needs-persist-p* nil)
          (*catalog* (load-catalog))
          (*wal-checkpoint-lsn* (getf manifest :checkpoint))
          (*wal-durable-lsn* (getf manifest :end))
@@ -670,7 +669,6 @@ unknown, even if the copied control has known resource metadata."
          (names (sort (mapcar #'first (getf manifest :files)) #'string<)))
     (unless (and (= *wal-insert-timeline* *wal-checkpoint-timeline* (getf manifest :timeline))
                  (or (= *wal-insert-timeline* 1) (eq *wal-segment-namespace* :timeline))
-                 (not *catalog-identity-needs-persist-p*)
                  (equal (catalog-cluster-identity *catalog*) (getf manifest :cluster-identity))
                  (= (catalog-system-identifier) (getf manifest :system-id))
                  (gethash "postgres" (catalog-databases *catalog*))

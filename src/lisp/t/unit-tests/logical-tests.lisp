@@ -420,7 +420,6 @@
          (*pgdata* test-pgdata)
          (*backend* nil)
          (*catalog* nil)
-         (*catalog-identity-needs-persist-p* nil)
          (*wal-control-metadata* nil)
          (*wal-ready* t)
          (*wal-logical-policy* nil)

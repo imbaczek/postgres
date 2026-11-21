@@ -253,11 +253,7 @@ are only startup calls in production."
 precedes catalog initialization, so startup must not invent an identity."
   (unless (probe-file (catalog-path))
     (error "physical slot startup requires the durable cluster catalog"))
-  (let* ((*catalog-identity-needs-persist-p* nil)
-         (catalog (load-catalog)))
-    (when *catalog-identity-needs-persist-p*
-      (error "physical slot startup cannot invent a missing cluster identity"))
-    (catalog-system-identifier catalog)))
+  (catalog-system-identifier (load-catalog)))
 
 (defun physical-slot-restore (slot inactive-since)
   "Remove temporary slots at startup and set the persistent inactive timestamp.

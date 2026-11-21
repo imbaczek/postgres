@@ -1061,7 +1061,6 @@
       (call-with-canonical-wal-slot-fixture
        (lambda ()
          (let* ((*wal-control-metadata* nil)
-                (*catalog-identity-needs-persist-p* nil)
                 (*catalog-logical-event-publication-p* nil)
                 (*catalog* (make-catalog :cluster-identity
                                          (when known-p "logical-slot-startup-cluster")))
@@ -1078,8 +1077,6 @@
                             (error () nil)))
                       "a durable identity is required; a legacy catalog cannot invent one")
              (rove:ok (null *catalog*) "startup validation does not initialize the live catalog")
-             (rove:ok (null *catalog-identity-needs-persist-p*)
-                      "validation does not leak a catalog repair request")
              (rove:ok (string= before (uiop:read-file-string (catalog-path)))
                       "durable catalog is never rewritten")
              (if known-p
