@@ -409,8 +409,13 @@ still has work outstanding.
   named binding before unlink. The active host's fence also covers bind aliases
   of its fixed archive child by device and inode, even across different mount
   IDs. A private mount namespace test verified the alias and an unrelated
-  archive. Generic references and holds still use canonical directory paths.
-  The imported-host fence stays closed.
+  archive. In `ee384379ac9`, references and holds capture archive device,
+  inode and mount identity. Owner operations validate the original binding,
+  and cleanup recognizes references on a bind alias of the same archive.
+  Thirty strict physical test heads and a real bind alias deletion test passed.
+  Restart the Lisp server across the reference and hold layout change.
+  Host ownership across continuation restoration still needs verification
+  before opening GC. The imported-host fence stays closed.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
