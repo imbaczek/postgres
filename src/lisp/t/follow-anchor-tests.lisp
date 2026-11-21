@@ -2068,13 +2068,13 @@
          (ok (signals (pg::physical-source-acquire-sender command) 'error))
          (ok (zerop (hash-table-count pg::*physical-source-senders*)))))))
 
-(defun follow-anchor-start-command (request &optional mode)
+(defun follow-anchor-start-command (request &optional mode (bootstrap-base 64))
   (pg::parse-replication-command
    (format nil
            "START_REPLICATION PHYSICAL ~a (proof_pin 'sibling', native_format '~a', system_id '~d', timeline '2', base_lsn '~a', prefix_digest '~d', manifest_digest '77'~a)"
            (pg::wal-format-lsn (getf request :receive-lsn))
            pg::+physical-native-format+ (getf request :system-id)
-           (pg::wal-format-lsn (if (equal mode "follow") (getf request :base) 64))
+           (pg::wal-format-lsn (if (equal mode "follow") (getf request :base) bootstrap-base))
            (getf request :receive-digest)
            (if mode (format nil ", mode '~a'" mode) ""))))
 
@@ -2266,15 +2266,27 @@
     (call-with-follow-anchor-source
      (lambda (root request eor)
        (declare (ignore root eor))
-       (let ((pin (pg::make-physical-source-pin
-                   :name "sibling" :system-id (getf request :system-id) :timeline 2
-                   :manifest-digest 77 :consistent-lsn 64 :restart-lsn 32
-                   :prefix-digest #xCBF29CE484222325)))
+       (let* ((start pg::*wal-durable-lsn*)
+              (encoded (multiple-value-list (physical-test-checkpoint-record start :timeline 2)))
+              (checkpoint (first encoded))
+              (end (+ start (length checkpoint)))
+              (pg::*wal-checkpoint-lsn* end)
+              (pg::*wal-checkpoint-snapshot* (second encoded))
+              (pin (pg::make-physical-source-pin
+                    :name "sibling" :system-id (getf request :system-id) :timeline 2
+                    :manifest-digest 77 :consistent-lsn end :restart-lsn start
+                    :prefix-digest #xCBF29CE484222325)))
+         (with-open-file (stream (pg::wal-segment-path 0) :direction :output :if-exists :append
+                                                          :element-type '(unsigned-byte 8))
+           (write-sequence checkpoint stream))
+         (setf pg::*wal-durable-lsn* end
+               (getf request :base) end
+               (getf request :receive-lsn) end)
          (setf (gethash "sibling" pg::*physical-source-pins*) pin)
          (ok (signals (pg::physical-source-acquire-sender
                        (follow-anchor-start-command request "follow")) 'error))
          (ok (zerop (hash-table-count pg::*physical-source-senders*)))
-         (let ((owner (pg::physical-source-acquire-sender (follow-anchor-start-command request))))
+         (let ((owner (pg::physical-source-acquire-sender (follow-anchor-start-command request nil end))))
            (pg::physical-source-release-sender "sibling" owner))))))
 
 (deftest physical-stream-mode-rejects-unknown-and-duplicate-values
