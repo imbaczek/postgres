@@ -1102,7 +1102,7 @@
        (let ((pg::*max-slot-wal-keep-bytes* nil)
              (pg::*wal-slot-retention-policy* nil))
          (pg::wal-create-physical-replication-slot "catalog_physical")
-         (let* ((fields (getf (pg::sql-system-relation-definition "pg_replication_slots") :fields))
+         (let* ((fields (pg::sql-system-relation-descriptor-fields (pg::sql-system-relation-definition "pg_replication_slots")))
                 (row (first (pg::sql-replication-slot-rows))))
            (ok (= 23 (length fields)))
            (ok (equal (loop for n from 1 to 23 collect n) (mapcar #'fourth fields)))

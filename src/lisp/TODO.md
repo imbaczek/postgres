@@ -218,6 +218,12 @@ kind, boot value, integer bounds, and units. Configuration ingestion, reload,
 SQL scope checks, `pg_settings`, and `--describe-config` read that registry.
 Session and startup integer settings share the same bounds and units parser.
 
+Virtual catalog descriptors supply OIDs, relation kinds, row producers, and
+field definitions to the executor and catalog views. They derive the
+`pg_class.relnatts` value from the highest original attribute number.
+Each relation lookup still builds fresh metadata with dense executor slots,
+and RowDescription translates those slots to the original attribute numbers.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

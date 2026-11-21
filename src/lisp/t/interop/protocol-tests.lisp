@@ -532,7 +532,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
       (ok (string= (aref row 4) "reserved"))
       (ok (= (aref row 5) 123))
       (ok (equal (loop for n from 1 to 23 collect n)
-                 (mapcar #'fourth (getf (pg::sql-system-relation-definition "pg_replication_slots") :fields))))
+                 (mapcar #'fourth (pg::sql-system-relation-descriptor-fields (pg::sql-system-relation-definition "pg_replication_slots")))))
       (ok (= -1 (pg::compare-3way restart (pg::sql-pg-lsn-input "10/0")))))
   (ok (test-row-equal-p '(#(t)) (derived-query-rows "SELECT 'F/FFFFFFFF'::pg_lsn<'10/0'::pg_lsn")))
   (ok (test-row-equal-p '(#("0/00000001")) (derived-query-rows "SELECT '0/1'::pg_lsn::text")))
@@ -540,8 +540,8 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (ok (equal "22P02" (sqlstate-of (pg::sql-pg-lsn-input text))))))
 
 (deftest standard-copy-catalog-column-identities
-    (let* ((class-fields (getf (pg::sql-system-relation-definition "pg_class") :fields))
-           (database-fields (getf (pg::sql-system-relation-definition "pg_database") :fields)))
+    (let* ((class-fields (pg::sql-system-relation-descriptor-fields (pg::sql-system-relation-definition "pg_class")))
+           (database-fields (pg::sql-system-relation-descriptor-fields (pg::sql-system-relation-definition "pg_database"))))
       (ok (= 28 (fourth (assoc "relispartition" class-fields :test #'string=))))
       (ok (equal '(("oid" :oid t 1) ("datname" :name t 2)) database-fields))))
 

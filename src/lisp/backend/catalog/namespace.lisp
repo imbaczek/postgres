@@ -528,59 +528,73 @@ synchronous_commit. Reject unsupported parameters and other local settings."
         unless (member name '("database" "retained_wal_bytes") :test #'string=)
           collect (list name type)))
 
+(defstruct (sql-system-relation-descriptor
+            (:constructor %make-sql-system-relation-descriptor
+                (oid name kind rows fields attribute-count)))
+  (oid nil :read-only t)
+  (name nil :read-only t)
+  (kind nil :read-only t)
+  (rows nil :read-only t)
+  (fields nil :read-only t)
+  (attribute-count nil :read-only t))
+
+(defun make-sql-system-relation-descriptor (oid name kind rows fields)
+  (%make-sql-system-relation-descriptor
+   oid name kind rows fields (reduce #'max fields :key #'fourth)))
+
 (defparameter +sql-system-relations+
   ;; Catalog OIDs and original attribute numbers follow the pinned C tree.
   ;; The sequence view OID is from that tree's unmodified initdb catalog.
   (list
-   (list :oid 12109 :name "pg_settings" :kind #\v
-         :rows 'startup-settings-rows :fields +sql-settings-fields+)
-   (list :oid 1260 :name "pg_authid" :kind #\r :rows 'sql-authid-rows
-         :fields '(("oid" :oid t 1) ("rolname" :name t 2)))
-   (list :oid 12110 :name "pg_roles" :kind #\v :rows 'sql-roles-rows
-         :fields '(("rolname" :name t 1) ("rolsuper" :bool t 2)
-                   ("rolcanlogin" :bool t 6) ("rolreplication" :bool t 7) ("oid" :oid t 13)))
-   (list :oid 1262 :name "pg_database" :kind #\r :rows 'sql-database-rows
-         :fields '(("oid" :oid t 1) ("datname" :name t 2)))
-   (list :oid 1259 :name "pg_class" :kind #\r :rows 'sql-class-rows
-         :fields '(("oid" :oid t 1) ("relname" :name t 2)
-                   ("relnamespace" :oid t 3) ("relkind" :char t 18)
-                   ("relnatts" :int2 t 19) ("relreplident" :char t 27)
-                   ("reltoastrelid" :oid t 14) ("relispartition" :bool t 28)))
-   (list :oid 1249 :name "pg_attribute" :kind #\r :rows 'sql-attribute-rows
-         :fields '(("attrelid" :oid t 1) ("attname" :name t 2)
-                   ("atttypid" :oid t 3) ("attnum" :int2 t 5)
-                   ("atttypmod" :int4 t 6) ("attnotnull" :bool t 12)
-                   ("attgenerated" :char t 16) ("attisdropped" :bool t 17)
-                   ("attstorage" :char t 10)))
-   (list :oid 1247 :name "pg_type" :kind #\r :rows 'sql-type-rows
-         :fields '(("oid" :oid t 1) ("typname" :name t 2)
-                   ("typnamespace" :oid t 3) ("typlen" :int2 t 5)
-                   ("typalign" :char t 23) ("typstorage" :char t 24)))
-   (list :oid 2610 :name "pg_index" :kind #\r :rows 'sql-index-rows
-         :fields '(("indexrelid" :oid t 1) ("indrelid" :oid t 2)
-                   ("indisunique" :bool t 5) ("indisprimary" :bool t 7)
-                   ("indisvalid" :bool t 11) ("indkey" :int2vector t 16)
-                   ("indnkeyatts" :int2 t 4)))
-   (list :oid 2615 :name "pg_namespace" :kind #\r :rows 'sql-namespace-rows
-         :fields '(("oid" :oid t 1) ("nspname" :name t 2)))
-   (list :oid 6104 :name "pg_publication" :kind #\r :rows 'sql-publication-rows
-         :fields +sql-publication-fields+)
-   (list :oid 12073 :name "pg_publication_sequences" :kind #\v
-         :rows 'sql-publication-sequence-rows
-         :fields '(("pubname" :name nil 1) ("schemaname" :name nil 2)
-                   ("sequencename" :name nil 3)))
-   (list :oid 12283 :name "pg_replication_slots" :kind #\v
-         :rows 'sql-replication-slot-rows
-         :fields +sql-replication-slot-fields+)))
+   (make-sql-system-relation-descriptor 12109 "pg_settings" #\v
+                                        'startup-settings-rows +sql-settings-fields+)
+   (make-sql-system-relation-descriptor 1260 "pg_authid" #\r 'sql-authid-rows
+                                        '(("oid" :oid t 1) ("rolname" :name t 2)))
+   (make-sql-system-relation-descriptor 12110 "pg_roles" #\v 'sql-roles-rows
+                                        '(("rolname" :name t 1) ("rolsuper" :bool t 2)
+                                          ("rolcanlogin" :bool t 6) ("rolreplication" :bool t 7) ("oid" :oid t 13)))
+   (make-sql-system-relation-descriptor 1262 "pg_database" #\r 'sql-database-rows
+                                        '(("oid" :oid t 1) ("datname" :name t 2)))
+   (make-sql-system-relation-descriptor 1259 "pg_class" #\r 'sql-class-rows
+                                        '(("oid" :oid t 1) ("relname" :name t 2)
+                                          ("relnamespace" :oid t 3) ("relkind" :char t 18)
+                                          ("relnatts" :int2 t 19) ("relreplident" :char t 27)
+                                          ("reltoastrelid" :oid t 14) ("relispartition" :bool t 28)))
+   (make-sql-system-relation-descriptor 1249 "pg_attribute" #\r 'sql-attribute-rows
+                                        '(("attrelid" :oid t 1) ("attname" :name t 2)
+                                          ("atttypid" :oid t 3) ("attnum" :int2 t 5)
+                                          ("atttypmod" :int4 t 6) ("attnotnull" :bool t 12)
+                                          ("attgenerated" :char t 16) ("attisdropped" :bool t 17)
+                                          ("attstorage" :char t 10)))
+   (make-sql-system-relation-descriptor 1247 "pg_type" #\r 'sql-type-rows
+                                        '(("oid" :oid t 1) ("typname" :name t 2)
+                                          ("typnamespace" :oid t 3) ("typlen" :int2 t 5)
+                                          ("typalign" :char t 23) ("typstorage" :char t 24)))
+   (make-sql-system-relation-descriptor 2610 "pg_index" #\r 'sql-index-rows
+                                        '(("indexrelid" :oid t 1) ("indrelid" :oid t 2)
+                                          ("indisunique" :bool t 5) ("indisprimary" :bool t 7)
+                                          ("indisvalid" :bool t 11) ("indkey" :int2vector t 16)
+                                          ("indnkeyatts" :int2 t 4)))
+   (make-sql-system-relation-descriptor 2615 "pg_namespace" #\r 'sql-namespace-rows
+                                        '(("oid" :oid t 1) ("nspname" :name t 2)))
+   (make-sql-system-relation-descriptor 6104 "pg_publication" #\r 'sql-publication-rows
+                                        +sql-publication-fields+)
+   (make-sql-system-relation-descriptor 12073 "pg_publication_sequences" #\v
+                                        'sql-publication-sequence-rows
+                                        '(("pubname" :name nil 1) ("schemaname" :name nil 2)
+                                          ("sequencename" :name nil 3)))
+   (make-sql-system-relation-descriptor 12283 "pg_replication_slots" #\v
+                                        'sql-replication-slot-rows
+                                        +sql-replication-slot-fields+)))
 
 (defun sql-system-relation-definition (identity)
-  (find identity +sql-system-relations+
-        :key (if (stringp identity) (lambda (entry) (getf entry :name))
-                 (lambda (entry) (getf entry :oid)))
-        :test (if (stringp identity) #'string= #'eql)))
+  (if (stringp identity)
+      (find identity +sql-system-relations+ :key #'sql-system-relation-descriptor-name :test #'string=)
+      (find identity +sql-system-relations+ :key #'sql-system-relation-descriptor-oid :test #'eql)))
 
 (defun sql-system-row-source (table)
-  (getf (sql-system-relation-definition (pg-class-oid table)) :rows))
+  (let ((descriptor (sql-system-relation-definition (pg-class-oid table))))
+    (when descriptor (sql-system-relation-descriptor-rows descriptor))))
 
 (defun sql-database-rows ()
   "Expose durable database identities to standard replication discovery."
@@ -671,9 +685,9 @@ Capture policy and keep size once for every row in the snapshot."
   (with-write-lock
     (let ((database (current-database))
           (rows (loop for entry in +sql-system-relations+
-                      collect (vector (getf entry :oid) (getf entry :name) 11
-                                      (char-code (getf entry :kind))
-                                      (reduce #'max (getf entry :fields) :key #'fourth)
+                      collect (vector (sql-system-relation-descriptor-oid entry) (sql-system-relation-descriptor-name entry) 11
+                                      (char-code (sql-system-relation-descriptor-kind entry))
+                                      (sql-system-relation-descriptor-attribute-count entry)
                                       (char-code #\d) 0 nil))))
       (labels ((add-object (oid name kind columns &optional (toast-oid 0) (namespace 2200) (identity #\d))
                  (push (vector oid name namespace (char-code kind) columns
@@ -742,8 +756,8 @@ Capture policy and keep size once for every row in the snapshot."
   (with-write-lock
     (let ((database (current-database)) (rows nil))
       (dolist (entry +sql-system-relations+)
-        (loop for field in (getf entry :fields)
-              do (push (sql-attribute-row (getf entry :oid) (first field) (second field)
+        (loop for field in (sql-system-relation-descriptor-fields entry)
+              do (push (sql-attribute-row (sql-system-relation-descriptor-oid entry) (first field) (second field)
                                           (fourth field) -1 (third field)) rows)))
       (maphash
        (lambda (name table)
@@ -837,21 +851,23 @@ Capture policy and keep size once for every row in the snapshot."
 
 (defun sql-result-column-attnum (table-oid slot)
   "Separate dense virtual-row slots from original catalog attribute numbers."
-  (let ((fields (getf (sql-system-relation-definition table-oid) :fields)))
+  (let* ((descriptor (sql-system-relation-definition table-oid))
+         (fields (and descriptor (sql-system-relation-descriptor-fields descriptor))))
     (if (and fields slot (<= 1 slot (length fields)))
         (fourth (nth (1- slot) fields))
         slot)))
 
-(defun make-sql-system-relation (oid name fields)
-  "Construct read-only catalog metadata with consistent column numbering."
-  (make-pg-class
-   :oid oid :name name :relfilenode (1- oid)
-   :columns
-   (coerce (loop for (column-name type notnull) in fields
-                 for attnum from 1
-                 collect (make-pg-column :name column-name :type type :typmod -1
-                                         :attnum attnum :notnull notnull))
-           'vector)))
+(defun make-sql-system-relation (descriptor)
+  "Build fresh executor metadata with dense, one-based column slots."
+  (let ((oid (sql-system-relation-descriptor-oid descriptor)))
+    (make-pg-class
+     :oid oid :name (sql-system-relation-descriptor-name descriptor) :relfilenode (1- oid)
+     :columns
+     (coerce (loop for (column-name type notnull) in (sql-system-relation-descriptor-fields descriptor)
+                   for attnum from 1
+                   collect (make-pg-column :name column-name :type type :typmod -1
+                                           :attnum attnum :notnull notnull))
+             'vector))))
 
 (defun sql-publication-rows ()
   "Snapshot the publication catalog in C column order."
@@ -878,7 +894,7 @@ Capture policy and keep size once for every row in the snapshot."
   "Return read-only supported catalog columns from their shared descriptor."
   (let ((entry (sql-system-relation-definition name)))
     (when entry
-      (make-sql-system-relation (getf entry :oid) (getf entry :name) (getf entry :fields)))))
+      (make-sql-system-relation entry))))
 
 (defun lookup-sql-relation (reference)
   "Resolve SQL schema qualification and search order without changing raw lookup."
