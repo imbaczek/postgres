@@ -82,6 +82,12 @@
             (let ((slots (hash-table-count *wal-replication-slots*))
                   (groups (hash-table-count *logical-slot-continuation-protections*)))
               (assert *wal-ready*)
+              (let* ((metadata (nth-value 6 (wal-read-control-fields)))
+                     (id (getf (getf metadata :retained-reference) :root-id)))
+                (when id
+                  (assert (eql id (physical-retained-root-current
+                                   (physical-promotion-retained-owner :primary))))
+                  (format t "~&IMPORTED-MAIN-PRIMARY-ROOT ~d~%" id)))
               (assert (not (recovery-in-progress-p)))
               (if (plusp slots)
                   (progn

@@ -84,3 +84,20 @@
      :startup-reconcile
      (lambda () (logical-slot-imported-startup-check-owned after)))
     after))
+
+(defun logical-slot-imported-restore-primary-retained (gate ownership)
+  "Restore the current primary control's root under the imported host owner."
+  (call-with-logical-slot-imported-host-startup-owner
+   gate ownership
+   (lambda (owner)
+     (when (getf *wal-control-metadata* :retained-reference)
+       (call-with-physical-directory-root
+        owner
+        (lambda (root path)
+          (declare (ignore path))
+          (call-with-logical-slot-imported-archive-directory
+           root
+           (lambda (archive-fd facts)
+             (declare (ignore facts))
+             (physical-promotion-restore-primary-retained
+              :expected-archive-key (physical-retained-archive-key archive-fd))))))))))

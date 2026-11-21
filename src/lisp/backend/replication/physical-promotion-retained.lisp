@@ -143,7 +143,7 @@ This reads objects but does not register a root or change files."
     (unless (equalp fields expected) (error "retained promotion archive primary control changed"))
     (getf (getf (seventh fields) :retained-reference) :root-id)))
 
-(defun physical-promotion-restore-primary-retained ()
+(defun physical-promotion-restore-primary-retained (&key expected-archive-key)
   "Validate committed child control and register its primary root owner.
 Return the complete control tuple for the subsequent retirement check."
   (let* ((fields (multiple-value-list (wal-read-control-fields)))
@@ -157,7 +157,8 @@ Return the complete control tuple for the subsequent retirement check."
           (physical-retained-root-reconcile
            (physical-promotion-retained-owner :primary) (physical-recovery-retained-directory)
            (physical-promotion-retained-identity (getf metadata :system-id) reference)
-           projected (lambda () (physical-promotion-primary-root-selection fields))))))
+           projected (lambda () (physical-promotion-primary-root-selection fields))
+           :expected-archive-key expected-archive-key))))
     fields))
 
 (defun physical-promotion-retire-pending-retained (fields)
