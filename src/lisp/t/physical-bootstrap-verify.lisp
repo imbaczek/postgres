@@ -19,7 +19,7 @@
              (with-standard-io-syntax
                (let ((*read-eval* nil)) (read-from-string text))))))
        (catalog (pg::load-catalog)))
-  (assert (= 1 (getf manifest :version)))
+  (assert (= 3 (getf manifest :version)))
   (assert (= (pg::catalog-system-identifier catalog) (getf manifest :system-id)))
   (assert (equal (pg::catalog-cluster-identity catalog) (getf manifest :cluster-identity)))
   (assert (probe-file (merge-pathnames "recovery.required" target)))
@@ -35,13 +35,20 @@
                 while (plusp count)
                 do (setf digest (pg::physical-store-update-digest digest (subseq buffer 0 count))))
           (assert (= expected-digest digest))))))
-  (multiple-value-bind (checkpoint durable) (pg::wal-read-control-fields)
+  (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline namespace)
+      (pg::wal-read-control-fields)
     (assert (= checkpoint (getf manifest :checkpoint)))
     (assert (= durable (getf manifest :end)))
-    (let ((pg::*wal-durable-lsn* durable))
+    (assert (= insertion checkpoint-timeline (getf manifest :timeline)))
+    (assert (= (getf snapshot :start) (getf manifest :checkpoint-start)))
+    (let ((pg::*wal-durable-lsn* durable)
+          (pg::*wal-insert-timeline* insertion)
+          (pg::*wal-segment-namespace* namespace)
+          (pg::*wal-checkpoint-snapshot* snapshot))
       (pg::physical-source-pin-check-wal
        (pg::make-physical-source-pin :name "copy" :system-id (getf manifest :system-id)
+                                     :timeline insertion
                                      :consistent-lsn checkpoint
-                                     :restart-lsn (if (zerop checkpoint) 0 (- checkpoint 32))))))
+                                     :restart-lsn (getf manifest :checkpoint-start)))))
   (assert (>= (pg::load-next-xid) (getf manifest :next-xid)))
   (format t "physical-bootstrap-verify: PASS~%"))

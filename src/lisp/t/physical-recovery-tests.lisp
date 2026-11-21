@@ -317,8 +317,8 @@
   (check-streaming-setup-transition-cut :success :error))
 
 (defun sample-recovery-manifest ()
-  (list :version 1 :system-id 123 :cluster-identity "fixture#identity" :timeline 1
-        :checkpoint 32 :end 32 :next-xid 3 :source-pin "copy"
+  (list :version 3 :system-id 123 :cluster-identity "fixture#identity" :timeline 1
+        :checkpoint 32 :checkpoint-start 0 :end 32 :next-xid 3 :source-pin "copy"
         :files (list (list "PG_VERSION" 3 9))))
 
 (defun write-recovery-manifest-text (root text)

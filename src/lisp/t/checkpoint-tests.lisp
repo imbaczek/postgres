@@ -279,19 +279,25 @@
                 (getf pg::*wal-checkpoint-snapshot* :time) 0)
           (ok (intake-fails-p (lambda () (pg::physical-source-pin-check-wal pin))))))))
 
-(deftest checkpoint-manifest-start-preserves-legacy-and-new-boundaries
-    (let* ((legacy (list :version 1 :system-id 123 :cluster-identity "checkpoint-test"
-                         :timeline 1 :checkpoint 64 :end 64 :next-xid 42
-                         :source-pin "checkpoint_test" :files '(("PG_VERSION" 3 7))))
-           (new (append (subseq legacy 0 8) (list :checkpoint 152 :checkpoint-start 32
-                                                  :end 152) (nthcdr 12 legacy))))
-      (setf (getf new :version) 2)
-      (ok (pg::recovery-check-manifest-schema legacy))
-      (ok (= 32 (pg::physical-manifest-checkpoint-start legacy)))
-      (ok (pg::recovery-check-manifest-schema new))
-      (ok (= 32 (pg::physical-manifest-checkpoint-start new)))
-      (setf (getf new :checkpoint-start) 33)
-      (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema new))))))
+(deftest checkpoint-manifest-requires-current-version-and-explicit-boundary
+    (let* ((current (list :version 3 :system-id 123 :cluster-identity "checkpoint-test"
+                          :timeline 1 :checkpoint 152 :checkpoint-start 32 :end 152
+                          :next-xid 42 :source-pin "checkpoint_test" :files '(("PG_VERSION" 3 7))))
+           (v1 (copy-list current))
+           (v2 (copy-list current))
+           (missing-start (copy-list current)))
+      (setf (getf v1 :version) 1
+            (getf v1 :checkpoint) 64
+            (getf v1 :end) 64
+            (getf v2 :version) 2)
+      (remf v1 :checkpoint-start)
+      (remf missing-start :checkpoint-start)
+      (ok (pg::recovery-check-manifest-schema current))
+      (ok (= 32 (pg::physical-manifest-checkpoint-start current)))
+      (dolist (invalid (list v1 v2 missing-start))
+        (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema invalid)))))
+      (setf (getf current :checkpoint-start) 33)
+      (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema current))))))
 
 (deftest native-logical-records-survive-streaming-intake
     (dolist (type (list pg::+wal-record-logical-changes+ pg::+wal-record-logical-catalog-event+))
