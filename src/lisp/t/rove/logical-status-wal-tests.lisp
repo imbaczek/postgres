@@ -462,6 +462,29 @@
         (rove:ok (unit-commit-ts-error-p
                   (lambda () (wal-logical-status-next on (record snapshot) 2)))))))
 
+(rove:deftest catalog-recovery-spill-releases-its-file-on-batch-discard
+    (let* ((directory
+             (uiop:ensure-directory-pathname
+              (sb-posix:mkdtemp
+               (namestring (merge-pathnames "pg-catalog-recovery.XXXXXX" (uiop:temporary-directory))))))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (bytes (make-array 1 :element-type '(unsigned-byte 8) :initial-element 11))
+           (chunk (make-wal-record :payload (wal-encode-catalog-chunk-payload bytes 0 2))))
+      (unwind-protect
+           (dolist (discard-at-marker '(nil t))
+             (let ((path nil))
+               (with-wal-replay-staging ()
+                 (wal-recovery-reset-batch t)
+                 (wal-recovery-stage-catalog-chunk chunk)
+                 (setf path (logical-spool-path *wal-recovery-catalog-spool*))
+                 (rove:ok (and path (probe-file path)))
+                 (when discard-at-marker
+                   (wal-recovery-reset-batch t)
+                   (rove:ok (not (probe-file path)))))
+               (rove:ok (and path (not (probe-file path))))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest history-and-redo-discard-incomplete-catalog-batches
     (flet ((record (type payload)
              (make-wal-record :version +wal-version+ :type type :xid 0
@@ -486,7 +509,7 @@
               (rove:ok (rove:signals (funcall consumer pages) 'error))
               (funcall consumer marker)
               (rove:ok *wal-recovery-reservation-batch-clean-p*)
-              (rove:ok (null *wal-recovery-catalog-chunks*))
+              (rove:ok (null *wal-recovery-catalog-spool*))
               (rove:ok (null *wal-recovery-catalog-chunk-count*))
               (rove:ok (zerop *wal-recovery-catalog-next-chunk*))
               (funcall consumer pages)

@@ -6,7 +6,7 @@
   (let* ((*wal-checkpoint-lsn* 0)
          (*wal-recovery-group-active* nil)
          (*wal-recovery-page-images* '())
-         (*wal-recovery-catalog-chunks* '())
+         (*wal-recovery-catalog-spool* nil)
          (*wal-recovery-catalog-chunk-count* nil)
          (*wal-recovery-catalog-next-chunk* 0)
          (empty (make-array 0 :element-type '(unsigned-byte 8)))
@@ -499,11 +499,7 @@
                        (= (car (last record-types))
                           +wal-record-catalog-commit+))
                   "oversized catalog image uses chunks and a terminal record")
-           (let ((*wal-recovery-group-active* nil)
-                 (*wal-recovery-page-images* '())
-                 (*wal-recovery-catalog-chunks* '())
-                 (*wal-recovery-catalog-chunk-count* nil)
-                 (*wal-recovery-catalog-next-chunk* 0))
+           (with-wal-replay-staging ()
              (wal-scan #'wal-replay-record))
            (with-open-file (stream (merge-pathnames "global/pg_catalog.dat"
                                                     *pgdata*)
@@ -514,10 +510,11 @@
                (read-sequence recovered stream)
                (check (equalp recovered catalog-bytes)
                       "chunked catalog WAL reassembles during recovery")))
-           (let ((*wal-recovery-catalog-chunks*
-                   (list (make-array 1 :element-type '(unsigned-byte 8))))
-                 (*wal-recovery-catalog-chunk-count* 1)
-                 (*wal-recovery-catalog-next-chunk* 1))
+           (with-wal-replay-staging ()
+             (wal-recovery-reset-batch t)
+             (wal-recovery-stage-catalog-chunk
+              (make-wal-record :payload (wal-encode-catalog-chunk-payload
+                                         (make-array 1 :element-type '(unsigned-byte 8)) 0 1)))
              (check (handler-case
                         (progn
                           (wal-reassemble-catalog-chunks 1 #xffffffffffffffff)

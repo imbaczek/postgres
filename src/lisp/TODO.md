@@ -232,6 +232,10 @@ batch, including its staged catalog chunks.
 Both consumers also validate complete native terminals through one decoder.
 Catalog chunks are reassembled before either consumer uses the payload.
 Selected end-of-recovery records follow their separate timeline transition.
+Catalog chunks use a recovery-owned spool that spills at the existing memory
+threshold. The terminal checks the observed chunk count and byte total before
+allocating the contiguous catalog image. Recovery releases scratch files on a
+replacement marker, at the terminal, or when the scan exits.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename

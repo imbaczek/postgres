@@ -656,7 +656,9 @@ short check alone cannot do so."
 (defvar *wal-recovery-page-spool* nil
   "Recovery page spool, with an ordinary cleanup owner rather than WAL's domain.")
 
-(defvar *wal-recovery-catalog-chunks* '())
+(defvar *wal-recovery-catalog-spool* nil
+  "Owns catalog chunks until the batch terminal or recovery cleanup.")
+
 (defvar *wal-recovery-catalog-chunk-count* nil)
 (defvar *wal-recovery-catalog-next-chunk* 0)
 (defvar *wal-recovery-logical-xid* nil)
@@ -2536,21 +2538,32 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
               (wal-encode-catalog-chunk-payload chunk index count))))
   (values))
 
+(defun wal-recovery-close-spool (spool kind)
+  (when spool
+    (close-logical-spool spool)
+    (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
+      (error "recovery ~a spool cleanup failed" kind)))
+  nil)
+
 (defun wal-reassemble-catalog-chunks (expected-count expected-length)
-  (unless (and (eql expected-count *wal-recovery-catalog-chunk-count*)
-               (= expected-count *wal-recovery-catalog-next-chunk*)
-               (= expected-count (length *wal-recovery-catalog-chunks*)))
-    (error "WAL catalog chunk sequence is incomplete"))
-  (let* ((chunks (nreverse *wal-recovery-catalog-chunks*))
-         (actual-length (reduce #'+ chunks :key #'length :initial-value 0)))
-    (unless (= actual-length expected-length)
-      (error "WAL catalog chunks do not match their declared length"))
-    (let ((payload (make-array actual-length
-                               :element-type '(unsigned-byte 8)))
+  (let ((spool *wal-recovery-catalog-spool*))
+    (multiple-value-bind (bytes count) (when spool (logical-spool-resource-size spool))
+      (unless (and count
+                   (eql expected-count *wal-recovery-catalog-chunk-count*)
+                   (= expected-count *wal-recovery-catalog-next-chunk* count))
+        (error "WAL catalog chunk sequence is incomplete"))
+      (unless (= expected-length bytes)
+        (error "WAL catalog chunks do not match their declared length")))
+    (logical-spool-seal spool)
+    (let ((payload (make-array expected-length :element-type '(unsigned-byte 8)))
           (offset 0))
-      (dolist (chunk chunks)
-        (replace payload chunk :start1 offset)
-        (incf offset (length chunk)))
+      (logical-spool-map-events
+       spool (lambda (chunk)
+               (replace payload chunk :start1 offset)
+               (incf offset (length chunk))))
+      (unless (= offset expected-length)
+        (error "WAL catalog spool length changed during reassembly"))
+      (setf *wal-recovery-catalog-spool* (wal-recovery-close-spool spool "catalog"))
       payload)))
 
 (defun wal-defer-relation-delete (relfilenode)
@@ -2981,12 +2994,8 @@ src/backend/access/transam/xlogreader.c."
     (lambda () (wal-apply-catalog-image deletes catalog-bytes))))
 
 (defun wal-recovery-close-page-spool ()
-  (when *wal-recovery-page-spool*
-    (close-logical-spool *wal-recovery-page-spool*)
-    (unless (eq :resolved (query-temp-cleanup-owner-state
-                           (logical-spool-owner *wal-recovery-page-spool*)))
-      (error "recovery page spool cleanup failed"))
-    (setf *wal-recovery-page-spool* nil))
+  (setf *wal-recovery-page-spool*
+        (wal-recovery-close-spool *wal-recovery-page-spool* "page"))
   (values))
 
 (defun wal-recovery-stage-page-record (record)
@@ -3023,12 +3032,12 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-recovery-reset-batch (active)
   "Discard staged batch records. ACTIVE starts a batch after a validated marker."
   (wal-recovery-close-page-spool)
+  (setf *wal-recovery-catalog-spool* (wal-recovery-close-spool *wal-recovery-catalog-spool* "catalog"))
   (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
   (setf *wal-recovery-group-active* active
         *wal-recovery-page-images* nil
         *wal-recovery-relation-resets* nil
         *wal-recovery-page-records-seen-p* nil
-        *wal-recovery-catalog-chunks* nil
         *wal-recovery-catalog-chunk-count* nil
         *wal-recovery-catalog-next-chunk* 0
         *wal-recovery-logical-catalog-event-p* nil)
@@ -3063,8 +3072,12 @@ src/backend/access/transam/xlogreader.c."
     (when (and *wal-recovery-catalog-chunk-count*
                (/= count *wal-recovery-catalog-chunk-count*))
       (error "WAL catalog chunk count changes within a batch"))
+    (unless *wal-recovery-catalog-spool*
+      (sb-sys:without-interrupts
+        (let ((*query-temp-file-limit-bytes* nil))
+          (setf *wal-recovery-catalog-spool* (make-logical-spool)))))
+    (logical-spool-append *wal-recovery-catalog-spool* bytes)
     (setf *wal-recovery-catalog-chunk-count* count)
-    (push bytes *wal-recovery-catalog-chunks*)
     (incf *wal-recovery-catalog-next-chunk*)))
 
 (defun wal-recovery-note-logical-catalog-event (record)
@@ -3255,7 +3268,7 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
          (*wal-recovery-relation-resets* nil)
          (*wal-recovery-page-records-seen-p* nil)
          (*wal-recovery-page-spool* nil)
-         (*wal-recovery-catalog-chunks* '())
+         (*wal-recovery-catalog-spool* nil)
          (*wal-recovery-catalog-chunk-count* nil)
          (*wal-recovery-catalog-next-chunk* 0)
          (*wal-recovery-logical-xid* nil)
@@ -3266,7 +3279,8 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
      (unwind-protect
           (progn ,@body)
        (unwind-protect (wal-recovery-close-page-spool)
-         (wal-recovery-reset-logical-change-batch)))))
+         (unwind-protect (wal-recovery-close-spool *wal-recovery-catalog-spool* "catalog")
+           (wal-recovery-reset-logical-change-batch))))))
 
 (defun wal-recovery-policy-incarnation (state incarnation record completed-p)
   "Carry private FPW evidence across a completed CLOG reset's identity change.
