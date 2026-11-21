@@ -1830,7 +1830,7 @@ The sync covers the whole current inserted stream, possibly beyond the request."
 
 (defun wal-decode-relation-reset (record)
   (let ((payload (wal-record-payload record)))
-    (unless (and (>= (wal-record-version record) 8)
+    (unless (and (= (wal-record-version record) +wal-version+)
                  (= (length payload) 8)
                  (plusp (wal-u32 payload 0))
                  (<= (wal-u32 payload 4) 1)

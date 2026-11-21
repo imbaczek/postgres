@@ -48,10 +48,7 @@ also reach this replay position and match the checkpoint's reservation bound."
     (let* ((record (wal-decode-record
                     (subseq prefix (mod start +wal-segment-size+)) start))
            (decoded (wal-checkpoint-record-snapshot record)))
-      (unless (and (>= (wal-record-version record) 7)
-                   (= (wal-record-type record) +wal-record-checkpoint+)
-                   (zerop (wal-record-xid record)) (= (wal-record-end record) end)
-                   (equal decoded snapshot))
+      (unless (equal decoded snapshot)
         (error "standby checkpoint WAL differs from its applied snapshot"))
       (values (copy-seq prefix) decoded))))
 

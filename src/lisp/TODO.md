@@ -85,10 +85,13 @@ and backup manifest schema retain their older variants for B3 and B11.
 Source transaction replay now follows WAL8 transitions. End-of-recovery
 keeps the proven reservation bound but clears completeness until the child
 checkpoint. End-of-recovery and CLOG reset clear source membership.
-Version-specific fixtures still cover running-xacts records, XID reservation,
-timeline lineage and end-of-recovery. Remove
-compatibility assertions alongside their reader branches and regenerate
-fixtures that exercise behavior still supported by WAL8.
+Running-xacts, XID reservation, end-of-recovery, relation reset, and policy
+terminal validators require WAL8. The follow-anchor test rejects a
+checksummed WAL7 transition while preserving the current digest vectors.
+Primary scan still recognizes retired transition headers so tail repair
+cannot truncate them as ordinary records.
+The checkpoint process suite rejects a checksummed WAL7 checkpoint before
+exercising native crash, replay and restartpoint behavior on a separate copy.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which

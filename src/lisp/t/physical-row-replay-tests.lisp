@@ -1,7 +1,7 @@
 (in-package #:pg-physical-tests)
 
 (defun row-replay-test-record (type &optional (xid 0))
-  (pg::make-wal-record :version 7 :type type :xid xid :start 0 :end 32
+  (pg::make-wal-record :version pg::+wal-version+ :type type :xid xid :start 0 :end 32
                        :payload (empty-octets)))
 
 (deftest row-replay-guards-record-types-and-full-xid-boundaries
@@ -76,7 +76,7 @@
                                  :relfilenode 900 :fork :main :block block
                                  :page (pg::page-init (pg::make-page))
                                  :provenance provenance :xids xids)))
-                     (pg::make-wal-record :version 7 :end lsn
+                     (pg::make-wal-record :version pg::+wal-version+ :end lsn
                                           :payload (pg::wal-encode-page-images (list image) lsn))))
                  (check (records horizon expected-allowed expected-error)
                    (pg::with-physical-replay-staging ()

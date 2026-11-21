@@ -53,13 +53,16 @@ start_source
 sql "$PORT" 'CREATE TABLE cp_data (id integer PRIMARY KEY); INSERT INTO cp_data VALUES (1); CHECKPOINT'
 probe >"$TMP/initial-copy.json"
 kill -KILL "$SOURCE"; wait "$SOURCE" 2>/dev/null || :; SOURCE=
-# Convert only this stopped test image to the old empty v5 record and PGWAL3.
-probe --legacy-fixture
+# Only change the record version and recompute the checksum on a stopped copy.
+cp -a "$TMP/source" "$TMP/retired-wal"
+python3 "$BASE/t/interop/checkpoint-snapshot.py" "$TMP/retired-wal" --retired-wal-fixture
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/retired-wal" >"$TMP/retired-wal-start.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -q 'invalid WAL record at LSN' "$TMP/retired-wal-start.log"
 start_source
 test "$(sql "$PORT" 'SELECT count(*) FROM cp_data')" = 1
-checked source '(assert (null *wal-checkpoint-snapshot*))' legacy-unknown
-sql "$PORT" CHECKPOINT
-probe --save "$TMP/old.json" >"$TMP/initial-copy.json"
+probe --save "$TMP/old.json" >"$TMP/restarted-initial-copy.json"
 sql "$PORT" 'INSERT INTO cp_data VALUES (2)'
 checked source '(setf *wal-test-pause-at* "after-checkpoint-wal-flush")' arm
 sql "$PORT" CHECKPOINT >"$TMP/paused-checkpoint.log" 2>&1 &
@@ -149,4 +152,4 @@ test "$result" -eq 1
 grep -q 'native timeline-keyed WAL is not yet supported' "$TMP/unsupported-insertion.log"
 snapshot_storage >"$TMP/unsupported-after.json"
 cmp "$TMP/unsupported-before.json" "$TMP/unsupported-after.json"
-echo 'checkpoint-snapshot: legacy upgrade, crash boundaries, checkpoint identity, replay/restartpoint and unsupported child rejection PASS'
+echo 'checkpoint-snapshot: retired WAL rejection, crash boundaries, checkpoint identity, replay/restartpoint and unsupported child rejection PASS'

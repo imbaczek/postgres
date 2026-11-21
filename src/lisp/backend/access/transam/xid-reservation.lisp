@@ -23,7 +23,7 @@
 (defun wal-xid-reservation-record-bound (record)
   "Validate the schema introduced in v7; the WAL header decoder checks versions."
   (unless (and (= (wal-record-type record) +wal-record-xid-reservation+)
-               (>= (wal-record-version record) 7)
+               (= (wal-record-version record) +wal-version+)
                (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))
