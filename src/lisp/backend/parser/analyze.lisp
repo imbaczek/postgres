@@ -443,17 +443,41 @@ exist\" messages."
   (if (eq (expr-type argument) :text) argument
       (list :cast argument :type :text :typmod -1)))
 
-(defun analyze-json-inspection-function (name arguments)
-  "Resolve the four JSON inspection functions against their catalog signatures.
-Unknown constants are coerced to the declared JSON or JSONB input type.  The
-result is text for typeof and int4 for array_length."
-  (let ((input-type (if (search "jsonb_" name) :jsonb :json)))
-    (unless (and (= (length arguments) 1)
-                 (or (eq (expr-type (first arguments)) input-type)
-                     (in-unknown-constant-p (first arguments))))
+(defstruct scalar-builtin name argument-types result-type volatility strict-p evaluator)
+
+(defparameter *scalar-builtin-descriptors*
+  (let ((registry (make-hash-table :test #'equal)))
+    (dolist (builtin
+             (list (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
+                                        :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
+                   (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
+                                        :volatility :immutable :strict-p t :evaluator 'sql-jsonb-kind)
+                   (make-scalar-builtin :name "json_array_length" :argument-types '(:json) :result-type :int4
+                                        :volatility :immutable :strict-p t :evaluator 'sql-json-source-array-length)
+                   (make-scalar-builtin :name "jsonb_array_length" :argument-types '(:jsonb) :result-type :int4
+                                        :volatility :immutable :strict-p t :evaluator 'sql-jsonb-array-length)))
+      (setf (gethash (scalar-builtin-name builtin) registry) builtin))
+    registry))
+
+(defun find-scalar-builtin (name)
+  (gethash name *scalar-builtin-descriptors*))
+
+(defun eval-scalar-builtin (builtin arguments)
+  (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
+      +null+
+      (apply (scalar-builtin-evaluator builtin) arguments)))
+
+(defun analyze-fixed-scalar-builtin (builtin arguments)
+  "Check a fixed signature with exact argument types or unknown constants."
+  (let ((types (scalar-builtin-argument-types builtin))
+        (name (scalar-builtin-name builtin)))
+    (unless (and (= (length arguments) (length types))
+                 (every (lambda (argument type)
+                          (or (eq (expr-type argument) type) (in-unknown-constant-p argument)))
+                        arguments types))
       (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (list :func name (list (coerce-common-expression (first arguments) input-type))
-          :type (if (search "_typeof" name) :text :int4) :typmod -1)))
+    (list :func name (mapcar #'coerce-common-expression arguments types)
+          :type (scalar-builtin-result-type builtin) :typmod -1)))
 
 (defun analyze-jsonb-set-function (name arguments)
   "Resolve jsonb_set(jsonb, text[], jsonb [, boolean])."
@@ -1707,6 +1731,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                  (some (lambda (argument) (eq (first argument) :named-arg)) (third expr))))
     (ereport "42601" "invalid GREATEST or LEAST syntax"))
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
+         (builtin (find-scalar-builtin name))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
                    (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic)
@@ -1763,12 +1788,11 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-nullary-record-function name args +control-checkpoint-result-fields+))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
-      ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
-               :test #'string=)
+      (builtin
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
-         (analyze-json-inspection-function name args)))
+         (analyze-fixed-scalar-builtin builtin args)))
       ((member name '("substr" "substring") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3877,7 +3901,9 @@ checks still apply."
   (and (consp form)
        (or (eq (first form) :subplan)
            (and (eq (first form) :func)
-                (not (or (integer-catalog-alias-p (second form))
+                (not (or (let ((builtin (find-scalar-builtin (second form))))
+                           (and builtin (member (scalar-builtin-volatility builtin) '(:immutable :stable))))
+                         (integer-catalog-alias-p (second form))
                          (float-catalog-alias (second form))
                          (trig-function-p (second form))
                          (numeric-arithmetic-function-p (second form))
@@ -3885,7 +3911,7 @@ checks still apply."
                          (member (second form)
                                  '("version" "pg_lisp_runtime" "current_database" "current_schema"
                                    "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
-                                   "json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
+                                   "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                                    "jsonb_build_array" "jsonb_build_object" "get_byte" "set_byte" "get_bit" "set_bit"
                                    "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
                                    "chr" "array_to_string" "string_to_array" "greatest" "least"
@@ -4631,6 +4657,8 @@ the full 64-bit ID as a signed value."
     (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))
 
 (defun eval-func (name args)
+  (let ((builtin (find-scalar-builtin name)))
+    (when builtin (return-from eval-func (eval-scalar-builtin builtin args))))
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
@@ -4650,13 +4678,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_last_xact_replay_timestamp")
      (let ((timestamp (or *last-replay-xact-timestamp* 0)))
        (if (zerop timestamp) +null+ timestamp)))
-    ((member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length")
-             :test #'string=)
-     (sql-strict-let ((value (first args)))
-       (cond ((string= name "json_typeof") (sql-json-source-kind value))
-             ((string= name "jsonb_typeof") (sql-jsonb-kind value))
-             ((string= name "json_array_length") (sql-json-source-array-length value))
-             (t (sql-jsonb-array-length value)))))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((member name '("chr" "array_to_string") :test #'string=)
      (eval-render-function name args))

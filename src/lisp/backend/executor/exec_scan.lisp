@@ -884,12 +884,14 @@ Mark direct scalar function sources through their aliases."
 (defun having-immutable-function-p (name)
   ;; Match the immutable declarations in pg_proc.dat for supported calls.
   ;; Other calls remain opaque even when their arguments are constants.
-  (or (integer-catalog-alias-p name)
+  (or (let ((builtin (find-scalar-builtin name)))
+        (and builtin (eq (scalar-builtin-volatility builtin) :immutable)))
+      (integer-catalog-alias-p name)
       (float-catalog-alias name)
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)
-      (member name '("json_typeof" "jsonb_typeof" "json_array_length" "jsonb_array_length" "jsonb_set" "jsonb_insert"
+      (member name '("jsonb_set" "jsonb_insert"
                      "lower" "substr" "substring" "length" "char_length" "character_length" "octet_length"
                      "pg_wal_lsn_diff" "pg_walfile_name"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"

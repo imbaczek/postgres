@@ -164,6 +164,10 @@ The WindowAgg drivers share partition resets, ranking, aggregate transitions,
 and transition origins. The window differential covers one-row portal
 resumption for ROWS prefixes, RANGE peer groups, and whole partitions.
 
+The first A3 slice registers the four JSON and JSONB inspection functions.
+Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING
+folding read the same signature, strictness, and volatility descriptors.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
