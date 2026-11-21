@@ -1002,48 +1002,47 @@ result includes the scan disposition and does not alter replay exhaustion."
 
 (defun physical-follow-check-pending-state-core (store verified-base config read-config)
   "Validate a saved pending binding against durable recovery and receive state.
-Accept only the saved old or post receive tuple; post recovery with old receive
-is invalid. Check the actual restartpoint and scan a disposable candidate
+Accept only the complete before or after receive snapshot; recovery cannot
+advance before receive. Check the restartpoint and scan a disposable candidate
 outside the store mutex, then recheck control and config for changes.
 The caller must exclude recovery and reload and protect the selected root."
-  ;; READ-CONFIG must independently read and decode the bound file on each
-  ;; call.  The caller protects the selected root and excludes recovery and
-  ;; reload.  A relocated activation reader must bind the held descriptor,
-  ;; name, identity and bytes, and apply the raw guard on both reads.
+  ;; A relocated reader must bind the held descriptor, name, identity and bytes
+  ;; and apply the raw guard on both reads.
   (physical-follow-check-config config)
   (unless (and (member (length config) '(5 6)) (eq :pending (getf (fifth config) :phase))
                (equal config (funcall read-config)))
     (error "pending follow config is absent, active or changed"))
-  (let* ((binding (fifth config)) (before (getf binding :before)) (after (getf binding :after))
-                                  (control (physical-recovery-read-control *pgdata*))
-                                  (recovery-position (physical-follow-pending-recovery-position verified-base binding control))
-                                  (position nil)
-                                  (candidate
-                                    (sb-thread:with-mutex ((physical-store-mutex store))
-                                      (physical-store-check-live store)
-                                      (physical-store-check-complete-input store)
-                                      (let ((current (physical-store-control-tuple store)))
-                                        (physical-store-read-retained-control store current)
-                                        (cond
-                                          ((equal current after)
-                                           (setf position :after)
-                                           (physical-follow-copy-replay-candidate store))
-                                          ((equal current before)
-                                           (when (eq recovery-position :after)
-                                             (error "pending follow recovery history precedes its receive publication"))
-                                           (setf position :before)
-                                           (multiple-value-bind (history fork eor)
-                                               (physical-follow-anchor-check (getf binding :anchor))
-                                             (declare (ignore history fork eor))
-                                             (physical-store-follow-candidate
-                                              store before (getf binding :applied) (getf binding :required)
-                                              (eighth after) (getf binding :child-history) (coerce (getf (getf binding :anchor) :eor-octets) '(vector (unsigned-byte 8))))))
-                                          (t (error "pending follow receive control differs from both saved states")))))))
-    (physical-follow-validate-candidate-replay candidate verified-base binding)
-    (unless (and (equal control (physical-recovery-read-control *pgdata*))
-                 (equal config (funcall read-config)))
-      (error "pending follow durable witnesses changed during validation"))
-    (values candidate position control)))
+  (let* ((binding (fifth config))
+         (before (apply #'physical-receive-control-from-fields (getf binding :before)))
+         (after (apply #'physical-receive-control-from-fields (getf binding :after)))
+         (control (physical-recovery-read-control *pgdata*))
+         (recovery-position (physical-follow-pending-recovery-position verified-base binding control)))
+    (multiple-value-bind (candidate position)
+        (sb-thread:with-mutex ((physical-store-mutex store))
+          (physical-store-check-live store)
+          (physical-store-check-complete-input store)
+          (let ((current (physical-store-control-snapshot store)))
+            (physical-store-read-retained-control store current)
+            (cond
+              ((physical-receive-control-equal-p current after)
+               (values (physical-follow-copy-replay-candidate store) :after))
+              ((physical-receive-control-equal-p current before)
+               (when (eq recovery-position :after)
+                 (error "pending follow recovery history precedes its receive publication"))
+               (let ((anchor (getf binding :anchor)))
+                 (physical-follow-anchor-check anchor)
+                 (values
+                  (physical-store-follow-candidate
+                   store before (getf binding :applied) (getf binding :required)
+                   (physical-receive-control-history-target after) (getf binding :child-history)
+                   (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))))
+                  :before)))
+              (t (error "pending follow receive control differs from both saved states")))))
+      (physical-follow-validate-candidate-replay candidate verified-base binding)
+      (unless (and (equal control (physical-recovery-read-control *pgdata*))
+                   (equal config (funcall read-config)))
+        (error "pending follow durable witnesses changed during validation"))
+      (values candidate position control))))
 
 (defun physical-follow-check-pending-state (store verified-base config)
   "Validate a pending binding against the root config and durable recovery state.
@@ -1129,12 +1128,14 @@ state. The active config still needs durable-state validation before admission."
                       (physical-follow-check-history-files candidate (fifth config))
                       (physical-follow-test-point :after-pending-preflight)
                       (setf started t)
-                      (let* ((binding (fifth config)) (after (getf binding :after))
-                                                      (anchor (getf binding :anchor)))
+                      (let* ((binding (fifth config))
+                             (after (apply #'physical-receive-control-from-fields (getf binding :after)))
+                             (anchor (getf binding :anchor)))
                         (if (eq position :before)
                             (physical-store-rewind-select-history
-                             store (getf binding :before) (getf binding :applied) (getf binding :required)
-                             (eighth after) (getf binding :child-history)
+                             store (apply #'physical-receive-control-from-fields (getf binding :before))
+                             (getf binding :applied) (getf binding :required)
+                             (physical-receive-control-history-target after) (getf binding :child-history)
                              (coerce (getf anchor :eor-octets) '(vector (unsigned-byte 8))))
                             (with-physical-store (store)
                               (physical-store-check-retained-root store)

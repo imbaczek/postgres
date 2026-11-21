@@ -113,6 +113,12 @@
   "Build the persisted receive witness list for STORE."
   (physical-receive-control-to-tuple (apply #'physical-store-control-snapshot store options)))
 
+(defun physical-receive-control-matches-p (snapshot expected)
+  "Compare SNAPSHOT with an in-memory snapshot or a persisted witness list."
+  (if (physical-receive-control-p expected)
+      (physical-receive-control-equal-p snapshot expected)
+      (equal (physical-receive-control-to-tuple snapshot) expected)))
+
 (defun physical-store-read-retained-control (store expected)
   "Read control under the store owner and check every field in EXPECTED.
 EXPECTED can be a snapshot or a persisted witness list.
@@ -125,9 +131,7 @@ The root update calls this outside the archive mutex."
                                      :retained-directory-value (physical-store-retained-directory store))))
     (physical-store-load-control probe)
     (let ((current (physical-store-control-snapshot probe)))
-      (unless (if (physical-receive-control-p expected)
-                  (physical-receive-control-equal-p expected current)
-                  (equal expected (physical-receive-control-to-tuple current)))
+      (unless (physical-receive-control-matches-p current expected)
         (error "receive control readback differs from its complete expected tuple")))
     (values (physical-store-retained-root probe) (physical-store-selection probe))))
 
