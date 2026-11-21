@@ -47,6 +47,12 @@ with PostgreSQL C 20devel and pinned Patroni 4.1.5.
 - Password-backed bootstrap and stock `post_bootstrap` role provisioning
   passed, including SCRAM login and admission of the named replication role.
 
+The archive checks at `41774ee2b32` passed with pinned Patroni. The archive-only
+standby replayed the child timeline and retained its rows across restart. The
+archive-to-stream standby restored the history, parent partial segment and
+proofs, then streamed on `follow_one` at the exact end in the child segment
+proof. It replayed new streamed rows before and after restart.
+
 ### What the milestone demonstrated
 
 | Goal | Evidence and limits |
