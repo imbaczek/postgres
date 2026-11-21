@@ -175,7 +175,7 @@ require replay to cover both the base and durable applied position."
 (defun physical-slot-check-standby-receive (store state replay &key restart-positions prefix-positions)
   "Check receive identity and replay against a checked candidate, then recheck
 its control tuple. The caller holds a root lease and excludes spool mutation;
-the candidate and tuple recheck alone do not protect the spool."
+the candidate and snapshot recheck alone do not protect the spool."
   (unless (and (eql (physical-store-system-id store) (getf state :system-id))
                (eql (physical-store-timeline store) (getf state :timeline))
                (eql (physical-store-base-lsn store) (getf state :end))
@@ -183,16 +183,16 @@ the candidate and tuple recheck alone do not protect the spool."
                       (physical-recovery-retained-identity state))
                (<= replay (physical-store-flushed-lsn store)))
     (error "physical slot receive store differs from its immutable recovery base"))
-  (let* ((tuple (physical-store-control-tuple store))
+  (let* ((snapshot (physical-store-control-snapshot store))
          (candidate (physical-follow-copy-checked-store store))
          (index (physical-follow-controller-index candidate)))
     (physical-recovery-check-store-point candidate replay (physical-recovery-replay-timeline state))
     (physical-slot-check-receive-chain candidate index replay
                                        :restart-positions restart-positions
                                        :prefix-positions prefix-positions)
-    (unless (equal tuple (physical-store-control-tuple store))
+    (unless (physical-receive-control-equal-p snapshot (physical-store-control-snapshot store))
       (error "physical slot receive state changed during validation"))
-    (physical-store-read-retained-control store tuple))
+    (physical-store-read-retained-control store snapshot))
   t)
 
 (defun physical-slot-check-standby-slots (slots system-id)
@@ -416,14 +416,14 @@ and reject normal use until startup validates the state."
   (let* ((state *physical-recovery-state*)
          (floor (physical-store-floor-lsn store))
          (base (getf state :end))
-         (tuple (physical-store-control-tuple store)))
+         (snapshot (physical-store-control-snapshot store)))
     (unless (and (= (physical-store-system-id store) (getf state :system-id)
                     (catalog-system-identifier))
                  (= (physical-store-base-lsn store) base)
                  (= (physical-store-timeline store) (getf state :timeline))
                  (<= base floor *last-replay-lsn* (physical-store-flushed-lsn store)))
       (error "physical slot reservation differs from verified standby storage"))
-    (physical-store-read-retained-control store tuple)
+    (physical-store-read-retained-control store snapshot)
     (if (= floor base)
         (physical-recovery-read-base-overlap state *pgdata*)
         (let* ((metadata (physical-restartpoint-read state))
@@ -521,7 +521,7 @@ verify the base floor before publishing under WAL."
   (assert (not (sb-thread:holding-mutex-p *wal-lock*)))
   (sb-thread:with-mutex ((physical-store-mutex store))
     (physical-store-check-live store)
-    (physical-store-read-retained-control store (physical-store-control-tuple store))
+    (physical-store-read-retained-control store (physical-store-control-snapshot store))
     (physical-follow-call-with-receive-root
      store
      (lambda ()

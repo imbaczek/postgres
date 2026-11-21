@@ -66,7 +66,7 @@ Return NIL when it is unavailable or cannot be verified."
     (with-physical-store-failure-latch (store)
       (when (and (= segment first) (plusp (mod floor +wal-segment-size+)))
         (let* ((entries (when root
-                          (physical-store-read-retained-control store (physical-store-control-tuple store))
+                          (physical-store-read-retained-control store (physical-store-control-snapshot store))
                           (getf (physical-retained-inventory-load
                                  (physical-store-retained-directory store) root
                                  (physical-store-retained-identity store)
@@ -180,7 +180,7 @@ flush point, or NIL if the archive cannot advance the current frontier."
          (interior-base (and (= segment (floor base +wal-segment-size+))
                              (plusp (mod base +wal-segment-size+)))))
     (when root
-      (physical-store-read-retained-control store (physical-store-control-tuple store)))
+      (physical-store-read-retained-control store (physical-store-control-snapshot store)))
     (when (< segment first)
       (return-from physical-store-live-archive-segment-under-lock
         (when root (physical-retained-archive-segment
@@ -256,7 +256,7 @@ Return the staged name and proved end, or NIL until the segment is closed."
       (dolist (entry (physical-store-history-segment-entries store))
         (note (first entry) (second entry)))
       (when root
-        (physical-store-read-retained-control store (physical-store-control-tuple store))
+        (physical-store-read-retained-control store (physical-store-control-snapshot store))
         (let ((inventory (physical-retained-inventory-read-index
                           (physical-store-retained-directory store) root
                           (physical-store-retained-identity store)
@@ -285,7 +285,7 @@ Return the staged name and proved end, or NIL until the segment is closed."
   (let ((selection (physical-store-selection store)))
     (when (and selection (not (eq selection (physical-store-archive-scan-selection store))))
       (let ((checked (nth-value 1 (physical-store-read-retained-control
-                                   store (physical-store-control-tuple store)))))
+                                   store (physical-store-control-snapshot store)))))
         (dolist (node (reverse (loop for item = checked then (getf item :previous) while item collect item)))
           (funcall publish (timeline-history-filename (getf node :target))
                    (string->bytes (getf node :history-text)))))
@@ -488,7 +488,7 @@ checks bound the index; final publication validates the full inventory and image
   "Seal the prefix and select its root while the caller owns STORE's mutex.
 
 Publish the restartpoint before receive control, then read back the complete
-control tuple before handing off local root ownership. The restartpoint callback
+control snapshot before handing off local root ownership. The restartpoint callback
 must durably publish data; control readback does not prove that it did so."
   (physical-store-check-retained-identity store)
   (when (and (null (physical-store-retained-root store))
@@ -513,7 +513,7 @@ must durably publish data; control readback does not prove that it did so."
            (physical-store-test-point :after-retained-inventory-publication store)
            (funcall publish-restartpoint digest)
            (physical-store-test-point :after-restartpoint-publication store)
-           (setf expected (physical-store-control-tuple store :floor cursor :floor-digest digest :root root)
+           (setf expected (physical-store-control-snapshot store :floor cursor :floor-digest digest :root root)
                  selected root)
            (physical-store-save-control store (physical-store-flushed-lsn store)
                                         :digest (physical-store-flushed-digest store)

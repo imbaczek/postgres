@@ -85,7 +85,9 @@ helpers.
   run passed 1,590 Rove test heads. Pending follow now also compares named
   snapshots before and after receive publication. Rewind uses the complete
   snapshot for readback before publishing in-memory state or removing the
-  discarded tail. The remaining witness consumers still need migration.
+  discarded tail. Retained WAL sealing, archive readback, promotion source
+  checks and standby slot validation also use complete snapshots. The
+  remaining persisted-witness consumers still need migration.
 
 ## Open development tasks
 
