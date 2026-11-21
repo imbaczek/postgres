@@ -27,23 +27,8 @@
     #+x86-64 (compiled "port/sbcl/ieee-crc32.lisp")
     #+x86-64 (compiled "backend/storage/wal-crc32.hot.lisp")
     #+x86-64 (compiled "port/sbcl/crc32c.lisp")
-    #+x86-64 (compiled "backend/storage/wal-crc32c.hot.lisp"))
-  ;; Compile the actual dispatcher, not a copy of its branching logic.
-  (let ((*package* (find-package :pg)))
-    (with-open-file (input (merge-pathnames "backend/storage/wal-core.lisp" root))
-      (loop for form = (read input nil nil)
-            while form
-            when (and (consp form) (eq (car form) 'defun)
-                      (eq (second form) (find-symbol "MAKE-WAL-CRC32-TABLE" :pg)))
-              do (eval form)
-            when (and (consp form) (eq (car form) 'defun)
-                      (eq (second form) (find-symbol "WAL-CRC32-TYPED-RANGE" :pg)))
-              do (eval '(defparameter pg::*wal-crc32c-reference-table*
-                         (pg::make-wal-crc32-table)))
-                 (eval '(defparameter pg::*wal-crc32-table*
-                         pg::*wal-crc32c-reference-table*))
-                 (eval form)
-                 (return)))))
+    #+x86-64 (compiled "backend/storage/wal-crc32c.hot.lisp")
+    (compiled "backend/storage/wal-record.lisp")))
 
 (in-package #:pg)
 

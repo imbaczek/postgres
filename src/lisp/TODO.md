@@ -37,7 +37,7 @@ why existing code could not meet the need when a new implementation is required.
 
 | Audit item | Current writer | Compatibility evidence |
 |---|---|---|
-| B1 | [Native WAL encoder](backend/storage/wal-core.lisp) | `wal-encode-record` stamps version 8. The maintenance replay, lineage byte preservation and receive byte preservation fixtures now use the current writer. |
+| B1 | [Native WAL encoder](backend/storage/wal-record.lisp) | `wal-encode-record` stamps version 8. The maintenance replay, lineage byte preservation and receive byte preservation fixtures now use the current writer. |
 | B2 | [Primary WAL control encoder](backend/storage/wal-checkpoint.lisp) | `wal-encode-control-image` writes PGWAL6, including variants for lifecycle metadata, retained references, resources, native checksums, and a local CLOG extent. |
 | B3 | [Checkpoint codec](backend/storage/wal-checkpoint.lisp) | The current checkpoint payload is PGCKPT02. Its optional flags carry transaction and resource state used by current startup and recovery. |
 | B4 | [B-tree page construction](backend/access/btree/btree.lisp) | New pages set their type via `+pd-flags-off+`. The [page decoder](backend/storage/bufpage.lisp) recognizes the historical byte-8 layout. |
@@ -242,8 +242,10 @@ by an unlink failure.
 
 `storage/wal-recovery.lisp` owns staging, terminal application, and primary
 recovery. ASDF loads it after the temporary spool implementation and before
-physical recovery and startup. WAL framing and shared record types stay in
-`storage/wal-core.lisp`.
+physical recovery and startup. `storage/wal-record.lisp` owns native framing,
+shared record types, integer fields, and CRC32C dispatch. WAL storage declares
+the codec component as a dependency, and the standalone CRC qualification
+compiles the complete codec directly.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
