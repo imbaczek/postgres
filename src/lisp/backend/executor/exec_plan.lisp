@@ -2585,6 +2585,12 @@ Compare the advertised column shape, independently of result format codes."
     (ereport "0A000" "cached plan must not change result type"))
   columns)
 
+(defun prepare-select-result (ast)
+  "Plan AST and derive the wire descriptor from its final output targets."
+  (let* ((plan (plan-select-query ast))
+         (targets (getf (query-plan-prepared plan) :targets)))
+    (values plan targets (mapcar #'target->result-column targets))))
+
 (defun exec-perform (ast)
   "Execute a SELECT for its effects and report whether it returned any rows."
   (let ((plan (plan-select-query ast))
@@ -2599,20 +2605,18 @@ Compare the advertised column shape, independently of result format codes."
     found-p))
 
 (defun exec-select (stream ast)
-  (let* ((plan (plan-select-query ast))
-         (targets (getf (query-plan-prepared plan) :targets))
-         (columns (mapcar #'target->result-column targets))
-         (row-count 0))
-    (when *select-suppress-description*
-      (check-result-column-shape columns *select-expected-result-columns*))
-    (flet ((send-row (row)
-             (send-select-row stream row targets)
-             (incf row-count)))
-      (call-with-admitted-select-plan
-       plan (lambda (registered)
-              (unless *select-suppress-description* (send-row-description stream columns))
-              (execute-query-plan plan registered #'send-row))))
-    (send-command-complete stream (format nil "SELECT ~a" row-count))))
+  (multiple-value-bind (plan targets columns) (prepare-select-result ast)
+    (let ((row-count 0))
+      (when *select-suppress-description*
+        (check-result-column-shape columns *select-expected-result-columns*))
+      (flet ((send-row (row)
+               (send-select-row stream row targets)
+               (incf row-count)))
+        (call-with-admitted-select-plan
+         plan (lambda (registered)
+                (unless *select-suppress-description* (send-row-description stream columns))
+                (execute-query-plan plan registered #'send-row))))
+      (send-command-complete stream (format nil "SELECT ~a" row-count)))))
 
 (defun copy-write-frame (stream type payload)
   "A partially transmitted COPY frame must close rather than interleave an error."

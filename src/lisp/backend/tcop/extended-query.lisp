@@ -229,11 +229,9 @@
            (call-with-query-execution-owner
             owner
             (lambda ()
-              (let* ((plan (plan-select-query (extended-statement-ast statement)))
-                     (prepared (query-plan-prepared plan))
-                     (targets (getf prepared :targets)))
-                (check-result-column-shape
-                 (mapcar #'target->result-column targets) *select-expected-result-columns*)
+              (multiple-value-bind (plan targets columns)
+                  (prepare-select-result (extended-statement-ast statement))
+                (check-result-column-shape columns *select-expected-result-columns*)
                 (setf (extended-select-execution-plan execution) plan
                       (extended-select-execution-targets execution) targets)
                 (flet ((initialize (relations)
@@ -556,12 +554,12 @@
 
 (defun extended-select-result-columns (ast &optional register-p)
   "Plan result columns and optionally retain relation readers for the transaction."
-  (let* ((prepared (query-plan-prepared (plan-select-query ast)))
-         (relations (getf prepared :relations))
-         (columns (mapcar #'target->result-column (getf prepared :targets))))
-    (when (and register-p relations)
-      (with-registered-select-relations (registered relations)
-        (declare (ignore registered))))
+  (multiple-value-bind (plan targets columns) (prepare-select-result ast)
+    (declare (ignore targets))
+    (let ((relations (getf (query-plan-prepared plan) :relations)))
+      (when (and register-p relations)
+        (with-registered-select-relations (registered relations)
+          (declare (ignore registered)))))
     columns))
 
 (defun extended-statement-returns-rows-p (statement)

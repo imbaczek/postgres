@@ -191,8 +191,11 @@ The first A13 slice shares SELECT plan admission across simple execution,
 PERFORM, COPY TO, EXPLAIN, and extended portal initialization. Admission
 registers and revalidates relation readers before reconciling the physical
 access paths. Portal initialization still owns its snapshot, table retention,
-index leases, and resumable iterator. Describe keeps its separate
-metadata-only registration path.
+index leases, and resumable iterator.
+Simple SELECT, portal initialization, and extended-protocol metadata now
+derive their result columns through the same preparation entry point. Parse
+and Bind still retain readers before returning, and statement Describe
+recomputes and checks the prepared statement's result signature.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
