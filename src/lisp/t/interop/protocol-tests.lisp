@@ -695,7 +695,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (let* ((directory (merge-pathnames (format nil "pg-array-agg-~a/" (gensym))
                                        (uiop:temporary-directory)))
            (descriptors '((:kind :count)
-                          (:kind :array-agg :input (:col 2 :type :text))))
+                          (:kind :array-agg :type :text-array :input (:col 2 :type :text))))
            (input (list (vector 1 "a") (vector 2 "x") (vector 1 pg::+null+)
                         (vector 2 "y") (vector 1 "b"))))
       (ensure-directories-exist directory)
