@@ -161,7 +161,7 @@ def exercise(root, source_port, target_port):
             assert follow.query(target_port, "SELECT count(*) FROM archive_probe") == [(0,)]
             assert not (archive / first).exists()
             assert not (queue / "archive_status" / (first + ".done")).exists()
-            assert (queue / first).read_bytes() == (source_data / "pg_wal/0000000000000000.wal").read_bytes()
+            assert (queue / first).read_bytes() == (source_data / "pg_wal" / first).read_bytes()
             print("standby-archive: staged durable WAL with replay paused and command failing", flush=True)
 
             queue.chmod(0o755)
@@ -178,11 +178,11 @@ def exercise(root, source_port, target_port):
             assert int.from_bytes(pointer[8:16], "little") > floor
             expected = {
                 name: hashlib.sha256(
-                    (source_data / "pg_wal" / f"{index:016X}.wal").read_bytes()).digest()
-                for index, name in enumerate((first, second))
+                    (source_data / "pg_wal" / name).read_bytes()).digest()
+                for name in (first, second)
             }
             for index, name in enumerate((first, second)):
-                raw_name = f"{index:016X}.wal"
+                raw_name = name
                 receipt = source_data / "pg_wal/archive_status" / (raw_name + ".proof.done")
                 follow.wait_for(receipt.is_file)
                 raw = (primary_archive / raw_name).read_bytes()
@@ -299,14 +299,15 @@ def restore_then_stream(root, source_port, target_port, reload_restore):
 
             last = advance_wal(source_port, 1, "0/2000000")
             for segment in (0, 1):
-                name = f"{segment:016X}.wal"
+                name = f"0000000100000000{segment:08X}.wal"
                 receipt = source_data / "pg_wal/archive_status" / (name + ".proof.done")
                 follow.wait_for(receipt.is_file)
                 assert (archive / name).read_bytes() == (source_data / "pg_wal" / name).read_bytes()
             source.send_signal(signal.SIGINT)
             assert source.wait(timeout=45) == 0
 
-            proof_name = "0000000000000000.wal.proof"
+            first_segment = "000000010000000000000000.wal"
+            proof_name = first_segment + ".proof"
             proof = archive / proof_name
             withheld = root / proof_name
             proof.rename(withheld)
@@ -336,7 +337,7 @@ def restore_then_stream(root, source_port, target_port, reload_restore):
             assert not stages[0].exists()
             print("archive-restore: cold restart removed the interrupted restore stage", flush=True)
             rows = "SELECT count(*), max(id) FROM archive_probe"
-            first_attempt = f"{proof_name} 0000000000000000.wal"
+            first_attempt = f"{proof_name} {first_segment}"
             follow.wait_for(lambda: attempts.is_file() and first_attempt in attempts.read_text().splitlines())
             assert follow.query(target_port, rows) == [(0, None)]
             if reload_restore:

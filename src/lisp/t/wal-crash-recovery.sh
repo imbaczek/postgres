@@ -221,7 +221,9 @@ import sys
 segment_size = 16 * 1024 * 1024
 records = []
 for path in sorted(glob.glob(sys.argv[1] + "/*.wal")):
-    segment = int(os.path.basename(path).split(".")[0], 16)
+    stem = os.path.basename(path).removesuffix(".wal")
+    assert len(stem) == 24 and stem[:8] == "00000001"
+    segment = 256 * int(stem[8:16], 16) + int(stem[16:], 16)
     data = open(path, "rb").read()
     offset = 0
     while offset < len(data):
@@ -382,7 +384,9 @@ segments = sorted(glob.glob(sys.argv[1] + "/*.wal"))
 if not segments:
     raise SystemExit("no WAL segment found for tail-recovery check")
 path = segments[-1]
-segment = int(os.path.basename(path)[:-4], 16)
+stem = os.path.basename(path).removesuffix(".wal")
+assert len(stem) == 24 and stem[:8] == "00000001"
+segment = 256 * int(stem[8:16], 16) + int(stem[16:], 16)
 with open(path, "ab") as stream:
     lsn = segment * (16 * 1024 * 1024) + stream.tell()
     record = bytearray(32)
@@ -546,7 +550,6 @@ checkpoint_images = {}
 group_images = None
 
 for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.wal"))):
-    segment = int(os.path.basename(path)[:16], 16)
     data = open(path, "rb").read()
     offset = 0
     while offset + 32 <= len(data):
@@ -899,7 +902,9 @@ import sys
 segments = sorted(glob.glob(sys.argv[1] + "/*.wal"))
 records = []
 for path in segments:
-    segment = int(os.path.basename(path)[:16], 16)
+    stem = os.path.basename(path).removesuffix(".wal")
+    assert len(stem) == 24 and stem[:8] == "00000001"
+    segment = 256 * int(stem[8:16], 16) + int(stem[16:], 16)
     data = bytearray(open(path, "rb").read())
     offset = 0
     while offset + 32 <= len(data):
