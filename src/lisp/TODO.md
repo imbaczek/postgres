@@ -76,6 +76,9 @@ logical progress derives its first LSNs from explicit FullXID contributors.
 Both page spool readers validate the WAL8 version before decoding images.
 The native SQL promotion contract passed with fresh source startup, physical
 base backup, streaming follow and standby promotion.
+The full WAL crash suite passed after the fixture primed an XID reservation
+with a rolled-back insert and checked the final checkpoint against its
+control snapshot before injecting corruption.
 Version-specific fixtures still cover checkpoint and running-xacts
 records, XID reservation, timeline lineage and end-of-recovery. Remove
 compatibility assertions alongside their reader branches and regenerate
