@@ -52,7 +52,6 @@ across reload.")
   ;; unattempted reservation can be cancelled. Published is still invisible;
   ;; accepted is logically committed while raw CLOG remains IN_PROGRESS.
   ;; Committed enters durable materialization; materialized has left the map.
-  ;; The legacy ownerless API also uses committed before materialization.
   (tag nil :read-only t)
   (owner nil :read-only t)
   (state :reserved))
@@ -392,50 +391,6 @@ snapshot alone cannot prevent a new stage."
                (eql *wal-insert-timeline* (clog-commit-tag-timeline tag)))
     (wal-invalid-input "pending CLOG tag belongs to another WAL store"))
   (values))
-
-(defun clog-stage-commit-under-wal-lock (xid end)
-  "Install or return the matching tag for XID and its exact terminal end.
-This legacy staging API exposes committed status immediately and remains for
-compatibility and tests. Production publication uses reserved completions."
-  (clog-check-commit-boundary-under-wal-lock xid end)
-  (sb-thread:with-mutex (*clog-lock*)
-    (let* ((key (xid32-of xid)) (old (gethash key *clog-pending-commits*)))
-      (when old
-        (let ((tag (clog-commit-completion-tag old)))
-          (clog-check-commit-tag-under-wal-lock tag)
-          (unless (and (eq :committed (clog-commit-completion-state old))
-                       (null (clog-commit-completion-owner old))
-                       (= xid (clog-commit-tag-xid tag))
-                       (= end (clog-commit-tag-terminal-end tag)))
-            (wal-invalid-input "pending CLOG slot already has another owner"))
-          (return-from clog-stage-commit-under-wal-lock tag)))
-      (unless *clog-stream* (clog-init-under-lock))
-      (unless (= +clog-in-progress+ (clog-read-status-under-lock xid))
-        (wal-invalid-input "pending CLOG commit would replace a terminal status"))
-      (let ((tag (%make-clog-commit-tag xid *wal-storage-incarnation* *wal-insert-timeline* end)))
-        (setf (gethash key *clog-pending-commits*)
-              (%make-clog-commit-completion tag nil :committed))
-        tag))))
-
-(defun clog-materialize-commit-under-wal-lock (tag &key fsync)
-  "Write TAG only after the authoritative WAL durable frontier reaches it."
-  (clog-check-commit-tag-under-wal-lock tag)
-  (unless (<= (clog-commit-tag-terminal-end tag) *wal-durable-lsn*)
-    (wal-invalid-input "pending CLOG commit WAL is not durable"))
-  (sb-thread:with-mutex (*clog-lock*)
-    (let ((completion (gethash (xid32-of (clog-commit-tag-xid tag)) *clog-pending-commits*)))
-      (unless (and completion
-                   (null (clog-commit-completion-owner completion))
-                   (eq tag (clog-commit-completion-tag completion))
-                   (eq :committed (clog-commit-completion-state completion)))
-        (wal-invalid-input "pending CLOG tag is not the installed committed owner"))
-      (clog-materialize-completion-under-lock completion :fsync fsync)))
-  (values))
-
-(defun clog-commit-durable-under-wal-lock (xid end)
-  "Stage and immediately write a commit after WAL flush, not asynchronous acceptance."
-  (clog-materialize-commit-under-wal-lock
-   (clog-stage-commit-under-wal-lock xid end)))
 
 (defun clog-get (xid)
   "Return logical status from the pending completion or raw CLOG bits.

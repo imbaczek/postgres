@@ -581,7 +581,6 @@
      (lambda (stream)
        (let ((wal (symbol-function 'wal-commit-transaction))
              (clog (symbol-function 'clog-set))
-             (commit (symbol-function 'clog-commit-durable-under-wal-lock))
              (release (symbol-function 'release-xid))
              (events nil))
          (unwind-protect
@@ -608,8 +607,6 @@
                                  "storage apply precedes XID release")
                         (push :storage-applied events)
                         (complete-test-commit-receipt xid source-id (when *wal-ready* 140) accepted-function))
-                      (symbol-function 'clog-commit-durable-under-wal-lock)
-                      (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
                       (symbol-function 'clog-set)
                       (lambda (&rest arguments) (declare (ignore arguments)))
                       (symbol-function 'release-xid)
@@ -618,7 +615,6 @@
                 (rove:ok (equal (nreverse events) '(:owner :wal :storage-applied :release))))
            (setf (symbol-function 'wal-commit-transaction) wal
                  (symbol-function 'clog-set) clog
-                 (symbol-function 'clog-commit-durable-under-wal-lock) commit
                  (symbol-function 'release-xid) release
                  (backend-xid *backend*) nil))))))
 
@@ -628,7 +624,6 @@
        (declare (ignore stream))
        (let ((wal (symbol-function 'wal-commit-transaction))
              (clog (symbol-function 'clog-set))
-             (commit (symbol-function 'clog-commit-durable-under-wal-lock))
              (release (symbol-function 'release-xid)))
          (unwind-protect
               (dolist (wal-ready '(nil t))
@@ -645,8 +640,6 @@
                             (declare (ignore backend))
                             (rove:ok (= xid 777))
                             (setf released t))
-                          (symbol-function 'clog-commit-durable-under-wal-lock)
-                          (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
                           (symbol-function 'clog-set)
                           (lambda (&rest arguments)
                             (declare (ignore arguments))
@@ -680,7 +673,6 @@
                           (backend-settings-transaction-start *backend*) nil))))
            (setf (symbol-function 'wal-commit-transaction) wal
                  (symbol-function 'clog-set) clog
-                 (symbol-function 'clog-commit-durable-under-wal-lock) commit
                  (symbol-function 'release-xid) release
                  (backend-xid *backend*) nil
                  (backend-settings-transaction-start *backend*) nil))))))
@@ -852,7 +844,6 @@
 (rove:deftest commit-captures-own-terminal-and-ignores-empty-preparation
     (let ((wal (symbol-function 'wal-commit-transaction))
           (clog (symbol-function 'clog-set))
-          (commit (symbol-function 'clog-commit-durable-under-wal-lock))
           (release (symbol-function 'release-xid))
           (*wal-ready* t)
           (*wal-poisoned* nil)
@@ -860,9 +851,7 @@
           (*sync-replication-state* (make-sync-replication-state :source-id :own)))
       (unwind-protect
            (progn
-             (setf (symbol-function 'clog-commit-durable-under-wal-lock)
-                   (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
-                   (symbol-function 'clog-set)
+             (setf (symbol-function 'clog-set)
                    (lambda (&rest arguments) (declare (ignore arguments)))
                    (symbol-function 'release-xid)
                    (lambda (&rest arguments) (declare (ignore arguments)))
@@ -891,7 +880,6 @@
                                (transaction-wal-obligation-source-id context))))))
         (setf (symbol-function 'wal-commit-transaction) wal
               (symbol-function 'clog-set) clog
-              (symbol-function 'clog-commit-durable-under-wal-lock) commit
               (symbol-function 'release-xid) release))))
 
 (defun commit-policy-test-boundary-result (ddl-p xid-p &optional requested-policy)
@@ -899,7 +887,7 @@
                                   :dirty-relations (when xid-p '(99))))
          (*wal-ready* t) (*wal-poisoned* nil)
          (*sync-replication-state* (make-sync-replication-state :source-id :policy-source))
-         (names '(wal-commit-transaction clog-set clog-commit-durable-under-wal-lock release-xid wait-for-committed-wal-obligation synchronous-commit-policy))
+         (names '(wal-commit-transaction clog-set release-xid wait-for-committed-wal-obligation synchronous-commit-policy))
          (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
          (local nil) (remote :not-called) (end nil) (captured nil))
     (unwind-protect
@@ -916,9 +904,7 @@
                (setf captured (transaction-wal-obligation-ddl-policy context))
                (record-final-ddl-wal-boundary context :policy-source 80))
              (session-set-synchronous-commit "local"))
-           (setf (symbol-function 'clog-commit-durable-under-wal-lock)
-                 (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
-                 (symbol-function 'clog-set)
+           (setf (symbol-function 'clog-set)
                  (lambda (&rest arguments) (declare (ignore arguments)))
                  (symbol-function 'release-xid)
                  (lambda (&rest arguments) (declare (ignore arguments)))
@@ -1048,7 +1034,7 @@
       (call-with-select-portal-test
        (lambda (stream)
          (let* ((*wal-ready* t) (*wal-poisoned* nil)
-                                (names '(wal-commit-transaction clog-set clog-commit-durable-under-wal-lock release-xid validate-wal-commit-receipt))
+                                (names '(wal-commit-transaction clog-set release-xid validate-wal-commit-receipt))
                                 (saved (mapcar (lambda (name) (cons name (symbol-function name))) names))
                                 (validate (symbol-function 'validate-wal-commit-receipt))
                                 (committed nil) (released nil) (outcome nil))
@@ -1057,8 +1043,6 @@
                   (setf (backend-stream *backend*) stream
                         (backend-xid *backend*) 777
                         (backend-dirty-relations *backend*) '(999)
-                        (symbol-function 'clog-commit-durable-under-wal-lock)
-                        (lambda (xid end) (declare (ignore end)) (clog-set xid +clog-committed+))
                         (symbol-function 'clog-set)
                         (lambda (xid status &key fsync)
                           (declare (ignore xid fsync))
