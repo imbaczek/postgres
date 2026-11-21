@@ -89,8 +89,9 @@ helpers.
   checks and standby slot validation also use complete snapshots. Follow
   replay, adoption planning and reseed installation, activation and
   retirement match current snapshots against the existing persisted
-  witnesses. The follow controller and logical slot copy still carry
-  positional state in memory.
+  witnesses. The follow controller holds named snapshots through planning
+  and serializes them when building the binding. Logical slot copy still
+  carries positional state in memory.
 
 ## Open development tasks
 
