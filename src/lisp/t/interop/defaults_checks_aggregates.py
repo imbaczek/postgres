@@ -23,6 +23,14 @@ CASES = (
     r"SELECT get_byte('\x00ff'::bytea,1),get_bit('\x0081'::bytea,8),get_bit('\x0081'::bytea,15)",
     r"SELECT set_byte('\x00ff'::bytea,0,258),set_bit('\x0081'::bytea,9,1)",
     "SELECT get_bit(B'101',0),set_bit(B'101',1,1),get_bit('101',0)",
+    r"SELECT pg_catalog.get_bit('\x80',7::bigint), pg_catalog.set_bit('\x00',7::bigint,1::smallint)",
+    r"SELECT get_bit(B'1',0::smallint), get_bit('\x80'::bytea,'7'), set_bit(B'0','0','1')",
+    "SELECT get_bit('101','0')",
+    "SELECT get_bit(B'101',0::bigint)",
+    "SELECT get_bit(NULL::bit,1/0)",
+    "SELECT set_bit(NULL::bytea,0,1), set_bit(NULL::bit,0,1)",
+    r"CREATE TABLE dc_bit_index(first_bit integer DEFAULT get_bit(set_bit(B'0',0,1),0), "
+    r"octets bytea DEFAULT set_bit('\x00'::bytea,7,1) CHECK (get_bit(octets,7) = 1))",
     r"SELECT get_byte('\x00'::bytea,-1)",
     r"SELECT set_bit('\x00'::bytea,8,3)",
     r"SELECT get_byte('\x'::bytea,0)",
@@ -1242,6 +1250,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                      "INSERT INTO dc_bit_index DEFAULT VALUES RETURNING first_bit, octets",
                     "INSERT INTO dc_decimal DEFAULT VALUES RETURNING a",
                     "INSERT INTO dc_decimal VALUES(0)",
                     "INSERT INTO dc_decimal VALUES(5)",

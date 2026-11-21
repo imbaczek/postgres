@@ -437,30 +437,69 @@ exist\" messages."
                                         :implicit-arguments-p t :defer-decorated-coercion-p nil)
                    (make-scalar-builtin :name "set_byte" :argument-types '(:bytea :int4 :int4) :result-type :bytea
                                         :volatility :immutable :strict-p t :evaluator 'sql-set-byte
+                                        :implicit-arguments-p t :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "get_bit" :argument-types '(:bytea :int8) :result-type :int4
+                                        :volatility :immutable :strict-p t :evaluator 'sql-bytea-get-bit
+                                        :implicit-arguments-p t :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "get_bit" :argument-types '(:bit :int4) :result-type :int4
+                                        :volatility :immutable :strict-p t :evaluator 'sql-bit-get-bit
+                                        :implicit-arguments-p t :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "set_bit" :argument-types '(:bytea :int8 :int4) :result-type :bytea
+                                        :volatility :immutable :strict-p t :evaluator 'sql-bytea-set-bit
+                                        :implicit-arguments-p t :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "set_bit" :argument-types '(:bit :int4 :int4) :result-type :bit
+                                        :volatility :immutable :strict-p t :evaluator 'sql-bit-set-bit
                                         :implicit-arguments-p t :defer-decorated-coercion-p nil)))
-      (setf (gethash (scalar-builtin-name builtin) registry) builtin))
+      (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
 (defun find-scalar-builtin (name)
-  (gethash name *scalar-builtin-descriptors*))
+  "Find a builtin whose name alone identifies its signature."
+  (let ((candidates (gethash name *scalar-builtin-descriptors*)))
+    (unless (rest candidates)
+      (first candidates))))
 
 (defun eval-scalar-builtin (builtin arguments)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
       +null+
       (apply (scalar-builtin-evaluator builtin) arguments)))
 
-(defun analyze-fixed-scalar-builtin (builtin arguments)
-  "Check the fixed signature using the builtin's argument coercion policy."
+(defun scalar-builtin-match-p (builtin arguments)
   (let ((types (scalar-builtin-argument-types builtin))
-        (name (scalar-builtin-name builtin))
         (matches-p (if (scalar-builtin-implicit-arguments-p builtin)
                        #'sql-implicit-coercion-p #'eq)))
-    (unless (and (= (length arguments) (length types))
-                 (every (lambda (argument type)
-                          (or (funcall matches-p (expr-type argument) type) (in-unknown-constant-p argument)))
-                        arguments types))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (list :func name (mapcar #'coerce-common-expression arguments types)
+    (and (= (length arguments) (length types))
+         (loop for argument in arguments for type in types
+               always (or (in-unknown-constant-p argument)
+                          (funcall matches-p (expr-type argument) type))))))
+
+(defun resolve-scalar-builtin (name candidates arguments)
+  "Use C's exact-match count for the supported overload families.
+The bit/bytea alternatives have different nonpreferred input categories, so
+after this step any surviving tie is ambiguous."
+  (let ((best nil) (best-count -1) (tied-p nil))
+    (dolist (candidate candidates)
+      (when (scalar-builtin-match-p candidate arguments)
+        (let ((count (loop for argument in arguments
+                           for type in (scalar-builtin-argument-types candidate)
+                           count (and (not (in-unknown-constant-p argument))
+                                      (eq (expr-type argument) type)))))
+          (cond ((> count best-count) (setf best candidate best-count count tied-p nil))
+                ((= count best-count) (setf tied-p t))))))
+    (cond ((not best)
+           (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+          (tied-p
+           (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
+          (t best))))
+
+(defun analyze-scalar-builtin (name candidates arguments decorated-p)
+  (let* ((builtin (resolve-scalar-builtin name candidates arguments))
+         (*defer-function-constant-coercion-p*
+           (if (scalar-builtin-defer-decorated-coercion-p builtin)
+               decorated-p
+               *defer-function-constant-coercion-p*)))
+    (list :func name (mapcar #'coerce-common-expression arguments
+                             (scalar-builtin-argument-types builtin))
           :type (scalar-builtin-result-type builtin) :typmod -1)))
 
 (defun analyze-jsonb-set-function (name arguments)
@@ -514,37 +553,6 @@ exist\" messages."
                     (coerce-common-expression value :record) value)
                 (when pretty (list (coerce-common-expression pretty :bool))))
           :type :json :typmod -1)))
-
-(defun analyze-bit-index-function (name arguments)
-  "Resolve get_bit and set_bit for bytea and fixed-bit arguments."
-  (let* ((set-p (string= name "set_bit"))
-         (arity (if set-p 3 2)))
-    (unless (and (= (length arguments) arity)
-                 (or (not set-p) (in-unknown-constant-p (third arguments))
-                     (sql-implicit-coercion-p (expr-type (third arguments)) :int4)))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (let* ((first-arg (first arguments)) (index (second arguments))
-                                         (first-type (expr-type first-arg))
-                                         (unknown (in-unknown-constant-p first-arg))
-                                         (index-unknown (in-unknown-constant-p index))
-                                         (index-type (expr-type index))
-                                         (input-type (cond
-                                                       ((eq first-type :bit) :bit)
-                                                       ((eq first-type :bytea) :bytea)
-                                                       ((and unknown (eq index-type :int8) (not index-unknown)) :bytea)
-                                                       ((and unknown (eq index-type :int4) (not index-unknown)) :bit)
-                                                       ((and unknown (or index-unknown (eq index-type :int2)))
-                                                        (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
-                                                       (t :bytea)))
-                                         (position-type (if (eq input-type :bytea) :int8 :int4)))
-      (unless (and (or unknown (eq first-type input-type))
-                   (or index-unknown (sql-implicit-coercion-p index-type position-type)))
-        (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-      (list :func name
-            (append (list (coerce-common-expression first-arg input-type)
-                          (coerce-common-expression index position-type))
-                    (when set-p (list (coerce-common-expression (third arguments) :int4))))
-            :type (if set-p input-type :int4) :typmod -1))))
 
 (defun analyze-render-function (name arguments)
   "Resolve chr, string_to_array and array_to_string against supported types."
@@ -1714,7 +1722,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                  (some (lambda (argument) (eq (first argument) :named-arg)) (third expr))))
     (ereport "42601" "invalid GREATEST or LEAST syntax"))
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
-         (builtin (find-scalar-builtin name))
+         (builtins (gethash name *scalar-builtin-descriptors*))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
                    (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic)
@@ -1757,8 +1765,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
            (ereport "42804" "VARIADIC argument must be an array")))
        (list :func name args :type (if (search "jsonb_" name) :jsonb :json) :typmod -1
                              :variadic (getf (cdddr expr) :variadic)))
-      ((member name '("get_bit" "set_bit") :test #'string=)
-       (analyze-bit-index-function name args))
       ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -1771,13 +1777,10 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-nullary-record-function name args +control-checkpoint-result-fields+))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
-      (builtin
-       (if (scalar-builtin-defer-decorated-coercion-p builtin)
-           (let ((*defer-function-constant-coercion-p*
-                   (or (getf (cdddr expr) :call-distinct)
-                       (getf (cdddr expr) :call-order))))
-             (analyze-fixed-scalar-builtin builtin args))
-           (analyze-fixed-scalar-builtin builtin args)))
+      (builtins
+       (analyze-scalar-builtin name builtins args
+                               (or (getf (cdddr expr) :call-distinct)
+                                   (getf (cdddr expr) :call-order))))
       ((member name '("substr" "substring") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3884,8 +3887,11 @@ checks still apply."
 
 (defun analyzed-function-volatile-p (name)
   "Treat unclassified calls as volatile for aggregate and CTE planning."
-  (not (or (let ((builtin (find-scalar-builtin name)))
-             (and builtin (member (scalar-builtin-volatility builtin) '(:immutable :stable))))
+  (not (or (let ((builtins (gethash name *scalar-builtin-descriptors*)))
+             (and builtins
+                  (every (lambda (builtin)
+                           (member (scalar-builtin-volatility builtin) '(:immutable :stable)))
+                         builtins)))
            (integer-catalog-alias-p name)
            (float-catalog-alias name)
            (trig-function-p name)
@@ -3895,7 +3901,7 @@ checks still apply."
                    '("version" "pg_lisp_runtime" "current_database" "current_schema"
                      "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                      "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
-                     "jsonb_build_array" "jsonb_build_object" "get_bit" "set_bit"
+                     "jsonb_build_array" "jsonb_build_object"
                      "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
                      "chr" "array_to_string" "string_to_array" "greatest" "least"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
@@ -4646,8 +4652,13 @@ the full 64-bit ID as a signed value."
   (let ((xid (get-current-xid)))
     (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))
 
-(defun eval-func (name args)
-  (let ((builtin (find-scalar-builtin name)))
+(defun eval-func (name args &optional first-argument)
+  (let* ((candidates (gethash name *scalar-builtin-descriptors*))
+         (builtin (if (rest candidates)
+                      ;; These signatures differ in their coerced first argument.
+                      (find (expr-type first-argument) candidates
+                            :key (lambda (entry) (first (scalar-builtin-argument-types entry))))
+                      (first candidates))))
     (when builtin (return-from eval-func (eval-scalar-builtin builtin args))))
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
@@ -5014,13 +5025,19 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
 (defun sql-set-byte (value index new-value)
   (sql-byte-bit-operation value index :bytea nil t new-value))
 
-(defun eval-bit-index-function (name arguments input-type)
-  (if (member +null+ arguments)
-      +null+
-      (sql-byte-bit-operation (first arguments) (second arguments) input-type t
-                              (string= name "set_bit") (third arguments))))
+(defun sql-bytea-get-bit (value index)
+  (sql-byte-bit-operation value index :bytea t nil nil))
 
-(defun eval-analyzed-function (name arguments type)
+(defun sql-bytea-set-bit (value index bit)
+  (sql-byte-bit-operation value index :bytea t t bit))
+
+(defun sql-bit-get-bit (value index)
+  (sql-byte-bit-operation value index :bit t nil nil))
+
+(defun sql-bit-set-bit (value index bit)
+  (sql-byte-bit-operation value index :bit t t bit))
+
+(defun eval-analyzed-function (name arguments type &optional first-argument)
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls.
 Map float catalog names and dispatch integer catalog names only here, after
@@ -5099,7 +5116,7 @@ expression identity has been resolved."
        (when (and (eq type :int8) (> value +int8-max+))
          (ereport "22003" "bigint out of range"))
        (sql-cast-value value type type -1)))
-    (t (eval-func name arguments))))
+    (t (eval-func name arguments first-argument))))
 
 (defun sql-integer-bitwise (op l r type)
   "Evaluate bitwise operators on already coerced, non-NULL integer operands.
@@ -5278,9 +5295,7 @@ truncate and interpret the result at TYPE's signed width."
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
             (type (expr-type expr)))
-       (cond ((member name '("get_bit" "set_bit") :test #'string=)
-              (eval-bit-index-function name arguments (expr-type (first (third expr)))))
-             ((string= name "to_jsonb")
+       (cond ((string= name "to_jsonb")
               (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
              ((member name '("to_json" "row_to_json" "array_to_json") :test #'string=)
               (if (member +null+ arguments) +null+
@@ -5288,7 +5303,7 @@ truncate and interpret the result at TYPE's signed width."
                                0 (second arguments))))
              ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
               (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
-             (t (eval-analyzed-function name arguments type)))))
+             (t (eval-analyzed-function name arguments type (first (third expr)))))))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 
