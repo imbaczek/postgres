@@ -465,8 +465,14 @@ still has work outstanding.
   It skips tail cleanup and lock creation. All 35 strict retained-root test
   heads passed. Instrumented startup observed the same receive registration
   before catalog initialization on three boots, and proof-loss refusal passed.
-  Enabling GC still requires rechecking host ownership and all required
-  registered protection at archive unlink.
+  In `02863b0ba8d`, the post-restoration check verifies the required
+  primary, receive and historical owner selections together against the
+  held archive's device, inode and mount. All 36 strict retained-root
+  test heads passed, including missing-owner and mount mismatch cases.
+  Both the two-slot and zero-slot layouts passed three instrumented
+  boots and the proof-loss refusal case.
+  Enabling GC still requires carrying the live host and receive ownership
+  through the archive unlink and rechecking those registrations there.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
