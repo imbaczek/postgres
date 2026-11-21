@@ -49,6 +49,12 @@ until a status record or checkpoint establishes it."
     (physical-logical-fact-next prior record timeline
                                 (if (functionp history) (funcall history) history))))
 
+(defun physical-replay-policy-facts-next (fpw-fact logical-fact record timeline history)
+  "Advance both source policies at a caller-validated complete terminal.
+HISTORY may resolve lazily so unknown facts do not require a history read."
+  (values (physical-replay-fpw-fact-next fpw-fact record timeline history)
+          (physical-replay-logical-fact-next logical-fact record timeline history)))
+
 (defun physical-recovery-resource-history (store state)
   (let ((selection (and store (physical-store-selection store))))
     (if selection (getf selection :history)
@@ -126,6 +132,15 @@ The caller must establish the checkpoint and its place in the selected history."
         (if fact (physical-logical-merge-checkpoint-interval fact expected) expected))
       fact))
 
+(defun physical-recovery-scan-policy-seeds (store state checkpoint start timeline fpw logical)
+  "Validate private policy seeds and refine them from the starting checkpoint."
+  (when fpw
+    (physical-fpw-check-fact fpw (physical-recovery-resource-history store state) start timeline))
+  (when logical
+    (physical-logical-check-fact logical (physical-recovery-resource-history store state) start timeline))
+  (values (physical-recovery-scan-checkpoint-fpw checkpoint fpw start timeline)
+          (physical-recovery-scan-checkpoint-logical checkpoint logical start timeline)))
+
 (defun physical-recovery-scan-resource-fact (store start end seed state
                                              &key (fpw-seed nil fpw-seed-p)
                                                (logical-seed nil logical-seed-p)
@@ -165,12 +180,8 @@ explicit NIL. Otherwise preserve the two-value interface."
         (unless (<= (getf fact :resource-lsn) start)
           (error "resource seed is newer than its replay position"))
         (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
-      (when fpw-fact
-        (physical-fpw-check-fact fpw-fact (physical-recovery-resource-history store state) start timeline))
-      (when logical-fact
-        (physical-logical-check-fact logical-fact (physical-recovery-resource-history store state) start timeline))
-      (setf fpw-fact (physical-recovery-scan-checkpoint-fpw checkpoint fpw-fact start timeline)
-            logical-fact (physical-recovery-scan-checkpoint-logical checkpoint logical-fact start timeline))
+      (multiple-value-setq (fpw-fact logical-fact)
+        (physical-recovery-scan-policy-seeds store state checkpoint start timeline fpw-fact logical-fact))
       (when (= start end)
         (return-from physical-recovery-scan-resource-fact
           (if logical-seed-p
@@ -200,12 +211,10 @@ explicit NIL. Otherwise preserve the two-value interface."
                  (setf fact (physical-resource-fact-next
                              fact record timeline
                              (lambda () (physical-recovery-resource-history store state)))))
-               (setf fpw-fact (physical-replay-fpw-fact-next
-                               fpw-fact record timeline
-                               (lambda () (physical-recovery-resource-history store state)))
-                     logical-fact (physical-replay-logical-fact-next
-                                   logical-fact record timeline
-                                   (lambda () (physical-recovery-resource-history store state))))
+               (multiple-value-setq (fpw-fact logical-fact)
+                 (physical-replay-policy-facts-next
+                  fpw-fact logical-fact record timeline
+                  (lambda () (physical-recovery-resource-history store state))))
                (when (= (wal-record-type record) +wal-record-checkpoint+)
                  (setf (getf *physical-recovery-state* :source-checkpoint)
                        (wal-checkpoint-record-snapshot record)))

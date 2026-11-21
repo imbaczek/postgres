@@ -637,10 +637,10 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                            (physical-resource-fact-next
                             resource-fact record timeline
                             (lambda () (physical-recovery-resource-history
-                                        candidate *physical-recovery-state*)))
-                           fpw-fact (physical-replay-fpw-fact-next fpw-fact record timeline history)
-                           logical-fact (physical-replay-logical-fact-next logical-fact record timeline history)
-                           terminal (wal-record-end record)
+                                        candidate *physical-recovery-state*))))
+                     (multiple-value-setq (fpw-fact logical-fact)
+                       (physical-replay-policy-facts-next fpw-fact logical-fact record timeline history))
+                     (setf terminal (wal-record-end record)
                            completed-checkpoint (getf *physical-recovery-state* :source-checkpoint))
                      (note-boundary)))
                  start))

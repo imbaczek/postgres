@@ -146,13 +146,11 @@ rechecks after their final flush."
                        (wal-checkpoint-record-snapshot record)))))
          (setf reservation (physical-source-reservation-next reservation record next))
          (unless *wal-recovery-group-active*
-           (setf fpw-fact (physical-replay-fpw-fact-next
-                           fpw-fact record timeline
-                           (lambda () (physical-recovery-resource-history store *physical-recovery-state*)))
-                 logical-fact (physical-replay-logical-fact-next
-                               logical-fact record timeline
-                               (lambda () (physical-recovery-resource-history store *physical-recovery-state*)))
-                 terminal (wal-record-end record))))
+           (multiple-value-setq (fpw-fact logical-fact)
+             (physical-replay-policy-facts-next
+              fpw-fact logical-fact record timeline
+              (lambda () (physical-recovery-resource-history store *physical-recovery-state*))))
+           (setf terminal (wal-record-end record))))
        :start-lsn *last-replay-lsn*))
     (/= timeline (getf (getf *physical-recovery-state* :source-checkpoint)
                        :timeline (getf *physical-recovery-state* :timeline)))))
