@@ -42,10 +42,13 @@
                             (length ,paths))))))
          (when ,flag (setf (symbol-function 'logical-spool-ensure-file) ,original))))))
 
-(defun native-host-cold-append ()
+(defun native-host-cold-append (&key commit)
   (with-wal-critical
     (wal-append-batch-start)
-    (wal-append-record +wal-record-maintenance+ 0 (make-array 0 :element-type '(unsigned-byte 8)))
+    (if commit
+        (wal-append-record +wal-record-commit+ (getf *wal-checkpoint-snapshot* :xid-reserved-through)
+                           (wal-encode-commit-timestamp 42))
+        (wal-append-record +wal-record-maintenance+ 0 (make-array 0 :element-type '(unsigned-byte 8))))
     (wal-flush-core))
   (sb-thread:with-mutex (*wal-lock*)
     (wal-save-control-fields *wal-checkpoint-lsn* *wal-durable-lsn*)))
@@ -1076,7 +1079,7 @@
 
 (defun native-host-cold-preparation-wal-change (gate ownership)
   (let ((files (native-host-cold-file-image)) (fds (native-host-writer-open-fds))
-                                              (entered nil) (proved nil) (refusal nil) (caught nil))
+                                              (entered nil) (proved nil) (refusal nil) (rechecked nil) (caught nil))
     (setf caught
           (handler-case
               (progn
@@ -1090,20 +1093,21 @@
                           (image (logical-slot-continuation-cold-preparation-semantic-image
                                   (logical-slot-publication-registry-image registry)))
                           (start (first (getf (getf observation :snapshot) :sealed-end)))
-                          (header (make-array +wal-header-size+ :element-type '(unsigned-byte 8))))
-                     (assert (< start (getf observation :horizon)))
-                     (with-open-file (stream (wal-segment-path (floor start +wal-segment-size+))
-                                             :direction :io :if-exists :overwrite :if-does-not-exist :error
-                                             :element-type '(unsigned-byte 8))
-                       (file-position stream (mod start +wal-segment-size+))
-                       (assert (= +wal-header-size+ (read-sequence header stream)))
-                       (assert (= +wal-record-batch-start+ (wal-record-type (wal-decode-record header start))))
-                       (wal-set-u16 header 4 +wal-version-v7+)
-                       (wal-set-u32 header 28 (wal-record-crc32 header))
-                       (assert (= +wal-version-v7+ (wal-record-version (wal-decode-record header start))))
-                       (file-position stream (mod start +wal-segment-size+))
-                       (write-sequence header stream)
-                       (fsync-stream stream))
+                          (commit-start (+ start +wal-header-size+)))
+                     (assert (< commit-start (getf observation :horizon)))
+                     (multiple-value-bind (segment offset) (floor commit-start +wal-segment-size+)
+                       (with-open-file (stream (wal-segment-path segment)
+                                               :direction :io :if-exists :overwrite :if-does-not-exist :error
+                                               :element-type '(unsigned-byte 8))
+                         (let* ((record (wal-lineage-read-record stream segment offset (file-length stream)))
+                                (timestamp (wal-decode-commit-timestamp (wal-record-payload record))))
+                           (assert (= +wal-record-commit+ (wal-record-type record)))
+                           (let ((bytes (wal-encode-record +wal-record-commit+ (wal-record-xid record) commit-start
+                                                           (wal-encode-commit-timestamp (logxor 1 timestamp)))))
+                             (assert (= (+ commit-start (length bytes)) (wal-record-end record)))
+                             (file-position stream offset)
+                             (write-sequence bytes stream)
+                             (fsync-stream stream)))))
                      (call-with-logical-slot-continuation-cold-reconstruction
                       gate ownership
                       (lambda (source observed reservation check current)
@@ -1128,10 +1132,13 @@
                      (assert (and proved refusal
                                   (search "differs from its fresh closed-scope proof" refusal)))
                      (native-host-cold-recheck-refused-before-io
-                      (lambda () (logical-slot-continuation-cold-preparation-call token :check))))))
+                      (lambda () (logical-slot-continuation-cold-preparation-call token :check)))
+                     (setf rechecked t))))
                 nil)
             (error (condition) (princ-to-string condition))))
-    (assert (and entered proved refusal caught))
+    (assert (and entered proved rechecked caught) ()
+            "WAL mutation proof did not reach claim refusal (entered ~s, proved ~s): ~a"
+            entered proved (or refusal caught))
     (assert (equalp files (native-host-cold-file-image)))
     (assert (equal fds (native-host-writer-open-fds)))
     (assert (zerop (hash-table-count *wal-replication-slots*)))
@@ -2239,7 +2246,8 @@
   (with-native-cold-spill-probe
       (handler-case
           (progn
-            (when (uiop:getenv "PG_NATIVE_COLD_APPEND") (native-host-cold-append))
+            (when (uiop:getenv "PG_NATIVE_COLD_APPEND")
+              (native-host-cold-append :commit (equal "prepare-wal" (uiop:getenv "PG_NATIVE_COLD_PROOF"))))
             (cond
               ((member (uiop:getenv "PG_NATIVE_COLD_PROOF")
                        '("empty-minted" "empty-prepared" "empty-before-commit" "empty-after-commit"
