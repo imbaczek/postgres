@@ -20,7 +20,7 @@
              (dolist (spec specs)
                (destructuring-bind (type payload &optional (xid 0)) spec
                  (let ((raw (if (and (= type pg::+wal-record-checkpoint+) (zerop (length payload)) (zerop xid))
-                                (legacy-checkpoint-record cursor)
+                                (physical-test-checkpoint-record cursor)
                                 (pg::wal-encode-record type xid cursor payload))))
                    (pg::physical-store-input store cursor raw)
                    (incf cursor (length raw)))))
