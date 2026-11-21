@@ -45,8 +45,9 @@ D is the copy base end; the pending source checkpoint at F is distinct."
   ;; A caller with an embedded checkpoint can supply its derived reservation;
   ;; otherwise use the ordinary verified-base reservation.
   (let* ((base (copy-tree manifest))
-         (snapshot (third (logical-slot-copy-control-fields
-                           (logical-slot-copy-descriptor-base-control descriptor))))
+         (fields (logical-slot-copy-control-fields
+                  (logical-slot-copy-descriptor-base-control descriptor)))
+         (snapshot (third fields))
          (history (timeline-parse-history
                    (getf manifest :timeline)
                    (bytes->string (logical-slot-copy-descriptor-history descriptor))))
@@ -57,7 +58,9 @@ D is the copy base end; the pending source checkpoint at F is distinct."
     (setf (getf base :source-checkpoint) snapshot
           (getf base :source-reservation)
           (if reservation-p (copy-list reservation)
-              (physical-recovery-initial-reservation manifest))
+              (let ((*wal-segment-namespace* (sixth fields))
+                    (*wal-insert-timeline* (fifth fields)))
+                (physical-recovery-initial-reservation manifest)))
           (getf base :base-source-resource-fact) (wal-copy-control-resource-fields snapshot)
           (getf base :base-source-fpw-fact) fpw
           (getf base :base-source-logical-fact) logical)
