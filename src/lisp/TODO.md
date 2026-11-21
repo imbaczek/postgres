@@ -152,6 +152,11 @@ For B14, restart the Lisp server across the backend layout change. Commit
 preflights logical row changes through the transaction spool, and the
 snapshot-handoff and rollback tests check that transaction cleanup releases it.
 
+For B17, restart the Lisp server across the portal and statement layout
+change. Portal result metadata and prepared result signatures now live on
+their owners. The SELECT and DML execution registries still track executable
+portal state for cleanup and suspension.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

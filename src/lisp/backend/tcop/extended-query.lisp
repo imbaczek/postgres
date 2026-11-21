@@ -2,11 +2,12 @@
 
 (in-package #:pg)
 
-(defstruct extended-statement ast types)
+(defstruct extended-statement ast types (result-signature nil :read-only t))
 
-(defstruct extended-portal statement values (executed-p nil))
-
-(defstruct extended-select-portal-metadata columns formats snapshot registration)
+(defstruct extended-portal statement values (executed-p nil)
+           (returns-rows-p nil :read-only t)
+           (result-columns nil :read-only t)
+           (result-formats nil :read-only t))
 
 (defstruct extended-select-execution owner plan targets iterator (at-end-p nil) (failed-p nil))
 
@@ -19,35 +20,15 @@
 
 (defvar *extended-execute-suspended-p* nil)
 
-(defvar *extended-select-portal-metadata* (make-hash-table :test #'eq :weakness :key))
-
-(defvar *extended-select-portal-metadata-lock* (sb-thread:make-mutex :name "extended SELECT portal metadata"))
-
-(defun extended-select-portal-info (portal)
-  (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
-    (gethash portal *extended-select-portal-metadata*)))
+(defvar *extended-portal-executions-lock* (sb-thread:make-mutex :name "extended portal executions"))
 
 (defun extended-portal-select-p (portal)
   (eq (getf (extended-statement-ast (extended-portal-statement portal)) :type) :select))
 
-(defun extended-portal-returns-rows-p (portal)
-  (not (null (extended-select-portal-info portal))))
-
-(defun extended-portal-result-columns (portal)
-  (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-columns info))))
-
-(defun extended-portal-result-formats (portal)
-  (let ((info (extended-select-portal-info portal))) (and info (extended-select-portal-metadata-formats info))))
-
 (defun make-extended-query-portal (statement values returns-rows-p columns formats)
-  ;; Keep row metadata outside the portal structure so a reload can use portals
-  ;; created by an older image. The weak table does not extend portal lifetime.
-  (let ((portal (make-extended-portal :statement statement :values values)))
-    (when returns-rows-p
-      (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
-        (setf (gethash portal *extended-select-portal-metadata*)
-              (make-extended-select-portal-metadata :columns columns :formats formats))))
-    portal))
+  (make-extended-portal :statement statement :values values
+                        :returns-rows-p returns-rows-p
+                        :result-columns columns :result-formats formats))
 
 (defun call-with-extended-bind-spool (input size function)
   "Read SIZE bytes into a checksummed anonymous spool, scoped to FUNCTION."
@@ -173,11 +154,11 @@
         (query-execution-owner-reload-state)))
 
 (defun extended-select-execution-for (portal)
-  (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+  (sb-thread:with-mutex (*extended-portal-executions-lock*)
     (gethash portal *extended-select-executions*)))
 
 (defun extended-dml-execution-for (portal)
-  (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+  (sb-thread:with-mutex (*extended-portal-executions-lock*)
     (gethash portal *extended-dml-executions*)))
 
 (defun invalidate-extended-dml-execution (execution)
@@ -202,7 +183,7 @@
             (extended-select-execution-targets execution) nil
             (extended-select-execution-iterator execution) nil)
       (unless failed-p
-        (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+        (sb-thread:with-mutex (*extended-portal-executions-lock*)
           (remhash portal *extended-select-executions*)))))
   (let ((execution (extended-dml-execution-for portal)))
     (when execution
@@ -212,7 +193,7 @@
         (unless closed (return-from extended-close-portal (values nil failures))))
       (invalidate-extended-dml-execution execution)
       (unless failed-p
-        (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+        (sb-thread:with-mutex (*extended-portal-executions-lock*)
           (remhash portal *extended-dml-executions*)))))
   t)
 
@@ -240,7 +221,7 @@
          (complete nil))
     (unwind-protect
          (progn
-           (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+           (sb-thread:with-mutex (*extended-portal-executions-lock*)
              (setf (gethash portal *extended-select-executions*) execution))
            (recovery-check-statement (extended-statement-ast statement))
            (query-execution-owner-acquire-snapshot
@@ -335,7 +316,7 @@
          (complete nil))
     (unwind-protect
          (progn
-           (sb-thread:with-mutex (*extended-select-portal-metadata-lock*)
+           (sb-thread:with-mutex (*extended-portal-executions-lock*)
              (setf (gethash portal *extended-dml-executions*) execution))
            (call-with-query-execution-owner
             owner
@@ -601,10 +582,6 @@
     (otherwise
      (mapcar #'target->result-column (getf (prepare-dml-subqueries ast) :returning)))))
 
-(defvar *extended-statement-signatures* (make-hash-table :test #'eq :weakness :key))
-
-(defvar *extended-statement-signatures-lock* (sb-thread:make-mutex :name "extended statement signatures"))
-
 (defun extended-result-signature (columns)
   "Match C equalRowTypes for supported scalar result attributes."
   (mapcar (lambda (column) (list (result-column-name column)
@@ -613,12 +590,9 @@
           columns))
 
 (defun extended-check-result-signature (statement columns)
-  (multiple-value-bind (signature present)
-      (sb-thread:with-mutex (*extended-statement-signatures-lock*)
-        (gethash statement *extended-statement-signatures*))
-    ;; Statements prepared by an older live-reload image have no stored signature.
-    (when (and present (not (equal signature (extended-result-signature columns))))
-      (ereport "0A000" "cached plan must not change result type")))
+  (unless (equal (extended-statement-result-signature statement)
+                 (extended-result-signature columns))
+    (ereport "0A000" "cached plan must not change result type"))
   columns)
 
 (defun extended-binary-type-p (type)
@@ -748,12 +722,10 @@
                  (with-statement-snapshot
                      (snapshot (lambda (registration) (statement-start registration nil)))
                    (extended-result-signature (extended-statement-result-columns ast t)))))
-             (statement (make-extended-statement :ast ast :types types)))
+             (statement (make-extended-statement :ast ast :types types :result-signature signature)))
         (let ((unknown (position nil types)))
           (when unknown
             (report-unresolved-query-parameter (1+ unknown))))
-        (sb-thread:with-mutex (*extended-statement-signatures-lock*)
-          (setf (gethash statement *extended-statement-signatures*) signature))
         (setf (gethash name (extended-query-state-statements state)) statement))
       (incf (backend-command-id *backend*))
       (write-message stream #\1 #()))))
