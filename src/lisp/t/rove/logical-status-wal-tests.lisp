@@ -485,6 +485,36 @@
                (rove:ok (and path (not (probe-file path))))))
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(rove:deftest catalog-recovery-retries-pending-spill-cleanup
+    (let* ((directory
+             (uiop:ensure-directory-pathname
+              (sb-posix:mkdtemp
+               (namestring (merge-pathnames "pg-catalog-cleanup.XXXXXX" (uiop:temporary-directory))))))
+           (*query-temp-directory* directory)
+           (*logical-capture-memory-bytes* 0)
+           (*error-output* (make-string-output-stream))
+           (unlink (symbol-function 'unlink-query-temp-file))
+           (bytes (make-array 1 :element-type '(unsigned-byte 8) :initial-element 11))
+           (chunk (make-wal-record :payload (wal-encode-catalog-chunk-payload bytes 0 1))))
+      (unwind-protect
+           (with-wal-replay-staging ()
+             (wal-recovery-reset-batch t)
+             (wal-recovery-stage-catalog-chunk chunk)
+             (let* ((spool *wal-recovery-catalog-spool*)
+                    (path (logical-spool-path spool)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'unlink-query-temp-file)
+                            (lambda (path) (declare (ignore path)) (error "injected unlink failure")))
+                      (rove:ok (rove:signals (wal-recovery-reset-batch t) 'error))
+                      (rove:ok (logical-spool-closed-p spool))
+                      (rove:ok (probe-file path)))
+                 (setf (symbol-function 'unlink-query-temp-file) unlink))
+               (wal-recovery-reset-batch t)
+               (rove:ok (not (probe-file path)))
+               (rove:ok (null *wal-recovery-catalog-spool*))))
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (rove:deftest history-and-redo-discard-incomplete-catalog-batches
     (flet ((record (type payload)
              (make-wal-record :version +wal-version+ :type type :xid 0

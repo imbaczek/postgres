@@ -236,6 +236,9 @@ Catalog chunks use a recovery-owned spool that spills at the existing memory
 threshold. The terminal checks the observed chunk count and byte total before
 allocating the contiguous catalog image. Recovery releases scratch files on a
 replacement marker, at the terminal, or when the scan exits.
+History and redo borrow the image bytes from that payload while consuming it.
+Recovery retries pending scratch cleanup if an earlier close was interrupted
+by an unlink failure.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename

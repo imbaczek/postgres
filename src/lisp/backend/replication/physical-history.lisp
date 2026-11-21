@@ -100,7 +100,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
     live))
 
 (defun physical-history-accept-catalog (payload identity removed)
-  (multiple-value-bind (deletes bytes) (wal-decode-catalog-payload payload)
+  (multiple-value-bind (deletes bytes) (wal-decode-catalog-payload payload :borrow-image-p t)
     (let ((live (physical-history-catalog-relfilenodes bytes identity)))
       (dolist (node deletes)
         (when (or (zerop node) (gethash node live))
@@ -165,7 +165,8 @@ at START-LSN. FPW and logical seeds are copied and folded privately while
 validating the suffix. A stateless
 parent scan can start with unknown seeds, but cannot cross EOR without a proven
 stage and XID. Return the deletion set, last terminal, and committed relation/fork
-resets and the first complete CLOG reset terminal, if any. No database files are written."
+resets and the first complete CLOG reset terminal, if any. Large catalog batches
+may use scratch files. The scan applies no database changes."
   (let ((state (or *physical-recovery-state*
                    (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store)))))
     (physical-recovery-check-store-point store start-lsn (physical-store-prefix-timeline store start-lsn))

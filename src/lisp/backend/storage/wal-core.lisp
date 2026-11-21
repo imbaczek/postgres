@@ -2445,9 +2445,8 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
   (values))
 
 ;; TODO: Stream catalog serialization into a temporary file and write bounded
-;; WAL chunks from it. Recovery should spool chunks, validate terminal metadata,
-;; then publish from the spool; this path currently holds several full-image
-;; byte arrays in memory.
+;; WAL chunks from it. Recovery already spills incomplete batches and borrows
+;; the catalog bytes from the validated contiguous terminal payload.
 (defun wal-encode-catalog-payload (bytes deletes)
   (let* ((payload (make-array (+ 8 (* 4 (length deletes)) (length bytes))
                               :element-type '(unsigned-byte 8)
@@ -2463,7 +2462,10 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
     (replace payload bytes :start1 offset)
     payload))
 
-(defun wal-decode-catalog-payload (payload)
+(defun wal-decode-catalog-payload (payload &key borrow-image-p)
+  "Validate PAYLOAD and return deletion IDs and the catalog image.
+BORROW-IMAGE-P lets synchronous consumers read the immutable input without
+copying the complete image."
   (when (< (length payload) 8)
     (error "WAL catalog record is too short"))
   (let* ((count (wal-u32 payload 0))
@@ -2480,7 +2482,11 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
         (unless (= (+ offset catalog-length) (length payload))
           (error "WAL catalog record has an invalid catalog image length (offset ~a, image ~a, payload ~a)"
                  offset catalog-length (length payload)))
-        (values deletes (subseq payload offset))))))
+        (values deletes
+                (if borrow-image-p
+                    (make-array catalog-length :element-type '(unsigned-byte 8)
+                                               :displaced-to payload :displaced-index-offset offset)
+                    (subseq payload offset)))))))
 
 (defun wal-encode-catalog-chunk-payload (bytes index count)
   (let ((payload (make-array (+ +wal-catalog-chunk-header-size+
@@ -2540,7 +2546,9 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
 
 (defun wal-recovery-close-spool (spool kind)
   (when spool
-    (close-logical-spool spool)
+    (if (logical-spool-closed-p spool)
+        (retry-query-temp-owner-cleanup (logical-spool-owner spool))
+        (close-logical-spool spool))
     (unless (eq :resolved (query-temp-cleanup-owner-state (logical-spool-owner spool)))
       (error "recovery ~a spool cleanup failed" kind)))
   nil)
@@ -2990,7 +2998,7 @@ src/backend/access/transam/xlogreader.c."
 (defun wal-prepare-catalog-record (payload)
   "Validate a catalog payload and return the operation that publishes it."
   (multiple-value-bind (deletes catalog-bytes)
-      (wal-decode-catalog-payload payload)
+      (wal-decode-catalog-payload payload :borrow-image-p t)
     (lambda () (wal-apply-catalog-image deletes catalog-bytes))))
 
 (defun wal-recovery-close-page-spool ()
