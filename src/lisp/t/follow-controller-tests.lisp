@@ -1936,7 +1936,7 @@
     (pg::physical-follow-operation-initial-config operation)
     (multiple-value-bind (entry snapshot) (pg::physical-follow-operation-intent operation view)
       (let ((anchor (copy-list (getf entry :request))))
-        (ok (= 152 (sixth (getf snapshot :before))))
+        (ok (= 152 (pg::physical-receive-control-floor (getf snapshot :before))))
         (call-with-promotion-exclusion
          (lambda () (pg::physical-store-compact store fork #'pg::physical-restartpoint-publish)))
         (setf (getf anchor :history-text) (getf view :history-text)
