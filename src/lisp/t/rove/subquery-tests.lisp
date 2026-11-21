@@ -36,6 +36,17 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest aggregate-owner-ignores-opaque-local-columns
+    (let* ((column '(:col 0 :type :int4))
+           (outer (list :outer-ref 2 column))
+           (nested (list :outer-ref 2 column))
+           (subplan (make-sql-subplan :test outer :prepared (list :where nested)))
+           (literal (list :const (list column) :type :record))
+           (call (list :func "test" (list outer literal) :saved (list column))))
+      (rove:ok (= 2 (aggregate-input-owner-depth call)))
+      (rove:ok (= 1 (aggregate-input-owner-depth (list :subplan subplan))))
+      (rove:ok (zerop (aggregate-input-owner-depth (list :whole-row 0 (list outer)))))))
+
 (rove:deftest subquery-consumer-stop-crosses-limit
     (let ((visited 0))
       (execute-physical-plan-node

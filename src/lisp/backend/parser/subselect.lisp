@@ -201,27 +201,32 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
           (mapcar (lambda (item) (cons (rewrite (car item)) (cdr item))) order)))))
 
 (defun aggregate-input-owner-depth (input)
-  ;; The nearest referenced query level owns the aggregate, even through sublinks.
+  "Find the nearest query level referenced by the aggregate input."
   (let ((minimum nil))
     (labels ((note (depth)
                (setf minimum (if minimum (min minimum depth) depth)))
-             (visit (form level)
-               (when (consp form)
-                 (cond
-                   ((eq (first form) :outer-ref)
-                    (when (>= (second form) level) (note (- (second form) level))))
-                   ((subquery-expression-p form)
-                    (visit (sql-subplan-test (second form)) level)
-                    (map-prepared-query-expressions
-                     (lambda (part nesting)
-                       (when (and (eq (first part) :outer-ref)
-                                  (>= (second part) nesting))
-                         (note (- (second part) nesting)))
-                       part)
-                     (sql-subplan-prepared (second form)) (1+ level)))
-                   ((member (first form) '(:col :whole-row)) (when (zerop level) (note 0)))
-                   (t (dolist (part form) (visit part level)))))))
-      (visit input 0))
+             (note-outer (form level)
+               (when (and (eq (first form) :outer-ref) (>= (second form) level))
+                 (note (- (second form) level)))))
+      (some-local-plan-expression
+       (lambda (form walk)
+         (case (first form)
+           (:outer-ref
+            (note-outer form 0)
+            (values nil t))
+           ((:col :whole-row)
+            (note 0)
+            (values nil t))
+           (:subplan
+            (let ((descriptor (second form)))
+              (funcall walk (sql-subplan-test descriptor))
+              (map-prepared-query-expressions
+               (lambda (part nesting)
+                 (note-outer part nesting)
+                 part)
+               (sql-subplan-prepared descriptor) 1))
+            (values nil t))))
+       input))
     (or minimum 0)))
 
 (defun rebase-aggregate-input (input owner-depth)
