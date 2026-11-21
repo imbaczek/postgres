@@ -187,12 +187,10 @@ A violation is an error; the outer replay path fences recovery."
                 (unless (physical-row-replay-spool-allowed-p horizon)
                   (return-from physical-row-replay-prefix :deferred))
                 (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
-                (let ((candidate (physical-resource-fact-next
-                                  resource-fact record (physical-recovery-replay-timeline) history))
-                      (fpw-candidate (physical-replay-fpw-fact-next
-                                      fpw-fact record (physical-recovery-replay-timeline) history))
-                      (logical-candidate (physical-replay-logical-fact-next
-                                          logical-fact record (physical-recovery-replay-timeline) history)))
+                (multiple-value-bind (candidate fpw-candidate logical-candidate)
+                    (physical-replay-terminal-facts-next
+                     resource-fact fpw-fact logical-fact record
+                     (physical-recovery-replay-timeline) history)
                   (wal-replay-record record)
                   (setf resource-fact candidate fpw-fact fpw-candidate logical-fact logical-candidate))
                 (apply #'physical-row-replay-publish-terminal record next-xid reservation source-xids

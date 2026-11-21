@@ -55,6 +55,13 @@ HISTORY may resolve lazily so unknown facts do not require a history read."
   (values (physical-replay-fpw-fact-next fpw-fact record timeline history)
           (physical-replay-logical-fact-next logical-fact record timeline history)))
 
+(defun physical-replay-terminal-facts-next (resource-fact fpw-fact logical-fact record timeline history)
+  "Validate the candidate facts before redo can modify standby storage."
+  (let ((resource (physical-resource-fact-next resource-fact record timeline history)))
+    (multiple-value-bind (fpw logical)
+        (physical-replay-policy-facts-next fpw-fact logical-fact record timeline history)
+      (values resource fpw logical))))
+
 (defun physical-recovery-resource-history (store state)
   (let ((selection (and store (physical-store-selection store))))
     (if selection (getf selection :history)
@@ -750,16 +757,11 @@ Stop before the next record when a published terminal causes a resource pause."
                 (setf next-xid (physical-replay-observed-next-xid record next-xid)
                       reservation (physical-source-reservation-next reservation record next-xid)
                       source-xids (physical-source-xids-next source-xids record next-xid))
-                (let* ((terminal (wal-terminal-record-type-p (wal-record-type record)))
-                       (candidate (when terminal
-                                    (physical-resource-fact-next
-                                     resource-fact record (physical-recovery-replay-timeline) resource-history)))
-                       (fpw-candidate (when terminal
-                                        (physical-replay-fpw-fact-next
-                                         fpw-fact record (physical-recovery-replay-timeline) resource-history)))
-                       (logical-candidate (when terminal
-                                            (physical-replay-logical-fact-next
-                                             logical-fact record (physical-recovery-replay-timeline) resource-history))))
+                (multiple-value-bind (candidate fpw-candidate logical-candidate)
+                    (when (wal-terminal-record-type-p (wal-record-type record))
+                      (physical-replay-terminal-facts-next
+                       resource-fact fpw-fact logical-fact record
+                       (physical-recovery-replay-timeline) resource-history))
                   (wal-replay-record record)
                   (unless *wal-recovery-group-active*
                     (setf resource-fact candidate fpw-fact fpw-candidate logical-fact logical-candidate)
