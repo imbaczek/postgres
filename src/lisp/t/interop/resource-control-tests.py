@@ -221,6 +221,14 @@ class ResourceControlTests(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         DECODE_CHECKPOINT(bad)
 
+    def test_checkpoint_reader_rejects_retired_base_snapshot(self):
+        snapshot = bytearray.fromhex(self.fields(timeline=1)[6])
+        self.assertEqual(len(snapshot), 88)
+        self.assertIsNone(DECODE_CHECKPOINT(snapshot).get("resource_fact"))
+        snapshot[:8] = b"PGCKPT01"
+        with self.assertRaises(AssertionError):
+            DECODE_CHECKPOINT(snapshot)
+
     def test_checkpoint_reader_requires_wal8_even_without_optional_facts(self):
         for policy, flags in ((None, 0), (False, 8), (True, 24)):
             fields = self.fields(timeline=1)

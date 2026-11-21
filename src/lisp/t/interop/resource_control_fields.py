@@ -13,13 +13,12 @@ def resource_values(data):
 
 def checkpoint_layout(data):
     assert len(data) >= 88
-    assert data[:8] in (b"PGCKPT01", b"PGCKPT02")
+    assert data[:8] == b"PGCKPT02"
     flags = int.from_bytes(data[84:88], "little")
     resource_end = len(data) - (8 if flags & 4 else 0) - (16 if flags & 128 else 0)
     assert resource_end in (88, 136) and flags <= 255
     assert not flags & 16 or flags & 8
     assert not flags & 64 or flags & 32
-    assert data[:8] == b"PGCKPT02" or (len(data) == 88 and flags == 0)
     if flags & 4:
         assert not any(data[resource_end:resource_end + 8])
     if flags & 128:
@@ -47,7 +46,7 @@ def checkpoint_resource_fact(data):
     _, resource_end = checkpoint_layout(data)
     if resource_end == 88:
         return None
-    assert data[:8] == b"PGCKPT02" and not any(data[132:136])
+    assert not any(data[132:136])
     values = resource_values(data[88:120])
     lsn = int.from_bytes(data[120:128], "little")
     timeline = int.from_bytes(data[128:132], "little")

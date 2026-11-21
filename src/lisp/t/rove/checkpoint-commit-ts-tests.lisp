@@ -104,7 +104,7 @@
                 (wal-set-u32 bad offset 3)
                 (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bad)))))))))))
 
-(rove:deftest checkpoint-commit-ts-requires-current-wal-and-keeps-legacy-snapshots
+(rove:deftest checkpoint-commit-ts-requires-current-wal-and-snapshot
     (dolist (known '(nil t))
       (let* ((snapshot (unit-commit-ts-snapshot :known known))
              (payload (wal-encode-checkpoint-snapshot snapshot)))
@@ -117,8 +117,7 @@
   (let* ((snapshot (unit-commit-ts-snapshot))
          (bytes (wal-encode-checkpoint-snapshot snapshot)))
     (setf (aref bytes 7) (char-code #\1))
-    (rove:ok (= 1 (getf (wal-decode-checkpoint-snapshot bytes) :version)))
-    (rove:ok (null (getf (wal-decode-checkpoint-snapshot bytes) :oldest-commit-ts-xid)))))
+    (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bytes))))))
 
 (rove:deftest checkpoint-commit-ts-keeps-exhausted-xids-and-resource-boundaries
     (dolist (resources '(nil t))

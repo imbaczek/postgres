@@ -1180,8 +1180,8 @@ checkpoint/restart. The final run passed at `/tmp/pg-parameter-wal-owned-v3.log`
 ### Resource facts in checkpoints and base images
 
 An ordinary native checkpoint now carries known resource facts in an optional
-48-byte suffix. The existing 88-byte `PGCKPT01`/`PGCKPT02` snapshots remain readable
-with unknown facts. A known tuple uses a 136-byte `PGCKPT02` snapshot and a 168-byte
+48-byte suffix. An 88-byte `PGCKPT02` snapshot remains readable with unknown
+resource facts. A known tuple uses a 136-byte `PGCKPT02` snapshot and a 168-byte
 WAL record in the existing version 8 format. The suffix contains the checked
 32-byte tuple, its originating parameter-record end and timeline, and a zero
 reserved word. Partial facts, future positions and malformed suffixes are errors.

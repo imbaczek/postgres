@@ -2,7 +2,7 @@
 (in-package #:pg-physical-tests)
 
 (defun sample-checkpoint-snapshot (&rest changes)
-  (let ((snapshot (list :version 1 :start 32 :end 152 :redo 32
+  (let ((snapshot (list :version 2 :start 32 :end 152 :redo 32
                         :next-xid 42 :xid-reserved-through 1002 :next-oid 16384
                         :time -1 :timeline 1 :prev-timeline 1 :oldest-active-xid 17)))
     (loop for (key value) on changes by #'cddr do (setf (getf snapshot key) value))
