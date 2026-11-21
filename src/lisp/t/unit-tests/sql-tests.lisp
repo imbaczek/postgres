@@ -201,22 +201,14 @@
                   (list :type :inner)
                   (list :index-scan 0 93011 93021 '(:bool t :type :bool) #(1))
                   (list :index-scan 1 93012 93022 '(:bool t :type :bool) #(1)))))
-         (original-ensure (symbol-function 'btree-ensure-init-before-read))
-         (original-locks (symbol-function 'call-with-btree-relation-read-leases))
          (original-backend-entry (symbol-function 'query-plan-backend-entry))
-         (locked-relfilenodes nil)
+         (expected-locks (mapcar #'btree-relation-lock '(202 101)))
          (executor-ran-under-locks-p nil))
     (unwind-protect
          (progn
            (check (equal (query-plan-index-relfilenodes plan relations) '(101 202))
                   "nested IndexScans resolve to sorted, deduplicated relation IDs")
-           (setf (symbol-function 'btree-ensure-init-before-read)
-                 (lambda (relfilenode) (declare (ignore relfilenode)) (values))
-                 (symbol-function 'call-with-btree-relation-read-leases)
-                 (lambda (relfilenodes function)
-                   (setf locked-relfilenodes relfilenodes)
-                   (funcall original-locks relfilenodes function))
-                 (symbol-function 'query-plan-backend-entry)
+           (setf (symbol-function 'query-plan-backend-entry)
                  (lambda (backend)
                    (declare (ignore backend))
                    (make-query-plan-backend
@@ -224,13 +216,13 @@
                     (lambda (query registered callback)
                       (declare (ignore query registered callback))
                       (setf executor-ran-under-locks-p
-                            (equal locked-relfilenodes '(101 202)))))))
+                            (and (every #'btree-read-lease-active-p *btree-read-leases*)
+                                 (equal (mapcar #'btree-read-lease-lock-state *btree-read-leases*)
+                                        expected-locks)))))))
            (execute-query-plan plan relations nil :backend :lock-order-test)
            (check executor-ran-under-locks-p
                   "executor starts only after the full sorted index read-lock set"))
-      (setf (symbol-function 'btree-ensure-init-before-read) original-ensure
-            (symbol-function 'call-with-btree-relation-read-leases) original-locks
-            (symbol-function 'query-plan-backend-entry) original-backend-entry))))
+      (setf (symbol-function 'query-plan-backend-entry) original-backend-entry))))
 
 (defun test-select-toast-reader-domain ()
   (let* ((toast (make-pg-toast :oid 100 :relfilenode 104 :index-relfilenode 102))

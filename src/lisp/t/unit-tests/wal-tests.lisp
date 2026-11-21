@@ -779,17 +779,48 @@
                 enabled)
            "slot creation appends and flushes a valid logical ON batch")))
 
+(defun wal-test-append-retention-batches (xid)
+  "Write replayable WAL through two rotations and return the first XID batch."
+  (let ((images (loop for block below 512
+                      collect (make-wal-page-image :relfilenode 7400 :block block
+                                                   :page (page-init (make-page))
+                                                   :xids (list xid))))
+        (empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (first nil))
+    (sb-thread:with-mutex (*wal-lock*)
+      ;; Establish a valid prefix and a positive first-contributor LSN.
+      (wal-append-batch-start)
+      (wal-append-record +wal-record-maintenance+ 0 empty)
+      (loop while (< *wal-end-lsn* (* 2 +wal-segment-size+))
+            do (let ((start (wal-append-batch-start)))
+                 (unless first
+                   (setf first start)
+                   (wal-record-page-xids-at-batch-start images start))
+                 (wal-append-page-images images)
+                 (wal-append-record +wal-record-maintenance+ 0 empty)))
+      (wal-flush))
+    first))
+
 (defun test-wal-replication-slot-durable-retention ()
   (let* ((test-pgdata (merge-pathnames "wal-replication-slot-test/" *pgdata*))
          (*pgdata* test-pgdata)
+         (*catalog* nil)
+         (*catalog-identity-needs-persist-p* nil)
+         (*catalog-durable-generation* 0)
+         (*catalog-oldest-relfrozenxid* nil)
          (*active-xids* '(6401))
          (*next-xid* 6402)
          (*wal-ready* t)
+         (*wal-storage-incarnation* (gensym "RETENTION-WAL-"))
+         (*wal-fpw-state* nil)
          (*wal-logical-policy* nil)
+         (*wal-logical-info* nil)
+         (*wal-logical-info-generation* 0)
+         (*backend-registry* (make-hash-table :test #'eql))
          (*logical-capture-force* nil)
          (*wal-poisoned* nil)
          (*wal-checkpoint-lsn* 0)
-         (*wal-end-lsn* (+ (* 2 +wal-segment-size+) 100))
+         (*wal-end-lsn* 0)
          (*wal-durable-lsn* *wal-end-lsn*)
          (*wal-new-segments* nil)
          (*wal-control-metadata* nil)
@@ -801,7 +832,8 @@
          (*logical-capture-live-slots* 0)
          (*wal-output-stream* nil)
          (*wal-output-segment* nil)
-         (initial-end *wal-end-lsn*)
+         (initial-end nil)
+         (first-xid-lsn nil)
          (checkpoint-lsn nil)
          (registration (make-snapshot-registration))
          (slot-owner (gensym "COPY-SLOT-"))
@@ -809,7 +841,6 @@
          (boundary-lsn nil)
          (restart-lsn nil)
          (slot nil))
-    (setf (gethash 6401 *wal-xid-first-lsn*) 100)
     (check (and (wal-valid-replication-slot-name-p "copy_slot")
                 (not (wal-valid-replication-slot-name-p "Copy_slot")))
            "replication slot names follow PostgreSQL's lowercase name rules")
@@ -818,7 +849,12 @@
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     (unwind-protect
          (progn
-           (wal-test-write-retention-segments initial-end)
+           (let ((*wal-ready* nil))
+             (catalog-init :initialize t))
+           (sb-thread:with-mutex (*wal-lock*)
+             (wal-logical-info-publish-under-lock nil :rebase t))
+           (setf first-xid-lsn (wal-test-append-retention-batches 6401)
+                 initial-end *wal-end-lsn*)
            (let ((*backend* (make-backend)))
              (call-with-logical-capture-armed
               (lambda ()
@@ -829,14 +865,14 @@
            (setf checkpoint-lsn *wal-durable-lsn*)
            (wal-test-check-logical-enable-tail initial-end checkpoint-lsn)
            (check (and snapshot (= boundary-lsn checkpoint-lsn)
-                       (= restart-lsn 100)
+                       (= restart-lsn first-xid-lsn)
                        (= (wal-replication-slot-consistent-lsn slot)
                           checkpoint-lsn))
                   "slot creation pairs a snapshot boundary with the oldest active-XID WAL")
            (check (and (probe-file (wal-replication-slot-path "copy_slot"))
                        (eq slot (gethash "copy_slot" *wal-replication-slots*)))
                   "slot reserves a WAL pin and finishes durable publication")
-           ;; This fixture has no transaction records, so finalize its
+           ;; This fixture has no transaction commits, so finalize its
            ;; consistent point before exercising startup metadata loading.
            (check (handler-case
                       (progn
@@ -870,14 +906,18 @@
            (wal-release-replication-slot-owner "copy_slot" slot-owner)
            ;; A restart reconstructs slot pins from durable metadata before
            ;; checkpoint recycling is allowed to run.
-           (setf *wal-replication-slots* (make-hash-table :test #'equal))
-           (wal-load-replication-slots)
-           (check (= (wal-replication-slot-restart-lsn
-                      (gethash "copy_slot" *wal-replication-slots*))
-                     100)
-                  "startup reloads the durable replication slot restart point")
            (release-xid 6401)
            (release-snapshot-registration registration)
+           (setf *wal-replication-slots* (make-hash-table :test #'equal))
+           (call-with-test-postmaster-data-directory
+            (lambda ()
+              (call-with-logical-slot-owned-startup-test
+               (lambda (gate-owner ownership)
+                 (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)))))
+           (check (= (wal-replication-slot-restart-lsn
+                      (gethash "copy_slot" *wal-replication-slots*))
+                     first-xid-lsn)
+                  "startup reloads the durable replication slot restart point")
            (wal-remove-checkpointed-segments checkpoint-lsn)
            (check (every (lambda (segment)
                            (probe-file (wal-segment-path segment)))
@@ -902,6 +942,9 @@
   (let* ((test-pgdata (merge-pathnames "exported-snapshot-scope-test/" *pgdata*))
          (*pgdata* test-pgdata)
          (*catalog* (make-catalog))
+         (*catalog-identity-needs-persist-p* nil)
+         (*catalog-durable-generation* 0)
+         (*catalog-oldest-relfrozenxid* nil)
          (*backend* (make-backend))
          (database (make-database :name "postgres" :oid 1))
          (*active-xids* nil)
@@ -932,6 +975,8 @@
           (gethash "postgres" (catalog-databases *catalog*)) database)
     (unwind-protect
          (progn
+           (let ((*wal-ready* nil))
+             (save-catalog))
            (multiple-value-setq (snapshot start-lsn)
              (with-exported-snapshot (captured captured-start
                                                :slot-name "base_copy")
@@ -1188,6 +1233,10 @@
   (let* ((test-pgdata (merge-pathnames "wal-replication-slot-fsync-test/"
                                        *pgdata*))
          (*pgdata* test-pgdata)
+         (*catalog* nil)
+         (*catalog-identity-needs-persist-p* nil)
+         (*catalog-durable-generation* 0)
+         (*catalog-oldest-relfrozenxid* nil)
          (*active-xids* '(6411))
          (*next-xid* 6412)
          (*wal-ready* t)
@@ -1219,6 +1268,8 @@
     (wal-ensure-directory-durable (wal-replication-slot-directory))
     (unwind-protect
          (progn
+           (let ((*wal-ready* nil))
+             (catalog-init :initialize t))
            (wal-test-write-retention-segments initial-end)
            (setf root-stat (sb-posix:stat (wal-replication-slot-directory)))
            (setf (symbol-function 'fsync-directory)

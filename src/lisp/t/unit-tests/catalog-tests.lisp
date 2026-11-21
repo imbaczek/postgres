@@ -397,29 +397,42 @@ Install buffer reads for these physical tuples for the duration of the call."
             (symbol-function 'ensure-current-table) original-ensure))))
 
 (defun test-nested-loop-seq-cost-models-replayable-inner ()
-  (let* ((table (make-pg-class
-                 :oid 61 :name "spooled_inner" :relfilenode 6101 :columns #()
-                 :statistics (make-pg-table-statistics :row-count 100)))
-         (path (make-select-scan-path :kind :seq-scan))
-         (base-cost (select-scan-path-cost table path))
-         (repeated-cost (nested-loop-inner-path-cost table path 5))
-         (index (make-pg-index :oid 6102 :relfilenode 6102
-                               :table-oid 61 :columns '(1)))
-         (cached-index-path
-           (make-select-scan-path :kind :index-scan :index index
-                                  :selectivity 0.1d0))
-         (parameterized-index-path
-           (make-select-scan-path :kind :index-scan :index index
-                                  :parameter-expr '(:col 1) :selectivity 0.1d0)))
-    (check (= repeated-cost (+ base-cost 4.0d0))
-           "SeqScan inner costing scans once and charges replay per later outer row")
-    (check (< repeated-cost (* 5 base-cost))
-           "replayable SeqScan costing is below a full rescan per outer row")
-    (check (< (nested-loop-inner-path-cost table cached-index-path 5)
-              (nested-loop-inner-path-cost table parameterized-index-path 5))
-           "unparameterized IndexScan is spooled while parameterized scans rescan")
-    (let ((*query-work-memory-bytes* 1))
-      (check (= (select-path-spool-spill-page-cost table path) 1.0d0)
-             "nested-loop costing estimates the disk pages for a spill")
-      (check (= (- (nested-loop-inner-path-cost table path 5) base-cost) 9.0d0)
-             "nested-loop costing charges the initial spill write and later rereads"))))
+  (let ((*pgdata* (uiop:ensure-directory-pathname
+                   (sb-posix:mkdtemp
+                    (namestring (merge-pathnames "planner-cost.XXXXXX"
+                                                 (uiop:temporary-directory))))))
+        (*wal-ready* nil)
+        (*relation-streams* (make-hash-table :test #'equal)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (relation-file-path 6101))
+           (smgr-create 6101)
+           (smgr-create 6102)
+           (let* ((table (make-pg-class
+                          :oid 61 :name "spooled_inner" :relfilenode 6101 :columns #()
+                          :statistics (make-pg-table-statistics :row-count 100)))
+                  (path (make-select-scan-path :kind :seq-scan))
+                  (base-cost (select-scan-path-cost table path))
+                  (repeated-cost (nested-loop-inner-path-cost table path 5))
+                  (index (make-pg-index :oid 6102 :relfilenode 6102
+                                        :table-oid 61 :columns '(1)))
+                  (cached-index-path
+                    (make-select-scan-path :kind :index-scan :index index
+                                           :selectivity 0.1d0))
+                  (parameterized-index-path
+                    (make-select-scan-path :kind :index-scan :index index
+                                           :parameter-expr '(:col 1) :selectivity 0.1d0)))
+             (check (= repeated-cost (+ base-cost 4.0d0))
+                    "SeqScan inner costing scans once and charges replay per later outer row")
+             (check (< repeated-cost (* 5 base-cost))
+                    "replayable SeqScan costing is below a full rescan per outer row")
+             (check (< (nested-loop-inner-path-cost table cached-index-path 5)
+                       (nested-loop-inner-path-cost table parameterized-index-path 5))
+                    "unparameterized IndexScan is spooled while parameterized scans rescan")
+             (let ((*query-work-memory-bytes* 1))
+               (check (= (select-path-spool-spill-page-cost table path) 1.0d0)
+                      "nested-loop costing estimates the disk pages for a spill")
+               (check (= (- (nested-loop-inner-path-cost table path 5) base-cost) 9.0d0)
+                      "nested-loop costing charges the initial spill write and later rereads"))))
+      (unwind-protect (smgr-close-all)
+        (uiop:delete-directory-tree *pgdata* :validate t)))))

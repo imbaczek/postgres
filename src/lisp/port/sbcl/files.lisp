@@ -426,6 +426,9 @@ The caller excludes concurrent changes; the reader validates selected entries."
 (defun atomic-replace-file (target-path temporary-path directory write-function
                             &key (element-type 'character) mode
                               (fsync-function #'sb-posix:fsync)
+                              (fsync-stream-function
+                               (lambda (stream)
+                                 (funcall fsync-function (sb-sys:fd-stream-fd stream))))
                               (rename-function #'sb-posix:rename)
                               (fsync-directory-function #'fsync-directory))
   "Write and sync TEMPORARY-PATH before atomically replacing TARGET-PATH."
@@ -443,7 +446,7 @@ The caller excludes concurrent changes; the reader validates selected entries."
            (finish-output stream)
            (atomic-replace-slot-failpoint :slot-file-after-write target-path)
            (atomic-replace-slot-failpoint :slot-file-before-fsync target-path)
-           (funcall fsync-function (sb-sys:fd-stream-fd stream))
+           (funcall fsync-stream-function stream)
            (atomic-replace-slot-failpoint :slot-file-after-fsync target-path))
          (atomic-replace-slot-failpoint :slot-file-before-rename target-path)
          (funcall rename-function (namestring temporary-path)
