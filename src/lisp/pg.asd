@@ -140,6 +140,9 @@
                    (:file "exec_constraints")
                    (:file "exec_vacuum")
                    (:file "exec_simple")))
+     ;; Recovery uses executor temporary storage and supplies the startup
+     ;; and physical replay entry points below.
+     (:file "storage/wal-recovery")
      (:module "tcop"
       :serial t
       :components ((:file "dest")

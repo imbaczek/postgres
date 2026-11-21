@@ -240,6 +240,11 @@ History and redo borrow the image bytes from that payload while consuming it.
 Recovery retries pending scratch cleanup if an earlier close was interrupted
 by an unlink failure.
 
+`storage/wal-recovery.lisp` owns staging, terminal application, and primary
+recovery. ASDF loads it after the temporary spool implementation and before
+physical recovery and startup. WAL framing and shared record types stay in
+`storage/wal-core.lisp`.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
