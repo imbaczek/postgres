@@ -1703,22 +1703,6 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                targets)
           environment)))
 
-(defun collect-select-no-from-rows (where targets)
-  (let ((row (make-select-result-row nil where targets)))
-    (if row (list row) nil)))
-
-(defun collect-select-table-rows (table relfilenode path where targets)
-  (let ((rows '()))
-    (labels ((consider (tuple)
-               (check-for-interrupts)
-               (let ((env (htup-values tuple)))
-                 ;; Index quals only produce candidates.  Recheck the complete
-                 ;; WHERE expression before projection just like SeqScan.
-                 (let ((row (make-select-result-row env where targets)))
-                   (when row (push row rows))))))
-      (scan-select-path table relfilenode path *current-snapshot* #'consider))
-    (nreverse rows)))
-
 (defun combine-select-join-environment (left right join)
   (if (getf join :reordered)
       (let* ((offset (getf join :right-offset))
@@ -1877,56 +1861,6 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                  (when stopped :stop))))
       (funcall left-stream #'visit-left)
       (if stopped :stop (values)))))
-
-(defun stream-select-joined-environments (relations joins callback)
-  (labels ((stream-level (level level-callback)
-             (if (= level 1)
-                 (let* ((relation (first relations))
-                        (table (getf relation :table)))
-                   (scan-select-path
-                    table (pg-class-relfilenode table) (getf relation :path)
-                    *current-snapshot*
-                    (lambda (tuple)
-                      (check-for-interrupts)
-                      (funcall level-callback (htup-values tuple)))))
-                 (let* ((relation (nth (1- level) relations))
-                        (join (nth (- level 2) joins))
-                        (table (getf relation :table))
-                        (path (getf relation :path)))
-                   ;; Joined WHERE clauses stay above the join tree. In
-                   ;; particular, filtering the right input here could turn a
-                   ;; matched row into a fabricated NULL-extended row.
-                   (unless (eq (select-scan-path-kind path) :seq-scan)
-                     (ereport "XX000" "joined relation scan must use SeqScan"))
-                   (stream-select-join-environments
-                    (lambda (left-callback)
-                      (stream-level (1- level) left-callback))
-                    (lambda (right-callback)
-                      (scan-select-path
-                       table (pg-class-relfilenode table) path
-                       *current-snapshot*
-                       (lambda (tuple)
-                         (check-for-interrupts)
-                         (funcall right-callback (htup-values tuple)))))
-                    join level-callback)))))
-    (when relations
-      (stream-level (length relations) callback))))
-
-(defun stream-select-joined-rows (relations joins where targets callback)
-  (stream-select-joined-environments
-   relations joins
-   (lambda (environment)
-     (check-for-interrupts)
-     (let ((row (make-select-result-row environment where targets)))
-       (when row (funcall callback row))))))
-
-(defun collect-select-joined-rows (relations joins where targets)
-  (let ((rows '()))
-    (stream-select-joined-rows
-     relations joins where targets
-     (lambda (row)
-       (push row rows)))
-    (nreverse rows)))
 
 (defun select-write-bytea-text (out bytes format)
   "Write PostgreSQL bytea text without building a value-sized string."

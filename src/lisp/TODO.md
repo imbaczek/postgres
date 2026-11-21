@@ -33,13 +33,47 @@ functions longer than 120 lines. In the polish pass, check naming, vacuous
 assertions and error checks, unnecessary complexity, and duplication. Document
 why existing code could not meet the need when a new implementation is required.
 
+### Milestone 0 producer inventory
+
+| Audit item | Current writer | Compatibility evidence |
+|---|---|---|
+| B1 | [Native WAL encoder](backend/storage/wal-core.lisp) | `wal-encode-record` stamps version 8. The legacy maintenance replay test writes version 3 by overriding the header and recomputing the CRC. Keep that fixture classified as compatibility coverage until the cutover changes the acceptance contract. |
+| B2 | [Primary WAL control encoder](backend/storage/wal-checkpoint.lisp) | `wal-encode-control-image` writes PGWAL6, including variants for lifecycle metadata, retained references, resources, native checksums, and a local CLOG extent. |
+| B3 | [Checkpoint codec](backend/storage/wal-checkpoint.lisp) | The current checkpoint payload is PGCKPT02. Its optional flags carry transaction and resource state used by current startup and recovery. |
+| B4 | [B-tree page construction](backend/access/btree/btree.lisp) | New pages set their type via `+pd-flags-off+`. The [page decoder](backend/storage/bufpage.lisp) recognizes the historical byte-8 layout. |
+| B5 | [CREATE PUBLICATION](backend/executor/exec_simple.lisp) and the [catalog codec](backend/catalog/catalog.lisp) | Creation allocates the OID before catalog publication. `catalog-init` separately backfills missing legacy OIDs. |
+| B6 | [Catalog codec](backend/catalog/catalog.lisp) | `catalog-to-sexp` always emits the cluster identity. `catalog-from-sexp` synthesizes it when absent and flags the catalog for persistence. Fresh catalogs also use the identity allocator. |
+| B7 | [Slot encoder](backend/storage/wal-core.lisp) and [logical slot state codec](backend/replication/logical-slot-state.lisp) | The current producer can emit PGSLOT4 or PGSLOT5. Provenance and explicit loss causes use PGSLOT6, and child ownership uses PGSLOT7. |
+| B8 | [Source pin encoder](backend/replication/physical-source.lisp) | Ordinary source pins use PGPHYSPIN2. Follow pins have a separate encoder. PGPHYSPIN1 appears in the reader. |
+| B9 | [Receive control codec](backend/replication/physical-store.lisp) | The writer uses PGPHYS03 at 68, 80, or 96 bytes for base control, history selection, and retained-root identity. The 52-byte PGPHYS02 reader supplies a default floor and seed. |
+| B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
+| B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
+| B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | The current producer constructs metadata version 4 and writes PGRPGEN2. The generic codec can still emit PGRPGEN1 when called with old metadata. Inventory those inputs before removing that branch. |
+
+For B15, callers of the ownerless CLOG staging and materialization functions
+are confined to their delegation chain and Rove fixtures. The tag validation
+helper also protects owned completions, so preserve it during the cutover.
+
+For B16, the three `collect-select-*-rows` wrappers had no production callers.
+The joined collector was the only caller of `stream-select-joined-rows`, which
+was itself the only caller of `stream-select-joined-environments`. The
+FROM-less collector had one legacy test caller. Its regression now executes a
+live plan. Cursor execution, plan execution and DML still share
+`make-select-result-row`, and live join operators retain their streaming
+helpers.
+
 ## Open development tasks
 
-- [ ] Bring the legacy WAL slot retention fixture up to the current startup
-  contract. The unit run reaches `test-wal-replication-slot-durable-retention`
-  after the snapshot handoff, then its synthetic PGDATA fails the durable
-  catalog check during slot creation. Qualify the fixture's WAL and ownership
-  when exercising slot restoration and checkpoint recycling.
+- [x] Bring the legacy WAL slot retention fixture up to the current startup
+  contract. The fixture writes replayable batches across three WAL segments
+  and restores the durable slot under real startup ownership. Its 12 checks
+  pass in isolation, and the combined unit run advances past the fixture.
+
+- [x] Reconcile XID wraparound recovery with strict primary startup. Stage and
+  sync the empty CLOG separately, atomically replace `pg_xact`, then sync
+  its directory. File and directory fsync faults leave a status file for
+  restart and hold the allocation gate closed. The combined unit suite
+  passed with 1,174 legacy checks and zero failures.
 
 - [ ] Close out the PostgreSQL backend and pinned Patroni comparison using the
   [goal closeout check](PHYSICAL-HA.md#goal-closeout-check). Complete standby
