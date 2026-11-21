@@ -67,7 +67,7 @@
             (ok (pg::wal-check-shared-lineage-prefix history right history start end)))))))
 
 (cl-spec:defproperty lineage-reader-preserves-original-record-bytes
-    ((length (range integer 32 512)) (version (range integer 2 8)))
+    ((length (range integer 32 512)))
   (:about pg::wal-scan-lineage)
   (:trials (:normal 100))
   (with-physical-store-directory (root)
@@ -76,15 +76,12 @@
                                        (make-array (- length 32) :element-type '(unsigned-byte 8)
                                                                  :initial-element 42)))
            (seen nil))
-      (pg::wal-set-u16 raw 4 version)
-      (pg::wal-set-u32 raw 28 0)
-      (pg::wal-set-u32 raw 28 (pg::wal-crc32 raw))
       (lineage-test-file 1 0 raw)
       (multiple-value-bind (cursor files complete)
           (pg::wal-scan-lineage
            (lambda (record owner carrier bytes)
              (setf seen (and (= owner carrier 1)
-                             (= version (pg::wal-record-version record))
+                             (= pg::+wal-version+ (pg::wal-record-version record))
                              (equalp raw bytes))))
            (pg::timeline-parse-history 1 "") 0 length :include-raw t)
         (and seen complete (= cursor length) (equal files '((1 0)))

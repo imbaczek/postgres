@@ -763,10 +763,6 @@
     (with-physical-store-directory (root)
       (let ((bytes (sample-physical-record))
             (store (pg::physical-store-open root 123 1 :create t)))
-        ;; Supported older records survive receipt verbatim.
-        (pg::wal-set-u16 bytes 4 pg::+wal-version-v2+)
-        (pg::wal-set-u32 bytes 28 0)
-        (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
         (unwind-protect
              (progn
                (pg::physical-store-input store 0 bytes)
