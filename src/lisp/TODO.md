@@ -64,6 +64,8 @@ fixtures now construct WAL8 checkpoints. The source fixture binds the
 matching in-memory checkpoint snapshot and keeps its record end at a
 segment boundary. Retained extent and inventory fixtures derive their
 start, fork, and end from the WAL8 checkpoint and end-of-recovery sizes.
+Retained projection fixtures also use WAL8 for overlap, fork clipping,
+multi-timeline carrier selection, and metadata budget checks.
 The recovery page spool
 also records the source version and decodes it when replaying page images.
 Version-specific fixtures cover page images, checkpoint and running-xacts

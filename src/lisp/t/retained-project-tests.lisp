@@ -1,30 +1,30 @@
 (in-package #:pg-physical-tests)
 
 (defun project-test-source (target)
-  (let* ((base (overlap-test-bytes 96))
+  (let* ((base (overlap-test-bytes 184 :native t))
          (raw (concatenate '(vector (unsigned-byte 8))
-                           (legacy-checkpoint-record 96) (legacy-checkpoint-record 128)
-                           (pg::wal-encode-end-of-recovery-record 160 42 2 1 1)
-                           (legacy-checkpoint-record 216)
+                           (physical-test-checkpoint-record 184) (physical-test-checkpoint-record 304)
+                           (pg::wal-encode-end-of-recovery-record 424 42 2 1 1)
+                           (physical-test-checkpoint-record 480 :timeline 2)
                            (when (= target 3)
                              (concatenate '(vector (unsigned-byte 8))
-                                          (legacy-checkpoint-record 248)
-                                          (pg::wal-encode-end-of-recovery-record 280 42 3 2 1)
-                                          (legacy-checkpoint-record 336)))))
+                                          (physical-test-checkpoint-record 600 :timeline 2)
+                                          (pg::wal-encode-end-of-recovery-record 720 42 3 2 1)
+                                          (physical-test-checkpoint-record 776 :timeline 3)))))
          (bytes (concatenate '(vector (unsigned-byte 8)) base raw))
-         (text (if (= target 2) (store-history-text 1 160)
-                   (concatenate 'string (store-history-text 1 160) (store-history-text 2 280))))
-         (metadata (list :version 1 :system-id 123 :base-timeline 1 :base 96 :manifest-digest 77
+         (text (if (= target 2) (store-history-text 1 424)
+                   (concatenate 'string (store-history-text 1 424) (store-history-text 2 720))))
+         (metadata (list :version 1 :system-id 123 :base-timeline 1 :base 184 :manifest-digest 77
                          :history-target target :history-digest (if (= target 2) 99 123)
-                         :history-text text :start 96 :end (length bytes)
+                         :history-text text :start 184 :end (length bytes)
                          :start-digest #xCBF29CE484222325
                          :end-digest (pg::physical-store-update-digest #xCBF29CE484222325 raw)
                          :segment 0 :file-timeline target
                          :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes))))
     (values (pg::physical-retained-extent-encode metadata bytes)
-            (pg::physical-retained-overlap-encode (overlap-test-metadata 96 base) base)
+            (pg::physical-retained-overlap-encode (overlap-test-metadata 184 base :native t) base)
             (pg::timeline-parse-history target text)
-            '(:system-id 123 :base-timeline 1 :base 96 :manifest-digest 77)
+            '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77)
             text bytes)))
 
 (defun project-test-publish-source (root image overlap identity target text)
@@ -56,9 +56,9 @@
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 2)
             (let* ((source (project-test-publish-source root image overlap identity 2 text))
                    (original (lineage-test-bytes (pg::physical-retained-object-path root :inventory source))))
-              (dolist (fork '(96 128 160))
+              (dolist (fork '(184 304 424))
                 (let ((selected nil) (owner (gensym))
-                                     (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 fork))))
+                                     (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 fork))))
                   (pg::call-with-physical-retained-root-update
                    (lambda (initial hold) (declare (ignore initial))
                      (setf selected (project-test-project-prefix
@@ -68,7 +68,7 @@
                                    root selected identity (pg::timeline-parse-history 1 "")))
                          (entries (getf payload :entries)))
                     (ok (getf payload :base-overlap))
-                    (if (= fork 96)
+                    (if (= fork 184)
                         (ok (null entries))
                         (multiple-value-bind (metadata captured)
                             (pg::physical-retained-extent-decode
@@ -87,9 +87,9 @@
       (with-retained-root-registry
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 3)
             (let* ((source (project-test-publish-source root image overlap identity 3 text))
-                   (parent-text (store-history-text 1 160))
-                   (fork 248) (selected nil)
-                   (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 fork))))
+                   (parent-text (store-history-text 1 424))
+                   (fork 600) (selected nil)
+                   (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 fork))))
               (pg::call-with-physical-retained-root-update
                (lambda (initial hold) (declare (ignore initial))
                  (setf selected (project-test-project-prefix
@@ -103,9 +103,9 @@
                      (pg::physical-retained-object-read root :extent (first entry) pg::+physical-retained-image-limit+))
                   (ok (= 2 (getf metadata :history-target) (getf metadata :file-timeline)))
                   (ok (= 99 (getf metadata :history-digest)))
-                  (ok (= 248 (length captured)))
+                  (ok (= 600 (length captured)))
                   (ok (= pg::+wal-record-end-of-recovery+
-                         (pg::wal-record-type (pg::wal-decode-record (subseq captured 160 216) 160))))
+                         (pg::wal-record-type (pg::wal-decode-record (subseq captured 424 480) 424))))
                   (ok (equalp captured (subseq bytes 0 fork))))))))))
 
 (deftest retained-projection-rejects-inexact-endpoints-and-divergent-ancestry
@@ -113,13 +113,13 @@
       (with-retained-root-registry
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 3)
             (let ((source (project-test-publish-source root image overlap identity 3 text))
-                  (parent-text (store-history-text 1 160)))
-              (dolist (case (list (list 1 "" nil 144 0)
-                                  (list 1 "" nil 128 0)
-                                  (list 1 "" nil 248 0)
-                                  (list 2 parent-text nil 248 0)
-                                  (list 2 (store-history-text 1 128) 99 248
-                                        (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 248)))))
+                  (parent-text (store-history-text 1 424)))
+              (dolist (case (list (list 1 "" nil 320 0)
+                                  (list 1 "" nil 304 0)
+                                  (list 1 "" nil 600 0)
+                                  (list 2 parent-text nil 600 0)
+                                  (list 2 (store-history-text 1 304) 99 600
+                                        (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 600)))))
                 (let ((owner (gensym)))
                   (ok (intake-fails-p
                        (lambda () (pg::call-with-physical-retained-root-update
@@ -133,25 +133,25 @@
       (with-retained-root-registry
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 2)
             (multiple-value-bind (metadata data) (pg::physical-retained-extent-decode image)
-              (setf (getf metadata :start) 128
+              (setf (getf metadata :start) 304
                     (getf metadata :start-digest)
-                    (pg::physical-store-update-digest #xCBF29CE484222325 (subseq data 96 128)))
+                    (pg::physical-store-update-digest #xCBF29CE484222325 (subseq data 184 304)))
               (setf image (pg::physical-retained-extent-encode metadata data)))
             (let ((source (project-test-publish-source root image overlap identity 2 text)))
               (ok (intake-fails-p
                    (lambda () (pg::call-with-physical-retained-root-update
                                (lambda (initial hold) (declare (ignore initial))
                                  (project-test-project-prefix
-                                  hold source history 1 "" nil 160
-                                  (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 160))))
+                                  hold source history 1 "" nil 424
+                                  (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 424))))
                                (gensym) root identity 1 "" nil :read-selected (lambda () nil))))))))))
 
 (deftest retained-projection-empty-root-requires-base-overlap-and-fixed-seed
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (dolist (base (list 32 96 pg::+wal-segment-size+))
-            (let* ((bytes (overlap-test-bytes base))
-                   (image (pg::physical-retained-overlap-encode (overlap-test-metadata base bytes) bytes))
+          (dolist (base (list (pg::wal-checkpoint-record-size) 184 pg::+wal-segment-size+))
+            (let* ((bytes (overlap-test-bytes base :native t))
+                   (image (pg::physical-retained-overlap-encode (overlap-test-metadata base bytes :native t) bytes))
                    (identity (list :system-id 123 :base-timeline 1 :base base :manifest-digest 77))
                    (history (pg::timeline-parse-history 1 ""))
                    (selected nil))
@@ -212,12 +212,12 @@
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 2)
             (multiple-value-bind (metadata ignored) (pg::physical-retained-extent-decode image)
               (declare (ignore ignored))
-              (let* ((digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 160)))
+              (let* ((digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 424)))
                      (left (copy-list metadata)) (right (copy-list metadata))
-                     (prefix (subseq bytes 0 160)))
-                (setf (getf left :end) 160 (getf left :end-digest) digest
+                     (prefix (subseq bytes 0 424)))
+                (setf (getf left :end) 424 (getf left :end-digest) digest
                       (getf left :prefix-digest) (pg::physical-store-update-digest #xCBF29CE484222325 prefix)
-                      (getf right :start) 160 (getf right :start-digest) digest)
+                      (getf right :start) 424 (getf right :start-digest) digest)
                 (let* ((first-image (pg::physical-retained-extent-encode left prefix))
                        (source (project-test-publish-source
                                 root (list first-image (pg::physical-retained-extent-encode right bytes))
@@ -226,7 +226,7 @@
                   (pg::call-with-physical-retained-root-update
                    (lambda (initial hold) (declare (ignore initial))
                      (setf selected (project-test-project-prefix
-                                     hold source history 1 "" nil 160 digest)))
+                                     hold source history 1 "" nil 424 digest)))
                    (gensym) root identity 1 "" nil :read-selected (lambda () selected))
                   (let* ((payload (pg::physical-retained-inventory-load
                                    root selected identity (pg::timeline-parse-history 1 "")))
@@ -239,7 +239,7 @@
     (with-physical-store-directory (root)
       (with-retained-root-registry
           (let* ((segment pg::+wal-segment-size+) (base (- segment 16))
-                                                  (prefix (overlap-test-bytes base))
+                                                  (prefix (overlap-test-bytes base :native t))
                                                   (raw (pg::wal-encode-end-of-recovery-record segment 42 2 1 1))
                                                   (digest (pg::physical-store-update-digest #xCBF29CE484222325 raw))
                                                   (text (store-history-text 1 base)) (history (pg::timeline-parse-history 2 text))
@@ -250,7 +250,7 @@
                                                                           :end-digest digest :segment 1 :file-timeline 2
                                                                           :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 raw))))
                                                   (image (pg::physical-retained-extent-encode metadata raw))
-                                                  (auxiliary (pg::physical-retained-overlap-encode (overlap-test-metadata base prefix) prefix))
+                                                  (auxiliary (pg::physical-retained-overlap-encode (overlap-test-metadata base prefix :native t) prefix))
                                                   (source (project-test-publish-source root image auxiliary identity 2 text)))
             (dolist (case (list (list 1 "" nil base #xCBF29CE484222325)
                                 (list 2 text 99 (+ segment 56) digest)))
@@ -297,7 +297,7 @@
                     (lambda (initial hold) (declare (ignore initial))
                       (let ((entry (pg::physical-retained-root-stage-overlap hold 1 "" overlap)))
                         (setf selected (pg::physical-retained-root-project-prefix
-                                        hold source history 1 "" nil 96 #xCBF29CE484222325
+                                        hold source history 1 "" nil 184 #xCBF29CE484222325
                                         :base-overlap entry :source-owner source-owner))))
                     (gensym) root identity 1 "" nil :read-selected (lambda () selected))
                 (when thread (sb-thread:join-thread thread :timeout 5 :default :timeout)))
@@ -310,28 +310,32 @@
             (declare (ignore ignored old-history ignored-identity ignored-text))
             (multiple-value-bind (metadata ignored) (pg::physical-retained-extent-decode image)
               (declare (ignore ignored))
-              (replace bytes (pg::wal-encode-end-of-recovery-record 160 42 3 2 1) :start1 160)
+              (replace bytes (physical-test-checkpoint-record 184 :timeline 2) :start1 184)
+              (replace bytes (physical-test-checkpoint-record 304 :timeline 2) :start1 304)
+              (replace bytes (pg::wal-encode-end-of-recovery-record 424 42 3 2 1) :start1 424)
+              (replace bytes (physical-test-checkpoint-record 480 :timeline 3) :start1 480)
               (let* ((parent-text (store-history-text 1 64))
-                     (text (concatenate 'string parent-text (store-history-text 2 160)))
+                     (text (concatenate 'string parent-text (store-history-text 2 424)))
                      (history (pg::timeline-parse-history 3 text))
-                     (identity '(:system-id 123 :base-timeline 2 :base 96 :manifest-digest 77))
-                     (base-bytes (subseq bytes 0 96))
+                     (identity '(:system-id 123 :base-timeline 2 :base 184 :manifest-digest 77))
+                     (base-bytes (overlap-test-bytes 184 :native t :timeline 2))
                      (overlap (pg::physical-retained-overlap-encode
-                               (overlap-test-metadata 96 base-bytes :timeline 2 :namespace :timeline) base-bytes))
-                     (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 128)))
+                               (overlap-test-metadata 184 base-bytes :timeline 2 :namespace :timeline :native t) base-bytes))
+                     (digest (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 304)))
                      (selected nil))
+                (replace bytes base-bytes)
                 (setf (getf metadata :base-timeline) 2 (getf metadata :history-target) 3
                       (getf metadata :history-digest) 123 (getf metadata :history-text) text
                       (getf metadata :file-timeline) 3
                       (getf metadata :end-digest)
-                      (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96))
+                      (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184))
                       (getf metadata :prefix-digest) (pg::physical-store-update-digest #xCBF29CE484222325 bytes))
                 (let ((source (project-test-publish-source
                                root (pg::physical-retained-extent-encode metadata bytes) overlap identity 3 text)))
                   (pg::call-with-physical-retained-root-update
                    (lambda (initial hold) (declare (ignore initial))
                      (setf selected (project-test-project-prefix
-                                     hold source history 2 parent-text nil 128 digest)))
+                                     hold source history 2 parent-text nil 304 digest)))
                    (gensym) root identity 2 parent-text nil :read-selected (lambda () selected))
                   (let* ((payload (pg::physical-retained-inventory-load
                                    root selected identity (pg::timeline-parse-history 2 parent-text)))
@@ -353,8 +357,8 @@
                      (lambda () (pg::call-with-physical-retained-root-update
                                  (lambda (initial hold) (declare (ignore initial))
                                    (project-test-project-prefix
-                                    hold source history 1 "" nil 128
-                                    (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 128))))
+                                    hold source history 1 "" nil 304
+                                    (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 304))))
                                  owner root identity 1 "" nil :read-selected (lambda () nil)))))
                 (ok (null (pg::physical-retained-root-current owner)))
                 (ok (= source (pg::physical-retained-root-current source-owner)))))))))
@@ -454,12 +458,12 @@
           (multiple-value-bind (image overlap history identity text bytes) (project-test-source 2)
             (multiple-value-bind (metadata ignored) (pg::physical-retained-extent-decode image)
               (declare (ignore ignored))
-              (let* ((middle (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 96 160)))
+              (let* ((middle (pg::physical-store-update-digest #xCBF29CE484222325 (subseq bytes 184 424)))
                      (left (copy-list metadata)) (right (copy-list metadata))
-                     (prefix (subseq bytes 0 160)))
-                (setf (getf left :end) 160 (getf left :end-digest) middle
+                     (prefix (subseq bytes 0 424)))
+                (setf (getf left :end) 424 (getf left :end-digest) middle
                       (getf left :prefix-digest) (pg::physical-store-update-digest #xCBF29CE484222325 prefix)
-                      (getf right :start) 160 (getf right :start-digest) middle)
+                      (getf right :start) 424 (getf right :start-digest) middle)
                 (let* ((images (list (pg::physical-retained-extent-encode left prefix)
                                      (pg::physical-retained-extent-encode right bytes)))
                        (source (project-test-publish-source root images overlap identity 2 text))
@@ -473,7 +477,7 @@
                                (lambda (directory kind id maximum)
                                  (when (eq kind :extent) (push id reads))
                                  (funcall reader directory kind id maximum)))
-                         (dolist (fork '(96 128))
+                         (dolist (fork '(184 304))
                            (setf reads nil)
                            (let ((selected nil))
                              (pg::call-with-physical-retained-root-update
@@ -481,9 +485,9 @@
                                 (setf selected (project-test-project-prefix
                                                 hold source history 1 "" nil fork
                                                 (pg::physical-store-update-digest #xCBF29CE484222325
-                                                                                  (subseq bytes 96 fork)))))
+                                                                                  (subseq bytes 184 fork)))))
                               (gensym) root identity 1 "" nil :read-selected (lambda () selected))
-                             (if (= fork 96) (ok (null reads)) (ok reads))
+                             (if (= fork 184) (ok (null reads)) (ok reads))
                              (ok (not (member discarded reads))))))
                     (setf (symbol-function 'pg::physical-retained-object-read) reader)))))))))
 
@@ -504,12 +508,12 @@
                                            (list source (gensym) identity)
                                            (list (logxor 1 source) source-owner identity)
                                            (list source source-owner
-                                                 '(:system-id 123 :base-timeline 1 :base 96 :manifest-digest 78))))
+                                                 '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 78))))
                          (ok (intake-fails-p
                               (lambda () (pg::call-with-physical-retained-root-update
                                           (lambda (initial hold) (declare (ignore initial))
                                             (pg::physical-retained-root-project-prefix
-                                             hold (first case) history 1 "" nil 96 #xCBF29CE484222325
+                                             hold (first case) history 1 "" nil 184 #xCBF29CE484222325
                                              :source-owner (second case)))
                                           (gensym) root (third case) 1 "" nil :read-selected (lambda () nil))))))
                        (ok (zerop reads)))
