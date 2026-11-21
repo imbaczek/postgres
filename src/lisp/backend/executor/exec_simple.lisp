@@ -859,6 +859,15 @@ Do not perform wire I/O while restoring transaction state."
             (pg-column-attnum (resolve-column-or-error table n)))
           names))
 
+(defun check-distinct-constraint-columns (table attnums primary-p)
+  (loop for attnum in attnums
+        for offset from 0
+        when (position attnum attnums :end offset)
+          do (ereport "42701" "column \"~a\" appears twice in ~a constraint"
+                      (pg-column-name
+                       (aref (pg-class-columns table) (1- attnum)))
+                      (if primary-p "primary key" "unique"))))
+
 (defun fsync-index (idx)
   (smgr-fsync (pg-index-relfilenode idx)))
 
@@ -1001,6 +1010,8 @@ before this removal horizon is captured."
             (install-table-expressions class cols constraints)
             (dolist (c (remove-if (lambda (c) (eq (getf c :kind) :check)) constraints))
               (let ((attnums (resolve-attnums class (getf c :columns))))
+                (check-distinct-constraint-columns class attnums
+                                                   (eq (getf c :kind) :primary))
                 (case (getf c :kind)
                   (:primary
                    (dolist (attnum attnums)
@@ -1316,6 +1327,7 @@ Release these locks before waiting for commit or sending replies."
                  index-name (pg-class-name table)))
       (unless (pg-index-unique-p idx)
         (ereport "42809" "\"~a\" is not a unique index" index-name))
+      (check-distinct-constraint-columns table (pg-index-columns idx) primary)
       (when primary
         (when (find-if #'pg-index-primary-p (table-indexes table))
           (ereport "42P16"
@@ -1443,6 +1455,7 @@ Release these locks before waiting for commit or sending replies."
           (ereport "42P16"
                    "multiple primary keys for table \"~a\" are not allowed"
                    (pg-class-name table)))
+        (check-distinct-constraint-columns table (pg-index-columns new-idx) t)
         (check-not-null-existing table (pg-index-columns new-idx) new-name)
         (when (or (gethash new-name (database-tables db))
                   (let ((named (gethash new-name (database-indexes db))))
@@ -1528,6 +1541,7 @@ Release these locks before waiting for commit or sending replies."
        (exec-alter-table-constraint stream db table ast))
       (t
        (let ((attnums (resolve-attnums table (getf ast :columns))))
+         (check-distinct-constraint-columns table attnums primary)
          (with-table-ddl (table :ast ast :refresh-snapshot t)
            (when (and primary
                       (find-if #'pg-index-primary-p (table-indexes table)))
