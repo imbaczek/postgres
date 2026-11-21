@@ -143,17 +143,8 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
        (physical-history-accept-terminal record identity removed))
       (t (error "unsupported record in catalog history")))))
 
-(declaim (ftype function physical-replay-check-selected-eor))
-
-(declaim (ftype function physical-replay-check-selected-eor physical-recovery-scan-seeds
-                physical-recovery-scan-stage physical-recovery-scan-checkpoint-fpw
-                physical-replay-check-child-initialization physical-replay-observed-next-xid
-                physical-replay-fpw-fact-next physical-recovery-resource-history
-                physical-recovery-check-store-point physical-fpw-check-fact physical-fpw-copy-fact))
-
-(declaim (ftype function physical-replay-logical-fact-next physical-recovery-scan-checkpoint-logical))
-
-(declaim (ftype function physical-recovery-scan-policy-seeds physical-replay-policy-facts-next))
+(declaim (ftype function physical-replay-check-selected-eor
+                physical-replay-check-child-initialization physical-recovery-check-store-point))
 
 (defun physical-recovery-proven-drops (store identity
                                        &key (start-lsn (physical-store-floor-lsn store))

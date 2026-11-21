@@ -162,6 +162,10 @@
                    (:file "../replication/physical-bootstrap")
                    (:file "../replication/physical-recovery")
                    (:file "../replication/physical-store-history")
+                   (:file "../replication/physical-replay-facts"
+                    :depends-on ("../replication/physical-store-history"
+                                 "../replication/physical-fpw"
+                                 "../replication/physical-logical-status"))
                    (:file "../replication/physical-recovery-policy")
                    (:file "../storage/wal-namespace")
                    (:file "../storage/wal-lineage")
@@ -169,10 +173,18 @@
                    (:file "../replication/logical-wal-cursor")
                    (:file "../replication/logical-wal-lane-provider")
                    (:file "../storage/wal-timeline")
-                   (:file "../replication/physical-history")
-                   (:file "../replication/physical-replay")
-                   (:file "../replication/physical-replay-history")
-                   (:file "../replication/physical-row-replay")
+                   (:file "../replication/physical-history"
+                    :depends-on ("../replication/physical-replay-facts"))
+                   (:file "../replication/physical-replay"
+                    :depends-on ("../replication/physical-replay-facts"
+                                 "../replication/physical-history"))
+                   (:file "../replication/physical-replay-history"
+                    :depends-on ("../replication/physical-replay-facts"
+                                 "../replication/physical-replay"))
+                   (:file "../replication/physical-row-replay"
+                    :depends-on ("../replication/physical-replay-facts"
+                                 "../replication/physical-replay"
+                                 "../replication/physical-replay-history"))
                    (:file "../replication/physical-prefix")
                    (:file "../replication/physical-follow-pin")
                    (:file "../replication/metadata-literal-envelope")
