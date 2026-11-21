@@ -251,33 +251,42 @@
          (t #'values)))
      (= type +wal-record-catalog-commit+))))
 
-(defun wal-replay-record (record)
-  (when (> (wal-record-end record) *wal-checkpoint-lsn*)
-    (wal-note-recovery-batch-record record)
+(defun wal-recovery-stage-batch-record (record page-handler)
+  "Stage a nonterminal batch record, returning NIL for terminal or unknown types.
+Redo and history supply their own page handling after the common ordering checks."
+  (wal-note-recovery-batch-record record)
+  (let ((type (wal-record-type record)))
     (cond
-      ((= (wal-record-type record) +wal-record-batch-start+)
-       ;; A prior group without a terminal record is a crash tail. Ignore its
-       ;; accumulated images and begin staging the next post-restart batch.
+      ((= type +wal-record-batch-start+)
+       ;; Discard staged images from a crash tail before opening the next batch.
        (wal-recovery-reset-batch t))
-      ((= (wal-record-type record) +wal-record-relation-reset+)
+      ((= type +wal-record-relation-reset+)
        (wal-recovery-stage-relation-reset record))
-      ((= (wal-record-type record) +wal-record-pages+)
+      ((= type +wal-record-pages+)
        (wal-recovery-note-page-record)
-       (if *wal-recovery-page-spool-enabled*
-           (wal-recovery-stage-page-record record)
-           (setf *wal-recovery-page-images*
-                 (nconc (reverse
-                         (wal-decode-page-images (wal-record-payload record)
-                                                 (wal-record-end record)))
-                        *wal-recovery-page-images*))))
-      ((= (wal-record-type record) +wal-record-logical-changes+)
+       (funcall page-handler record))
+      ((= type +wal-record-logical-changes+)
        (wal-recovery-stage-logical-changes record))
-      ((= (wal-record-type record) +wal-record-logical-catalog-event+)
+      ((= type +wal-record-logical-catalog-event+)
        (wal-recovery-note-logical-catalog-event record))
-      ((= (wal-record-type record) +wal-record-catalog-chunk+)
+      ((= type +wal-record-catalog-chunk+)
        (wal-recovery-stage-catalog-chunk record))
-      ((wal-terminal-record-type-p (wal-record-type record))
-       (wal-replay-terminal record)))))
+      (t (return-from wal-recovery-stage-batch-record nil))))
+  t)
+
+(defun wal-recovery-stage-redo-pages (record)
+  (if *wal-recovery-page-spool-enabled*
+      (wal-recovery-stage-page-record record)
+      (setf *wal-recovery-page-images*
+            (nconc (reverse (wal-decode-page-images (wal-record-payload record)
+                                                    (wal-record-end record)))
+                   *wal-recovery-page-images*))))
+
+(defun wal-replay-record (record)
+  (when (and (> (wal-record-end record) *wal-checkpoint-lsn*)
+             (not (wal-recovery-stage-batch-record record #'wal-recovery-stage-redo-pages))
+             (wal-terminal-record-type-p (wal-record-type record)))
+    (wal-replay-terminal record)))
 
 (defmacro with-wal-replay-staging (() &body body)
   "Isolate one native batch decoder; primary redo and history share this state."

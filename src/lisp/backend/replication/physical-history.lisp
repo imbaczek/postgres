@@ -122,26 +122,17 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
        (physical-history-accept-catalog decoded identity removed))))
   (wal-recovery-reset-batch nil))
 
+(defun physical-history-validate-pages (record)
+  (wal-decode-page-images (wal-record-payload record) (wal-record-end record)))
+
 (defun physical-history-accept-record (record identity removed)
   "Validate native batch ordering and payloads without applying any storage."
   (wal-require-fpw-physical-replay-supported record)
   (wal-require-logical-status-physical-replay-supported record)
-  (wal-note-recovery-batch-record record)
-  (let ((type (wal-record-type record)))
-    (cond
-      ((= type +wal-record-batch-start+) (wal-recovery-reset-batch t))
-      ((= type +wal-record-relation-reset+) (wal-recovery-stage-relation-reset record))
-      ((= type +wal-record-pages+)
-       (wal-recovery-note-page-record)
-       (wal-decode-page-images (wal-record-payload record)
-                               (wal-record-end record)))
-      ((= type +wal-record-logical-changes+)
-       (wal-recovery-stage-logical-changes record))
-      ((= type +wal-record-logical-catalog-event+) (wal-recovery-note-logical-catalog-event record))
-      ((= type +wal-record-catalog-chunk+) (wal-recovery-stage-catalog-chunk record))
-      ((wal-terminal-record-type-p type)
-       (physical-history-accept-terminal record identity removed))
-      (t (error "unsupported record in catalog history")))))
+  (unless (wal-recovery-stage-batch-record record #'physical-history-validate-pages)
+    (if (wal-terminal-record-type-p (wal-record-type record))
+        (physical-history-accept-terminal record identity removed)
+        (error "unsupported record in catalog history"))))
 
 (declaim (ftype function physical-replay-check-selected-eor
                 physical-replay-check-child-initialization physical-recovery-check-store-point))

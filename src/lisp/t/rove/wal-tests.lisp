@@ -2117,7 +2117,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (unwind-protect
            (progn
              (setf (symbol-function 'clog-set)
-                   (lambda (xid status) (push (list xid status) committed)))
+                   (lambda (xid status)
+                     (push (list xid status (smgr-nblocks 7311)
+                                 (aref (smgr-read 7311 0) 100))
+                           committed)))
              (smgr-create 7311)
              (dolist (spool-p '(nil t))
                (smgr-reset-fork 7311 :main)
@@ -2175,7 +2178,10 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                      (smgr-fsync-all)
                      (smgr-forget 7311)
                      (rove:ok (= 1 (smgr-nblocks 7311)) "reset survives closing buffered streams")))))
-             (rove:ok (member '(44 1) committed :test #'equal)))
+             (rove:ok (equal (reverse committed)
+                             '((45 1 2 42) (44 1 1 99)
+                               (45 1 2 42) (44 1 1 99)))
+                      "commit status follows storage effects in either staging mode"))
         (setf (symbol-function 'clog-set) clog-set)
         (smgr-close-all)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
