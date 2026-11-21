@@ -60,6 +60,12 @@ result=0
 timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/retired-wal" >"$TMP/retired-wal-start.log" 2>&1 || result=$?
 test "$result" -eq 1
 grep -q 'invalid WAL record at LSN' "$TMP/retired-wal-start.log"
+cp -a "$TMP/source" "$TMP/retired-control"
+python3 "$BASE/t/interop/checkpoint-snapshot.py" "$TMP/retired-control" --retired-control-fixture
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/retired-control" >"$TMP/retired-control-start.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -q 'corrupt WAL control image' "$TMP/retired-control-start.log"
 start_source
 test "$(sql "$PORT" 'SELECT count(*) FROM cp_data')" = 1
 probe --save "$TMP/old.json" >"$TMP/restarted-initial-copy.json"
@@ -152,4 +158,4 @@ test "$result" -eq 1
 grep -q 'native timeline-keyed WAL is not yet supported' "$TMP/unsupported-insertion.log"
 snapshot_storage >"$TMP/unsupported-after.json"
 cmp "$TMP/unsupported-before.json" "$TMP/unsupported-after.json"
-echo 'checkpoint-snapshot: retired WAL rejection, crash boundaries, checkpoint identity, replay/restartpoint and unsupported child rejection PASS'
+echo 'checkpoint-snapshot: retired WAL and control rejection, crash boundaries, checkpoint identity, replay/restartpoint and unsupported child rejection PASS'

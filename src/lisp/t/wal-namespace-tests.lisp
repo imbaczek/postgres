@@ -69,10 +69,7 @@
         (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline decoded)
             (pg::wal-decode-control-line line)
           (ok (= checkpoint durable 0)) (ok (null snapshot))
-          (ok (= insertion checkpoint-timeline 1)) (ok (eq namespace decoded)))))
-  (let* ((prefix "PGWAL5 0 0 1 1 -")
-         (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
-    (ok (eq :legacy (nth-value 5 (pg::wal-decode-control-line line))))))
+          (ok (= insertion checkpoint-timeline 1)) (ok (eq namespace decoded))))))
 
 (defun call-with-wal-namespace-fixture (function)
   (let ((pg::*wal-segment-namespace* :legacy) (pg::*wal-insert-timeline* 1)

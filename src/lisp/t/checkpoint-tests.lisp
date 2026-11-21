@@ -110,7 +110,7 @@
                  (cl-spec:run-property 'checkpoint-snapshot-preserves-full-source-facts :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
-(deftest checkpoint-control-copy-is-crc-bound-and-legacy-readable
+(deftest checkpoint-control-copy-is-crc-bound-and-rejects-retired-formats
     (let* ((snapshot (sample-checkpoint-snapshot))
            (text (string-right-trim '(#\Newline)
                                     (pg::bytes->string (pg::wal-encode-control-image 152 300 snapshot)))))
@@ -122,11 +122,11 @@
         (ok (intake-fails-p (lambda () (pg::wal-decode-control-line bad)))))
       (ok (intake-fails-p (lambda () (pg::wal-encode-control-image 153 300 snapshot))))
       (ok (intake-fails-p (lambda () (pg::wal-encode-control-image 152 151 snapshot)))))
-  (dolist (version '("PGWAL2" "PGWAL3"))
-    (let* ((prefix (format nil "~a 64 300" version))
-           (text (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
-      (multiple-value-bind (checkpoint durable copy) (pg::wal-decode-control-line text)
-        (ok (= checkpoint 64)) (ok (= durable 300)) (ok (null copy))))))
+  (dolist (prefix (list "PGWAL2 64 300" "PGWAL3 64 300" "PGWAL5 0 0 1 1 -"
+                        (format nil "PGWAL4 152 300 ~a"
+                                (pg::wal-checkpoint-snapshot-hex (sample-checkpoint-snapshot)))))
+    (let ((text (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+      (ok (intake-fails-p (lambda () (pg::wal-decode-control-line text)))))))
 
 (deftest wal-control-keeps-insertion-timeline-separate-from-checkpoint-timeline
     (let* ((snapshot (sample-checkpoint-snapshot))
@@ -140,14 +140,7 @@
         (ok (= insertion 3)) (ok (= checkpoint-timeline 1))))
   (ok (intake-fails-p
        (lambda () (pg::wal-encode-control-image 152 300 (sample-checkpoint-snapshot)
-                                                :timeline 1 :checkpoint-timeline 2))))
-  (dolist (version '("PGWAL2" "PGWAL3"))
-    (let* ((prefix (format nil "~a 64 300" version))
-           (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
-      (multiple-value-bind (checkpoint durable copy insertion checkpoint-timeline)
-          (pg::wal-decode-control-line line)
-        (declare (ignore checkpoint durable copy))
-        (ok (= insertion 1)) (ok (= checkpoint-timeline 1))))))
+                                                :timeline 1 :checkpoint-timeline 2)))))
 
 (deftest wal-startup-rejects-child-control-before-mutating-legacy-storage
     (with-physical-store-directory (root)
@@ -198,15 +191,6 @@
                    (ok (equalp before (pg::recovery-read-bytes (pg::physical-recovery-control-path)))))
               (setf (symbol-function 'pg::physical-recovery-check-streaming-base) checker)))))))
 
-(deftest wal-control-v4-remains-explicitly-timeline-one
-    (let* ((snapshot (sample-checkpoint-snapshot))
-           (prefix (format nil "PGWAL4 152 300 ~a" (pg::wal-checkpoint-snapshot-hex snapshot)))
-           (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
-      (multiple-value-bind (checkpoint durable copy insertion checkpoint-timeline)
-          (pg::wal-decode-control-line line)
-        (ok (= checkpoint 152)) (ok (= durable 300)) (ok (equal copy snapshot))
-        (ok (= insertion 1)) (ok (= checkpoint-timeline 1)))))
-
 (cl-spec:defproperty wal-control-preserves-independent-insertion-identity
     ((timeline (range integer 1 4294967295)))
   (:about pg::wal-encode-control-image)
@@ -240,7 +224,7 @@
       (ok (intake-fails-p (lambda () (pg::wal-decode-checkpoint-snapshot bytes))))
       (let* ((hex (with-output-to-string (out)
                     (loop for byte across bytes do (format out "~2,'0X" byte))))
-             (prefix (format nil "PGWAL4 152 300 ~a" hex))
+             (prefix (format nil "PGWAL6 152 300 1 1 legacy ~a" hex))
              (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
         (ok (intake-fails-p (lambda () (pg::wal-decode-control-line line)))))))
 
