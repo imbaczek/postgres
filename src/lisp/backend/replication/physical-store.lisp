@@ -278,23 +278,23 @@ history selection. A root-bearing control also records the manifest digest."
   (physical-store-test-point :after-control-write store))
 
 (defun physical-store-load-control (store)
-  "Read legacy or current receive control and check its base identity.
+  "Read PGPHYS03 receive control and check its base identity.
 
 For a root-bearing control, require the supplied immutable identity and matching
 manifest digest. Control alone does not establish base provenance."
   (let* ((bytes (read-bounded-regular-file (physical-store-path store "receive.control") 96))
          (size (length bytes)))
-    (unless (member size '(52 68 80 96))
+    (unless (member size '(68 80 96))
       (error "invalid physical receive control length"))
-    (let* ((v3 (>= size 68))
-           (crc-offset (- size 4)) (crc (wal-u32 bytes crc-offset))
-           (base (wal-u64 bytes 24)) (flush (wal-u64 bytes 32))
-           (floor (if v3 (wal-u64 bytes 48) base))
-           (seed (if v3 (wal-u64 bytes 56) #xCBF29CE484222325))
+    (let* ((crc-offset (- size 4))
+           (crc (wal-u32 bytes crc-offset))
+           (base (wal-u64 bytes 24))
+           (flush (wal-u64 bytes 32))
+           (floor (wal-u64 bytes 48))
+           (seed (wal-u64 bytes 56))
            (history-p (or (= size 80) (and (= size 96) (plusp (wal-u32 bytes 64))))))
       (wal-set-u32 bytes crc-offset 0)
-      (unless (and (equalp (subseq bytes 0 8)
-                           (if v3 #(80 71 80 72 89 83 48 51) #(80 71 80 72 89 83 48 50)))
+      (unless (and (equalp (subseq bytes 0 8) #(80 71 80 72 89 83 48 51))
                    (zerop (wal-u32 bytes 20)) (= crc (wal-crc32 bytes))
                    (= (wal-u64 bytes 8) (physical-store-system-id store))
                    (= (wal-u32 bytes 16) (physical-store-timeline store))

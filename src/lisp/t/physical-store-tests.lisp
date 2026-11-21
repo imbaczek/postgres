@@ -828,6 +828,22 @@
                (ok (= 64 (pg::physical-store-flushed-lsn store))))
           (pg::physical-store-close store)))))
 
+(deftest physical-store-rejects-retired-receive-control
+    (with-physical-store-directory (root)
+      (pg::physical-store-close (pg::physical-store-open root 123 1 :create t))
+      (let* ((path (merge-pathnames "receive.control" root))
+             (current (pg::read-bounded-regular-file path 96))
+             (old (make-array 52 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (replace old current :end1 48)
+        (setf (aref old 7) (char-code #\2))
+        (pg::wal-set-u32 old 48 (pg::wal-crc32 old))
+        (pg::wal-atomic-write-bytes path old)
+        (ok (handler-case
+                (progn (pg::physical-store-close (pg::physical-store-open root 123 1)) nil)
+              (error (condition)
+                (search "invalid physical receive control length" (princ-to-string condition)))))
+        (ok (equalp old (pg::read-bounded-regular-file path 96))))))
+
 (deftest physical-store-rejects-foreign-history-and-owners
     (with-physical-store-directory (root)
       (let ((store (pg::physical-store-open root 123 1 :create t)))
