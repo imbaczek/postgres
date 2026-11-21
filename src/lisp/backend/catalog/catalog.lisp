@@ -247,8 +247,13 @@ DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
   (:last pg-sequence-last-value :last-value)
   (:called pg-sequence-called-p :called-p))
 
+(defun catalog-decode-publication-oid (oid)
+  (unless (typep oid '(integer 1 *))
+    (error "invalid or missing publication OID in catalog"))
+  oid)
+
 (define-catalog-codec publication make-pg-publication
-  (:oid pg-publication-oid :oid)
+  (:oid pg-publication-oid :oid :decode #'catalog-decode-publication-oid)
   (:name pg-publication-name :name)
   (:all-tables pg-publication-all-tables-p :all-tables-p)
   (:tables pg-publication-tables :tables)
@@ -717,31 +722,12 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
   (prog1 (catalog-next-oid *catalog*)
     (incf (catalog-next-oid *catalog*))))
 
-(defun catalog-upgrade-publication-oids (catalog)
-  "Assign durable identities to legacy publications before admitting clients."
-  (let ((changed-p nil))
-    (dolist (database (sort (loop for db being the hash-values of (catalog-databases catalog)
-                                  collect db)
-                            #'string< :key #'database-name))
-      (dolist (publication
-               (sort (loop for pub being the hash-values of (database-publications database)
-                           collect pub)
-                     #'string< :key #'pg-publication-name))
-        (unless (pg-publication-oid publication)
-          (setf (pg-publication-oid publication) (catalog-next-oid catalog)
-                changed-p t)
-          (incf (catalog-next-oid catalog)))))
-    changed-p))
-
 (defun catalog-init (&key initialize)
   (setf *catalog-identity-needs-persist-p* nil
         *catalog* (if initialize (make-catalog) (load-catalog)))
   (check-primary-catalog-identity *catalog* *wal-control-metadata*)
-  (when (catalog-upgrade-publication-oids *catalog*)
-    (setf *catalog-identity-needs-persist-p* t))
   (when *catalog-identity-needs-persist-p*
-    ;; Persist generated cluster/publication identities before any client can
-    ;; observe them, so restart retains the same publisher incarnation and OIDs.
+    ;; Persist the generated cluster identity before clients can observe it.
     (save-catalog)
     (setf *catalog-identity-needs-persist-p* nil))
   (unless (gethash "postgres" (catalog-databases *catalog*))
