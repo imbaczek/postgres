@@ -766,8 +766,11 @@
 
 (rove:deftest continuation-boundary-checkpoint-does-not-certify-an-ack
     (let* ((start 80)
-           (raw (wal-encode-record +wal-record-checkpoint+ 0 start
-                                   (make-array 0 :element-type '(unsigned-byte 8))))
+           (snapshot (unit-commit-ts-snapshot :start start))
+           (raw (progn
+                  (setf (getf snapshot :timeline) 1 (getf snapshot :prev-timeline) 1)
+                  (wal-encode-record +wal-record-checkpoint+ 0 start
+                                     (wal-encode-checkpoint-snapshot snapshot))))
            (record (wal-decode-record raw start)))
       (dolist (kind '(:confirmed :restart))
         (multiple-value-bind (observe finish)
