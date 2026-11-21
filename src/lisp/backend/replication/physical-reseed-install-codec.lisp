@@ -222,7 +222,7 @@
   (let* ((plan (physical-reseed-install-copy plan))
          (body (string->bytes (physical-bootstrap-manifest-text plan)))
          (crc (wal-crc32 body))
-         (header (string->bytes (format nil "PGRESEEDINSTALL1 ~d ~8,'0X~%" (length body) crc))))
+         (header (metadata-sized-literal-header "PGRESEEDINSTALL1" (length body) crc)))
     (unless (and (typep step '(integer 0 100012)) (<= step (physical-reseed-install-last-step plan))
                  (<= (length body) +physical-reseed-install-body-maximum+))
       (error "reseed install image or progress exceeds its bound"))
@@ -240,36 +240,20 @@
 ;; the end of the last complete line.  The caller must validate the namespace
 ;; before using that boundary for recovery.
 (defun physical-reseed-install-decode (bytes)
-  "Decode a bounded reseed installation journal from stable BYTES.
-Validate the body checksum and canonical encoding before trusting progress.
-The returned plan is detached from BYTES; compute its last step once and match
-each bounded progress span against the scratch prefix, including partial tails."
-  (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (<= (length bytes) +physical-reseed-install-maximum-bytes+))
-    (error "invalid or oversized reseed install journal"))
-  (let* ((newline (position 10 bytes :end (min 64 (length bytes))))
-         (parts (and newline (uiop:split-string (bytes->string bytes :end newline) :separator " "))))
-    (unless (and (= 3 (length parts)) (equal "PGRESEEDINSTALL1" (first parts))
-                 (<= 1 (length (second parts)) 8) (every #'digit-char-p (second parts))
-                 (= 8 (length (third parts))))
-      (error "invalid reseed install header"))
-    (let* ((size (parse-integer (second parts))) (crc (parse-integer (third parts) :radix 16))
-                                                 (start (1+ newline)) (end (+ start size)))
-      (unless (and (<= 1 size +physical-reseed-install-body-maximum+)
-                   (< end (length bytes)) (= 10 (aref bytes end))
-                   (= crc (wal-crc32 bytes start end))
-                   (equal (bytes->string bytes :end start)
-                          (format nil "PGRESEEDINSTALL1 ~d ~8,'0X~%" size crc)))
-        (error "reseed install header or checksum mismatch"))
-      (let* ((plan (physical-reseed-install-copy
-                    (recovery-parse-manifest-text (bytes->string bytes :start start :end end))))
-             (header-length (1+ end)))
-        (unless (null (mismatch bytes (string->bytes (physical-bootstrap-manifest-text plan))
-                                :start1 start :end1 end))
-          (error "noncanonical reseed install body"))
-        (multiple-value-bind (step valid-length partial)
-            (physical-install-read-progress bytes header-length crc
-                                            (physical-reseed-install-last-step plan)
-                                            "reseed install")
-          (list :plan plan :step step :valid-length valid-length :file-size (length bytes)
-                :header-length header-length :body-crc crc :partial partial))))))
+  "Read a validated reseed install plan and its complete or partial progress."
+  (multiple-value-bind (start end crc)
+      (metadata-sized-literal-span bytes "PGRESEEDINSTALL1" +physical-reseed-install-maximum-bytes+
+                                   +physical-reseed-install-body-maximum+ "reseed install journal"
+                                   :maximum-header 64 :maximum-size-digits 8)
+    (let* ((plan (physical-reseed-install-copy
+                  (recovery-parse-manifest-text (bytes->string bytes :start start :end end))))
+           (header-length (1+ end)))
+      (when (mismatch bytes (string->bytes (physical-bootstrap-manifest-text plan))
+                      :start1 start :end1 end)
+        (error "noncanonical reseed install body"))
+      (multiple-value-bind (step valid-length partial)
+          (physical-install-read-progress bytes header-length crc
+                                          (physical-reseed-install-last-step plan)
+                                          "reseed install")
+        (list :plan plan :step step :valid-length valid-length :file-size (length bytes)
+              :header-length header-length :body-crc crc :partial partial)))))

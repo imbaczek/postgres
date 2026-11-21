@@ -23,6 +23,16 @@
         (ok (equal value (pg::physical-backup-lease-decode-literal magic expected bound #'identity)))
         (ok (signals (pg::physical-backup-lease-encode-literal magic value (1- bound)) 'error)))))
 
+(deftest metadata-sized-literal-envelope-preserves-utf8-wire-bytes
+    (let* ((magic "PGÉ")
+           (value '(:label "é"))
+           (expected (pg::string->bytes (format nil "~a 13 DCC50ACA~%(:LABEL \"é\")~%" magic)))
+           (bound (length expected)))
+      (flet ((encode (literal)
+               (pg::logical-slot-copy-literal-image magic bound literal "test literal")))
+        (ok (equalp expected (encode value)))
+        (ok (equal value (pg::logical-slot-copy-literal-decode expected magic bound #'encode "test literal"))))))
+
 (deftest backup-lease-rewind-seal-digest-is-published-once
     (let* ((capturing (backup-lease-test-record :capturing))
            (legacy (backup-lease-test-record :ready))
