@@ -77,6 +77,13 @@ helpers.
 - The strict physical selection passed 22 test heads covering exact UTF-8
   bytes, checksum failures, canonicality, publication cuts, and journal
   prefix recovery.
+- A14 introduces named receive-control snapshots for active follow and
+  retained root restoration. Active follow checks selection identity,
+  monotone progress and exact readback. Persisted witnesses still use the
+  eleven-field list. Seven strict physical test heads passed, including a
+  regression that changes each witness field independently. The strict unit
+  run passed 1,590 Rove test heads. Pending follow and the other witness
+  consumers still need migration.
 
 ## Open development tasks
 

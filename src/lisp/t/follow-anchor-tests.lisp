@@ -231,6 +231,29 @@
       (setf (getf witness :resource-fact) nil)
       (ok (intake-fails-p (lambda () (pg::physical-follow-check-config config))))))
 
+(deftest receive-control-snapshot-compares-every-witness-field
+    (let* ((tuple '(1 2 3 4 5 6 7 8 9 10 11))
+           (store (pg::%make-physical-store
+                   :system-id 1 :timeline 2 :base-lsn 3 :flushed-lsn 4 :flushed-digest 5
+                   :floor-lsn 6 :floor-digest 7 :selection '(:target 8 :digest 9)
+                   :retained-identity '(:manifest-digest 10) :retained-root 11))
+           (snapshot (pg::physical-store-control-snapshot store)))
+      (ok (equal tuple (pg::physical-receive-control-to-tuple snapshot)))
+      (ok (equal '(1 2 3 4 5 12 13 8 9 10 nil)
+                 (pg::physical-store-control-tuple store :floor 12 :floor-digest 13 :root nil)))
+      (ok (pg::physical-receive-control-equal-p
+           snapshot (apply #'pg::physical-receive-control-from-fields tuple)))
+      (dotimes (index (length tuple))
+        (let ((changed (copy-list tuple)))
+          (incf (nth index changed))
+          (let ((other (apply #'pg::physical-receive-control-from-fields changed))
+                (identity-field-p (member index '(0 1 2 7 8 9))))
+            (ok (eq (not identity-field-p)
+                    (pg::physical-receive-control-same-identity-p snapshot other)))
+            (ok (eq (not (null identity-field-p))
+                    (pg::physical-receive-control-same-progress-p snapshot other)))
+            (ok (not (pg::physical-receive-control-equal-p snapshot other))))))))
+
 (deftest same-timeline-binding-preserves-every-receive-control-field
     (let* ((config (same-timeline-follow-binding-config))
            (binding (fifth config))
