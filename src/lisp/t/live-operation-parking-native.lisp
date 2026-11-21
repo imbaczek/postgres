@@ -58,7 +58,7 @@ an extensionless destination."
           (symbol-function 'eval-setting-function) *parking-native-wrapper*
           *live-operation-before-open-hook*
           (lambda ()
-            (when (and (string= (sb-thread:thread-name sb-thread:*current-thread*) "pg reloader")
+            (when (and (string= (sb-thread:thread-name sb-thread:*current-thread*) "pg code reloader")
                        (plusp (live-operation-parked-count))
                        (not (probe-file (merge-pathnames "reload-backed-off" root))))
               (parking-native-marker "reload-backed-off")))))
