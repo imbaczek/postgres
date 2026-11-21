@@ -480,11 +480,12 @@ identity and any prepared writer epoch from the validated plan."
       (close *clog-stream*)
       (setf *clog-stream* nil))
     (let ((path (clog-path)))
-      (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8)
-                                   :if-exists :supersede :if-does-not-exist :create)
-        (funcall fsync-function stream))
-      (funcall fsync-directory-function *pgdata*)
-      (clog-init-under-lock)))
+      (with-atomic-output (stream path (make-pathname :type "tmp" :defaults path)
+                                  *pgdata* :element-type '(unsigned-byte 8)
+                                  :fsync-stream-function fsync-function
+                                  :fsync-directory-function fsync-directory-function)
+        (declare (ignore stream))))
+    (clog-init-under-lock))
   (publish-primary-wal-writer-clog-reset-under-lock epoch-plan)
   (values))
 
