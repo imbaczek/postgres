@@ -45,7 +45,7 @@ why existing code could not meet the need when a new implementation is required.
 | B6 | [Catalog codec](backend/catalog/catalog.lisp) | `catalog-to-sexp` always emits the cluster identity. `catalog-from-sexp` synthesizes it when absent and flags the catalog for persistence. Fresh catalogs also use the identity allocator. |
 | B7 | [Slot encoder](backend/storage/wal-core.lisp) and [logical slot state codec](backend/replication/logical-slot-state.lisp) | The current producer can emit PGSLOT4 or PGSLOT5. Provenance and explicit loss causes use PGSLOT6, and child ownership uses PGSLOT7. |
 | B8 | [Source pin encoder](backend/replication/physical-source.lisp) | Ordinary source pins use PGPHYSPIN2. Follow pins have a separate encoder. |
-| B9 | [Receive control codec](backend/replication/physical-store.lisp) | The writer uses PGPHYS03 at 68, 80, or 96 bytes for base control, history selection, and retained-root identity. The 52-byte PGPHYS02 reader supplies a default floor and seed. |
+| B9 | [Receive control codec](backend/replication/physical-store.lisp) | The writer uses PGPHYS03 at 68, 80, or 96 bytes for base control, history selection, and retained-root identity. |
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
 | B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | The current producer constructs metadata version 4 and writes PGRPGEN2. The generic codec can still emit PGRPGEN1 when called with old metadata. Inventory those inputs before removing that branch. |
@@ -129,6 +129,11 @@ that inventory and no-op proof paths preserve the original bytes.
 For B8, the bootstrap pin reader requires PGPHYSPIN2 and rejects a
 checksummed PGPHYSPIN1 pin without rewriting it. PGPHYSPIN2 keeps both
 manifest-bound and unbound encodings. Follow pins use their own codec.
+
+For B9, reopening the receive store requires PGPHYS03 with a recorded floor
+and digest seed. A checksummed PGPHYS02 image is rejected without rewriting
+it. PGPHYS03 still supports control with no history selection, with history
+selection, and with a retained-root identity.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
