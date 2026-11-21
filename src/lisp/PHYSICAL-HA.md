@@ -53,6 +53,14 @@ archive-to-stream standby restored the history, parent partial segment and
 proofs, then streamed on `follow_one` at the exact end in the child segment
 proof. It replayed new streamed rows before and after restart.
 
+The archive rewind fixture now selects the timeline-qualified segment produced
+by the fresh cluster (`72cc65a1a5b`). Stock Patroni rejected missing and
+truncated archive inputs without changing the target, restored the valid
+segment, and rejoined the rewound node. The separate SCRAM lifecycle passed
+clone, slot reconnect, `remote_apply`, promotion, rewind with a dedicated
+login, and read-only rejoin and restart. Each run recorded only expected exits
+and verified that its recorded process IDs were gone.
+
 ### What the milestone demonstrated
 
 | Goal | Evidence and limits |

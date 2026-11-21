@@ -396,10 +396,12 @@ still has work outstanding.
   restart and hold the allocation gate closed. The combined unit suite
   passed with 1,174 legacy checks and zero failures.
 
-- [ ] Close out the PostgreSQL backend and pinned Patroni comparison using the
+- [x] Close out the PostgreSQL backend and pinned Patroni comparison using the
   [goal closeout check](PHYSICAL-HA.md#goal-closeout-check). Standby feedback,
   both logical-slot copy variants, and password-backed bootstrap passed at
-  `4679be54534`. Complete the remaining archive and rewind qualification.
+  `4679be54534`. Archive-only and archive-to-stream recovery passed at
+  `41774ee2b32`. Archive-backed rewind passed with the corrected fixture in
+  `72cc65a1a5b`, and the SCRAM lifecycle passed rewind and read-only rejoin.
 
 - [ ] Bind retained-root deletion to checked archive and host identities before
   permitting deletion after continuation restoration. The fence assumes the
