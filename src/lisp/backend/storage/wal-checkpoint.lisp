@@ -112,7 +112,7 @@ Absence means unknown; present NIL means off and present T means on."
 
 (defun wal-checkpoint-snapshot-valid-p (snapshot)
   "Check checkpoint coordinates and optional resource and status facts.
-Version 1 has no extensions. Full-page-writes and logical-decoding facts may
+Full-page-writes and logical-decoding facts may
 be absent, NIL or T: absence is unknown, NIL is off and T is on.
 The zero commit timestamp pair represents disabled tracking; absence preserves
 unknown history. Ancestry requires separate history validation."
@@ -121,20 +121,15 @@ unknown history. Ancestry requires separate history validation."
         (redo (getf snapshot :redo)) (next (getf snapshot :next-xid))
         (reserved (getf snapshot :xid-reserved-through))
         (oid (getf snapshot :next-oid)) (active (getf snapshot :oldest-active-xid)))
-    (and (member version '(1 2))
+    (and (eql version 2)
          (wal-control-resource-fields-valid-p snapshot)
          (wal-checkpoint-commit-ts-fields-valid-p snapshot)
          (wal-checkpoint-full-page-writes-fields-valid-p snapshot)
          (wal-checkpoint-logical-decoding-fields-valid-p snapshot)
-         (or (= version 2)
-             (and (null (getf snapshot :oldest-commit-ts-xid))
-                  (null (get-properties snapshot '(:full-page-writes :logical-decoding-enabled)))))
          (every (lambda (value) (typep value '(unsigned-byte 64)))
                 (list start end redo reserved))
-         (typep next (if (= version 1) '(integer 3 18446744073709551615)
-                         '(integer 3 18446744073709551616)))
-         (typep active (if (= version 1) '(unsigned-byte 64)
-                           '(integer 0 18446744073709551616)))
+         (typep next '(integer 3 18446744073709551616))
+         (typep active '(integer 0 18446744073709551616))
          (= end (+ start (wal-checkpoint-record-size snapshot)))
          (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+))
          (= redo start) (<= next (1+ reserved)) (<= 2 reserved)
@@ -144,8 +139,7 @@ unknown history. Ancestry requires separate history validation."
          (typep (getf snapshot :timeline) '(integer 1 4294967295))
          (typep (getf snapshot :prev-timeline) '(integer 1 4294967295))
          (or (null (wal-control-resource-parameters snapshot))
-             (and (= version 2)
-                  (<= (getf snapshot :resource-lsn) start)
+             (and (<= (getf snapshot :resource-lsn) start)
                   (<= (getf snapshot :resource-timeline) (getf snapshot :timeline))))
          (wal-logical-on-interval-valid-p
           (getf snapshot :logical-decoding-enabled)
@@ -157,7 +151,7 @@ unknown history. Ancestry requires separate history validation."
   "Encode a validated checkpoint snapshot.
 PGCKPT02 uses flags for one-past FullXIDs. Bit 3 marks full-page-writes
 presence and bit 4 its value; bits 5 and 6 do the same for logical decoding.
-These status bits add no payload bytes. Version 1 has no extensions.
+These status bits add no payload bytes.
 Resource facts add 48 bytes. Bit 7 adds the final 16-byte ON interval.
 Flag bit 2 adds the eight-byte oldest and newest u32 commit timestamp pair
 after the base payload and any resource extension. Currently, both values
@@ -167,8 +161,7 @@ must be zero. Absence preserves unknown history."
                             :element-type '(unsigned-byte 8) :initial-element 0))
          (next-exhausted (= (getf snapshot :next-xid) 18446744073709551616))
          (active-exhausted (= (getf snapshot :oldest-active-xid) 18446744073709551616)))
-    (replace bytes (if (= 1 (getf snapshot :version))
-                       #(80 71 67 75 80 84 48 49) #(80 71 67 75 80 84 48 50)))
+    (replace bytes #(80 71 67 75 80 84 48 50))
     (loop for key in '(:start :end :redo :next-xid :xid-reserved-through :next-oid)
           for offset from 8 by 8 for value = (or (getf snapshot key) 0)
           do (wal-set-u64 bytes offset (if (= value 18446744073709551616) 0 value)))
@@ -204,18 +197,17 @@ and any 48-byte resource extension. Bits 3 and 4 mark full-page-writes
 presence and value; bits 5 and 6 mark logical decoding presence and value.
 These four bits do not change payload length, and a value without presence is
 invalid. Bit 7 adds a final 16-byte ON interval after the commit timestamp
-pair, if present. Version 1 has no extensions. Absent status is unknown;
+pair, if present. Absent status is unknown;
 present NIL is off and present T is on."
   (unless (wal-checkpoint-snapshot-length-p (length bytes))
     (error "invalid checkpoint snapshot length"))
-  (let* ((version (cond ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 49)) 1)
-                        ((equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 50)) 2)))
-         (flags (wal-u32 bytes 84))
+  (let* ((flags (wal-u32 bytes 84))
          (commit-ts-p (logbitp 2 flags))
          (interval-p (logbitp 7 flags))
          (resource-end (- (length bytes) (if commit-ts-p +wal-checkpoint-commit-ts-size+ 0)
                           (if interval-p +wal-checkpoint-logical-interval-size+ 0))))
-    (unless (and version (if (= version 1) (zerop flags) (<= 0 flags 255))
+    (unless (and (equalp (subseq bytes 0 8) #(80 71 67 75 80 84 48 50))
+                 (<= flags 255)
                  (or (not (logbitp 4 flags)) (logbitp 3 flags))
                  (or (not (logbitp 6 flags)) (logbitp 5 flags))
                  (or (not interval-p)
@@ -223,14 +215,13 @@ present NIL is off and present T is on."
                           (zerop (wal-u32 bytes (- (length bytes) 4)))))
                  (member resource-end
                          (list +wal-checkpoint-snapshot-size+ +wal-checkpoint-resource-snapshot-size+))
-                 (or (= (length bytes) +wal-checkpoint-snapshot-size+) (= version 2))
                  (member (wal-u32 bytes 80) '(0 1))
                  (or (= 1 (wal-u32 bytes 80)) (zerop (wal-u64 bytes 48)))
                  (or (not (logbitp 0 flags)) (zerop (wal-u64 bytes 32)))
                  (or (not (logbitp 1 flags)) (zerop (wal-u64 bytes 72))))
       (error "corrupt or unsupported native checkpoint snapshot"))
     (let ((snapshot
-            (list :version version :start (wal-u64 bytes 8) :end (wal-u64 bytes 16)
+            (list :version 2 :start (wal-u64 bytes 8) :end (wal-u64 bytes 16)
                   :redo (wal-u64 bytes 24)
                   :next-xid (if (logbitp 0 flags) 18446744073709551616 (wal-u64 bytes 32))
                   :xid-reserved-through (wal-u64 bytes 40)

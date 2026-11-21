@@ -80,8 +80,8 @@ The full WAL crash suite passed after the fixture primed an XID reservation
 with a rolled-back insert and checked the final checkpoint against its
 control snapshot before injecting corruption.
 Checkpoint WAL validation now requires a nonempty WAL8 record, and base
-reservation seeding requires its exact source counters. The snapshot codec
-and backup manifest schema retain their older variants for B3 and B11.
+reservation seeding requires its exact source counters. The backup manifest
+schema retains its older variants for B11.
 Source transaction replay now follows WAL8 transitions. End-of-recovery
 keeps the proven reservation bound but clears completeness until the child
 checkpoint. End-of-recovery and CLOG reset clear source membership.
@@ -99,6 +99,11 @@ live checkpoint suite rejects a stopped copy with PGWAL5 before exercising
 PGWAL6 crash recovery and standby restartpoints. Both segment namespaces
 and the current lifecycle, retained, resource, logical evidence, page
 checksum and CLOG extent fields retain their existing checks.
+
+For B3, the checkpoint codec and independent inspection tools require
+PGCKPT02. The base snapshot can still omit optional facts. Exhausted
+FullXIDs, resource facts, commit timestamp counters, Boolean policy facts
+and logical ON intervals retain their existing encodings.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
