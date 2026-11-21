@@ -314,6 +314,18 @@ helpers.
   and cold catalog tests passed, along with 54 installation staging crash
   cuts and their retries.
 
+### pgoutput decoder and adapter verification (A15, A18)
+
+- Complete pgoutput messages share `logical-wire-operation` across the
+  in-memory and streaming receive paths in `backend/replication/worker.lisp`.
+  The protocol fixtures decode complete frames and check independent expected
+  values. Rove tuple fixtures use a test-local cursor helper to check field
+  markers, offsets, and binary bytea.
+- The unit and ASDF interop suites passed after the tuple-only production
+  adapter was removed. `t/logical-interior-ack.sh` confirmed exact transaction
+  replay after the publisher crashed with an interior acknowledgment, and
+  confirmed that a durable acknowledgment at transaction end suppressed replay.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
