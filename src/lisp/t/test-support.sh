@@ -42,8 +42,11 @@ test_wait_owned_sql_server() {
 # Launch within the caller's private fixture directory. The caller records
 # $! before waiting for readiness so its cleanup trap also covers startup failure.
 test_launch_lisp_server() {
-    rm -f "$3" || return
-    "$BASE/pg-lisp.sh" -p "$1" -D "$2" --control-socket "$3" >>"$4" 2>&1 &
+    TEST_LAUNCH_PORT=$1 TEST_LAUNCH_DATA=$2 TEST_LAUNCH_SOCKET=$3 TEST_LAUNCH_LOG=$4
+    shift 4
+    rm -f "$TEST_LAUNCH_SOCKET" || return
+    "$BASE/pg-lisp.sh" -p "$TEST_LAUNCH_PORT" -D "$TEST_LAUNCH_DATA" \
+        --control-socket "$TEST_LAUNCH_SOCKET" "$@" >>"$TEST_LAUNCH_LOG" 2>&1 &
 }
 
 test_lisp_control() {

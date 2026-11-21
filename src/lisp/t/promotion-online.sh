@@ -28,12 +28,11 @@ sql() {
     PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$1" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$2"
 }
 checked() {
-    printf '%s\n(quit)\n' "$2" | "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log"
 }
 start_target() {
-    rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    test_launch_lisp_server "$TARGET_PORT" "$TMP/copy" "$TMP/target.sock" "$TMP/target.log" \
+        -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS"
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
     test "$(sql "$TARGET_PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"
@@ -50,7 +49,8 @@ wait_value() {
     done
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
+test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log" \
+    -c "max_worker_processes=$WORKER_PROCESSES" -c "wal_level=$WAL_LEVEL" -c "wal_log_hints=$WAL_LOG_HINTS"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 test "$(sql "$PORT" 'SHOW max_worker_processes')" = "$WORKER_PROCESSES"

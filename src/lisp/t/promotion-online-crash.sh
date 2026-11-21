@@ -22,9 +22,16 @@ else
     SEED=$(sed -n 's/^physical-restartpoint-auto: artifacts=//p' "$TMP/seed.log")
 fi
 sql() { PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"; }
+check_seed_rows() {
+    if [ -f "$SEED/target.rows" ]; then
+        sql 'SELECT id FROM data ORDER BY id' >"$CASE/recovered.rows"
+        diff -u "$SEED/target.rows" "$CASE/recovered.rows"
+    else
+        test "$(sql 'SELECT count(*) FROM data')" = 5
+    fi
+}
 checked() {
-    printf '%s\n(quit)\n' "$1" | "$SBCL" --script "$BASE/t/control-client.lisp" unix "$CASE/control.sock" >"$CASE/$2.log"
-    if grep -q ';; error:' "$CASE/$2.log"; then cat "$CASE/$2.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/control.sock" "$1" "$CASE/$2.log"
 }
 clone() {
     CASE=$TMP/$1
@@ -33,8 +40,7 @@ clone() {
     rm -f "$CASE/data/physical-follow.control"
 }
 start() {
-    rm -f "$CASE/control.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" --control-socket "$CASE/control.sock" >>"$CASE/server.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$CASE/data" "$TMP/control.sock" "$CASE/server.log"
     SERVER=$!
     test_wait_owned_sql_server "$SERVER" "$PORT" "$PSQL"
 }
@@ -51,7 +57,7 @@ barrier() {
 }
 for point in before-online-intent after-online-intent after-child-control-rename; do
     clone "$point"
-    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" PG_PROMOTION_SOCKET="$CASE/control.sock" \
+    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" PG_PROMOTION_SOCKET="$TMP/control.sock" \
         PG_PROMOTION_PAUSE="$point" PG_PROMOTION_MARKER="$CASE/marker" \
         "$SBCL" --script "$BASE/t/promotion-online-native.lisp" >"$CASE/server.log" 2>&1 &
     SERVER=$!
@@ -65,7 +71,7 @@ for point in before-online-intent after-online-intent after-child-control-rename
         "$BASE/bin/pg_ctl" promote -D "$CASE/data" -w -t 20
     fi
     test "$(sql 'SELECT pg_is_in_recovery()')" = f
-    test "$(sql 'SELECT count(*) FROM data')" = 5
+    check_seed_rows
     sql 'CREATE TABLE online_crash_write (id integer); INSERT INTO online_crash_write VALUES (1)'
     stop
     echo "promotion-online-crash: $point PASS"
@@ -87,7 +93,7 @@ if [ "${LIVE_CHILD_ADOPTION:-0}" = 1 ]; then
         crash
         start
         test "$(sql 'SELECT pg_is_in_recovery()')" = f
-        test "$(sql 'SELECT count(*) FROM data')" = 5
+        check_seed_rows
         sql 'CREATE TABLE live_crash_write (id integer); INSERT INTO live_crash_write VALUES (1)'
         stop
         echo "promotion-online-crash: live $point PASS"
@@ -96,7 +102,7 @@ fi
 for kind in stale queued; do
     clone "startup-$kind"
     : >"$CASE/data/promote"
-    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" PG_PROMOTION_SOCKET="$CASE/control.sock" \
+    PG_PROMOTION_DATA="$CASE/data" PG_PROMOTION_PORT="$PORT" PG_PROMOTION_SOCKET="$TMP/control.sock" \
         PG_PROMOTION_PAUSE=after-promotion-request-initialization PG_PROMOTION_MARKER="$CASE/marker" \
         PG_PROMOTION_RELEASE="$CASE/release" "$SBCL" --script "$BASE/t/promotion-online-native.lisp" >"$CASE/server.log" 2>&1 &
     SERVER=$!
@@ -121,7 +127,7 @@ clone incomplete-batch
 start
 checked '(let* ((cursor (physical-store-flushed-lsn *physical-receive-store*)) (bytes (wal-encode-record +wal-record-batch-start+ 0 cursor #()))) (physical-recovery-receive cursor bytes) (physical-recovery-flush))' incomplete-batch
 "$BASE/bin/pg_ctl" promote -D "$CASE/data" -w -t 20
-test "$(sql 'SELECT count(*) FROM data')" = 5
+check_seed_rows
 test "$(sql 'SELECT pg_is_in_recovery()')" = f
 stop
 echo 'promotion-online-crash: process boundaries, startup signal handling and unfinished receive batch PASS'
