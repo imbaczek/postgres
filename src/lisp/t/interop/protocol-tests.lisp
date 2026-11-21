@@ -143,16 +143,18 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
          (ok (gethash "native_slot" pg::*wal-replication-slots*))))))
 
 (deftest standard-system-identifier-projection
-    (dolist
-        (case
-            '(("" 14695981039346656037) ("a" 12638187200555641996) ("hello" 11831194018420276491)
-              ("λ" 780254166137709982) ("legacy arbitrary identity" 9738095430658919642)))
-      (let* ((identity (first case))
-             (catalog (pg::make-catalog :cluster-identity identity))
-             (decoded (pg::catalog-from-sexp (pg::catalog-to-sexp catalog))))
-        (ok (= (second case) (pg::catalog-system-identifier catalog)))
-        (ok (= (second case) (pg::catalog-system-identifier decoded)))
-        (ok (equal identity (pg::catalog-cluster-identity decoded))))))
+    (ok (= 14695981039346656037
+           (pg::catalog-system-identifier (pg::make-catalog :cluster-identity ""))))
+  (dolist (case '(("a" 12638187200555641996)
+                  ("hello" 11831194018420276491)
+                  ("λ" 780254166137709982)
+                  ("legacy arbitrary identity" 9738095430658919642)))
+    (let* ((identity (first case))
+           (catalog (pg::make-catalog :cluster-identity identity))
+           (decoded (pg::catalog-from-sexp (pg::catalog-to-sexp catalog))))
+      (ok (= (second case) (pg::catalog-system-identifier catalog)))
+      (ok (= (second case) (pg::catalog-system-identifier decoded)))
+      (ok (equal identity (pg::catalog-cluster-identity decoded))))))
 
 (deftest standard-slot-publication-excludes-writers
     (call-with-standard-slot-fixture

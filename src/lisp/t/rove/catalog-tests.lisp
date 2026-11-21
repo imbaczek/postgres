@@ -317,6 +317,18 @@
         (rove:ok (handler-case (progn (read-live toast) nil) (error () t))
                  "malformed or ambiguous TOAST ownership is rejected"))))
 
+(rove:deftest catalog-read-requires-a-stored-cluster-identity
+    (let ((image (catalog-to-sexp (make-catalog))))
+      (dolist (identity '(nil "" 42))
+        (setf (getf image :cluster-identity) identity)
+        (rove:ok (handler-case (progn (catalog-from-sexp image) nil)
+                   (error (condition)
+                     (search "invalid or missing cluster identity" (princ-to-string condition))))))
+      (remf image :cluster-identity)
+      (rove:ok (handler-case (progn (catalog-from-sexp image) nil)
+                 (error (condition)
+                   (search "invalid or missing cluster identity" (princ-to-string condition)))))))
+
 (rove:deftest test-index-catalog-roundtrip
     (let* ((catalog (make-catalog))
            (identity (catalog-cluster-identity catalog))
