@@ -11,7 +11,7 @@
        (with-open-file (stream (pg::wal-segment-path 0) :direction :io
                                                         :if-exists :overwrite
                                                         :element-type '(unsigned-byte 8))
-         (write-sequence (legacy-checkpoint-record 0) stream)
+         (write-sequence (pg::wal-encode-record pg::+wal-record-maintenance+ 0 0 (empty-octets)) stream)
          (pg::fsync-stream stream))
        (let* ((bytes (pg::read-bounded-regular-file (pg::wal-segment-path 0) 1024))
               (digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))

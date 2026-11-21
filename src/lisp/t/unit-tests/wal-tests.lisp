@@ -609,12 +609,13 @@
        (uiop:delete-directory-tree test-pgdata :validate t
                                                :if-does-not-exist :ignore)))))
 
-(defun wal-test-legacy-checkpoint-record (start)
-  (let ((bytes (wal-encode-record +wal-record-checkpoint+ 0 start #())))
-    (wal-set-u16 bytes 4 5)
-    (wal-set-u32 bytes 28 0)
-    (wal-set-u32 bytes 28 (wal-crc32 bytes))
-    bytes))
+(defun wal-test-checkpoint-record (start)
+  (let ((snapshot (list :version 2 :start start :end (+ start (wal-checkpoint-record-size))
+                        :redo start :next-xid 3 :xid-reserved-through 2 :next-oid nil
+                        :time 0 :timeline 1 :prev-timeline 1 :oldest-active-xid 0)))
+    (values (wal-encode-record +wal-record-checkpoint+ 0 start
+                               (wal-encode-checkpoint-snapshot snapshot))
+            snapshot)))
 
 (defun test-wal-segment-rotation ()
   (let* ((test-pgdata (merge-pathnames "wal-segment-test/" *pgdata*))
@@ -1384,19 +1385,17 @@
 (defun test-wal-checkpoint-skips-obsolete-prefix ()
   (let* ((test-pgdata (merge-pathnames "wal-checkpoint-scan-test/" *pgdata*))
          (*pgdata* test-pgdata)
-         (*wal-checkpoint-lsn* (+ (* 2 +wal-segment-size+)
-                                  (* 2 +wal-header-size+)))
-         (*wal-durable-lsn* (+ (* 2 +wal-segment-size+)
-                               (* 3 +wal-header-size+)))
+         (checkpoint-start (+ (* 2 +wal-segment-size+) +wal-header-size+))
+         (result (multiple-value-list (wal-test-checkpoint-record checkpoint-start)))
+         (checkpoint (first result))
+         (*wal-checkpoint-snapshot* (second result))
+         (*wal-checkpoint-lsn* (+ checkpoint-start (length checkpoint)))
+         (*wal-durable-lsn* (+ *wal-checkpoint-lsn* +wal-header-size+))
          (prefix (wal-encode-record +wal-record-commit+ 1 0 #()))
          (same-segment-prefix
            (wal-encode-record +wal-record-commit+ 3
                               (* 2 +wal-segment-size+) #()))
-         (checkpoint-start (+ (* 2 +wal-segment-size+) +wal-header-size+))
-         (checkpoint (wal-test-legacy-checkpoint-record checkpoint-start))
-         (post-checkpoint (wal-encode-record
-                           +wal-record-commit+ 2
-                           (+ checkpoint-start +wal-header-size+) #()))
+         (post-checkpoint (wal-encode-record +wal-record-commit+ 2 *wal-checkpoint-lsn* #()))
          (obsolete-bytes (copy-seq prefix))
          (same-segment-obsolete-bytes (copy-seq same-segment-prefix)))
     (wal-ensure-directory-durable *pgdata*)
@@ -1445,7 +1444,7 @@
                             :if-exists :overwrite)
       (file-position stream +wal-header-size+)
       (write-sequence checkpoint stream)
-      (file-position stream (+ (* 2 +wal-header-size+) 28))
+      (file-position stream (+ +wal-header-size+ (length checkpoint) 28))
       (write-byte (logxor (aref post-checkpoint 28) #xFF) stream))
     (check (handler-case
                (progn (wal-scan (lambda (record) (declare (ignore record)))) nil)
@@ -1456,7 +1455,10 @@
 (defun test-wal-missing-interior-segment ()
   (let* ((test-pgdata (merge-pathnames "wal-gap-test/" *pgdata*))
          (*pgdata* test-pgdata)
-         (*wal-checkpoint-lsn* +wal-header-size+)
+         (result (multiple-value-list (wal-test-checkpoint-record 0)))
+         (checkpoint (first result))
+         (*wal-checkpoint-snapshot* (second result))
+         (*wal-checkpoint-lsn* (length checkpoint))
          (*wal-durable-lsn* (+ (* 2 +wal-segment-size+) +wal-header-size+)))
     (wal-ensure-directory-durable *pgdata*)
     (wal-ensure-directory-durable (wal-directory))
@@ -1466,7 +1468,7 @@
                        +wal-record-checkpoint+
                        +wal-record-commit+))
              (record (if (= type +wal-record-checkpoint+)
-                         (wal-test-legacy-checkpoint-record start)
+                         checkpoint
                          (wal-encode-record
                           type 0 start
                           ;; Fill segment 1 so the record in segment 2 is
