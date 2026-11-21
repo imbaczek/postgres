@@ -1,5 +1,46 @@
 # Development TODO
 
+## SBCL Postgres architecture milestones
+
+The [North Star Architecture](https://chatgpt.com/space/page_04dbb65e3a248191bce48fde324f9c66)
+defines the audit IDs and contracts. The [original discussion](https://chatgpt.com/s/t_6b01b753c7bc81919c7e12e9cc234410)
+reviews the audit through `06cc90a`. Refresh its findings against the current
+checkout before marking any item complete.
+
+| Milestone | Implementation and exit criteria |
+|---|---|
+| 0. Refresh the audit and baseline verification (A17) | Inventory live callers, format writers and fixtures. Record row lifetime, snapshots, reload, commit and redo contracts. Reuse fixture setup and cleanup across the fault scenarios. Every removal needs evidence about its current callers or producers. |
+| 1. Remove unused paths and share metadata mechanics (A5, A6, A14, B15, B16) | Remove obsolete SELECT wrappers and switch tests to owned CLOG completion. Extract metadata envelopes, adoption/reseed progress-prefix parsing and named receive-control snapshots. Verify identical current bytes and preserve partial tails and full readback comparisons. |
+| 2. Cut over the development baseline (B1–B14, B17–B18) | Regenerate development data and fixtures by format family as retired readers are removed. Keep WAL8, PGSLOT4/5 and recovery-control 3/4 while current producers emit them. Change WAL filename producers before retiring legacy-named data, backups and ancestral WAL. Restart for obsolete image layouts. Verify fresh init, restart, backup, follow, promotion and explicit rejection of retired formats. Pair rollback code with matching data. |
+| 3A. Share query semantics (A1, A3, A7–A9, A13) | Start with projection and WindowAgg, then consolidate preparation and admission, types and builtins, scope-aware S-expression visitors and claimed-tuple replacement. Verify push/pull results and errors, row lifetimes and origins, suspension and early stop, cleanup and hot-path allocation. |
+| 3B. Share WAL grammar and replay facts (A2, A4) | Move history and redo to shared framing and batch transitions. Accumulate facts in record order and bound retained bytes. Preserve selected end-of-recovery as its own transition. Verify accepted prefixes, incomplete tails, distinct redo and primary settlement order, FIFO retirement and immutable receipts. |
+| 4. Consolidate subsystems and enforce dependencies (A10–A12, A15–A16, A19) | Extract catalog and settings descriptors, B-tree child-range selection and one production pgoutput decoder with independent expected results. Split WAL responsibilities after ownership is explicit. Add package and ASDF dependencies once both tracks exercise the interfaces. Verify strict compilation, catalog rollback identity, setting scope and B-tree lock ownership. |
+| 5. Retire adapters and update verification and docs (A18, A20) | Remove adapters after their last callers move. Unify discovery and reporting for the existing legacy and Rove suites, keeping their tests in their current harnesses. Update runbooks and format support. Link every audit item to implementation and acceptance evidence. |
+
+Start with the inventory, obsolete SELECT wrappers, envelopes and progress
+prefixes, then receive-control snapshots. The query and WAL tracks can proceed
+in parallel wherever their inputs are stable. Keep format cutovers, replay-order
+changes and package reorganizations in separate PRs.
+
+Consult the corresponding PostgreSQL C implementation during planning and
+implementation. Work REPL-first with SLIME or Sly and use cl-mcp for Lisp edits.
+Use tilth or a code-search MCP for other code. Use cl-spec and Rove where useful
+for new tests. Luna max reviews checkpoints and Sol high reviews major
+milestones and full diffs. Consult Sol xhigh when uncertain and Astra high on
+exceptionally difficult issues. After implementation, have Sol medium look for
+macros that centralize invariants and reduce repetition. Refactor production
+functions longer than 120 lines. In the polish pass, check naming, vacuous
+assertions and error checks, unnecessary complexity, and duplication. Document
+why existing code could not meet the need when a new implementation is required.
+
+## Open development tasks
+
+- [ ] Bring the legacy WAL slot retention fixture up to the current startup
+  contract. The unit run reaches `test-wal-replication-slot-durable-retention`
+  after the snapshot handoff, then its synthetic PGDATA fails the durable
+  catalog check during slot creation. Qualify the fixture's WAL and ownership
+  when exercising slot restoration and checkpoint recycling.
+
 - [ ] Close out the PostgreSQL backend and pinned Patroni comparison using the
   [goal closeout check](PHYSICAL-HA.md#goal-closeout-check). Complete standby
   feedback and logical-slot acceptance, password-backed bootstrap, and the

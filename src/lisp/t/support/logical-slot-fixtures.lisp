@@ -224,6 +224,22 @@
          (setf sb-ext:*exit-hooks* saved-exit-hooks))))
    :initialize-storage nil))
 
+(defun call-with-test-postmaster-data-directory (function)
+  "Publish real postmaster ownership for the fixture's isolated PGDATA."
+  (let ((*postmaster-data-lock* nil) (*postmaster-pid-stream* nil)
+                                     (*postmaster-pid-directory* nil) (*postmaster-pid-inode* nil)
+                                     (*postmaster-start-time* nil) (*postmaster-start-timestamp* nil)
+                                     (*postmaster-pid-host* nil) (*postmaster-pid-port* nil)
+                                     (exit-hooks sb-ext:*exit-hooks*))
+    (sb-posix:chmod (namestring *pgdata*) #o700)
+    (unwind-protect
+         (progn
+           (postmaster-own-data-directory "127.0.0.1" 5439)
+           (funcall function))
+      (unwind-protect (postmaster-remove-pid-file)
+        (setf sb-ext:*exit-hooks* exit-hooks)
+        (when *postmaster-data-lock* (close *postmaster-data-lock*))))))
+
 (defun call-with-logical-slot-owned-startup-test (function)
   (call-with-live-operation-startup-quiescence
    (lambda (gate-owner)

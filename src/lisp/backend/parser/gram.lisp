@@ -167,9 +167,11 @@ Range and negative checks occur when the LIMIT executes."
                   (expect-punct p #\;))))
 
 (defun parse-do-if-found (p)
-  (let ((negated-p (match-kw p "not")))
-    (expect-kw p "found")
+  (let* ((condition (parse-expr p))
+         (negated-p (equal condition '(:not (:column "found")))))
     (expect-kw p "then")
+    (unless (or negated-p (equal condition '(:column "found")))
+      (ereport "0A000" "inline PL/pgSQL IF requires FOUND or NOT FOUND"))
     (let* ((then (parse-do-statements p '("else" "end")))
            (else (when (match-kw p "else")
                    (parse-do-statements p '("end")))))

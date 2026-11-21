@@ -180,6 +180,7 @@ The shared slot fixture mocks the logger and leaves control metadata unset."
          (progn
            (with-open-file (stream path :direction :output :if-exists :error
                                         :element-type '(unsigned-byte 8))
+             (sb-posix:fchmod (sb-sys:fd-stream-fd stream) #o600)
              (write-sequence bytes stream))
            (funcall function path))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

@@ -1331,7 +1331,12 @@
             (wal-logical-slot-acknowledge "handoff_slot" ack-lsn))))
        ;; Slot files persist subscriber progress across restart. The resumed
        ;; reader must start after the last durable acknowledgment.
-       (wal-load-replication-slots)
+       (setf *wal-replication-slots* (make-hash-table :test #'equal))
+       (call-with-test-postmaster-data-directory
+        (lambda ()
+          (call-with-logical-slot-owned-startup-test
+           (lambda (gate-owner ownership)
+             (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)))))
        (setf slot (gethash "handoff_slot" *wal-replication-slots*))
        (check (and (= (wal-replication-slot-database-oid slot) 7)
                    (= (wal-replication-slot-confirmed-flush-lsn slot) ack-lsn))

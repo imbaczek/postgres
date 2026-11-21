@@ -1329,6 +1329,19 @@ at the printed path. The strict compiler cache and log remain in the
 temporary work directory for archiving or explicit cleanup by their owner;
 the RAM-disk wrapper places that directory in the owned RAM root.
 
+Set `PG_LISP_TEST_COVERAGE_DIR` to write an SBCL coverage report for a direct
+test run:
+
+```sh
+PG_LISP_TEST_COVERAGE_DIR=/absolute/path/to/coverage ./t/run-system-tests.sh unit
+PG_LISP_TEST_COVERAGE_DIR=/absolute/path/to/legacy-coverage ./t/run-unit-tests.sh
+```
+
+Open `cover-index.html` in the report directory. Coverage uses a private
+instrumented ASDF cache and measures code executed in the test runner's
+Lisp image. Independently launched server processes and the strict compiler
+child do not contribute to the report. Run coverage outside test campaigns.
+
 For repeated strict ASDF runs against one unchanged checkout, create a campaign
 and use the path printed by `create` in subsequent commands:
 
