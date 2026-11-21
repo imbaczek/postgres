@@ -105,6 +105,11 @@ PGCKPT02. The base snapshot can still omit optional facts. Exhausted
 FullXIDs, resource facts, commit timestamp counters, Boolean policy facts
 and logical ON intervals retain their existing encodings.
 
+For B4, buffer reads no longer move a historical B-tree type byte out of
+the checksum field. The checksum reader rejects that layout without
+rewriting the page. Indexes from that layout must be rebuilt from matching
+data before using the current reader.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The

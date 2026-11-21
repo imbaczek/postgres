@@ -986,7 +986,7 @@ other inputs and modified tables use the scalar recurrence. BYTES is read only."
   (let ((lsn (page-u64 page +pd-lsn-off+))
         (checksum (page-u16 page +pd-checksum-off+)))
     (if (zerop lsn)
-        ;; New pages staged in memory and legacy pages both have no WAL LSN.
+        ;; Unstamped pages have no WAL LSN or checksum.
         ;; Persisted WAL pages always carry a nonzero LSN and must have a CRC.
         (zerop checksum)
         (= checksum (wal-page-checksum page relfilenode block fork)))))

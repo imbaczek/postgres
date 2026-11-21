@@ -15,6 +15,27 @@
     (close (smgr-close-interrupt-test-file stream) :abort abort)
     (call-next-method)))
 
+(deftest btree-buffer-rejects-the-retired-type-byte
+    (with-physical-store-directory (root)
+      (let ((pg::*pgdata* root)
+            (pg::*relation-streams* (make-hash-table :test #'equal))
+            (pg::*wal-page-cache* (make-hash-table :test #'equal))
+            (pg::*wal-ready* nil)
+            (pg::*backend* (pg::make-backend))
+            (pg::*wal-control-metadata* nil))
+        (ensure-directories-exist (pg::relation-file-path 900))
+        (unwind-protect
+             (progn
+               (pg::btree-init 900)
+               (let ((page (pg::buf-read 900 0)))
+                 (ok (= pg::+btree-page-meta+ (pg::btree-page-type page)))
+                 (pg::page-set-u16 page pg::+pd-checksum-off+ (pg::btree-page-type page))
+                 (pg::page-set-u16 page pg::+pd-flags-off+ 0)
+                 (pg::smgr-write 900 0 page)
+                 (ok (equal "XX001" (recovery-state-of (lambda () (pg::btree-read-meta 900)))))
+                 (ok (equalp page (pg::smgr-read 900 0)))))
+          (pg::smgr-close-all)))))
+
 (deftest relation-cache-registers-an-open-before-delivering-a-queued-interrupt
     (dolist (fork '(:main :visibility))
       (with-physical-store-directory (root)

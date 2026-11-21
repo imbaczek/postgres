@@ -143,8 +143,6 @@ staged cache, but does not scan the old physical relation."
          (page (if replacement (replacement-read-page replacement block)
                    (wal-buffer-read relfilenode block fork))))
     (when page
-      (when (eq fork :main)
-        (page-migrate-legacy-btree-header page))
       (let ((version (page-u16 page +pd-pagesize-version-off+))
             (expected (logior +blcksz+ +pg-page-layout-version+)))
         (unless (= version expected)
