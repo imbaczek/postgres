@@ -17,7 +17,7 @@ cold = runpy.run_path(str(HERE / 'source-fpw-cold.py'))
 api = cold['api']
 
 
-def state(server):
+def state(server, *, timeout=15):
     path = server.root / 'fpw-config-state.txt'
     server.control(f'''(let ((state (sb-thread:with-mutex (*wal-lock*)
                                      (wal-checked-fpw-state-under-lock))))
@@ -28,7 +28,8 @@ def state(server):
           (wal-fpw-state-start state) (wal-fpw-state-end state)
           (wal-fpw-state-witness-kind state)
           (primary-wal-writer-cycles *primary-wal-writer*)
-          (if (eq *fpw-config-test-root* (startup-capture-configuration)) 0 1))))''')
+          (if (eq *fpw-config-test-root* (startup-capture-configuration)) 0 1))))''',
+                   timeout=timeout)
     enabled, start, end, kind, cycles, changed = path.read_text().split()
     return dict(enabled=int(enabled), start=int(start), end=int(end), kind=kind,
                 cycles=int(cycles), root_changed=int(changed))
@@ -52,7 +53,8 @@ def reload_to(server, connection, value):
         lambda: api['scalar'](connection, 'SHOW full_page_writes') == value)
     expected = int(value == 'on')
     def installed():
-        current = state(server)
+        # Control probes wait while SIGHUP rebuilds Lisp definitions.
+        current = state(server, timeout=90)
         return (current['enabled'] == expected and current['root_changed'] == 1
                 and current['cycles'] > before['cycles'] + 1)
     api['follow']['wait_for'](installed)
