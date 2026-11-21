@@ -28,8 +28,8 @@
           (unwind-protect
                (progn
                  (setf (symbol-function 'pg::open-relation-file)
-                       (lambda (pathname)
-                         (setf opened (funcall original pathname))
+                       (lambda (pathname &rest options)
+                         (setf opened (apply original pathname options))
                          (incf calls)
                          (sb-thread:interrupt-thread
                           sb-thread:*current-thread*
@@ -848,6 +848,7 @@
                  (ok (equal "XX001" (recovery-state-of
                                      (lambda () (pg::toast-fetch-value toast wrong snapshot))))))
                ;; An aborted insertion may leave a stale index entry beside the real chunk.
+               (pg::clog-init :initialize t)
                (pg::clog-set 43 pg::+clog-aborted+)
                (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
                  (pg::with-write-lock
@@ -915,6 +916,7 @@
                (ok (nth-value 2 (pg::toast-pointer-storage-size toast compressed)))
                ;; A full-value projection of the same column must retain the
                ;; ordinary fetch path while its substring still returns SQL text.
+               (pg::clog-init :initialize t)
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::with-write-lock
                  (pg::heapam-insert (pg::pg-class-relfilenode table)
@@ -1057,6 +1059,7 @@
                    (setf pointer (pg::toast-store-value-unlocked toast raw nil 42 0))
                    (pg::heapam-insert (pg::pg-class-relfilenode table)
                                       (pg::pg-class-columns table) (vector 1 2 pointer) 42 0)))
+               (pg::clog-init :initialize t)
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::register-active-snapshot snapshot registration)
                (setf (pg::pg-class-checks table)
@@ -1141,6 +1144,7 @@
                (pg::with-write-lock
                  (pg::heapam-insert (pg::pg-class-relfilenode target) (pg::pg-class-columns target) (vector 1 array) 42 0)
                  (pg::heapam-insert (pg::pg-class-relfilenode source) (pg::pg-class-columns source) (vector 1 array) 42 0))
+               (pg::clog-init :initialize t)
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::register-active-snapshot snapshot registration)
                (with-open-file (out out-path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
@@ -1275,6 +1279,7 @@
                    (setf physical (pg::toast-externalize-tuple-unlocked toast (vector array) columns 42 0))
                    (pg::heapam-insert (pg::pg-class-relfilenode table) columns physical 42 0)))
                (ok (pg::heap-external-varlena-p (aref physical 0)))
+               (pg::clog-init :initialize t)
                (pg::clog-set 42 pg::+clog-committed+)
                (pg::register-active-snapshot snapshot registration)
                (let ((found nil))
@@ -1323,6 +1328,7 @@
                       toast (make-array 1 :element-type '(unsigned-byte 8) :initial-element 17)
                       (+ i 1000) 42 0))))
                (ok (> (nth-value 0 (pg::btree-read-meta (pg::pg-toast-index-relfilenode toast))) 0))
+               (pg::clog-init :initialize t)
                (let ((pg::*toast-next-value-id* #xffffffff)
                      (one-byte (make-array 1 :element-type '(unsigned-byte 8) :initial-element 42)))
                  (pg::with-btree-relation-locks ((list (pg::pg-toast-index-relfilenode toast)))
@@ -1555,6 +1561,7 @@
         (pg::page-add-item page tuple)
         (unwind-protect
              (progn
+               (pg::smgr-create 991)
                (pg::buf-extend 991 page)
                (ok (not (pg::heapam-get-tuple 991 0 1 pg::*toast-chunk-columns* t)))
                (ok (intake-fails-p (lambda ()
@@ -1588,6 +1595,7 @@
                (pg::smgr-create 900)
                (pg::smgr-create 901)
                (pg::btree-init 902)
+               (pg::clog-init :initialize t)
                (pg::clog-set 10 pg::+clog-committed+)
                (multiple-value-bind (block offset)
                    (pg::heapam-insert 901 columns #(7) 10 0)
