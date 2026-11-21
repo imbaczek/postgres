@@ -109,7 +109,8 @@ Keep the overlap descriptor as the value of its object key."
       (let* ((archive-key (physical-retained-archive-key fd))
              ;; Typed readers already hold their own anchored directory and
              ;; receive the original name so they can check its identity.
-             (read-directory (if (eq reader 'physical-retained-object-read)
+             (read-directory (if (or (eq reader 'physical-retained-object-read)
+                                     (eq reader #'physical-retained-object-read))
                                  (uiop:ensure-directory-pathname (slot-state-fd-path fd))
                                  directory))
              (payload (physical-retained-inventory-load read-directory id identity history :reader reader)))
@@ -500,16 +501,15 @@ retains protection until readback reconciliation or durable retirement."
   "Check the archive parent and a possible bind alias of the active host's archive."
   (or (logical-slot-continuation-gc-fenced-p
        (uiop:pathname-parent-directory-pathname directory))
-      (when (and *pgdata* (logical-slot-continuation-gc-fenced-p *pgdata*))
-        (with-slot-state-directory (host-fd *pgdata*)
-          (with-slot-state-directory
-              (archive-fd (slot-state-fd-path host-fd "pg_physical_retained") t)
-            (when archive-fd
-              (let ((candidate (physical-image-file-facts fd))
-                    (archive (physical-image-file-facts archive-fd)))
-                ;; Bind aliases change mount IDs but share device and inode.
-                (and (= (first candidate) (first archive))
-                     (= (second candidate) (second archive))))))))))
+      (when (and *pgdata* (slot-state-lstat *pgdata*))
+        (with-slot-state-directory (host-fd (truename *pgdata*) t)
+          (when (and host-fd (logical-slot-continuation-fd-fenced-p host-fd))
+            (with-slot-state-directory
+                (archive-fd (slot-state-fd-path host-fd "pg_physical_retained") t)
+              (when archive-fd
+                (physical-retained-same-archive-p
+                 (physical-retained-archive-key fd)
+                 (physical-retained-archive-key archive-fd)))))))))
 
 (defun physical-retained-root-delete-unprotected (directory kind id)
   "Delete an unprotected object using a held archive directory descriptor.

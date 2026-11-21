@@ -24,17 +24,34 @@
         (unless (member (length bytes) '(0 8)) (error "invalid test control length"))
         (unless (zerop (length bytes)) (pg::wal-u64 bytes 0))))))
 
+(deftest continuation-host-fence-adopts-sticky-evidence-from-another-mount
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (declare (ignore images identity history text))
+       (let ((pg::*logical-slot-continuation-fenced-roots*
+               (make-hash-table :test #'equal :synchronized t)))
+         (pg::with-slot-state-directory (fd root)
+           (destructuring-bind (device inode mount) (pg::physical-retained-archive-key fd)
+             (ng (pg::logical-slot-continuation-fd-fenced-p fd))
+             (setf (gethash (list device inode (1+ mount))
+                            pg::*logical-slot-continuation-fenced-roots*) t)
+             (ok (pg::logical-slot-continuation-fd-fenced-p fd))
+             (ok (gethash (list device inode) pg::*logical-slot-continuation-fenced-roots*))))))))
+
 (deftest retained-root-fence-recognizes-held-archive-outside-host-parent
     (call-with-retained-inventory
      (lambda (root images identity history text)
        (declare (ignore images identity history text))
        (let* ((pg::*logical-slot-continuation-fenced-roots* (make-hash-table :test #'equal))
-              (pg::*pgdata* (merge-pathnames "host/" root))
-              (archive (merge-pathnames "pg_physical_retained/" pg::*pgdata*))
+              (host (merge-pathnames "host/" root))
+              (host-link (merge-pathnames "host-link" root))
+              (pg::*pgdata* (uiop:ensure-directory-pathname host-link))
+              (archive (merge-pathnames "pg_physical_retained/" host))
               (other (merge-pathnames "elsewhere/archive/" root))
-              (marker (merge-pathnames "logical-slot-copy.source-proof" pg::*pgdata*)))
+              (marker (merge-pathnames "logical-slot-copy.source-proof" host)))
          (ensure-directories-exist archive)
          (ensure-directories-exist other)
+         (sb-posix:symlink (namestring host) (namestring host-link))
          (with-open-file (stream marker :direction :output)
            (write-char #\x stream))
          (pg::with-slot-state-directory (archive-fd archive)
