@@ -1425,6 +1425,10 @@
                  (cl-spec:run-property 'follow-anchor-format-roundtrips-independent-proof-fields :seed 42))))
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
+(defun follow-test-prefix-record (start)
+  "Encode a fixed-size WAL8 terminal for raw prefix and retention proofs."
+  (pg::wal-encode-record pg::+wal-record-maintenance+ 0 start (empty-octets)))
+
 (defun call-with-follow-anchor-source (function)
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root) (pg::*catalog* (pg::make-catalog))
@@ -1436,7 +1440,7 @@
                                (pg::*wal-segment-namespace* :timeline) (pg::*wal-poisoned* nil)
                                (pg::*pm-requested-mode* pg::+no-shutdown+) (pg::*max-slot-wal-keep-bytes* nil)
                                (prefix (concatenate '(vector (unsigned-byte 8))
-                                                    (legacy-checkpoint-record 0) (legacy-checkpoint-record 32)))
+                                                    (follow-test-prefix-record 0) (follow-test-prefix-record 32)))
                                (eor (pg::wal-encode-end-of-recovery-record 64 42 2 1 1))
                                (pg::*wal-durable-lsn* (+ 64 (length eor)))
                                (seed (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 32)))
@@ -1528,7 +1532,7 @@
                (getf request :receive-lsn) 32
                (getf request :receive-digest) seed
                (getf request :overlap-digest)
-               (pg::physical-store-update-digest seed (legacy-checkpoint-record 0)))
+               (pg::physical-store-update-digest seed (follow-test-prefix-record 0)))
          (let* ((pin (pg::physical-source-follow-prepare "sibling" request))
                 (command
                   (pg::parse-replication-command
@@ -1546,7 +1550,7 @@
                     (ok (= 32 (pg::physical-source-pin-confirmed-lsn pin))))
                   (setf (pg::logical-replication-command-requested-lsn command) 65)
                   (ok (signals (pg::physical-source-validate-resume command owner) 'error))
-                  (let ((digest (pg::physical-store-update-digest seed (legacy-checkpoint-record 32))))
+                  (let ((digest (pg::physical-store-update-digest seed (follow-test-prefix-record 32))))
                     (ok (= digest (pg::physical-source-prove-range "sibling" owner 32 64 seed)))
                     (pg::physical-source-confirm-feedback command owner 64 digest)
                     (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))))
@@ -1611,11 +1615,11 @@
                                (pg::*wal-poisoned* nil) (pg::*pm-requested-mode* pg::+no-shutdown+)
                                (pg::*max-slot-wal-keep-bytes* nil)
                                (prefix (concatenate '(vector (unsigned-byte 8))
-                                                    (legacy-checkpoint-record 0) (legacy-checkpoint-record 32)
+                                                    (follow-test-prefix-record 0) (follow-test-prefix-record 32)
                                                     (if (= timeline 1) #()
                                                         (pg::wal-encode-end-of-recovery-record 64 42 2 1 1))))
                                (cursor (length prefix))
-                               (wal (concatenate '(vector (unsigned-byte 8)) prefix (legacy-checkpoint-record cursor)))
+                               (wal (concatenate '(vector (unsigned-byte 8)) prefix (follow-test-prefix-record cursor)))
                                (pg::*wal-durable-lsn* (length wal))
                                (anchor (same-timeline-follow-anchor
                                         cursor (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 32))
@@ -2153,7 +2157,7 @@
        (setf (getf request :receive-lsn) 32
              (getf request :receive-digest) #xCBF29CE484222325
              (getf request :overlap-digest)
-             (pg::physical-store-update-digest #xCBF29CE484222325 (legacy-checkpoint-record 0)))
+             (pg::physical-store-update-digest #xCBF29CE484222325 (follow-test-prefix-record 0)))
        (let* ((pin (pg::physical-source-follow-ready "sibling" request))
               (command (follow-anchor-start-command request "follow"))
               (names '(pg::physical-stream-send-data pg::physical-stream-feedback
@@ -2187,7 +2191,7 @@
                 (ok (= 1 (length sent)))
                 (ok (= 32 (first (first sent))))
                 (ok (= 64 (second (first sent))))
-                (ok (equalp (third (first sent)) (legacy-checkpoint-record 32)))
+                (ok (equalp (third (first sent)) (follow-test-prefix-record 32)))
                 (ok (= 64 (pg::physical-source-pin-confirmed-lsn pin)))
                 (setf (pg::logical-replication-command-requested-lsn command) 64
                       (cdr (assoc "prefix_digest" (pg::logical-replication-command-options command)
@@ -2211,7 +2215,7 @@
          (setf (getf request :receive-lsn) 32
                (getf request :receive-digest) #xCBF29CE484222325
                (getf request :overlap-digest)
-               (pg::physical-store-update-digest #xCBF29CE484222325 (legacy-checkpoint-record 0)))
+               (pg::physical-store-update-digest #xCBF29CE484222325 (follow-test-prefix-record 0)))
          (let* ((pin (pg::physical-source-follow-ready "sibling" request))
                 (command (follow-anchor-start-command request "follow"))
                 (pg::*backend* (pg::make-backend :state :idle))
@@ -2355,7 +2359,7 @@
      (lambda (root request eor)
        (declare (ignore root eor))
        (let ((prefix (concatenate '(vector (unsigned-byte 8))
-                                  (legacy-checkpoint-record 0) (legacy-checkpoint-record 32))))
+                                  (follow-test-prefix-record 0) (follow-test-prefix-record 32))))
          (setf (getf request :receive-lsn) 48
                (getf request :overlap-digest)
                (pg::physical-store-update-digest #xCBF29CE484222325 (subseq prefix 0 48)))
@@ -2495,7 +2499,7 @@
               (start pg::+wal-segment-size+)
               (raw (pg::wal-encode-end-of-recovery-record start 42 2 1 1))
               (prefix (concatenate '(vector (unsigned-byte 8))
-                                   (legacy-checkpoint-record 0) (legacy-checkpoint-record 32))))
+                                   (follow-test-prefix-record 0) (follow-test-prefix-record 32))))
          ;; A promoted source may retain only the old backup prefix under TLI 1.
          ;; Its complete TLI-2 copy of segment 0 has already been recycled.
          (delete-file (pg::wal-segment-path 0 2 :timeline))
@@ -2522,7 +2526,7 @@
               (start pg::+wal-segment-size+)
               (raw (pg::wal-encode-end-of-recovery-record start 42 2 1 1))
               (prefix (concatenate '(vector (unsigned-byte 8))
-                                   (legacy-checkpoint-record 0) (legacy-checkpoint-record 32))))
+                                   (follow-test-prefix-record 0) (follow-test-prefix-record 32))))
          ;; Current naming alone cannot justify a gap from 64 to the fork.
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 0 2 :timeline) prefix)
          (pg::wal-atomic-write-bytes (pg::wal-segment-path 1 2 :timeline) raw)
