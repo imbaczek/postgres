@@ -179,19 +179,19 @@
                                   (system-id (range integer 0 18446744073709551615)))
   (:about pg::physical-retained-project-extent)
   (:trials (:normal 200))
-  (let* ((base 96) (fork (+ base (* count 32))) (end (+ base (* (1+ (mod (1- kept) count)) 32)))
-                   (raw (apply #'concatenate '(vector (unsigned-byte 8))
-                               (append (loop for index below count collect (legacy-checkpoint-record (+ base (* index 32))))
-                                       (list (pg::wal-encode-end-of-recovery-record fork 42 2 1 1)))))
-                   (bytes (concatenate '(vector (unsigned-byte 8)) (overlap-test-bytes base) raw))
-                   (metadata (list :version 1 :system-id system-id :base-timeline 1 :base base :manifest-digest 77
-                                   :history-target 2 :history-digest 99 :history-text (store-history-text 1 fork)
-                                   :start base :end (length bytes) :start-digest #xCBF29CE484222325
-                                   :end-digest (pg::physical-store-update-digest #xCBF29CE484222325 raw)
-                                   :segment 0 :file-timeline 2
-                                   :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
-                   (image (pg::physical-retained-extent-encode metadata bytes))
-                   (projected (pg::physical-retained-project-extent image 1 "" nil end)))
+  (let* ((base 184) (size (pg::wal-checkpoint-record-size)) (fork (+ base (* count size))) (end (+ base (* (1+ (mod (1- kept) count)) size)))
+                    (raw (apply #'concatenate '(vector (unsigned-byte 8))
+                                (append (loop for index below count collect (physical-test-checkpoint-record (+ base (* index size))))
+                                        (list (pg::wal-encode-end-of-recovery-record fork 42 2 1 1)))))
+                    (bytes (concatenate '(vector (unsigned-byte 8)) (overlap-test-bytes base :native t) raw))
+                    (metadata (list :version 1 :system-id system-id :base-timeline 1 :base base :manifest-digest 77
+                                    :history-target 2 :history-digest 99 :history-text (store-history-text 1 fork)
+                                    :start base :end (length bytes) :start-digest #xCBF29CE484222325
+                                    :end-digest (pg::physical-store-update-digest #xCBF29CE484222325 raw)
+                                    :segment 0 :file-timeline 2
+                                    :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
+                    (image (pg::physical-retained-extent-encode metadata bytes))
+                    (projected (pg::physical-retained-project-extent image 1 "" nil end)))
     (multiple-value-bind (loaded prefix) (pg::physical-retained-extent-decode projected)
       (and (= end (length prefix) (getf loaded :end))
            (= system-id (getf loaded :system-id))
@@ -362,24 +362,24 @@
 (deftest retained-projection-bounds-expanded-history-metadata-before-staging
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((count 32) (fork (+ 96 (* count 32))) (bytes (overlap-test-bytes 96))
+          (let* ((count 32) (size (pg::wal-checkpoint-record-size)) (fork (+ 184 (* count size))) (bytes (overlap-test-bytes 184 :native t))
                             (text (store-history-text 1 fork)) (history (pg::timeline-parse-history 2 text))
-                            (identity '(:system-id 123 :base-timeline 1 :base 96 :manifest-digest 77))
+                            (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                             (digest #xCBF29CE484222325) (images nil))
             (dotimes (index count)
-              (let* ((start (+ 96 (* index 32))) (raw (legacy-checkpoint-record start))
-                                                 (next (pg::physical-store-update-digest digest raw)))
+              (let* ((start (+ 184 (* index size))) (raw (physical-test-checkpoint-record start))
+                                                    (next (pg::physical-store-update-digest digest raw)))
                 (setf bytes (concatenate '(vector (unsigned-byte 8)) bytes raw))
                 (push (pg::physical-retained-extent-encode
                        (append (list :version 1) identity
                                (list :history-target 2 :history-digest 99 :history-text text
-                                     :start start :end (+ start 32) :start-digest digest :end-digest next
+                                     :start start :end (+ start (length raw)) :start-digest digest :end-digest next
                                      :segment 0 :file-timeline 2
                                      :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 bytes)))
                        bytes) images)
                 (setf digest next)))
-            (let* ((base (overlap-test-bytes 96))
-                   (overlap (pg::physical-retained-overlap-encode (overlap-test-metadata 96 base) base))
+            (let* ((base (overlap-test-bytes 184 :native t))
+                   (overlap (pg::physical-retained-overlap-encode (overlap-test-metadata 184 base :native t) base))
                    (source (project-test-publish-source root (nreverse images) overlap identity 2 text))
                    (parent-text (with-output-to-string (stream)
                                   (dotimes (index 700) (write-char #\# stream)
@@ -402,25 +402,26 @@
 (deftest retained-projection-uses-eligible-carriers-across-segments
     (with-physical-store-directory (root)
       (with-retained-root-registry
-          (let* ((segment pg::+wal-segment-size+) (base (overlap-test-bytes 96))
+          (let* ((segment pg::+wal-segment-size+) (base (overlap-test-bytes 184 :native t))
                                                   (filler (pg::wal-encode-record
-                                                           pg::+wal-record-batch-start+ 0 96
-                                                           (make-array (- segment 96 pg::+wal-header-size+)
+                                                           pg::+wal-record-batch-start+ 0 184
+                                                           (make-array (- segment 184 pg::+wal-header-size+)
                                                                        :element-type '(unsigned-byte 8) :initial-element 0)))
                                                   (first-bytes (concatenate '(vector (unsigned-byte 8)) base filler))
                                                   (eor (pg::wal-encode-end-of-recovery-record segment 42 2 1 1))
-                                                  (checkpoint (legacy-checkpoint-record (+ segment 56)))
-                                                  (fork (+ segment 88))
+                                                  (checkpoint-start (+ segment (length eor)))
+                                                  (checkpoint (physical-test-checkpoint-record checkpoint-start :timeline 2))
+                                                  (fork (+ checkpoint-start (length checkpoint)))
                                                   (future (pg::wal-encode-end-of-recovery-record fork 42 3 2 1))
                                                   (second-bytes (concatenate '(vector (unsigned-byte 8)) eor checkpoint future))
                                                   (parent-text (store-history-text 1 segment))
                                                   (text (concatenate 'string parent-text (store-history-text 2 fork)))
                                                   (history (pg::timeline-parse-history 3 text))
-                                                  (identity '(:system-id 123 :base-timeline 1 :base 96 :manifest-digest 77))
+                                                  (identity '(:system-id 123 :base-timeline 1 :base 184 :manifest-digest 77))
                                                   (middle (pg::physical-store-update-digest #xCBF29CE484222325 filler))
                                                   (digest (pg::physical-store-update-digest middle (concatenate '(vector (unsigned-byte 8)) eor checkpoint)))
                                                   (images (loop for data in (list first-bytes second-bytes)
-                                                                for start in (list 96 segment) for end in (list segment (+ fork 56))
+                                                                for start in (list 184 segment) for end in (list segment (+ fork (length future)))
                                                                 for initial in (list #xCBF29CE484222325 middle)
                                                                 for carrier in '(1 3) for number from 0
                                                                 collect (pg::physical-retained-extent-encode
@@ -432,7 +433,7 @@
                                                                                        :segment number :file-timeline carrier
                                                                                        :prefix-digest (pg::physical-store-update-digest #xCBF29CE484222325 data)))
                                                                          data)))
-                                                  (overlap (pg::physical-retained-overlap-encode (overlap-test-metadata 96 base) base))
+                                                  (overlap (pg::physical-retained-overlap-encode (overlap-test-metadata 184 base :native t) base))
                                                   (source (project-test-publish-source root images overlap identity 3 text))
                                                   (selected nil))
             (pg::call-with-physical-retained-root-update
