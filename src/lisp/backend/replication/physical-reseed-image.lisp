@@ -351,8 +351,7 @@ Remove a reset fork and clear all candidates for catalog changes."
              (cond
                ((= type +wal-record-pages+)
                 (dolist (image (wal-decode-page-images (wal-record-payload record)
-                                                       (wal-record-end record)
-                                                       (wal-record-version record)))
+                                                       (wal-record-end record)))
                   (remhash (list (physical-rewind-page-name (wal-page-image-relfilenode image)
                                                             (wal-page-image-fork image))
                                  (* +blcksz+ (wal-page-image-block image)))

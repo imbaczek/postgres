@@ -418,11 +418,8 @@ Direct control operation; does not promote, follow a network source or coordinat
          (when snapshot
            (setf next-xid (max next-xid (getf snapshot :next-xid))))))
       ((= (wal-record-type record) +wal-record-pages+)
-       (unless (>= (wal-record-version record) +wal-version-v4+)
-         (error "streaming redo requires FullXID contributor metadata"))
        (dolist (image (wal-decode-page-images (wal-record-payload record)
-                                              (wal-record-end record)
-                                              (wal-record-version record)))
+                                              (wal-record-end record)))
          (dolist (xid (wal-page-image-xids image)) (observe xid))))
       ((= (wal-record-type record) +wal-record-clog-reset+)
        (setf next-xid (max next-xid (wal-read-u64-payload (wal-record-payload record))))))

@@ -564,9 +564,15 @@
               (pg::wal-record-payload record) payload)
         ;; A reset boundary is already NEXT, not an allocated transaction.
         (ok (= (+ cycle 3) (pg::physical-replay-observed-next-xid record 3))))
-      (setf (pg::wal-record-type record) pg::+wal-record-pages+
-            (pg::wal-record-version record) pg::+wal-version-v3+)
-      (ok (intake-fails-p (lambda () (pg::physical-replay-observed-next-xid record 3))))))
+      (let* ((lsn 16384)
+             (image (pg::make-wal-page-image :relfilenode 900 :block 0
+                                             :page (pg::page-init (pg::make-page))
+                                             :xids (list (+ cycle 42))))
+             (payload (pg::wal-encode-page-images (list image) lsn))
+             (start (- lsn pg::+wal-header-size+ (length payload)))
+             (wire (pg::wal-encode-record pg::+wal-record-pages+ 0 start payload))
+             (page-record (pg::wal-decode-record wire start)))
+        (ok (= (+ cycle 43) (pg::physical-replay-observed-next-xid page-record 3))))))
 
 (deftest streaming-catalog-creates-new-empty-heaps-without-masking-loss
     (with-physical-store-directory (root)

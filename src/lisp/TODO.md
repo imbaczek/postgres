@@ -71,9 +71,12 @@ and parent tip, including archive-only reads and startup slot checks.
 The cold continuation proof changes a native commit timestamp and checks
 that policy and pending state remain equal while the raw transcript changes.
 The cold proof and ten targeted physical test heads passed after the cutover.
-The recovery page spool
-also records the source version and decodes it when replaying page images.
-Version-specific fixtures cover page images, checkpoint and running-xacts
+The page-image decoder now requires fork and contributor metadata. Retained
+logical progress derives its first LSNs from explicit FullXID contributors.
+Both page spool readers validate the WAL8 version before decoding images.
+The native SQL promotion contract passed with fresh source startup, physical
+base backup, streaming follow and standby promotion.
+Version-specific fixtures still cover checkpoint and running-xacts
 records, XID reservation, timeline lineage and end-of-recovery. Remove
 compatibility assertions alongside their reader branches and regenerate
 fixtures that exercise behavior still supported by WAL8.

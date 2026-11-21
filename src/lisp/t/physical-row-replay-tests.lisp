@@ -125,15 +125,13 @@
                                              :page (pg::page-init (pg::make-page))
                                              :xids '(42) :provenance provenance))
              (payload (pg::wal-encode-page-images (list image) 4096))
-             (decoded (first (pg::wal-decode-page-images payload 4096 7))))
+             (decoded (first (pg::wal-decode-page-images payload 4096))))
         (ok (eq provenance (pg::wal-page-image-provenance decoded)))
         (ok (equal '(42) (pg::wal-page-image-xids decoded)))
         (ok (eql (eq provenance :row)
                  (not (null (pg::physical-row-replay-images-allowed-p (list decoded) 3)))))
-        (unless (eq provenance :unknown)
-          (ok (intake-fails-p (lambda () (pg::wal-decode-page-images payload 4096 4)))))
         (pg::wal-set-u32 payload (+ 4 12 pg::+blcksz+) #x40000001)
-        (ok (intake-fails-p (lambda () (pg::wal-decode-page-images payload 4096 7)))))))
+        (ok (intake-fails-p (lambda () (pg::wal-decode-page-images payload 4096)))))))
 
 (deftest row-page-provenance-never-loses-maintenance-or-legacy-taint
     (let* ((pg::*wal-ready* t)
@@ -178,7 +176,7 @@
                                          :page (pg::page-init (pg::make-page))
                                          :xids (list xid) :provenance provenance))
          (decoded (first (pg::wal-decode-page-images
-                          (pg::wal-encode-page-images (list image) 4096) 4096 7))))
+                          (pg::wal-encode-page-images (list image) 4096) 4096))))
     (and (eq provenance (pg::wal-page-image-provenance decoded))
          (equal (list xid) (pg::wal-page-image-xids decoded)))))
 
