@@ -62,7 +62,9 @@ their expected LSNs from the encoded lengths. Source retention, history
 proof, retained inventory overlap and the restartpoint suffix and seal
 fixtures now construct WAL8 checkpoints. The source fixture binds the
 matching in-memory checkpoint snapshot and keeps its record end at a
-segment boundary. The recovery page spool
+segment boundary. Retained extent and inventory fixtures derive their
+start, fork, and end from the WAL8 checkpoint and end-of-recovery sizes.
+The recovery page spool
 also records the source version and decodes it when replaying page images.
 Version-specific fixtures cover page images, checkpoint and running-xacts
 records, XID reservation, timeline lineage and end-of-recovery. Remove

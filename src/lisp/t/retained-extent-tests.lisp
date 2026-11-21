@@ -110,7 +110,9 @@
                     (list (first images) (first images)) identity
                     (pg::timeline-parse-history 2 (store-history-text 1 +retained-extent-test-fork+)) +retained-extent-test-start+ +retained-extent-test-fork+) 'error))
       (ok (signals (pg::physical-retained-wal-plan
-                    images identity (pg::timeline-parse-history 2 (store-history-text 1 (+ +retained-extent-test-fork+ +retained-extent-test-start+))) +retained-extent-test-start+ +retained-extent-test-end+) 'error))))
+                    images identity
+                    (pg::timeline-parse-history 2 (store-history-text 1 (+ +retained-extent-test-fork+ 32)))
+                    +retained-extent-test-start+ +retained-extent-test-end+) 'error))))
 
 (deftest retained-extent-plan-owns-decoded-bytes
     (multiple-value-bind (images identity history) (retained-extent-chain)
