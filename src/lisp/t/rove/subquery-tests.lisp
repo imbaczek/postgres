@@ -327,7 +327,8 @@
                       (mapcar (lambda (statement) (getf statement :type)) nested)))
       (rove:ok (eq :select (getf (getf (second nested) :query) :type))))
   (rove:ok (null (getf (compile-do-source "BEGIN END") :statements)))
-  (dolist (source '("BEGIN NULL END;" "BEGIN" "BEGIN END; NULL;" "BEGIN BEGIN END END"))
+  (dolist (source '("BEGIN NULL END;" "BEGIN" "BEGIN END; NULL;" "BEGIN BEGIN END END"
+                    "BEGIN IF ; THEN NULL; END IF; END;"))
     (rove:ok (handler-case (progn (compile-do-source source) nil)
                (pg-error (condition) (string= "42601" (pg-error-sqlstate condition))))
              source))

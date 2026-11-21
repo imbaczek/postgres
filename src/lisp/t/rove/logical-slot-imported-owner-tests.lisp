@@ -3,20 +3,10 @@
 (defun call-with-imported-scan-postmaster-test (function)
   (call-with-imported-principal-test
    (lambda (scan)
-     (let ((*postmaster-data-lock* nil) (*postmaster-pid-stream* nil)
-                                        (*postmaster-pid-directory* nil) (*postmaster-start-time* nil)
-                                        (*postmaster-start-timestamp* nil) (*postmaster-pid-host* nil)
-                                        (*postmaster-pid-port* nil) (*postmaster-pid-inode* nil)
-                                        (exit-hooks sb-ext:*exit-hooks*))
-       (sb-posix:chmod (namestring *pgdata*) #o700)
-       (unwind-protect
-            (progn
-              (postmaster-own-data-directory "127.0.0.1" 5439)
-              (let ((source (sb-thread:with-mutex (*wal-lock*) (logical-wal-capture-source scan))))
-                (funcall function scan source)))
-         (postmaster-remove-pid-file)
-         (setf sb-ext:*exit-hooks* exit-hooks)
-         (when *postmaster-data-lock* (close *postmaster-data-lock*)))))))
+     (call-with-test-postmaster-data-directory
+      (lambda ()
+        (let ((source (sb-thread:with-mutex (*wal-lock*) (logical-wal-capture-source scan))))
+          (funcall function scan source)))))))
 
 (rove:deftest imported-scan-owner-borrows-real-postmaster-and-matching-principal
     (let ((escaped nil))

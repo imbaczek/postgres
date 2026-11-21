@@ -211,8 +211,10 @@ String case and scalar types must match exactly."
      (and (vectorp right) (not (stringp right))
           (equal (array-element-type left) (array-element-type right))
           (= (length left) (length right))
-          (loop for a across left for b across right
-                always (logical-slot-copy-committed-image-equal-p a b))))
+          (if (typep left '(vector (unsigned-byte 8)))
+              (equalp left right)
+              (loop for a across left for b across right
+                    always (logical-slot-copy-committed-image-equal-p a b)))))
     ((timeline-history-entry-p left)
      (and (timeline-history-entry-p right)
           (eql (timeline-history-entry-timeline left) (timeline-history-entry-timeline right))
