@@ -888,7 +888,8 @@ invalid candidates once. This path does not take the code reload lock."
   (let ((*standard-output* (or *server-output* *standard-output*))
         (*error-output* (or *server-error* *error-output*))
         (*compile-verbose* nil) (*load-verbose* nil))
-    (asdf:load-system "pg" :force t)
+    ;; Reinstall the SQL types dependency inside the same definition exclusion.
+    (asdf:load-system "pg" :force '("pg" "pg/sql-types"))
     (startup-reload-settings-under-definition-lock)
     t))
 

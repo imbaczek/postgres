@@ -1,13 +1,18 @@
+(asdf:defsystem "pg/sql-types"
+  :description "Shared SQL type identities, assignment rules, and SQLSTATE errors"
+  :serial t
+  :components ((:file "packages")
+               (:file "backend/utils/elog")
+               (:file "backend/utils/adt/sql-types")))
+
 (asdf:defsystem "pg"
   :version "0.1"
   :description "Minimal PostgreSQL-compatible server in Common Lisp"
   :license "PostgreSQL"
+  :depends-on ("pg/sql-types")
   :serial t
   :components
-  ((:file "packages")
-   ;; Port lock checks use the condition handlers in elog.
-   (:file "elog" :pathname "backend/utils/elog")
-   (:module "include"
+  ((:module "include"
     :serial t
     :components ((:file "pg-limits")
                  (:file "pg-protocol")))
@@ -55,7 +60,6 @@
                    (:file "wal-logical-status")
                    (:file "wal-logical-policy")
                    (:file "bufmgr")))
-     (:file "utils/adt/sql-types")
      (:file "utils/adt/pglz")
      (:file "utils/adt/json")
      (:file "utils/adt/numeric")
