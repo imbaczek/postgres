@@ -32,8 +32,7 @@
                                 functions))
          (whole-p (and aggregates (eq (second (getf stage :frame)) :unbounded-following)))
          (peers-p (and aggregates (not whole-p) (eq (first (getf stage :frame)) :range)))
-         (states nil) (transition-origins nil) (results-origins nil) (position 0) (rank 1) (dense 1)
-         (partition-key nil) (peer-key nil) (pending nil)
+         (transition (make-window-transition)) (results-origins nil) (pending nil)
          (buffer nil) (reader nil) (results nil))
     (labels
         ((close-buffer ()
@@ -48,29 +47,13 @@
          (row-partition (item) (subseq (car item) 0 (length partition)))
          (row-peer (item) (subseq (car item) (length partition)))
          (advance (item origins presence)
-           (let* ((*query-row-origins* origins)
-                  (*query-row-presence* presence)
-                  (environment (cdr item))
-                  (new-partition (row-partition item))
-                  (new-peer (row-peer item))
-                  (same-partition (and (plusp position)
-                                       (window-key-equal-p partition-key new-partition)))
-                  (same-peer (and same-partition (window-key-equal-p peer-key new-peer))))
-             (unless same-partition
-               (close-aggregate-transition-states states)
-               (setf states (make-aggregate-transition-states aggregates)
-                     transition-origins (and *datum-origin-capture* (make-array (length aggregates) :initial-element nil))
-                     position 0 rank 1 dense 1 partition-key (copy-query-sort-value new-partition)))
-             (incf position)
-             (when (> position 1)
-               (destructuring-bind (new-rank new-dense)
-                   (window-rank-step position rank dense same-peer)
-                 (setf rank new-rank dense new-dense)))
-             (setf peer-key (copy-query-sort-value new-peer))
-             (multiple-value-bind (inputs input-origins) (window-aggregate-inputs aggregates environment)
-               (step-aggregate-transition-origins states aggregates inputs input-origins transition-origins 0)
-               (step-aggregate-transition-states states aggregates inputs 0))
-             (list environment position rank dense)))
+           (let ((*query-row-origins* origins)
+                 (*query-row-presence* presence)
+                 (environment (cdr item)))
+             (multiple-value-bind (position rank dense)
+                 (advance-window-transition transition aggregates environment
+                                            (row-partition item) (row-peer item))
+               (list environment position rank dense))))
          (project (row values)
            (window-project-row (first row) (getf stage :width) functions values
                                (second row) (third row) (fourth row))))
@@ -89,8 +72,8 @@
              (unless present (return (values nil nil)))
              (unless (or whole-p peers-p)
                (let ((row (advance first origins presence)))
-                 (return (values (project row (aggregate-transition-results states aggregates nil)) t
-                                 (window-output-origins origins (getf stage :width) functions transition-origins)
+                 (return (values (project row (aggregate-transition-results (window-transition-states transition) aggregates nil)) t
+                                 (window-output-origins origins (getf stage :width) functions (window-transition-origins transition))
                                  nil presence))))
              (setf buffer (make-query-replay-store nil))
              (let ((group-partition (row-partition first)) (group-peer (row-peer first)))
@@ -106,11 +89,16 @@
                    (append-query-replay-row buffer (advance item item-origins item-presence) item-origins item-presence))))
              (query-row-spool-seal (query-replay-store-spool buffer))
              (setf (query-replay-store-eof-p buffer) t
-                   results (aggregate-transition-results states aggregates nil)
-                   results-origins (and transition-origins (copy-seq transition-origins))
+                   results (aggregate-transition-results (window-transition-states transition) aggregates nil)
+                   results-origins (let ((origins (window-transition-origins transition)))
+                                     (and origins (copy-seq origins)))
                    reader (make-query-replay-reader buffer)))))
        (lambda ()
          (close-buffer)
-         (close-aggregate-transition-states states)
+         (close-aggregate-transition-states (window-transition-states transition))
          (close-sql-iterator source)
-         (setf states nil pending nil partition-key nil peer-key nil))))))
+         (setf (window-transition-states transition) nil
+               (window-transition-partition-key transition) nil
+               (window-transition-peer-key transition) nil
+               (window-transition-origins transition) nil
+               pending nil))))))

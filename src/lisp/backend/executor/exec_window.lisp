@@ -113,6 +113,45 @@
                (when result-origins (setf (aref result-origins i) origin))))
     (values values result-origins)))
 
+(defstruct window-transition
+  states origins partition-key peer-key (position 0) (rank 1) (dense 1))
+
+(defun advance-window-transition (transition aggregates environment partition-key peer-key
+                                  &optional flush-group peers-p)
+  "Advance one row after emitting any completed group from its prior state."
+  (let* ((position (window-transition-position transition))
+         (same-partition (and (plusp position)
+                              (window-key-equal-p partition-key (window-transition-partition-key transition))))
+         (same-peer (and same-partition
+                         (window-key-equal-p peer-key (window-transition-peer-key transition)))))
+    (when (and flush-group
+               (or (and (not same-partition) (plusp position)) (and peers-p (not same-peer))))
+      (funcall flush-group))
+    (unless same-partition
+      (close-aggregate-transition-states (window-transition-states transition))
+      (setf (window-transition-states transition) (make-aggregate-transition-states aggregates)
+            (window-transition-origins transition)
+            (and *datum-origin-capture* (make-array (length aggregates) :initial-element nil))
+            (window-transition-position transition) 0
+            (window-transition-rank transition) 1
+            (window-transition-dense transition) 1
+            (window-transition-partition-key transition) (copy-query-sort-value partition-key)))
+    (let ((position (incf (window-transition-position transition))))
+      (when (> position 1)
+        (destructuring-bind (rank dense)
+            (window-rank-step position (window-transition-rank transition)
+                              (window-transition-dense transition) same-peer)
+          (setf (window-transition-rank transition) rank
+                (window-transition-dense transition) dense))))
+    (setf (window-transition-peer-key transition) (copy-query-sort-value peer-key))
+    (let ((states (window-transition-states transition)))
+      (multiple-value-bind (inputs input-origins) (window-aggregate-inputs aggregates environment)
+        (step-aggregate-transition-origins states aggregates inputs input-origins
+                                           (window-transition-origins transition) 0)
+        (step-aggregate-transition-states states aggregates inputs 0)))
+    (values (window-transition-position transition)
+            (window-transition-rank transition) (window-transition-dense transition))))
+
 (defun stream-window-stage (source stage emit)
   ;; Ranking streams independently of the frame. Aggregate ROWS prefixes emit
   ;; per row; RANGE peers and whole partitions buffer until their result is known.
@@ -130,8 +169,7 @@
                                 (width (getf stage :width))
                                 (whole-p (and aggregates (eq (second (getf stage :frame)) :unbounded-following)))
                                 (peers-p (and aggregates (not whole-p) (eq (first (getf stage :frame)) :range)))
-                                (buffer nil) (states nil) (transition-origins nil) (partition-key nil) (peer-key nil)
-                                (position 0) (rank 1) (dense 1))
+                                (buffer nil) (transition (make-window-transition)))
                            (labels
                                ((close-buffer ()
                                   (when buffer
@@ -139,18 +177,14 @@
                                     (when (query-row-spool-pathname buffer)
                                       (delete-query-temp-file (query-row-spool-pathname buffer)))
                                     (setf buffer nil)))
-                                (advance-states (environment)
-                                  (multiple-value-bind (inputs input-origins) (window-aggregate-inputs aggregates environment)
-                                    (step-aggregate-transition-origins states aggregates inputs input-origins transition-origins 0)
-                                    (step-aggregate-transition-states states aggregates inputs 0)))
                                 (output (environment results row-position row-rank row-dense)
-                                  (let ((*query-row-origins* (window-output-origins *query-row-origins* width functions transition-origins)))
+                                  (let ((*query-row-origins* (window-output-origins *query-row-origins* width functions (window-transition-origins transition))))
                                     (funcall emit (window-project-row environment width functions results
                                                                       row-position row-rank row-dense))))
                                 (flush-buffer ()
                                   (when buffer
                                     (query-row-spool-seal buffer)
-                                    (let ((results (aggregate-transition-results states aggregates nil)))
+                                    (let ((results (aggregate-transition-results (window-transition-states transition) aggregates nil)))
                                       (unwind-protect
                                            (when (eq (map-query-row-spool
                                                       buffer
@@ -163,36 +197,25 @@
                                              (return-from stream-window-stage :stop))
                                         (close-buffer)))))
                                 (consume (row)
-                                  (let* ((environment (cdr row))
-                                         (all-keys (car row))
-                                         (new-partition (subseq all-keys 0 (length partition)))
-                                         (new-peer (subseq all-keys (length partition)))
-                                         (same-partition (and (plusp position)
-                                                              (window-key-equal-p new-partition partition-key)))
-                                         (same-peer (and same-partition (window-key-equal-p new-peer peer-key))))
+                                  (let ((environment (cdr row)) (keys (car row)))
                                     (check-for-interrupts)
-                                    (when (or (and (not same-partition) (plusp position))
-                                              (and peers-p (not same-peer)))
-                                      (flush-buffer))
-                                    (unless same-partition
-                                      (close-aggregate-transition-states states)
-                                      (setf states (make-aggregate-transition-states aggregates)
-                                            transition-origins (and *datum-origin-capture* (make-array (length aggregates) :initial-element nil))
-                                            position 0 rank 1 dense 1 partition-key (copy-query-sort-value new-partition)))
-                                    (incf position)
-                                    (when (> position 1)
-                                      (destructuring-bind (new-rank new-dense)
-                                          (window-rank-step position rank dense same-peer)
-                                        (setf rank new-rank dense new-dense)))
-                                    (setf peer-key (copy-query-sort-value new-peer))
-                                    (advance-states environment)
-                                    (if (or whole-p peers-p)
-                                        (progn
-                                          (unless buffer (setf buffer (make-query-row-spool)))
-                                          (query-row-spool-append buffer (list (copy-query-sort-value environment) position rank dense
-                                                                               (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*))
-                                                                               *query-row-presence*)))
-                                        (output environment (aggregate-transition-results states aggregates nil) position rank dense))))
+                                    (multiple-value-bind (position rank dense)
+                                        (advance-window-transition
+                                         transition aggregates environment
+                                         (subseq keys 0 (length partition)) (subseq keys (length partition))
+                                         #'flush-buffer peers-p)
+                                      (if (or whole-p peers-p)
+                                          (progn
+                                            (unless buffer (setf buffer (make-query-row-spool)))
+                                            (query-row-spool-append
+                                             buffer (list (copy-query-sort-value environment) position rank dense
+                                                          (and *datum-origin-capture*
+                                                               (datum-origins-for-spill *query-row-origins*))
+                                                          *query-row-presence*)))
+                                          (output environment
+                                                  (aggregate-transition-results
+                                                   (window-transition-states transition) aggregates nil)
+                                                  position rank dense)))))
                                 (input (callback)
                                   (funcall source
                                            (lambda (environment)
@@ -213,4 +236,4 @@
                                         (when (eq (input #'consume) :stop) (return-from stream-window-stage :stop))
                                         (finish)))
                                (close-buffer)
-                               (close-aggregate-transition-states states))))))
+                               (close-aggregate-transition-states (window-transition-states transition)))))))

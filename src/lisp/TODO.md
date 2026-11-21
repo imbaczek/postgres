@@ -160,6 +160,9 @@ portal state for cleanup and suspension.
 The first A1 slice shares physical row projection between the callback and
 iterator drivers. It preserves deferred sort expressions, ProjectSet
 pass-through rows, and origin capture through both entry points.
+The WindowAgg drivers share partition resets, ranking, aggregate transitions,
+and transition origins. The window differential covers one-row portal
+resumption for ROWS prefixes, RANGE peer groups, and whole partitions.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
