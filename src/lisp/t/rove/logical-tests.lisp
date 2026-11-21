@@ -446,6 +446,23 @@
              (rove:ok (null operations)))
         (setf (symbol-function 'logical-pgoutput-apply-operation) original))))
 
+(rove:deftest test-pgoutput-operation-owns-vector-fields
+    ;; logicalrep_write_insert and logicalrep_write_tuple field order.
+    (let* ((payload (make-array 24 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(73 0 0 0 7 78 0 4
+                                                       110 117 116 0 0 0 2 206 187
+                                                       98 0 0 0 2 0 255)))
+           (runtime (make-logical-subscription-runtime :transaction-open-p t)))
+      (destructuring-bind (kind oid tuple) (logical-pgoutput-read-operation runtime payload)
+        (fill payload 0)
+        (rove:ok (char= kind #\I))
+        (rove:ok (= oid 7))
+        (rove:ok (= (length tuple) 4))
+        (rove:ok (null (aref tuple 0)))
+        (rove:ok (eq :unchanged-toast (aref tuple 1)))
+        (rove:ok (string= "λ" (aref tuple 2)))
+        (rove:ok (equalp #(0 255) (logical-binary-bytea-data (aref tuple 3)))))))
+
 (rove:deftest test-logical-wire-cursor-applies-only-complete-frame
     (let* ((path (merge-pathnames (format nil "pg-wire-cursor-~d-~d" (sb-posix:getpid) (random 1000000))
                                   (uiop:temporary-directory)))

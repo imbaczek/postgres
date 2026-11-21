@@ -821,84 +821,23 @@ Invalid scalars fall back to the encoder and retain its error behavior."
        (gethash (pgoutput-relation-name relation)
                 (logical-subscription-runtime-validated-relations runtime))))
 
+(defvar *logical-wire-field-owner* nil)
+
 (defun logical-pgoutput-read-relation (payload &optional standard-p)
-  (let* ((position 1)
-         (oid (bytes-to-u32 payload position))
-         (namespace nil)
-         (columns '())
-         (key-columns '()))
-    (incf position 4)
-    (multiple-value-setq (namespace position)
-      (pg-client-cstring payload position))
-    (multiple-value-bind (name next) (pg-client-cstring payload position)
-      (setf position next)
-      (when (> position (1- (length payload)))
-        (error "truncated pgoutput Relation message"))
-      (when (and standard-p (/= (aref payload position) (char-code #\d)))
-        (error "standard replication requires default replica identity"))
-      (incf position) ; replica identity mode
-      (let ((count (bytes-to-u16 payload position)))
-        (incf position 2)
-        (dotimes (i count)
-          (when (> (+ position 1) (length payload))
-            (error "truncated pgoutput Relation column flags"))
-          (let ((key-p (= (aref payload position) 1)))
-            (unless (member (aref payload position) '(0 1))
-              (error "unsupported pgoutput Relation column flags"))
-            (incf position)
-            (multiple-value-bind (column-name after-name)
-                (pg-client-cstring payload position)
-              (setf position after-name)
-              (when (> (+ position 8) (length payload))
-                (error "truncated pgoutput Relation column metadata"))
-              (let ((column
-                      (make-pgoutput-column
-                       :name column-name :key-p key-p
-                       :type-oid (bytes-to-u32 payload position)
-                       :typmod (logical-u32-signed
-                                (bytes-to-u32 payload (+ position 4))))))
-                (incf position 8) ; type OID and type modifier
-                (push column columns)
-                (when key-p (push column key-columns)))))))
-      (unless (= position (length payload))
-        (error "pgoutput Relation message has trailing bytes"))
-      (make-pgoutput-relation :oid oid :namespace namespace :name name
-                              :columns (nreverse columns)
-                              :key-columns (nreverse key-columns)))))
+  (when (zerop (length payload)) (error "truncated pgoutput Relation message"))
+  (let* ((cursor (make-logical-wire-cursor :bytes payload :remaining (1- (length payload))))
+         (relation (logical-wire-relation cursor standard-p)))
+    (unless (zerop (logical-wire-cursor-remaining cursor))
+      (error "pgoutput Relation message has trailing bytes"))
+    relation))
 
 (defun logical-pgoutput-read-tuple (payload position)
-  (when (> (+ position 2) (length payload))
-    (error "truncated pgoutput tuple header"))
-  (let ((count (bytes-to-u16 payload position))
-        (values '()))
-    (incf position 2)
-    (dotimes (i count)
-      (when (>= position (length payload))
-        (error "truncated pgoutput tuple value"))
-      (let ((kind (code-char (aref payload position))))
-        (incf position)
-        (case kind
-          (#\n (push nil values))
-          (#\u (push :unchanged-toast values))
-          (#\t
-           (when (> (+ position 4) (length payload))
-             (error "truncated pgoutput text value length"))
-           (let ((size (bytes-to-u32 payload position)))
-             (incf position 4)
-             (unless (<= (+ position size) (length payload))
-               (error "truncated pgoutput text value"))
-             (push (bytes->string payload :start position :end (+ position size))
-                   values)
-             (incf position size)))
-          (#\b
-           (when (> (+ position 4) (length payload)) (error "truncated pgoutput binary value length"))
-           (let ((size (bytes-to-u32 payload position)))
-             (incf position 4)
-             (unless (<= (+ position size) (length payload)) (error "truncated pgoutput binary value"))
-             (push (make-logical-binary-bytea :data (subseq payload position (+ position size))) values)
-             (incf position size)))
-          (otherwise (error "unsupported pgoutput tuple value kind ~s" kind)))))
-    (values (coerce (nreverse values) 'vector) position)))
+  (unless (<= 0 position (length payload))
+    (error "invalid pgoutput tuple position"))
+  (let ((cursor (make-logical-wire-cursor :bytes payload :remaining (- (length payload) position)))
+        (*logical-wire-field-owner* nil))
+    (let ((tuple (logical-wire-tuple cursor)))
+      (values tuple (- (length payload) (logical-wire-cursor-remaining cursor))))))
 
 (defun logical-validate-pgoutput-tuple (relation tuple unchanged-allowed-p)
   "Check tuple width and pgoutput's external marker against column types."
@@ -930,8 +869,6 @@ Invalid scalars fall back to the encoder and retain its error behavior."
     (when (char= character #\') (write-char #\' output))
     (write-char character output))
   character)
-
-(defvar *logical-wire-field-owner* nil)
 
 (defclass logical-field-integer-stream (sb-gray:fundamental-character-output-stream)
   ((output :initarg :output :reader logical-field-integer-output)
@@ -1430,26 +1367,8 @@ Invalid scalars fall back to the encoder and retain its error behavior."
   "Decode a nonstreamed Message and return prefix, LSN, content, transactional-p."
   (when (< (length payload) 10)
     (error "truncated pgoutput Message header"))
-  (let ((flags (aref payload 1))
-        (position 10)
-        (lsn (pg-client-u64 payload 2))
-        (prefix nil))
-    (unless (member flags '(0 1))
-      (error "unsupported pgoutput Message flags"))
-    (when (and (= flags 1)
-               (not (logical-subscription-runtime-transaction-open-p runtime)))
-      (error "transactional pgoutput Message outside a transaction"))
-    (multiple-value-setq (prefix position) (pg-client-cstring payload position))
-    (when (> (+ position 4) (length payload))
-      (error "truncated pgoutput Message content length"))
-    (let ((size (bytes-to-u32 payload position)))
-      (incf position 4)
-      (unless (and (<= size +max-logical-transaction-bytes+)
-                   (= (+ position size) (length payload)))
-        (error "invalid pgoutput Message content length"))
-      (values prefix lsn
-              (bytes->string payload :start position :end (length payload))
-              (= flags 1)))))
+  (logical-wire-message
+   runtime (make-logical-wire-cursor :bytes payload :remaining (1- (length payload)))))
 
 (defun logical-standalone-event-key (options database-oid)
   (format nil "~a:~d:~a:~a:~d:~a"
@@ -1488,17 +1407,10 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 
 (defun logical-pgoutput-read-truncate (payload)
   "Decode native TRUNCATE; reject flags whose effects we cannot preserve."
-  (unless (and (>= (length payload) 6)
-               (= (aref payload 0) (char-code #\T)))
+  (unless (and (>= (length payload) 6) (= (aref payload 0) (char-code #\T)))
     (error "invalid pgoutput TRUNCATE header"))
-  (let ((count (bytes-to-u32 payload 1))
-        (flags (aref payload 5)))
-    (unless (zerop flags)
-      (error "unsupported pgoutput TRUNCATE flags ~d" flags))
-    (unless (= (length payload) (+ 6 (* count 4)))
-      (error "invalid pgoutput TRUNCATE relation count"))
-    (loop for offset from 6 below (length payload) by 4
-          collect (bytes-to-u32 payload offset))))
+  (logical-wire-truncate
+   (make-logical-wire-cursor :bytes payload :remaining (1- (length payload)))))
 
 (defun logical-truncate-target-tables (runtime names)
   "Apply one TRUNCATE operation with shared fault boundaries for all its tables."
@@ -1538,37 +1450,10 @@ Invalid scalars fall back to the encoder and retain its error behavior."
               tables))))
 
 (defun logical-pgoutput-read-control (runtime payload)
-  "Decode a complete control message without applying it."
-  (when (zerop (length payload)) (error "empty pgoutput message"))
-  (case (code-char (aref payload 0))
-    (#\B
-     (when (logical-subscription-runtime-transaction-open-p runtime)
-       (error "nested pgoutput transaction"))
-     (unless (= (length payload) 21) (error "invalid pgoutput Begin message"))
-     (let ((final-lsn (pg-client-u64 payload 1)))
-       (when (zerop final-lsn) (error "invalid pgoutput Begin final LSN"))
-       (list #\B (bytes-to-u32 payload 17) final-lsn (pg-client-i64 payload 9))))
-    (#\C
-     (unless (and (= (length payload) 26) (zerop (aref payload 1)))
-       (error "invalid pgoutput Commit message"))
-     (list #\C (pg-client-u64 payload 10) (pg-client-u64 payload 2)
-           (pg-client-i64 payload 18)))
-    (#\R
-     (list #\R (logical-pgoutput-read-relation
-                payload (eq (logical-subscription-options-mode
-                             (logical-subscription-runtime-options runtime)) :standard))))
-    (#\T
-     (unless (logical-subscription-runtime-transaction-open-p runtime)
-       (error "pgoutput TRUNCATE appeared outside a transaction"))
-     (list #\T (logical-pgoutput-read-truncate payload)))
-    (#\M
-     (when (eq (logical-subscription-options-mode
-                (logical-subscription-runtime-options runtime)) :standard)
-       (error "standard subscriber does not accept extension Message events"))
-     (multiple-value-bind (prefix lsn content transactional-p)
-         (logical-pgoutput-read-message runtime payload)
-       (list #\M prefix lsn content transactional-p)))
-    (otherwise (error "unsupported pgoutput control message"))))
+  "Decode one complete pgoutput control message without applying it."
+  (unless (and (plusp (length payload)) (find (code-char (aref payload 0)) "BCRTM"))
+    (error "unsupported pgoutput control message"))
+  (logical-pgoutput-read-operation runtime payload))
 
 (defun logical-pgoutput-read-keepalive (payload)
   (unless (= (length payload) 18) (error "invalid logical keepalive frame"))
@@ -1586,24 +1471,13 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                      collect (pgoutput-relation-name relation)))))
 
 (defun logical-pgoutput-read-operation (runtime payload)
-  "Decode a complete pgoutput message before performing any effects."
-  (when (zerop (length payload)) (error "empty pgoutput message"))
-  (let ((kind (code-char (aref payload 0))))
-    (if (member kind '(#\I #\U #\D))
-        (progn
-          (unless (logical-subscription-runtime-transaction-open-p runtime)
-            (error "pgoutput row change appeared outside a transaction"))
-          (when (< (length payload) 5) (error "truncated pgoutput row message"))
-          (let ((oid (bytes-to-u32 payload 1)))
-            (ecase kind
-              (#\I (list kind oid (logical-pgoutput-read-insert payload 5)))
-              (#\U (multiple-value-bind (old new tuple-kind)
-                       (logical-pgoutput-read-update payload 5)
-                     (list kind oid old new tuple-kind)))
-              (#\D (multiple-value-bind (tuple tuple-kind)
-                       (logical-pgoutput-read-delete payload 5)
-                     (list kind oid tuple tuple-kind))))))
-        (logical-pgoutput-read-control runtime payload))))
+  "Decode a complete in-memory pgoutput message without applying it."
+  (let ((cursor (make-logical-wire-cursor :bytes payload :remaining (length payload)))
+        (*logical-wire-field-owner* nil))
+    (let ((operation (logical-wire-operation runtime cursor)))
+      (unless (zerop (logical-wire-cursor-remaining cursor))
+        (error "pgoutput message has trailing bytes"))
+      operation)))
 
 (defun logical-pgoutput-apply-operation (runtime operation)
   (let ((kind (first operation)))
@@ -1694,11 +1568,17 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                       (code-char (aref payload 0))))))
 
 (defun logical-wire-cstring (cursor)
-  (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
-                             :adjustable t :fill-pointer 0)))
-    (loop for byte = (logical-wire-byte cursor)
-          until (zerop byte) do (vector-push-extend byte bytes))
-    (bytes->string bytes)))
+  (let ((source (logical-wire-cursor-bytes cursor)))
+    (if source
+        (multiple-value-bind (value next)
+            (pg-client-cstring source (- (length source) (logical-wire-cursor-remaining cursor)))
+          (setf (logical-wire-cursor-remaining cursor) (- (length source) next))
+          value)
+        (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                                   :adjustable t :fill-pointer 0)))
+          (loop for byte = (logical-wire-byte cursor)
+                until (zerop byte) do (vector-push-extend byte bytes))
+          (bytes->string bytes)))))
 
 (defun logical-wire-tuple (cursor &optional columns)
   (let ((count (logical-wire-uint cursor 2)))
@@ -1711,13 +1591,8 @@ Invalid scalars fall back to the encoder and retain its error behavior."
                      (#\t (let ((size (logical-wire-uint cursor 4)))
                             (logical-wire-received-field cursor size *logical-wire-field-owner*
                                                          (and column (pgoutput-column-type-oid column)))))
-                     (#\b (let* ((size (logical-wire-uint cursor 4))
-                                 (data (if (and *logical-wire-field-owner*
-                                                (or (> size *logical-wire-field-spill-threshold*)
-                                                    (not (logical-wire-reserve-field *logical-wire-field-owner* size))))
-                                           (logical-wire-binary-field-capture *logical-wire-field-owner* cursor size)
-                                           (logical-wire-octets cursor size))))
-                            (make-logical-binary-bytea :data data)))
+                     (#\b (logical-wire-received-binary-bytea
+                           cursor (logical-wire-uint cursor 4) *logical-wire-field-owner*))
                      (otherwise (error "unsupported pgoutput tuple value kind"))))
      'vector)))
 
@@ -1743,6 +1618,27 @@ Invalid scalars fall back to the encoder and retain its error behavior."
           (when (= flags 1) (push column keys)))))
     (make-pgoutput-relation :oid oid :namespace namespace :name name
                             :columns (nreverse columns) :key-columns (nreverse keys))))
+
+(defun logical-wire-truncate (cursor)
+  (let ((count (logical-wire-uint cursor 4))
+        (flags (logical-wire-byte cursor)))
+    (unless (zerop flags) (error "unsupported pgoutput TRUNCATE flags ~d" flags))
+    (unless (= (logical-wire-cursor-remaining cursor) (* count 4))
+      (error "invalid pgoutput TRUNCATE relation count"))
+    (loop repeat count collect (logical-wire-uint cursor 4))))
+
+(defun logical-wire-message (runtime cursor)
+  (let* ((flags (logical-wire-byte cursor))
+         (lsn (logical-wire-uint cursor 8)))
+    (unless (member flags '(0 1)) (error "unsupported pgoutput Message flags"))
+    (when (and (= flags 1) (not (logical-subscription-runtime-transaction-open-p runtime)))
+      (error "transactional pgoutput Message outside a transaction"))
+    (let ((prefix (logical-wire-cstring cursor))
+          (size (logical-wire-uint cursor 4)))
+      (unless (and (<= size +max-logical-transaction-bytes+)
+                   (= size (logical-wire-cursor-remaining cursor)))
+        (error "invalid pgoutput Message content length"))
+      (values prefix lsn (logical-wire-text cursor size) (= flags 1)))))
 
 (defun logical-wire-operation (runtime cursor)
   (let ((kind (code-char (logical-wire-byte cursor))))
@@ -1781,24 +1677,13 @@ Invalid scalars fall back to the encoder and retain its error behavior."
       (#\T
        (unless (logical-subscription-runtime-transaction-open-p runtime)
          (error "pgoutput TRUNCATE appeared outside a transaction"))
-       (let ((count (logical-wire-uint cursor 4)) (flags (logical-wire-byte cursor)))
-         (unless (zerop flags) (error "unsupported pgoutput TRUNCATE flags"))
-         (unless (= (logical-wire-cursor-remaining cursor) (* count 4))
-           (error "invalid pgoutput TRUNCATE relation count"))
-         (list kind (loop repeat count collect (logical-wire-uint cursor 4)))))
+       (list kind (logical-wire-truncate cursor)))
       (#\M
        (when (eq (logical-subscription-options-mode
                   (logical-subscription-runtime-options runtime)) :standard)
          (error "standard subscriber does not accept extension Message events"))
-       (let* ((flags (logical-wire-byte cursor)) (lsn (logical-wire-uint cursor 8)))
-         (unless (member flags '(0 1)) (error "unsupported pgoutput Message flags"))
-         (when (and (= flags 1) (not (logical-subscription-runtime-transaction-open-p runtime)))
-           (error "transactional pgoutput Message outside a transaction"))
-         (let ((prefix (logical-wire-cstring cursor)) (size (logical-wire-uint cursor 4)))
-           (unless (and (<= size +max-logical-transaction-bytes+)
-                        (= size (logical-wire-cursor-remaining cursor)))
-             (error "invalid pgoutput Message content length"))
-           (list kind prefix lsn (logical-wire-text cursor size) (= flags 1)))))
+       (multiple-value-bind (prefix lsn content transactional-p) (logical-wire-message runtime cursor)
+         (list kind prefix lsn content transactional-p)))
       (otherwise (error "unsupported pgoutput message ~s" kind)))))
 
 (defun logical-read-stream-operation (runtime source)

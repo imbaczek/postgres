@@ -51,15 +51,19 @@
   (let ((value (pg-client-u64 bytes offset)))
     (if (logbitp 63 value) (- value #x10000000000000000) value)))
 
-(defstruct logical-wire-cursor stream remaining)
+(defstruct logical-wire-cursor stream remaining bytes)
 
 (defun logical-wire-byte (cursor)
-  (when (zerop (logical-wire-cursor-remaining cursor))
-    (error "truncated logical replication frame"))
-  (let ((byte (read-byte (logical-wire-cursor-stream cursor) nil nil)))
-    (unless byte (error "logical replication connection ended during a frame"))
-    (decf (logical-wire-cursor-remaining cursor))
-    byte))
+  (let ((remaining (logical-wire-cursor-remaining cursor))
+        (bytes (logical-wire-cursor-bytes cursor)))
+    (when (zerop remaining)
+      (error "truncated logical replication frame"))
+    (let ((byte (if bytes
+                    (aref bytes (- (length bytes) remaining))
+                    (read-byte (logical-wire-cursor-stream cursor) nil nil))))
+      (unless byte (error "logical replication connection ended during a frame"))
+      (decf (logical-wire-cursor-remaining cursor))
+      byte)))
 
 (defun logical-wire-uint (cursor size)
   (loop repeat size for value = (logical-wire-byte cursor)
@@ -67,15 +71,22 @@
         finally (return result)))
 
 (defun logical-wire-octets (cursor size)
-  (unless (<= size (logical-wire-cursor-remaining cursor))
-    (error "truncated logical replication value"))
-  (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
-    (loop for position = 0 then next
-          while (< position size)
-          for next = (read-sequence bytes (logical-wire-cursor-stream cursor) :start position)
-          do (when (= next position) (error "logical replication connection ended during a value"))
-             (decf (logical-wire-cursor-remaining cursor) (- next position)))
-    bytes))
+  (let ((remaining (logical-wire-cursor-remaining cursor))
+        (source (logical-wire-cursor-bytes cursor)))
+    (unless (<= size remaining)
+      (error "truncated logical replication value"))
+    (if source
+        (let* ((start (- (length source) remaining))
+               (bytes (subseq source start (+ start size))))
+          (decf (logical-wire-cursor-remaining cursor) size)
+          bytes)
+        (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+          (loop for position = 0 then next
+                while (< position size)
+                for next = (read-sequence bytes (logical-wire-cursor-stream cursor) :start position)
+                do (when (= next position) (error "logical replication connection ended during a value"))
+                   (decf (logical-wire-cursor-remaining cursor) (- next position)))
+          bytes))))
 
 (defun logical-wire-write-text (cursor size output &optional octet-consumer)
   "Validate SIZE UTF-8 bytes, writing decoded characters to OUTPUT when supplied.
@@ -109,8 +120,16 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
 
 (defun logical-wire-text (cursor size)
   "Decode a bounded UTF-8 field without retaining its complete octet vector."
-  (with-output-to-string (output)
-    (logical-wire-write-text cursor size output)))
+  (let ((source (logical-wire-cursor-bytes cursor)))
+    (if source
+        (let* ((remaining (logical-wire-cursor-remaining cursor))
+               (start (- (length source) remaining)))
+          (unless (<= size remaining)
+            (error "truncated logical replication value"))
+          (prog1 (bytes->string source :start start :end (+ start size))
+            (decf (logical-wire-cursor-remaining cursor) size)))
+        (with-output-to-string (output)
+          (logical-wire-write-text cursor size output)))))
 
 (defparameter *logical-wire-resident-field-budget* (* 4 1024 1024)
   "Conservative budget for retained field strings per receiver scope.")

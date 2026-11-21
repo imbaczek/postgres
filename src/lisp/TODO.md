@@ -207,6 +207,12 @@ read-lease tests passed. The SQL index regression checks indexed results
 against sequential results and verifies the DROP INDEX handoff using the
 reader's canonical relation-lock owner.
 
+The pgoutput subscriber decodes complete socket messages and in-memory replay
+through the same grammar. Stream fields retain their bounded spill and cleanup
+rules. In-memory text and binary fields own their values. The independent
+INSERT fixture uses the C tuple field order and checks null, unchanged TOAST,
+UTF-8 text, and binary data after overwriting the input bytes.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
