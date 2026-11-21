@@ -1985,6 +1985,21 @@ ROW's source environment.  Only final target origins leave this projection."
                       (funcall emit (car row)))))
       (close-cte-frame-cache (cdr frame)))))
 
+(defun project-physical-row (environment targets deferred set-node)
+  "Return the projected row and its origins for either execution driver."
+  (cond
+    (set-node (values environment *query-row-origins*))
+    (deferred (make-sort-project-input-row environment targets deferred))
+    (*datum-origin-capture*
+     (let ((values (make-array (length targets)))
+           (origins (make-array (length targets) :initial-element nil)))
+       (loop for target in targets for i from 0
+             do (multiple-value-bind (value origin)
+                    (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
+                  (setf (aref values i) value (aref origins i) origin)))
+       (values (cons values environment) origins)))
+    (t (values (make-select-result-row environment nil targets) nil))))
+
 (defun execute-physical-projection (node emit run-child)
   (let* ((targets (second node))
          (deferred (and *query-sort-project*
@@ -1995,25 +2010,13 @@ ROW's source environment.  Only final target origins leave this projection."
     (funcall run-child
              (third node)
              (lambda (environment)
-               (cond
-                 (set-node (funcall emit environment))
-                 (deferred
-                     (multiple-value-bind (row origins)
-                         (make-sort-project-input-row environment targets deferred)
+               (multiple-value-bind (row origins)
+                   (project-physical-row environment targets deferred set-node)
+                 (when (or set-node row)
+                   (if (and (not set-node) (or deferred *datum-origin-capture*))
                        (let ((*query-row-origins* origins))
-                         (funcall emit row))))
-                 (*datum-origin-capture*
-                  (let ((values (make-array (length targets)))
-                        (origins (make-array (length targets) :initial-element nil)))
-                    (loop for target in targets for i from 0
-                          do (multiple-value-bind (value origin)
-                                 (eval-expr-with-origin (getf target :expr) environment *query-row-origins*)
-                               (setf (aref values i) value (aref origins i) origin)))
-                    (let ((*query-row-origins* origins))
-                      (funcall emit (cons values environment)))))
-                 (t
-                  (let ((row (make-select-result-row environment nil targets)))
-                    (when row (funcall emit row)))))))))
+                         (funcall emit row))
+                       (funcall emit row))))))))
 
 (defun execute-physical-order (node emit run-child)
   (let* ((top-n-p (eq (first node) :top-n))

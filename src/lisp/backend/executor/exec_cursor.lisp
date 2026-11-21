@@ -672,29 +672,18 @@ source itself.  Closing the result closes the sort and its source."
       (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))
       :preserve-toast-context t))
     (:project
-     (let* ((deferred (and *query-sort-project*
+     (let* ((targets (second node))
+            (deferred (and *query-sort-project*
                            (eq node (car *query-sort-project*))
                            (cdr *query-sort-project*)))
             (set-node (and (null deferred) (project-set-projection-node node)))
-            (*query-project-set* (and set-node (cons set-node (second node)))))
+            (*query-project-set* (and set-node (cons set-node targets))))
        (make-mapping-sql-iterator
         (make-physical-plan-iterator (third node) relations)
         (lambda (row)
-          (cond
-            (set-node (values row t *query-row-origins*))
-            (deferred
-                (multiple-value-bind (projected origins)
-                    (make-sort-project-input-row row (second node) deferred)
-                  (values projected t origins)))
-            (*datum-origin-capture*
-             (let ((values (make-array (length (second node))))
-                   (origins (make-array (length (second node)) :initial-element nil)))
-               (loop for target in (second node) for i from 0
-                     do (multiple-value-bind (value origin)
-                            (eval-expr-with-origin (getf target :expr) row *query-row-origins*)
-                          (setf (aref values i) value (aref origins i) origin)))
-               (values (cons values row) t origins)))
-            (t (values (make-select-result-row row nil (second node)) t nil)))))))
+          (multiple-value-bind (projected origins)
+              (project-physical-row row targets deferred set-node)
+            (values projected t origins))))))
     (:window-input
      (make-mapping-sql-iterator
       (make-physical-plan-iterator (third node) relations)
