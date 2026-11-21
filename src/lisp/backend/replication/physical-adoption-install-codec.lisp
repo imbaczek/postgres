@@ -139,7 +139,7 @@
   (let* ((plan (physical-adoption-install-copy plan))
          (body (string->bytes (physical-bootstrap-manifest-text plan)))
          (crc (wal-crc32 body))
-         (header (string->bytes (format nil "PGADOPTIONINSTALL1 ~d ~8,'0X~%" (length body) crc)))
+         (header (metadata-sized-literal-header "PGADOPTIONINSTALL1" (length body) crc))
          (image (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
     (unless (and (typep step '(integer 0 200001)) (<= step (physical-adoption-install-last-step plan))
                  (<= (length body) +physical-adoption-install-body-maximum+))
@@ -153,38 +153,20 @@
     image))
 
 (defun physical-adoption-install-decode (bytes)
-  "Decode a bounded adoption installation journal from stable BYTES.
-Validate the body checksum and canonical encoding before trusting progress.
-The returned plan is detached from BYTES; compute its last step once and match
-each bounded progress span against the scratch prefix, including partial tails."
-  (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (<= (length bytes) +physical-adoption-install-maximum-bytes+))
-    (error "invalid or oversized adoption installation journal"))
-  (let* ((newline (position 10 bytes :end (min 64 (length bytes))))
-         (parts (and newline (uiop:split-string (bytes->string bytes :end newline) :separator " "))))
-    (unless (and (= 3 (length parts)) (equal "PGADOPTIONINSTALL1" (first parts))
-                 (plusp (length (second parts))) (every #'digit-char-p (second parts))
-                 (= 8 (length (third parts))))
-      (error "invalid adoption installation header"))
-    (let* ((size (parse-integer (second parts)))
-           (crc (parse-integer (third parts) :radix 16))
-           (start (1+ newline))
-           (end (+ start size)))
-      (unless (and (<= 1 size +physical-adoption-install-body-maximum+)
-                   (< end (length bytes)) (= 10 (aref bytes end))
-                   (= crc (wal-crc32 bytes start end))
-                   (equal (bytes->string bytes :end start)
-                          (format nil "PGADOPTIONINSTALL1 ~d ~8,'0X~%" size crc)))
-        (error "adoption installation header or checksum mismatch"))
-      (let* ((plan (physical-adoption-install-copy
-                    (recovery-parse-manifest-text (bytes->string bytes :start start :end end))))
-             (header-length (1+ end)))
-        (unless (null (mismatch bytes (string->bytes (physical-bootstrap-manifest-text plan))
-                                :start1 start :end1 end))
-          (error "noncanonical adoption installation body"))
-        (multiple-value-bind (step valid-length partial)
-            (physical-install-read-progress bytes header-length crc
-                                            (physical-adoption-install-last-step plan)
-                                            "adoption installation")
-          (list :plan plan :step step :valid-length valid-length :file-size (length bytes)
-                :header-length header-length :body-crc crc :partial partial))))))
+  "Read a validated adoption installation plan and its complete or partial progress."
+  (multiple-value-bind (start end crc)
+      (metadata-sized-literal-span bytes "PGADOPTIONINSTALL1" +physical-adoption-install-maximum-bytes+
+                                   +physical-adoption-install-body-maximum+ "adoption installation journal"
+                                   :maximum-header 64)
+    (let* ((plan (physical-adoption-install-copy
+                  (recovery-parse-manifest-text (bytes->string bytes :start start :end end))))
+           (header-length (1+ end)))
+      (when (mismatch bytes (string->bytes (physical-bootstrap-manifest-text plan))
+                      :start1 start :end1 end)
+        (error "noncanonical adoption installation body"))
+      (multiple-value-bind (step valid-length partial)
+          (physical-install-read-progress bytes header-length crc
+                                          (physical-adoption-install-last-step plan)
+                                          "adoption installation")
+        (list :plan plan :step step :valid-length valid-length :file-size (length bytes)
+              :header-length header-length :body-crc crc :partial partial)))))

@@ -34,3 +34,32 @@
     (unless (equalp bytes (metadata-literal-envelope-image magic record maximum label))
       (error "noncanonical ~a record" label))
     record))
+
+(defun metadata-sized-literal-header (magic size crc)
+  "Encode the canonical sized header for a literal or journal body."
+  (string->bytes (format nil "~a ~d ~8,'0X~%" magic size crc)))
+
+(defun metadata-sized-literal-span (bytes magic maximum maximum-body label
+                                    &key maximum-header maximum-size-digits)
+  "Validate a sized header and body checksum, returning body start, end and CRC.
+The caller validates the literal schema and any bytes after the body's newline."
+  (unless (and (typep bytes '(vector (unsigned-byte 8))) (<= (length bytes) maximum))
+    (error "invalid or oversized ~a" label))
+  (let* ((limit (if maximum-header (min maximum-header (length bytes)) (length bytes)))
+         (newline (position 10 bytes :end limit))
+         (parts (and newline (uiop:split-string (bytes->string bytes :end newline) :separator " "))))
+    (unless (and (= 3 (length parts)) (equal magic (first parts))
+                 (plusp (length (second parts)))
+                 (or (null maximum-size-digits) (<= (length (second parts)) maximum-size-digits))
+                 (every #'digit-char-p (second parts)) (= 8 (length (third parts))))
+      (error "invalid ~a header" label))
+    (let* ((size (parse-integer (second parts)))
+           (crc (parse-integer (third parts) :radix 16))
+           (start (1+ newline))
+           (end (+ start size)))
+      (unless (and (<= 1 size maximum-body)
+                   (< end (length bytes)) (= 10 (aref bytes end))
+                   (= crc (wal-crc32 bytes start end))
+                   (not (mismatch bytes (metadata-sized-literal-header magic size crc) :end1 start)))
+        (error "~a length or checksum mismatch" label))
+      (values start end crc))))
