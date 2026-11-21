@@ -139,12 +139,12 @@
 
 (deftest same-timeline-proof-extension-preserves-descendant-anchor-identity
     ;; Independent CRC32C (reflected polynomial #x82F63B78) and UTF-8/FNV-1a fixtures.
-    ;; The supported v7 frame layout retains its own identity; the encoder emits v8.
+    ;; A checksummed retired EOR frame cannot authorize a follow anchor.
     (let ((legacy (follow-anchor-request 123 456)))
       (setf (getf legacy :eor-octets)
             '(80 71 87 76 7 0 13 0 56 0 0 0 96 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
               101 216 18 143 42 0 0 0 0 0 0 0 2 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0))
-      (ok (= 11258429459462708627 (pg::physical-follow-anchor-digest legacy))))
+      (ok (signals (pg::physical-follow-anchor-check legacy) 'error)))
   (ok (= 2211786516971929622
          (pg::physical-follow-anchor-digest (follow-anchor-request 123 456))))
   (ok (= 15813853048420144424

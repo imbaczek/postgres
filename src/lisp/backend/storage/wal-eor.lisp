@@ -35,7 +35,7 @@
 (defun wal-end-of-recovery-record-info (record)
   "Validate syntax only; history, minimum recovery and writer authority are separate."
   (unless (and (= (wal-record-type record) +wal-record-end-of-recovery+)
-               (>= (wal-record-version record) 7)
+               (= (wal-record-version record) +wal-version+)
                (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))

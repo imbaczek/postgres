@@ -125,7 +125,7 @@ capacity is twice N. The default autovacuum slot count is 16."
   "Validate a native version 8 parameter terminal and decode its tuple.
 This record is not PostgreSQL C physical WAL."
   (unless (and (= (wal-record-type record) +wal-record-parameter-change+)
-               (>= (wal-record-version record) 8)
+               (= (wal-record-version record) +wal-version+)
                (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))

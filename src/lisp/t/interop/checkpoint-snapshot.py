@@ -80,10 +80,7 @@ def read_copy(pgdata):
         stream.seek(facts["start"] % 16777216)
         record = bytearray(stream.read(32 + len(data)))
     magic, wal_version, kind, size, start, xid, crc = struct.unpack_from("<4sHHIQQI", record)
-    assert wal_version in (6, 7, 8)
-    assert wal_version >= 7 or data[:8] == b"PGCKPT01"
-    assert wal_version >= 8 or len(data) == 88
-    assert wal_version >= 8 or not int.from_bytes(data[84:88], "little") & 40
+    assert wal_version == 8
     assert (magic, kind, size, start, xid) == (b"PGWL", 4, 32 + len(data), facts["start"], 0)
     struct.pack_into("<I", record, 28, 0)
     assert crc32c(record) == crc and record[32:] == data
@@ -99,7 +96,7 @@ def check_stopped(pgdata):
     raise AssertionError("fixture conversion requires a stopped, owned test server")
 
 
-def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False):
+def convert_fixture(pgdata, facts, payload, retired_wal, unsupported_insertion=False):
     """Only the shell regression calls this, after killing and waiting its PID."""
     check_stopped(pgdata)
     assert facts["timeline"] == facts["previous"] == 1
@@ -108,20 +105,20 @@ def convert_fixture(pgdata, facts, payload, legacy, unsupported_insertion=False)
     assert int(fields[1]) == int(fields[2]) == facts["end"]
     if unsupported_insertion:
         prefix = f"PGWAL5 {facts['end']} {facts['end']} 2 1 {payload}"
-    elif legacy:
+    elif retired_wal:
         segment = pgdata / f"pg_wal/{facts['start'] // 16777216:016X}.wal"
-        assert sorted((pgdata / "pg_wal").glob("*.wal"))[-1] == segment
-        header = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 5, 4, 32, facts["start"], 0, 0))
-        struct.pack_into("<I", header, 28, crc32c(header))
+        offset = facts["start"] % 16777216
         with segment.open("r+b") as stream:
-            assert stream.seek(0, 2) == facts["end"] - facts["start"] // 16777216 * 16777216
-            stream.seek(facts["start"] % 16777216)
-            stream.write(header)
-            stream.truncate()
+            stream.seek(offset)
+            record = bytearray(stream.read(facts["end"] - facts["start"]))
+            struct.pack_into("<H", record, 4, 7)
+            struct.pack_into("<I", record, 28, 0)
+            struct.pack_into("<I", record, 28, crc32c(record))
+            stream.seek(offset)
+            stream.write(record)
             stream.flush()
             os.fsync(stream.fileno())
-        end = facts["start"] + 32
-        prefix = f"PGWAL3 {end} {end}"
+        return
     else:
         data = bytearray.fromhex(payload)
         struct.pack_into("<q", data, 56, facts["time"] + 1)
@@ -139,13 +136,13 @@ def main():
     parser.add_argument("--expect", type=Path)
     parser.add_argument("--hex", action="store_true")
     fixture = parser.add_mutually_exclusive_group()
-    fixture.add_argument("--legacy-fixture", action="store_true")
+    fixture.add_argument("--retired-wal-fixture", action="store_true")
     fixture.add_argument("--corrupt-copy-fixture", action="store_true")
     fixture.add_argument("--unsupported-insertion-fixture", action="store_true")
     args = parser.parse_args()
     facts, payload = read_copy(args.pgdata)
-    if args.legacy_fixture or args.corrupt_copy_fixture or args.unsupported_insertion_fixture:
-        convert_fixture(pgdata=args.pgdata, facts=facts, payload=payload, legacy=args.legacy_fixture,
+    if args.retired_wal_fixture or args.corrupt_copy_fixture or args.unsupported_insertion_fixture:
+        convert_fixture(pgdata=args.pgdata, facts=facts, payload=payload, retired_wal=args.retired_wal_fixture,
                         unsupported_insertion=args.unsupported_insertion_fixture)
         return
     if args.expect:

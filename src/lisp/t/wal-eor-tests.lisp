@@ -30,7 +30,7 @@
       (ok (= 32 pg::*last-replay-lsn* pg::*wal-durable-lsn*))))
 
 (deftest eor-is-invalid-in-older-native-record-formats-even-with-valid-crc
-    (loop for version from 2 to 6
+    (loop for version from 2 below pg::+wal-version+
           do (let ((bytes (eor-test-frame)))
                (pg::wal-set-u16 bytes 4 version)
                (eor-test-restamp bytes)

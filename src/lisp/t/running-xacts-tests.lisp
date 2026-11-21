@@ -134,7 +134,7 @@
         (setf (first bad) :unexpected)
         (ok (intake-fails-p (lambda () (pg::running-xacts-check-state bad)))))))
 
-(deftest running-xacts-native-record-requires-v7-and-empty-metadata-batch
+(deftest running-xacts-native-record-requires-wal8-and-empty-metadata-batch
     (let* ((payload (pg::wal-encode-running-xacts 10 '(3 9) t))
            (bytes (pg::wal-encode-record pg::+wal-record-running-xacts+ 0 32 payload))
            (record (pg::wal-decode-record bytes 32)))
@@ -151,7 +151,7 @@
                     (list pg::+wal-record-running-xacts+ payload))))))
       (setf (pg::wal-record-xid record) 3)
       (ok (intake-fails-p (lambda () (pg::wal-running-xacts-record-info record))))
-      (pg::wal-set-u16 bytes 4 6)
+      (pg::wal-set-u16 bytes 4 7)
       (pg::wal-set-u32 bytes 28 0)
       (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
       (ok (intake-fails-p (lambda () (pg::wal-decode-record bytes 32))))))

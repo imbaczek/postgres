@@ -188,7 +188,7 @@ NIL state stays unknown until an anchor. Inferred XIDs may already have aborted.
 (defun wal-running-xacts-record-info (record)
   "Validate a native record and return its decoded snapshot."
   (unless (and (= (wal-record-type record) +wal-record-running-xacts+)
-               (>= (wal-record-version record) 7)
+               (= (wal-record-version record) +wal-version+)
                (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))

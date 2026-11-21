@@ -45,10 +45,10 @@ not its end. A timeline number alone does not prove ancestry."
 
 (defun wal-require-boolean-change-envelope (record type size)
   "Validate the shared Boolean terminal envelope for TYPE and payload SIZE.
-Require WAL version 8 or newer, XID zero, exact record size and one segment.
+Require the current WAL version, XID zero, exact record size and one segment.
 The caller's payload decoder validates the payload itself."
   (unless (and (= (wal-record-type record) type)
-               (>= (wal-record-version record) 8) (zerop (wal-record-xid record))
+               (= (wal-record-version record) +wal-version+) (zerop (wal-record-xid record))
                (typep (wal-record-start record) '(unsigned-byte 64))
                (typep (wal-record-end record) '(unsigned-byte 64))
                (= (wal-record-end record) (+ (wal-record-start record) +wal-header-size+ size))

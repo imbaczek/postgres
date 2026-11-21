@@ -14,13 +14,13 @@
                      (make-array length :element-type '(unsigned-byte 8) :initial-element 0)))))))
 
 (deftest wal-xid-reservation-record-requires-new-format-and-no-transaction
-    (let ((record (pg::make-wal-record :version 7 :type pg::+wal-record-xid-reservation+
+    (let ((record (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-xid-reservation+
                                        :start 32 :end 72 :xid 0
                                        :payload (pg::wal-encode-xid-reservation 1002))))
       (ok (= 1002 (pg::wal-xid-reservation-record-bound record)))
-      (setf (pg::wal-record-version record) 6)
+      (setf (pg::wal-record-version record) 7)
       (ok (intake-fails-p (lambda () (pg::wal-xid-reservation-record-bound record))))
-      (setf (pg::wal-record-version record) 7 (pg::wal-record-xid record) 3)
+      (setf (pg::wal-record-version record) pg::+wal-version+ (pg::wal-record-xid record) 3)
       (ok (intake-fails-p (lambda () (pg::wal-xid-reservation-record-bound record))))
       (setf (pg::wal-record-xid record) 0 (pg::wal-record-end record) 73)
       (ok (intake-fails-p (lambda () (pg::wal-xid-reservation-record-bound record))))
@@ -868,10 +868,10 @@
              (before (pg::recovery-read-bytes (pg::control-path))))
          (pg::with-physical-replay-staging ()
            (pg::wal-replay-record
-            (pg::make-wal-record :version 7 :type pg::+wal-record-batch-start+
+            (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-batch-start+
                                  :start 0 :end 32 :xid 0 :payload (empty-octets)))
            (pg::wal-replay-record
-            (pg::make-wal-record :version 7 :type pg::+wal-record-xid-reservation+
+            (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-xid-reservation+
                                  :start 32 :end 72 :xid 0
                                  :payload (pg::wal-encode-xid-reservation 2002))))
          (ok (= 50 pg::*next-xid* pg::*xid-batch-end*))
