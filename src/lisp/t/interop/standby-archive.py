@@ -59,7 +59,10 @@ def check_primary_archive_handoff(node, port, data, archive, attempts, command, 
     assert int.from_bytes(proof[32:40], "little") == end
     new_attempts = attempts.read_text().splitlines()[len(previous_attempts):]
     assert child in new_attempts and proof_name in new_attempts
-    assert not any(name.startswith("00000001") for name in new_attempts)
+    # The promoted writer can finish archiving the staged partial at the fork.
+    # Complete parent segments and their proofs were already archived.
+    assert not any(name.startswith("00000001") and name.endswith((".wal", ".wal.proof"))
+                   for name in new_attempts)
     return last
 
 
