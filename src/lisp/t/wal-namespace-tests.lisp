@@ -80,7 +80,8 @@
      (lambda ()
        ;; Reserve real WAL bytes without retaining a transaction across restart.
        (pg::release-xid (pg::assign-xid))
-       (funcall function)))))
+       (funcall function))
+     :legacy-namespace t)))
 
 (defun migrate-test-wal-namespace ()
   (pg::with-write-lock
