@@ -97,35 +97,46 @@
               (id (getf (getf (seventh fields) :retained-reference) :root-id)))
          (when id (list (physical-promotion-retained-owner :primary) id)))))))
 
-(defun logical-slot-imported-restore-receive-retained (root proof)
-  "Restore a surviving receive selection without writing or trimming the spool."
+(defun call-with-logical-slot-imported-receive-retained (root proof function)
+  "Restore the receive selection and call FUNCTION while holding spool ownership."
   (let ((path (slot-state-fd-path root "pg_physical_receive")))
     (with-slot-state-directory (receive-fd path t)
-      (when (and receive-fd
-                 (slot-state-lstat (slot-state-fd-path receive-fd "receive.control")))
-        (let* ((certificate (getf (logical-slot-copy-check-source-proof proof) :certificate))
-               (system-id (getf certificate :system-id))
-               (identity (physical-promotion-retained-identity
-                          system-id (getf certificate :retained-reference))))
-          (call-with-logical-slot-imported-archive-directory
-           root
-           (lambda (archive-fd facts)
-             (declare (ignore facts))
-             (let ((store nil))
-               (unwind-protect
-                    (progn
-                      (physical-store-open
-                       (physical-image-fd-path receive-fd) system-id (getf identity :base-timeline)
-                       :discard-tail nil :create-lock nil :retained-identity identity
-                       :retained-directory (physical-image-fd-path archive-fd)
-                       :expected-archive-key (physical-retained-archive-key archive-fd)
-                       :on-open (lambda (opened) (setf store opened)))
-                      (physical-retained-check-archive-binding
-                       (merge-pathnames "pg_physical_receive/" (physical-image-fd-path root))
-                       receive-fd)
-                      (let ((id (physical-store-retained-root store)))
-                        (when id (list (physical-store-retained-owner store) id))))
-                 (when store (physical-store-close store)))))))))))
+      (if (and receive-fd
+               (slot-state-lstat (slot-state-fd-path receive-fd "receive.control")))
+          (let* ((certificate (getf (logical-slot-copy-check-source-proof proof) :certificate))
+                 (system-id (getf certificate :system-id))
+                 (identity (physical-promotion-retained-identity
+                            system-id (getf certificate :retained-reference))))
+            (call-with-logical-slot-imported-archive-directory
+             root
+             (lambda (archive-fd facts)
+               (declare (ignore facts))
+               (let ((store nil))
+                 (unwind-protect
+                      (progn
+                        (physical-store-open
+                         (physical-image-fd-path receive-fd) system-id (getf identity :base-timeline)
+                         :discard-tail nil :create-lock nil :retained-identity identity
+                         :retained-directory (physical-image-fd-path archive-fd)
+                         :expected-archive-key (physical-retained-archive-key archive-fd)
+                         :on-open (lambda (opened) (setf store opened)))
+                        (let ((snapshot (physical-store-control-snapshot store)))
+                          (flet ((check ()
+                                   (physical-retained-check-archive-binding
+                                    (merge-pathnames "pg_physical_receive/" (physical-image-fd-path root))
+                                    receive-fd)
+                                   (physical-store-check-held-lock store)
+                                   (physical-store-read-retained-control store snapshot)))
+                            (check)
+                            (let* ((id (physical-store-retained-root store))
+                                   (selection (when id (list (physical-store-retained-owner store) id))))
+                              (multiple-value-prog1 (funcall function selection #'check)
+                                (check))))))
+                   (when store (physical-store-close store)))))))
+          (funcall function nil
+                   (lambda ()
+                     (when (slot-state-lstat (slot-state-fd-path root "pg_physical_receive/receive.control"))
+                       (error "receive control appeared after observing its absence"))))))))
 
 (defun logical-slot-imported-restore-startup-retained (gate ownership proof)
   "Restore current primary and surviving receive roots before slot loading."
@@ -136,31 +147,40 @@
       owner
       (lambda (root path)
         (declare (ignore path))
-        (remove nil (list (logical-slot-imported-restore-primary-retained root)
-                          (logical-slot-imported-restore-receive-retained root proof))))))))
+        (list (logical-slot-imported-restore-primary-retained root)
+              (call-with-logical-slot-imported-receive-retained
+               root proof (lambda (selection check) (funcall check) selection))))))))
 
-(defun logical-slot-imported-check-startup-retained (gate ownership selections)
-  "Verify primary, receive and historical root registrations after slot restoration."
-  (call-with-logical-slot-imported-host-startup-owner
-   gate ownership
-   (lambda (owner)
-     (call-with-physical-directory-root
-      owner
-      (lambda (root path)
-        (declare (ignore path))
-        (call-with-physical-image-owned-context
-         root t
-         (lambda (context)
-           (let ((origin (logical-slot-continuation-storage-startup-origin owner context)))
-             (call-with-logical-slot-imported-archive-directory
-              root
-              (lambda (archive-fd facts)
-                (declare (ignore facts))
-                (let ((archive-key (physical-retained-archive-key archive-fd)))
-                  (sb-thread:with-mutex (*wal-lock*)
-                    (logical-slot-imported-host-startup-under-lock owner)
-                    (multiple-value-bind (token reference)
-                        (logical-slot-imported-host-origin-call origin :selection)
-                      (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
-                        (physical-retained-check-required-roots-under-lock
-                         archive-key (cons (list token (getf reference :root-id)) selections))))))))))))))))
+(defun logical-slot-imported-check-startup-retained (gate ownership proof selections)
+  "Verify root registrations after slot restoration with the receive control held."
+  (destructuring-bind (primary expected-receive) selections
+    (call-with-logical-slot-imported-host-startup-owner
+     gate ownership
+     (lambda (owner)
+       (call-with-physical-directory-root
+        owner
+        (lambda (root path)
+          (declare (ignore path))
+          (call-with-logical-slot-imported-receive-retained
+           root proof
+           (lambda (receive check-receive)
+             (unless (equal receive expected-receive)
+               (error "receive root changed during imported startup"))
+             (call-with-physical-image-owned-context
+              root t
+              (lambda (context)
+                (let ((origin (logical-slot-continuation-storage-startup-origin owner context)))
+                  (call-with-logical-slot-imported-archive-directory
+                   root
+                   (lambda (archive-fd facts)
+                     (declare (ignore facts))
+                     (let ((archive-key (physical-retained-archive-key archive-fd)))
+                       (sb-thread:with-mutex (*wal-lock*)
+                         (logical-slot-imported-host-startup-under-lock owner)
+                         (funcall check-receive)
+                         (multiple-value-bind (token reference)
+                             (logical-slot-imported-host-origin-call origin :selection)
+                           (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
+                             (physical-retained-check-required-roots-under-lock
+                              archive-key (remove nil (list (list token (getf reference :root-id))
+                                                            primary receive))))))))))))))))))))

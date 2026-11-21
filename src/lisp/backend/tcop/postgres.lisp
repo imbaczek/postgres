@@ -1008,7 +1008,8 @@ Hold the drained admission gate and borrow the real postmaster ownership."
                                  gate-owner ownership (getf (getf imported-startup :inputs) :proof)))))
               (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
               (when imported-startup
-                (logical-slot-imported-check-startup-retained gate-owner ownership selections)))
+                (logical-slot-imported-check-startup-retained
+                 gate-owner ownership (getf (getf imported-startup :inputs) :proof) selections)))
             (check-primary-feedback-after-replay reset-boundary))
           (if initialize (catalog-init :initialize t) (catalog-init))
           (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
