@@ -39,6 +39,25 @@ test_wait_owned_sql_server() {
     return 1
 }
 
+# Launch within the caller's private fixture directory. The caller records
+# $! before waiting for readiness so its cleanup trap also covers startup failure.
+test_launch_lisp_server() {
+    rm -f "$3" || return
+    "$BASE/pg-lisp.sh" -p "$1" -D "$2" --control-socket "$3" >>"$4" 2>&1 &
+}
+
+test_lisp_control() {
+    printf '%s\n(quit)\n' "$2" | "${SBCL:-sbcl}" --script "$BASE/t/control-client.lisp" unix "$1"
+}
+
+test_lisp_control_checked() {
+    test_lisp_control "$1" "$2" >"$3" || return
+    if grep -Eq ';; (read )?error:' "$3"; then
+        cat "$3" >&2
+        return 1
+    fi
+}
+
 # EXPLAIN emits a tree, so check for a node as an indented exact line instead
 # of comparing the full plan output to a single scan node.
 plan_contains_indented_node() {

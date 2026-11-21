@@ -15,11 +15,10 @@ sql() {
         -qAt -v ON_ERROR_STOP=1 "$@"
 }
 control() {
-    printf '%s\n(quit)\n' "$2" | "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock"
+    test_lisp_control "$TMP/$1.sock" "$2"
 }
 checked() {
-    control "$1" "$2" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log"
 }
 cleanup() {
     status=$?
@@ -36,16 +35,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 start_source() {
-    rm -f "$TMP/source.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" \
-        --control-socket "$TMP/source.sock" >>"$TMP/source.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
     SOURCE=$!
     test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 }
 start_target() {
-    rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
-        --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    test_launch_lisp_server "$TARGET_PORT" "$TMP/copy" "$TMP/target.sock" "$TMP/target.log"
     TARGET=$!
     # Before local R publication this fixture has over 30 MiB to replay;
     # later restarts must also work after its original receive segment is gone.
@@ -68,6 +63,7 @@ sql "$PORT" -c "CREATE TABLE data (id integer PRIMARY KEY,payload varchar(120));
 checked source "(physical-base-backup \"$TMP/copy/\" \"advance\")" backup
 checked source '(format t "OLDSEG=~d~%" (floor (physical-source-pin-restart-lsn (gethash "advance" *physical-source-pins*)) +wal-segment-size+))' old-segment
 old_segment=$(awk -F= '/OLDSEG=/{print $2}' "$TMP/old-segment.log")
+printf "checkpoint_timeout = '300s'\nmax_wal_size = '2MB'\n" >"$TMP/copy/postgresql.auto.conf"
 start_target
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"advance\")" follow
 mkfifo "$TMP/tx.fifo"
@@ -85,9 +81,11 @@ attempt=0
 while ! grep -q '^12345$' "$TMP/tx.log"; do
     attempt=$((attempt + 1)); test "$attempt" -lt 100; sleep 0.1
 done
+# A repeatable-read snapshot can coexist with row redo. Pause apply explicitly
+# to make the receive-versus-replay boundary independent of that snapshot.
+sql "$TARGET_PORT" -c 'SELECT pg_wal_replay_pause()' >/dev/null
 replay_before=$(sql "$TARGET_PORT" -c 'SELECT pg_last_wal_replay_lsn()')
-# A due automatic restartpoint must use applied progress, not receive flush.
-checked target '(setf *physical-restartpoint-timeout* 300 *physical-restartpoint-wal-bytes* 1)' automatic-byte-trigger
+# The configured byte trigger must use applied progress, not receive flush.
 python3 - "$TMP/writes.sql" <<'PY'
 import sys
 with open(sys.argv[1], "w") as stream:
@@ -122,6 +120,7 @@ printf 'COMMIT;\n\\q\n' >&7
 exec 7>&-
 wait "$TX"
 TX=
+sql "$TARGET_PORT" -c 'SELECT pg_wal_replay_resume()' >/dev/null
 wait_target 'SELECT count(*) FROM data' 1802
 sql "$TARGET_PORT" -c 'SELECT id,payload FROM data ORDER BY id' >"$TMP/actual.rows"
 diff -u "$TMP/expected.rows" "$TMP/actual.rows"
@@ -132,7 +131,7 @@ while :; do
     if ! grep -q ';; error:' "$TMP/local-recycled.log"; then break; fi
     attempt=$((attempt + 1)); test "$attempt" -lt 200; sleep 0.1
 done
-checked target '(setf *physical-restartpoint-wal-bytes* (* 1024 1024 1024))' reset-byte-trigger
+printf "checkpoint_timeout = '300s'\nmax_wal_size = '1GB'\n" >"$TMP/copy/postgresql.auto.conf"
 checked target '(reload)' restartpoint-reload
 kill -KILL "$TARGET"
 wait "$TARGET" 2>/dev/null || :
@@ -144,9 +143,15 @@ diff -u "$TMP/expected.rows" "$TMP/restarted.rows"
 # A capped, disconnected consumer becomes durably lost rather than advancing
 # past data it has never flushed. It must not prevent primary startup.
 checked target '(physical-follow-stop)' stop
-checked source '(setf *max-slot-wal-keep-bytes* 0)' cap
+printf "max_slot_wal_keep_size = '0MB'\n" >"$TMP/source/postgresql.auto.conf"
+checked source '(assert (configuration-reload-step))' cap
 checked source '(setf *physical-source-test-hook* (lambda (point pin) (when (and (eq point :after-save) (physical-source-pin-lost-p pin)) (sb-posix:kill (sb-posix:getpid) sb-posix:sigkill))))' lost-crash-hook
 sql "$PORT" -c "INSERT INTO data VALUES (9999,'unreceived'); CHECKPOINT" >"$TMP/lost-writer.log" 2>&1 || :
+attempt=0
+while kill -0 "$SOURCE" 2>/dev/null; do
+    case $(ps -o stat= -p "$SOURCE" 2>/dev/null || :) in Z*|'') break;; esac
+    attempt=$((attempt + 1)); test "$attempt" -lt 200; sleep 0.1
+done
 crash_status=0
 wait "$SOURCE" 2>/dev/null || crash_status=$?
 test "$crash_status" -eq 137
