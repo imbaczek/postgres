@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from binary_values import parse
+from returning_portals import bind, close_portal, compare, execute, expect_kinds
 from subqueries import QueryConnection
 from subqueries_concurrency import control, spill_counter, assert_no_spill_files
 
@@ -144,6 +146,31 @@ for trial in range(30):
     CASES.append(f"SELECT id,sum(v) OVER(PARTITION BY g ORDER BY {ordering} {mode} BETWEEN UNBOUNDED PRECEDING AND {tail}),rank() OVER(PARTITION BY g ORDER BY v),dense_rank() OVER(PARTITION BY g ORDER BY v) FROM ({source}) d ORDER BY id")
 
 
+def check_resumed_windows(peers):
+    name = b"window_portal"
+    sql_prefix = "SELECT id,rank() OVER w,dense_rank() OVER w,sum(v) OVER w FROM win_input WINDOW w AS "
+    for frame in ("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                  "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                  "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"):
+        sql = sql_prefix + f"(PARTITION BY g ORDER BY v {frame}) ORDER BY g,v,id"
+        expected = peers[0].query(sql)
+        for peer in peers:
+            peer.query("BEGIN")
+        expect_kinds(compare(peers, [parse(sql, ()), bind((), portal=name)],
+                             frame), [b"1", b"2", b"Z"])
+        rows = []
+        for _ in expected:
+            result = compare(peers, [execute(1, name)], frame)
+            expect_kinds(result, [b"D", b"s", b"Z"])
+            rows.append(peers[0].data_row(result[0][1]))
+        assert rows == expected, (frame, rows, expected)
+        expect_kinds(compare(peers, [execute(1, name)], frame), [b"C", b"Z"])
+        expect_kinds(compare(peers, [close_portal(name)], frame), [b"3", b"Z"])
+        for peer in peers:
+            peer.query("COMMIT")
+    print("windows: resumed ROWS, RANGE peers and whole partitions PASS", flush=True)
+
+
 def check(reference_port, native_port, base, socket):
     peers = [QueryConnection(reference_port, "windows"), QueryConnection(native_port, "windows")]
     try:
@@ -155,6 +182,7 @@ def check(reference_port, native_port, base, socket):
             assert results[0] == results[1], (index, sql, results)
             print(f"windows: {index}: PASS", flush=True)
         print(f"windows: {len(CASES)} C differential cases PASS", flush=True)
+        check_resumed_windows(peers)
     finally:
         for peer in peers:
             peer.close()
