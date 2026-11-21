@@ -89,7 +89,7 @@
   (test-live-operation-gate)
   (test-live-operation-quiescence-ownership)
   (test-nested-control-repl-reload)
-  (test-legacy-live-operation-gate-call-shapes)
+  (test-live-operation-boolean-drain-predicates)
   (test-live-operation-entry-interrupt-cleanup)
   (test-simple-query-terminal-statement-drain)
   (test-cancel-query-waiting-for-live-operation-admission)

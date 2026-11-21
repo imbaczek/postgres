@@ -790,28 +790,13 @@
               thread (lambda () (error "nested reload test timed out"))))
             (ignore-errors (sb-thread:join-thread thread :timeout 2))))))))
 
-(defun test-legacy-live-operation-gate-call-shapes ()
+(defun test-live-operation-boolean-drain-predicates ()
   (let ((*live-operation-admission-open* nil)
         (*live-operation-drain-open* t))
     (check (eq (live-operation-admitted-p t) :drain)
-           "legacy boolean drain predicates remain supported")
+           "true boolean drain predicates admit the drain lane")
     (check (null (live-operation-admitted-p nil))
-           "legacy false drain predicates remain closed"))
-  (test-reset-live-operation-admission)
-  ;; Simulate the first reload from an image whose old close function knew
-  ;; nothing about owner tokens. The reload mutex identifies that old caller.
-  (let ((*live-operation-admission-open* nil)
-        (*live-operation-quiescence-owner* nil)
-        (*live-operation-quiescence-owner-thread* nil)
-        (*live-operation-drain-open* nil))
-    (sb-thread:with-mutex (*reload-run-lock*)
-      (adopt-legacy-live-operation-quiescence)
-      (check (eq *live-operation-quiescence-owner-thread*
-                 sb-thread:*current-thread*)
-             "the first reload adopts its ownerless closed gate")
-      (open-live-operation-admission)
-      (check *live-operation-admission-open*
-             "the first reload's legacy open call restores admission"))))
+           "false boolean drain predicates remain closed")))
 
 (defun test-live-operation-entry-interrupt-cleanup ()
   (let ((count-before *live-operation-count*)

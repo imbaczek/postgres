@@ -144,6 +144,10 @@ For B11, the backup and recovery readers require a version 3 manifest with
 an explicit checkpoint start. The schema rejects versions 1 and 2, missing
 checkpoint starts, and inconsistent checkpoint boundaries.
 
+For B13, restart the Lisp server across the gate representation cutover.
+The admission gate now closes and reopens with the current quiescence owner
+token. The load-time bridge for ownerless gates has been removed.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's
