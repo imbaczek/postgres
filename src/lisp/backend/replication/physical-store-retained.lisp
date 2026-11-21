@@ -135,16 +135,17 @@ The root update calls this outside the archive mutex."
         (error "receive control readback differs from its complete expected tuple")))
     (values (physical-store-retained-root probe) (physical-store-selection probe))))
 
-(defun physical-store-restore-retained-reference (store)
+(defun physical-store-restore-retained-reference (store &key expected-archive-key)
   "Restore or reconcile local root ownership from the store's durable control."
   (when (and (physical-store-retained-identity store)
              (uiop:directory-exists-p (physical-store-retained-directory store)))
     (physical-retained-root-reconcile
      (physical-store-retained-owner store) (physical-store-retained-directory store)
      (physical-store-retained-identity store) (physical-store-retained-history store)
-     (lambda () (physical-store-read-retained-control store (physical-store-control-snapshot store))))))
+     (lambda () (physical-store-read-retained-control store (physical-store-control-snapshot store)))
+     :expected-archive-key expected-archive-key)))
 
-(defun physical-store-check-retained-root (store)
+(defun physical-store-check-retained-root (store &key expected-archive-key)
   "Validate the referenced inventory and every image against the selected history.
 
 Require coverage from the base to the receive floor with the recorded digest,
@@ -157,5 +158,5 @@ then restore or reconcile the process-local reference. This preserves the root s
                    (physical-store-retained-directory store) (physical-store-retained-root store)
                    (physical-store-retained-identity store) history)))
       (physical-store-check-retained-coverage store (getf index :entries))))
-  (physical-store-restore-retained-reference store)
+  (physical-store-restore-retained-reference store :expected-archive-key expected-archive-key)
   t)

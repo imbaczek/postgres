@@ -541,7 +541,7 @@ is reported after releasing the mutex."
            stream)
       (unless stream (sb-posix:close fd)))))
 
-(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory on-open)
+(defun physical-store-open (directory system-id timeline &key create (start-lsn 0) (discard-tail t) (create-lock t) retained-identity retained-directory on-open expected-archive-key)
   "Own a native receive spool, creating only in an existing empty directory.
 CREATE never overwrites an old incarnation. Opening an existing spool validates
 its control, selected history, durable prefix and referenced inventory, then
@@ -594,7 +594,7 @@ interrupts briefly. Validation and scanning remain interruptible."
                (progn
                  (physical-store-load-control store)
                  (physical-store-validate-prefix store)
-                 (physical-store-check-retained-root store)
+                 (physical-store-check-retained-root store :expected-archive-key expected-archive-key)
                  (when discard-tail (physical-store-discard-tail store))))
            (setf (physical-store-decoder store)
                  (make-physical-wal-decoder :start-lsn (physical-store-flushed-lsn store)))

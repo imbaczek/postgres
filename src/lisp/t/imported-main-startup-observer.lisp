@@ -88,6 +88,13 @@
                   (assert (eql id (physical-retained-root-current
                                    (physical-promotion-retained-owner :primary))))
                   (format t "~&IMPORTED-MAIN-PRIMARY-ROOT ~d~%" id)))
+              (let* ((spool (physical-recovery-spool-directory))
+                     (control (merge-pathnames "receive.control" spool)))
+                (when (slot-state-lstat control)
+                  (let ((id (physical-retained-root-current
+                             (physical-store-retained-owner (%make-physical-store :directory spool)))))
+                    (when id
+                      (format t "~&IMPORTED-MAIN-RECEIVE-ROOT ~d~%" id)))))
               (assert (not (recovery-in-progress-p)))
               (if (plusp slots)
                   (progn

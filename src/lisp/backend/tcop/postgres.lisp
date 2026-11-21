@@ -1004,7 +1004,8 @@ Hold the drained admission gate and borrow the real postmaster ownership."
             ;; restoring slots, which can also remove temporary slot files.
             (check-primary-storage-startup-context gate-owner ownership)
             (when imported-startup
-              (logical-slot-imported-restore-primary-retained gate-owner ownership))
+              (logical-slot-imported-restore-startup-retained
+               gate-owner ownership (getf (getf imported-startup :inputs) :proof)))
             (wal-load-replication-slots :gate-owner gate-owner :ownership ownership)
             (check-primary-feedback-after-replay reset-boundary))
           (if initialize (catalog-init :initialize t) (catalog-init))
