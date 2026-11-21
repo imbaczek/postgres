@@ -263,34 +263,21 @@ present NIL is off and present T is on."
       snapshot)))
 
 (defun wal-checkpoint-record-snapshot (record)
-  "Validate a checkpoint terminal.  Legacy empty payloads have unknown metadata.
-Resource parameters, a commit timestamp pair, or a present full-page-writes
-or logical-decoding fact require WAL version 8 or newer, including when a
-Boolean fact is false."
+  "Decode the WAL8 checkpoint snapshot and bind it to the record coordinates."
   (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
+               (= (wal-record-version record) +wal-version+)
                (zerop (wal-record-xid record)))
     (error "invalid native checkpoint record"))
-  (if (zerop (length (wal-record-payload record)))
-      (progn
-        (unless (and (member (wal-record-version record) '(2 3 4 5))
-                     (= (wal-record-end record) (+ (wal-record-start record) +wal-header-size+)))
-          (error "invalid legacy checkpoint record boundary"))
-        nil)
-      (let ((snapshot (wal-decode-checkpoint-snapshot (wal-record-payload record))))
-        (unless (and (>= (wal-record-version record)
-                         (cond ((or (getf snapshot :resource-parameters)
-                                    (getf snapshot :oldest-commit-ts-xid)
-                                    (get-properties snapshot '(:full-page-writes :logical-decoding-enabled))) 8)
-                               ((= 2 (getf snapshot :version)) 7) (t 6)))
-                     (= (wal-record-start record) (getf snapshot :start))
-                     (= (wal-record-end record) (getf snapshot :end)))
-          (error "checkpoint snapshot differs from its WAL record"))
-        snapshot)))
+  (let ((snapshot (wal-decode-checkpoint-snapshot (wal-record-payload record))))
+    (unless (and (= (wal-record-start record) (getf snapshot :start))
+                 (= (wal-record-end record) (getf snapshot :end)))
+      (error "checkpoint snapshot differs from its WAL record"))
+    snapshot))
 
 (defun wal-read-checkpoint-record (start end)
   "Read the exact supported record length and validate the decoded snapshot."
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
-               (wal-checkpoint-record-length-p (- end start))
+               (wal-checkpoint-snapshot-length-p (- end start +wal-header-size+))
                (= (floor start +wal-segment-size+) (floor (1- end) +wal-segment-size+)))
     (error "invalid checkpoint record coordinates"))
   (let ((bytes (make-array (- end start) :element-type '(unsigned-byte 8)))

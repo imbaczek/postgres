@@ -435,22 +435,17 @@ Direct control operation; does not promote, follow a network source or coordinat
        (member (getf state :complete) '(nil t))))
 
 (defun physical-recovery-checkpoint-reservation (manifest record next-xid)
-  ;; Derive a base reservation from the supplied checkpoint without I/O or
-  ;; replay-state mutation.  Old record formats do not prove completeness.
-  (let* ((end (getf manifest :end))
-         (bound (1- (canonical-next-full-xid next-xid)))
-         (complete (>= (wal-record-version record) 7)))
-    (unless (and (= (wal-record-type record) +wal-record-checkpoint+)
-                 (zerop (wal-record-xid record))
-                 (= (wal-record-start record) (physical-manifest-checkpoint-start manifest))
+  "Derive the base reservation from the checkpoint and verified manifest."
+  (let ((end (getf manifest :end))
+        (bound (1- (canonical-next-full-xid next-xid)))
+        (snapshot (wal-checkpoint-record-snapshot record)))
+    (unless (and (= (wal-record-start record) (physical-manifest-checkpoint-start manifest))
                  (= (wal-record-end record) end))
       (error "base reservation record differs from checkpoint coordinates"))
-    (when complete
-      (let ((snapshot (wal-checkpoint-record-snapshot record)))
-        (unless (and (= bound (getf snapshot :xid-reserved-through))
-                     (= (getf manifest :next-xid) (getf snapshot :next-xid)))
-          (error "base XID counters differ from checkpoint"))))
-    (list :version 1 :through end :bound bound :complete complete)))
+    (unless (and (= bound (getf snapshot :xid-reserved-through))
+                 (= (getf manifest :next-xid) (getf snapshot :next-xid)))
+      (error "base XID counters differ from checkpoint"))
+    (list :version 1 :through end :bound bound :complete t)))
 
 (defun physical-recovery-initial-reservation (manifest)
   "Only after immutable base verification; old source formats do not prove coverage."

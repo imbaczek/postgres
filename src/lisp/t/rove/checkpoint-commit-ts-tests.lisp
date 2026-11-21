@@ -104,14 +104,14 @@
                 (wal-set-u32 bad offset 3)
                 (rove:ok (unit-commit-ts-error-p (lambda () (wal-decode-checkpoint-snapshot bad)))))))))))
 
-(rove:deftest checkpoint-commit-ts-requires-current-wal-and-keeps-legacy-records
+(rove:deftest checkpoint-commit-ts-requires-current-wal-and-keeps-legacy-snapshots
     (dolist (known '(nil t))
       (let* ((snapshot (unit-commit-ts-snapshot :known known))
              (payload (wal-encode-checkpoint-snapshot snapshot)))
         (dolist (version '(7 8))
           (let ((record (make-wal-record :version version :type +wal-record-checkpoint+
                                          :xid 0 :start 64 :end (getf snapshot :end) :payload payload)))
-            (if (and known (= version 7))
+            (if (/= version +wal-version+)
                 (rove:ok (unit-commit-ts-error-p (lambda () (wal-checkpoint-record-snapshot record))))
                 (rove:ok (equal snapshot (wal-checkpoint-record-snapshot record))))))))
   (let* ((snapshot (unit-commit-ts-snapshot))

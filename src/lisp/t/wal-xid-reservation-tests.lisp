@@ -989,7 +989,7 @@
            (snapshot (sample-checkpoint-snapshot :version 2 :next-xid actual
                                                  :xid-reserved-through 4294967298
                                                  :oldest-active-xid actual))
-           (record (pg::make-wal-record :version 7 :type pg::+wal-record-checkpoint+
+           (record (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-checkpoint+
                                         :start 32 :end 152 :xid 0
                                         :payload (pg::wal-encode-checkpoint-snapshot snapshot))))
       (ok (= actual (pg::physical-replay-observed-next-xid record 3)))

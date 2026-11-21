@@ -79,7 +79,7 @@
            (complete (append prefix (list (list pg::+wal-record-catalog-commit+ terminal)))))
       (ok (zerop (hash-table-count (history-drop-proof prefix))))
       (ok (gethash 900 (history-drop-proof complete)))
-      (let ((restarted (append prefix (history-batch pg::+wal-record-checkpoint+ (empty-octets))))
+      (let ((restarted (append prefix (history-batch pg::+wal-record-maintenance+ (empty-octets))))
             (missing (append (butlast prefix)
                              (list (list pg::+wal-record-catalog-commit+ terminal))))
             (wrong-terminal (append prefix (list (list pg::+wal-record-maintenance+ (empty-octets))))))

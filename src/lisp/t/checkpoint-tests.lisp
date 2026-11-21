@@ -57,7 +57,7 @@
 
 (deftest checkpoint-record-payload-binds-actual-record-boundaries
     (let* ((snapshot (sample-checkpoint-snapshot))
-           (record (pg::make-wal-record :version 6 :type pg::+wal-record-checkpoint+
+           (record (pg::make-wal-record :version pg::+wal-version+ :type pg::+wal-record-checkpoint+
                                         :xid 0 :start 32 :end 152
                                         :payload (pg::wal-encode-checkpoint-snapshot snapshot))))
       (ok (= 32 (getf (pg::wal-checkpoint-record-snapshot record) :start)))
@@ -65,34 +65,28 @@
       (ok (intake-fails-p (lambda () (pg::wal-checkpoint-record-snapshot record))))
       (setf (pg::wal-record-start record) 32 (pg::wal-record-version record) 5)
       (ok (intake-fails-p (lambda () (pg::wal-checkpoint-record-snapshot record))))
-      (setf (pg::wal-record-payload record) (empty-octets) (pg::wal-record-end record) 64)
-      (ok (null (pg::wal-checkpoint-record-snapshot record)))
-      (setf (pg::wal-record-version record) 6)
+      (setf (pg::wal-record-payload record) (empty-octets)
+            (pg::wal-record-end record) 64
+            (pg::wal-record-version record) pg::+wal-version+)
       (ok (intake-fails-p (lambda () (pg::wal-checkpoint-record-snapshot record))))))
 
-(deftest checkpoint-reservation-seed-keeps-source-capacity-and-legacy-unknown
-    (dolist (version '(6 7))
-      (let* ((manifest (list :version 3 :checkpoint-start 32 :end 152 :next-xid 42))
-             (record (pg::make-wal-record
-                      :version version :type pg::+wal-record-checkpoint+ :xid 0
-                      :start 32 :end 152
-                      :payload (pg::wal-encode-checkpoint-snapshot (sample-checkpoint-snapshot))))
-             (reservation (pg::physical-recovery-checkpoint-reservation manifest record 1003)))
-        (ok (= 152 (getf reservation :through)))
-        (ok (= 1002 (getf reservation :bound)))
-        (ok (eq (>= version 7) (getf reservation :complete)))
-        (when (>= version 7)
+(deftest checkpoint-reservation-seed-keeps-source-capacity
+    (let* ((manifest (list :version 3 :checkpoint-start 32 :end 152 :next-xid 42))
+           (record (pg::make-wal-record
+                    :version pg::+wal-version+ :type pg::+wal-record-checkpoint+ :xid 0
+                    :start 32 :end 152
+                    :payload (pg::wal-encode-checkpoint-snapshot (sample-checkpoint-snapshot))))
+           (reservation (pg::physical-recovery-checkpoint-reservation manifest record 1003)))
+      (ok (= 152 (getf reservation :through)))
+      (ok (= 1002 (getf reservation :bound)))
+      (ok (getf reservation :complete))
+      (ok (intake-fails-p
+           (lambda () (pg::physical-recovery-checkpoint-reservation manifest record 1004))))
+      (dolist (key '(:checkpoint-start :end :next-xid))
+        (let ((changed (copy-list manifest)))
+          (incf (getf changed key))
           (ok (intake-fails-p
-               (lambda () (pg::physical-recovery-checkpoint-reservation manifest record 1004))))
-          (let ((changed (copy-list manifest)))
-            (setf (getf changed :next-xid) 43)
-            (ok (intake-fails-p
-                 (lambda () (pg::physical-recovery-checkpoint-reservation changed record 1003))))))
-        (dolist (key '(:checkpoint-start :end))
-          (let ((changed (copy-list manifest)))
-            (incf (getf changed key))
-            (ok (intake-fails-p
-                 (lambda () (pg::physical-recovery-checkpoint-reservation changed record 1003)))))))))
+               (lambda () (pg::physical-recovery-checkpoint-reservation changed record 1003))))))))
 
 (cl-spec:defproperty checkpoint-snapshot-preserves-full-source-facts
     ((position (range integer 0 1000000))

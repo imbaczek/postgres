@@ -79,8 +79,11 @@ base backup, streaming follow and standby promotion.
 The full WAL crash suite passed after the fixture primed an XID reservation
 with a rolled-back insert and checked the final checkpoint against its
 control snapshot before injecting corruption.
-Version-specific fixtures still cover checkpoint and running-xacts
-records, XID reservation, timeline lineage and end-of-recovery. Remove
+Checkpoint WAL validation now requires a nonempty WAL8 record, and base
+reservation seeding requires its exact source counters. The snapshot codec
+and backup manifest schema retain their older variants for B3 and B11.
+Version-specific fixtures still cover running-xacts records, XID reservation,
+timeline lineage and end-of-recovery. Remove
 compatibility assertions alongside their reader branches and regenerate
 fixtures that exercise behavior still supported by WAL8.
 
