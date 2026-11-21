@@ -1,11 +1,7 @@
-;;;; unit-tests.lisp -- Load topic-specific tests and run the Lisp unit suite.
-;;;; Run via t/run-unit-tests.sh, which loads the "pg" system first.
+;;;; Legacy unit harness, run by the pg-unit-tests/all ASDF test operation.
 
 (in-package #:pg)
 
-;; Run the discoverable regressions before the stateful legacy fixture.
-;; ASDF signals on failure so the shell entry point also exits nonzero.
-(asdf:test-system "pg-unit-tests")
 
 (let ((test-directory (merge-pathnames #p"unit-tests/" *load-truename*)))
   (dolist (module '("support.lisp"

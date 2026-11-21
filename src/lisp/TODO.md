@@ -247,6 +247,11 @@ shared record types, integer fields, and CRC32C dispatch. WAL storage declares
 the codec component as a dependency, and the standalone CRC qualification
 compiles the complete codec directly.
 
+The `pg-unit-tests/all` ASDF test operation runs the Rove and legacy unit
+harnesses in order. The coverage-aware shell wrapper delegates to that
+operation. Direct Rove head selection and its campaign receipts use the
+existing Rove-only system.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

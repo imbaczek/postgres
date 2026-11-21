@@ -1319,8 +1319,10 @@ no-init child while the suite loads, treating warnings as errors. Tests wait
 for successful compilation. Optional unqualified head names select individual
 tests, for example
 `./t/run-system-tests.sh physical --strict promotion-cold-resume-closes-interrupted-store-handoffs`.
-This runner executes the ASDF suite only; use `./t/run-unit-tests.sh` when the
-deferred legacy cases are needed. It honors `SBCL` and normal init files. If
+This runner selects Rove test heads. The combined `./t/run-unit-tests.sh`
+entry point invokes the `pg-unit-tests/all` ASDF test operation, which runs
+the Rove suite and then the legacy harness. The direct runner honors
+`SBCL` and normal init files. If
 `PG_LISP_TEST_RUN_DIR` is absent, it enters the test RAM-disk wrapper, which
 requires a provisioned RAM mount. `PG_LISP_TEST_SEED` may be a nonnegative
 integer; unset or empty leaves the normal random state. Phase and per-head timings
@@ -1501,9 +1503,9 @@ path does not establish production integration or admission.
 
 The unit suite contains 68 regressions migrated from the legacy runner, eight
 Properties and one Function Spec, all explicitly executed through Rove. Loading
-it alone does not run tests. `./t/run-unit-tests.sh` executes this ASDF suite and
-then the 161 deferred legacy cases (arena cases remain conditional on runtime
-support). See the [complete test inventory](t/TEST-INVENTORY.md) for every case,
+it alone does not run tests. The combined test operation then runs the legacy
+cases (arena cases remain conditional on runtime support). See the
+[complete test inventory](t/TEST-INVENTORY.md) for every case,
 shared helper, retained process harness, deferral reason and generated domain.
 
 `python3 t/interop/native-basebackup.py --reference-bin /path/to/bin` exercises

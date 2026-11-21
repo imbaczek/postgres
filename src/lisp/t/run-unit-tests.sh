@@ -1,5 +1,5 @@
 #!/bin/sh
-# t/run-unit-tests.sh -- load the pg system and run t/unit-tests.lisp.
+# Run both unit harnesses through ASDF.
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
@@ -13,4 +13,4 @@ exec "$SBCL" --non-interactive \
               (lambda ()
                 (asdf:load-system \"pg\")
                 (load \"$BASE/t/test-dependencies.lisp\")
-                (load \"$BASE/t/unit-tests.lisp\")))"
+                (asdf:test-system \"pg-unit-tests/all\")))"

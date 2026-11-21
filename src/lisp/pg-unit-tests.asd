@@ -122,3 +122,13 @@
                          (declare (ignore operation component))
                          (unless (uiop:symbol-call :rove :run :pg-unit-tests)
                            (error "Unit regressions or generated contracts failed"))))
+
+(asdf:defsystem "pg-unit-tests/all"
+  :description "Run the Rove and legacy pg-lisp unit harnesses"
+  :components ((:static-file "t/unit-tests.lisp"))
+  :in-order-to ((asdf:test-op (asdf:test-op "pg-unit-tests")))
+  :perform (asdf:test-op (operation component)
+                         (declare (ignore operation))
+                         (format t "~&unit-tests: Rove suite passed~%")
+                         (load (asdf:system-relative-pathname component "t/unit-tests.lisp"))
+                         (format t "~&unit-tests: combined suite passed~%")))
