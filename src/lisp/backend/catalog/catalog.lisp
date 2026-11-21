@@ -120,7 +120,6 @@ the original private cluster identity when loading or migrating catalogs."
              (/= (catalog-system-identifier catalog) (getf metadata :system-id)))
     (error "primary control and catalog system identifiers differ")))
 
-(defvar *catalog-identity-needs-persist-p* nil)
 (defvar *catalog-mutex* (sb-thread:make-mutex :name "pg catalog mutex"))
 (defvar *catalog-oldest-relfrozenxid* nil)
 ;; Incremented only after a catalog image has been durably committed.

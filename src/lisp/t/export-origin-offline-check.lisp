@@ -7,7 +7,6 @@
 (destructuring-bind (directory system timeline base manifest endpoint digest)
     (uiop:command-line-arguments)
   (let* ((*pgdata* (uiop:ensure-directory-pathname (truename directory)))
-         (*catalog-identity-needs-persist-p* nil)
          (*catalog* (load-catalog))
          (*physical-recovery-state* nil)
          (*physical-export-origins* (make-hash-table :test #'equal))

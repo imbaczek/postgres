@@ -223,7 +223,6 @@
            (pg::*logical-capture-xid-modes* (make-hash-table :test #'eql))
            (pg::*backend-registry* (make-hash-table :test #'eql))
            (pg::*shutdown-abandoned-backends* nil)
-           (pg::*catalog-identity-needs-persist-p* nil)
            (pg::*catalog* (pg::load-catalog))
            (pg::*active-xids* nil) (pg::*active-snapshots* 0)
            (pg::*active-snapshot-set* (make-hash-table :test #'eq))

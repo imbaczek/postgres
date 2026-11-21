@@ -66,7 +66,6 @@ or authority."
          (history (logical-slot-primary-history-under-lock))
          (catalog-xmin nil))
     (unless (and *catalog*
-                 (not *catalog-identity-needs-persist-p*)
                  (eql system-id (catalog-system-identifier))
                  (or (null *wal-control-metadata*)
                      (eql system-id (getf *wal-control-metadata* :system-id))))

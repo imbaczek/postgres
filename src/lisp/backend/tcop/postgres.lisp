@@ -982,9 +982,7 @@ Hold the drained admission gate and borrow the real postmaster ownership."
         (when imported-startup
           (logical-slot-imported-startup-check-owned imported-startup))
         (let* ((initialize (primary-storage-bootstrap-p))
-               (catalog (unless initialize
-                          (let ((*catalog-identity-needs-persist-p* nil))
-                            (load-catalog)))))
+               (catalog (unless initialize (load-catalog))))
           (unless initialize
             (unless (probe-file (clog-path))
               (error "transaction status file ~a is missing" (clog-path)))

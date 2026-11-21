@@ -21,7 +21,7 @@
   (let ((system-id (physical-slot-startup-system-id)))
     (sb-thread:with-mutex (*wal-lock*)
       (let ((fields (multiple-value-list (wal-read-control-fields))))
-        (unless (and *catalog* (not *catalog-identity-needs-persist-p*)
+        (unless (and *catalog*
                      (eql system-id (catalog-system-identifier))
                      (eql system-id (getf *wal-control-metadata* :system-id))
                      (equal fields

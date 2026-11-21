@@ -119,6 +119,7 @@ For B6, catalog decode requires a stored, nonempty cluster identity.
 Fresh cluster construction still generates and persists an identity,
 and existing identities still use the same system identifier projection.
 The read path no longer generates a replacement identity.
+Replay, adoption and slot checks compare stored identities directly.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
