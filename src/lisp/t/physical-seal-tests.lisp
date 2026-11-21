@@ -254,7 +254,9 @@
          (selected (member token '("AFTER-CONTROL-RENAME" "AFTER-CONTROL-DIRECTORY-FSYNC" "AFTER-RETAINED-ROOT-HANDOFF" "AFTER-FLOOR-PUBLICATION" "AFTER-OBSOLETE-SEGMENT-DELETE-EACH") :test #'string=))
          (identity (list :system-id 123 :base-timeline 1 :base 32 :manifest-digest 77))
          (partial (string= token "AFTER-OBSOLETE-SEGMENT-DELETE-EACH"))
-         (cursor (if partial (+ (* 2 pg::+wal-segment-size+) 32) 96)))
+         (cursor (if partial
+                     (+ (* 2 pg::+wal-segment-size+) (pg::wal-checkpoint-record-size))
+                     96)))
     (unwind-protect
          (progn
            (ok (equal token (getf payload :point)))
