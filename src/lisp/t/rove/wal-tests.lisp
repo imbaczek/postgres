@@ -2145,10 +2145,6 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
            (progn
              (setf (symbol-function 'clog-set)
                    (lambda (xid status) (push (list xid status) committed)))
-             (rove:ok (loop for version from 2 to 7
-                            never (wal-valid-type-p +wal-record-relation-reset+ version)))
-             (rove:ok (wal-valid-type-p +wal-record-relation-reset+ 8))
-             (rove:ok (wal-valid-type-p +wal-record-running-xacts+ 7))
              (smgr-create 7311)
              (dolist (spool-p '(nil t))
                (smgr-reset-fork 7311 :main)

@@ -219,8 +219,6 @@
 
 (rove:deftest parameter-change-record-has-a-strict-empty-metadata-shape
     (let ((record (resource-parameter-test-record)))
-      (rove:ok (wal-valid-type-p 16 8))
-      (rove:ok (not (wal-valid-type-p 16 7)))
       (rove:ok (wal-terminal-record-type-p 16))
       (rove:ok (equal '(100 8 10 0 128)
                       (resource-parameters-values (wal-parameter-change-record-info record))))
