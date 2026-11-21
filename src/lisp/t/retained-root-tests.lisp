@@ -24,6 +24,28 @@
         (unless (member (length bytes) '(0 8)) (error "invalid test control length"))
         (unless (zerop (length bytes)) (pg::wal-u64 bytes 0))))))
 
+(deftest retained-root-fence-recognizes-held-archive-outside-host-parent
+    (call-with-retained-inventory
+     (lambda (root images identity history text)
+       (declare (ignore images identity history text))
+       (let* ((pg::*logical-slot-continuation-fenced-roots* (make-hash-table :test #'equal))
+              (pg::*pgdata* (merge-pathnames "host/" root))
+              (archive (merge-pathnames "pg_physical_retained/" pg::*pgdata*))
+              (other (merge-pathnames "elsewhere/archive/" root))
+              (marker (merge-pathnames "logical-slot-copy.source-proof" pg::*pgdata*)))
+         (ensure-directories-exist archive)
+         (ensure-directories-exist other)
+         (with-open-file (stream marker :direction :output)
+           (write-char #\x stream))
+         (pg::with-slot-state-directory (archive-fd archive)
+           ;; The candidate name is outside PGDATA, but its held directory
+           ;; identifies the fenced host's archive.
+           (ok (pg::physical-retained-root-archive-fenced-p other archive-fd))
+           (delete-file marker)
+           (ok (pg::physical-retained-root-archive-fenced-p other archive-fd)))
+         (pg::with-slot-state-directory (other-fd other)
+           (ng (pg::physical-retained-root-archive-fenced-p other other-fd)))))))
+
 (deftest retained-root-reader-protects-retired-control-until-unwind
     (with-retained-root-registry
         (call-with-retained-inventory

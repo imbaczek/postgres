@@ -459,20 +459,40 @@ retains protection until readback reconciliation or durable retirement."
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
       (physical-retained-root-protected-under-lock directory kind id))))
 
-(defun physical-retained-root-delete-unprotected (directory kind id)
-  "Delete an unprotected object under the archive mutex and sync its directory.
+(defun physical-retained-root-archive-fenced-p (directory fd)
+  "Check the archive parent and a possible bind alias of the active host's archive."
+  (or (logical-slot-continuation-gc-fenced-p
+       (uiop:pathname-parent-directory-pathname directory))
+      (when (and *pgdata* (logical-slot-continuation-gc-fenced-p *pgdata*))
+        (with-slot-state-directory (host-fd *pgdata*)
+          (with-slot-state-directory
+              (archive-fd (slot-state-fd-path host-fd "pg_physical_retained") t)
+            (when archive-fd
+              (let ((candidate (physical-image-file-facts fd))
+                    (archive (physical-image-file-facts archive-fd)))
+                ;; Bind aliases change mount IDs but share device and inode.
+                (and (= (first candidate) (first archive))
+                     (= (second candidate) (second archive))))))))))
 
-Restore all durable references before deletion begins.  Do not acquire store or
+(defun physical-retained-root-delete-unprotected (directory kind id)
+  "Delete an unprotected object using a held archive directory descriptor.
+
+Restore all durable references before deletion begins. Do not acquire store or
 WAL locks while holding the archive mutex."
-  ;; The continuation guard assumes the fixed PGDATA/pg_physical_retained
-  ;; parent; an alias of the archive directory needs separate handling.
   (let ((directory (physical-retained-root-directory directory)))
     (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
-      (unless (or (physical-retained-root-protected-under-lock directory kind id)
-                  (logical-slot-continuation-gc-fenced-p
-                   (uiop:pathname-parent-directory-pathname directory)))
-        (let ((path (physical-retained-object-path directory kind id)))
-          (when (wal-namespace-file-stat path t)
-            (delete-file path)
-            (fsync-directory directory)
-            t))))))
+      (with-slot-state-directory (fd directory)
+        (unless (or (physical-retained-root-protected-under-lock directory kind id)
+                    (physical-retained-root-archive-fenced-p directory fd))
+          (let* ((name (file-namestring (physical-retained-object-path directory kind id)))
+                 (path (slot-state-fd-path fd name)))
+            (when (wal-namespace-file-stat path t)
+              (unless (wal-archive-directory-binding-p
+                       (physical-image-file-facts fd)
+                       (physical-image-file-facts
+                        fd (string-right-trim "/" (namestring directory))))
+                (error "retained WAL archive no longer names the held directory"))
+              (unless (zerop (port-unlinkat fd name 0))
+                (error "could not delete retained WAL object ~a: errno ~d" name (sb-alien:get-errno)))
+              (sb-posix:fsync fd)
+              t)))))))
