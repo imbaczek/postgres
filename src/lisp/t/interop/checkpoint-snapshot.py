@@ -48,6 +48,13 @@ def checkpoint(data):
     return facts
 
 
+def checkpoint_segment(pgdata, facts, namespace):
+    number = facts["start"] // 16777216
+    name = (f"{number:016X}" if namespace == "legacy"
+            else f"{facts['timeline']:08X}{number // 256:08X}{number % 256:08X}")
+    return pgdata / "pg_wal" / f"{name}.wal"
+
+
 def read_copy(pgdata):
     raw = (pgdata / "global/pg_wal_control").read_text(encoding="ascii")
     assert raw.endswith("\n") and raw.count("\n") == 1
@@ -63,9 +70,7 @@ def read_copy(pgdata):
     facts = checkpoint(data)
     assert facts["timeline"] == int(checkpoint_tli)
     assert facts["end"] == int(end) <= int(durable)
-    number = facts['start'] // 16777216
-    name = (f"{number:016X}" if namespace == "legacy" else f"{facts['timeline']:08X}{number // 256:08X}{number % 256:08X}")
-    segment = pgdata / f"pg_wal/{name}.wal"
+    segment = checkpoint_segment(pgdata, facts, namespace)
     with segment.open("rb") as stream:
         stream.seek(facts["start"] % 16777216)
         record = bytearray(stream.read(32 + len(data)))
@@ -98,7 +103,7 @@ def convert_fixture(pgdata, facts, payload, *, retired_wal, retired_control, uns
     elif retired_control:
         fields = ["PGWAL5", *fields[1:5], payload]
     elif retired_wal:
-        segment = pgdata / f"pg_wal/{facts['start'] // 16777216:016X}.wal"
+        segment = checkpoint_segment(pgdata, facts, fields[5])
         offset = facts["start"] % 16777216
         with segment.open("r+b") as stream:
             stream.seek(offset)

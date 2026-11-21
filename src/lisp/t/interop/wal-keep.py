@@ -62,7 +62,7 @@ def exercise_checkpoint_loss(root, port, native):
         restart = connection.query("SELECT restart_lsn FROM pg_replication_slots WHERE slot_name='cap_test'")[0][0]
         segment = lsn(restart) // SIZE
         boundary = (segment + 2) * SIZE
-        filename = f'{segment:016X}.wal' if native else f'00000001{segment // 256:08X}{segment % 256:08X}'
+        filename = f'00000001{segment // 256:08X}{segment % 256:08X}' + ('.wal' if native else '')
         retained = root / 'data/pg_wal' / filename
         if native:
             for index in range(6000):

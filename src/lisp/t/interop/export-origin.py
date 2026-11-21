@@ -58,14 +58,18 @@ def control(data):
     image = (data / 'global/pg_wal_control').read_bytes()
     fields = image.split()
     assert fields[0] == b'PGWAL6' and crc32c(b' '.join(fields[:-1])) == int(fields[-1], 16)
-    assert fields[3:6] == [b'1', b'1', b'legacy']
+    assert fields[3:6] == [b'1', b'1', b'timeline']
     return int(fields[1]), int(fields[2]), int(fields[8])
+
+
+def source_segment(data, segment):
+    return data / 'pg_wal' / f'00000001{segment // 256:08X}{segment % 256:08X}.wal'
 
 
 def hash_history(data, cursor, endpoint, digest=SEED):
     while cursor < endpoint:
         segment, offset = divmod(cursor, SEGMENT)
-        with (data / 'pg_wal' / f'{segment:016X}.wal').open('rb') as stream:
+        with source_segment(data, segment).open('rb') as stream:
             stream.seek(offset)
             header = stream.read(32)
         start = cursor
@@ -74,7 +78,7 @@ def hash_history(data, cursor, endpoint, digest=SEED):
             segment += 1
             offset = 0
             start = segment * SEGMENT
-        with (data / 'pg_wal' / f'{segment:016X}.wal').open('rb') as stream:
+        with source_segment(data, segment).open('rb') as stream:
             stream.seek(offset)
             header = stream.read(32)
             assert len(header) == 32
@@ -233,7 +237,7 @@ def check(binary, adopt=False):
             assert checkpoint == durable and state == 1 and durable > endpoint
             digest = hash_history(source.data, endpoint, durable, digest)
             assert origin(source.data, identity) == (durable, digest)
-            old_segment = source.data / 'pg_wal' / f'{base // SEGMENT:016X}.wal'
+            old_segment = source_segment(source.data, base // SEGMENT)
             assert not old_segment.exists(), 'export origin retained historical WAL'
             print('export-origin: independent multisegment digest and final checkpoint survive WAL recycling PASS', flush=True)
 
