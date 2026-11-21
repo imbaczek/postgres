@@ -17,6 +17,7 @@ test_debug_setup index-scan-regression "$PORT" "$TMP" "$LOG"
 cleanup() {
     : > "$TMP/drop-handoff.release"
     : > "$TMP/drop-handoff.ddl-release"
+    exec 3>&-
     [ -z "$DROPPER" ] || kill "$DROPPER" 2>/dev/null || true
     [ -z "$READER" ] || kill "$READER" 2>/dev/null || true
     [ -z "$SRV" ] || kill "$SRV" 2>/dev/null || true
@@ -180,6 +181,7 @@ install_output=$(control <<EOF
 (defvar *index-drop-handoff-heap* nil)
 (defvar *index-drop-handoff-index* nil)
 (defvar *index-drop-handoff-xid* nil)
+(defvar *index-drop-handoff-backend* nil)
 (defvar *index-drop-handoff-original-readers* nil)
 (defvar *index-drop-handoff-original-build-locks* nil)
 (defvar *index-drop-handoff-original-wait* nil)
@@ -198,7 +200,8 @@ install_output=$(control <<EOF
 (setf (symbol-function 'register-relation-readers)
       (lambda (relfilenodes xid)
         (when (member *index-drop-handoff-heap* relfilenodes :test #'=)
-          (setf *index-drop-handoff-xid* xid)
+          (setf *index-drop-handoff-backend* *backend*
+                *index-drop-handoff-xid* (relation-lock-owner-xid xid))
           (with-open-file (out "$TMP/drop-handoff.ready"
                                :direction :output :if-exists :supersede)
             (write-string "ready" out))
@@ -221,11 +224,9 @@ install_output=$(control <<EOF
           token)))
 (setf (symbol-function 'condition-wait-with-timeout)
       (lambda (waitqueue mutex)
-        (when (and *backend*
-                   *index-drop-handoff-xid*
-                   (eql mutex *relation-lock-mutex*)
-                   (= (or (backend-xid *backend*) 0)
-                      *index-drop-handoff-xid*))
+        (when (and *index-drop-handoff-backend*
+                   (eq *backend* *index-drop-handoff-backend*)
+                   (eq waitqueue *relation-lock-cv*))
           (with-open-file (out "$TMP/drop-handoff.reader-waiting"
                                :direction :output :if-exists :supersede)
             (write-string "waiting" out)))

@@ -202,6 +202,10 @@ one internal-page child range. Equality visits the preceding child and every
 child in an equal separator run. Insert uses the right endpoint. The range
 calculation examines the full page because the first separator can be stale.
 Each caller keeps its existing relation lock or read lease.
+The Rove separator regression, legacy duplicate-key scan, and all 12 focused
+read-lease tests passed. The SQL index regression checks indexed results
+against sequential results and verifies the DROP INDEX handoff using the
+reader's canonical relation-lock owner.
 
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
