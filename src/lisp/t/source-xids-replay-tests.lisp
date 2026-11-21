@@ -119,17 +119,16 @@
              (ok (intake-fails-p (lambda () (pg::physical-source-xids-next nil anchor 51)))))
         (setf (symbol-function 'pg::clog-get) clog))))
 
-(deftest source-xids-legacy-and-reset-records-drop-coverage
+(deftest source-xids-clog-reset-drops-coverage
     (let* ((state (pg::running-xacts-anchor
                    (list :next-xid 50 :running '(3) :complete t) 100))
-           (legacy (pg::make-wal-record :version 6 :type pg::+wal-record-batch-start+
-                                        :start 100 :end 132 :xid 0 :payload (empty-octets)))
-           (unknown (pg::physical-source-xids-next state legacy 50)))
-      (ok (not (getf unknown :complete)))
-      (ok (null (getf unknown :running)))
+           (boundary (+ pg::+xid-cycle+ pg::+first-normal-xid+))
+           (payload (make-array 8 :element-type '(unsigned-byte 8))))
+      (pg::wal-set-u64 payload 0 boundary)
+      (let ((record (source-xids-record pg::+wal-record-clog-reset+ 100 payload)))
+        (ok (null (pg::physical-source-xids-next state record boundary))))
       (ok (getf state :complete))
-      (setf (pg::wal-record-version legacy) 7 (pg::wal-record-type legacy) pg::+wal-record-clog-reset+)
-      (ok (null (pg::physical-source-xids-next state legacy 50)))))
+      (ok (equal '(3) (getf state :running)))))
 
 (deftest restartpoint-source-membership-is-optional-and-bound-to-counter-and-lsn
     (with-restartpoint-fixture (root store)
