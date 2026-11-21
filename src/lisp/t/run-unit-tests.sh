@@ -5,6 +5,19 @@ set -eu
 BASE=$(cd "$(dirname "$0")/.." && pwd)
 SBCL=${SBCL:-sbcl}
 
+if [ "$#" -eq 1 ] && [ "$1" = "--list" ]; then
+    exec "$SBCL" --non-interactive \
+        --eval '(require :asdf)' \
+        --eval "(push #p\"$BASE/\" asdf:*central-registry*)" \
+        --load "$BASE/t/test-dependencies.lisp" \
+        --load "$BASE/t/system-test-runner.lisp" \
+        --eval '(cl-user::pg-print-unit-test-inventory)'
+fi
+if [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--list]" >&2
+    exit 2
+fi
+
 exec "$SBCL" --non-interactive \
     --eval '(require :asdf)' \
     --eval "(push #p\"$BASE/\" asdf:*central-registry*)" \

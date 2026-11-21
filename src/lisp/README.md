@@ -1323,7 +1323,10 @@ tests, for example
 `./t/run-system-tests.sh physical --strict promotion-cold-resume-closes-interrupted-store-handoffs`.
 This runner selects Rove test heads. The combined `./t/run-unit-tests.sh`
 entry point invokes the `pg-unit-tests/all` ASDF test operation, which runs
-the Rove suite and then the legacy harness. The direct runner honors
+the Rove suite and then the legacy harness. Use `./t/run-unit-tests.sh --list`
+to list both harnesses' registered cases without running them. Legacy cases
+with platform guards appear in the inventory even when skipped at runtime.
+The direct runner honors
 `SBCL` and normal init files. If
 `PG_LISP_TEST_RUN_DIR` is absent, it enters the test RAM-disk wrapper, which
 requires a provisioned RAM mount. `PG_LISP_TEST_SEED` may be a nonnegative

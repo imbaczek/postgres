@@ -131,4 +131,5 @@
                          (declare (ignore operation))
                          (format t "~&unit-tests: Rove suite passed~%")
                          (load (asdf:system-relative-pathname component "t/unit-tests.lisp"))
+                         (uiop:symbol-call :pg :run-unit-tests)
                          (format t "~&unit-tests: combined suite passed~%")))

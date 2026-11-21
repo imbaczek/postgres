@@ -23,9 +23,25 @@
                     "vacuum-tests.lisp"))
     (load (merge-pathnames module test-directory))))
 
-(defun run-query-and-concurrency-unit-tests ()
+(defmacro define-legacy-unit-group (name &body cases)
+  "Declare ordered legacy calls and expose their names without running their setup."
+  (labels ((case-names (form)
+             (case (first form)
+               ((let when) (loop for nested in (cddr form) append (case-names nested)))
+               (otherwise
+                (unless (and (symbolp (first form)) (null (rest form)))
+                  (error "Expected a named legacy unit case, got ~s" form))
+                (list (first form))))))
+    (let ((names (loop for form in cases append (case-names form))))
+      `(defun ,name (&optional list-p)
+         (if list-p ',names (progn ,@cases))))))
+
+(defun test-legacy-wait-helper-explicit-timeout ()
   (check (test-wait-until (lambda () t) 0.01)
-         "test wait helper accepts an explicit timeout")
+         "test wait helper accepts an explicit timeout"))
+
+(define-legacy-unit-group run-query-and-concurrency-unit-tests
+    (test-legacy-wait-helper-explicit-timeout)
   (test-exported-snapshot-schema-lock-coordination)
   (test-schema-gate-allows-independent-writers)
   (test-schema-gate-queued-writers-enter-together)
@@ -74,8 +90,8 @@
     (test-sort-arena-interrupt-after-switch))
   (test-select-row-qualification-before-projection))
 
-(defun run-backend-protocol-and-wal-unit-tests ()
-  (test-replication-slots-catalog-view)
+(define-legacy-unit-group run-backend-protocol-and-wal-unit-tests
+    (test-replication-slots-catalog-view)
   (test-logical-ddl-response-deferral)
   (test-protocol-packet-limits)
   (test-protocol-decoding-enters-live-operation)
@@ -151,8 +167,8 @@
   (test-wal-checkpoint-skips-obsolete-prefix)
   (test-wal-missing-interior-segment))
 
-(defun run-storage-and-planner-unit-tests ()
-  (test-xid-tuple-update-roundtrip)
+(define-legacy-unit-group run-storage-and-planner-unit-tests
+    (test-xid-tuple-update-roundtrip)
   (test-heap-update-chain-follow)
   (test-heap-free-space-map)
   (test-postgres-special-xid-statuses)
@@ -179,15 +195,18 @@
   (test-visibility)
   (test-statement-snapshot-acquisition-interrupt-cleanup))
 
-(defun run-vacuum-and-transaction-unit-tests ()
-  (test-vacuum-page-publication-is-atomic)
+(defun test-vacuum-reuses-tid-clears-index-and-vm-with-failpoint ()
+  (test-vacuum-reuses-tid-clears-index-and-vm t))
+
+(define-legacy-unit-group run-vacuum-and-transaction-unit-tests
+    (test-vacuum-page-publication-is-atomic)
   (test-vacuum-current-table-index-set-lock-guard)
   (test-vacuum-xid-normalization-invariant)
   (test-vacuum-full-publish-failure-boundaries)
   (test-vacuum-page-retry-rebuilds-proposal)
   (test-vacuum-page-read-releases-global-write-lock)
   (test-vacuum-reuses-tid-clears-index-and-vm)
-  (test-vacuum-reuses-tid-clears-index-and-vm t)
+  (test-vacuum-reuses-tid-clears-index-and-vm-with-failpoint)
   (test-vacuum-snapshot-horizon)
   (test-btree-relation-lock-macro)
   (test-btree-relation-lock-set-macro)
@@ -204,6 +223,12 @@
   (test-xid-wraparound-freezes-tuples)
   (test-xid-wraparound-fault-recovery)
   (test-xid-wraparound-coordinator-cancel))
+
+(defun legacy-unit-test-names ()
+  (append (run-query-and-concurrency-unit-tests t)
+          (run-backend-protocol-and-wal-unit-tests t)
+          (run-storage-and-planner-unit-tests t)
+          (run-vacuum-and-transaction-unit-tests t)))
 
 (defun run-unit-tests ()
   (setf *test-failures* 0
@@ -234,5 +259,3 @@
           *test-checks* *test-failures*)
   (when (plusp *test-failures*)
     (error "Legacy unit tests failed: ~d failures" *test-failures*)))
-
-(run-unit-tests)

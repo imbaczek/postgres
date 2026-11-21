@@ -358,6 +358,11 @@ failure counts. Either suite can signal an error, which produces a nonzero shell
 exit status. The combined success line appears after both suites pass. Loading
 `pg-unit-tests` defines tests for direct Rove discovery and selection.
 
+Run `./t/run-unit-tests.sh --list` to print both inventories without running
+tests. Each `TEST-CASE` line identifies the harness and package-qualified case
+name. The legacy list follows runner order and includes platform-conditional
+cases. The failpoint variant of the VACUUM TID-reuse case has its own name.
+
 With the test dependencies installed, in a REPL with this directory registered:
 
 ```lisp

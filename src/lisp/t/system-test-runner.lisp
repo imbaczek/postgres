@@ -123,6 +123,15 @@
     (funcall (find-symbol "SUITE-TESTS" package)
              (funcall (find-symbol "FIND-SUITE" package) suite))))
 
+(defun pg-print-unit-test-inventory ()
+  (let ((rove-heads (copy-list (pg-test-suite-heads :pg))))
+    (load (asdf:system-relative-pathname "pg-unit-tests" "t/unit-tests.lisp"))
+    (loop for (harness cases) in (list (list "rove" (sort rove-heads #'string< :key #'symbol-name))
+                                       (list "legacy" (uiop:symbol-call :pg :legacy-unit-test-names)))
+          do (dolist (name cases)
+               (format t "~&TEST-CASE ~a ~a::~a~%" harness
+                       (package-name (symbol-package name)) (symbol-name name))))))
+
 (defun pg-test-record-suite-manifest (suite heads)
   (flet ((name (head)
            (format nil "~a::~a" (package-name (symbol-package head)) (symbol-name head))))

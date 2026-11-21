@@ -373,7 +373,7 @@ still has work outstanding.
 | A15. WAL core concentration | Recovery and record framing moved in `f1a33ccac3d` and `42c52f3357f`. Audit publication, slots, and archiving boundaries. |
 | A16. Settings metadata | Read-only descriptors in `63085c92361`. Verify startup, session, transaction-local, and reload behavior through their public entry points. |
 | A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. Audit shared setup and retirement ownership across fault scenarios. |
-| A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. Audit legacy discovery and result reporting against the common contract. |
+| A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. `t/run-unit-tests.sh --list` uses Rove registration and the legacy execution declarations to list 1,596 Rove heads and 166 legacy cases without running them. The legacy listing matches the previous invocation order, including the named VACUUM failpoint variant. Normal execution still passed 1,172 legacy checks. |
 | A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. Audit package boundaries and independent subsystem loading before claiming dependency enforcement. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. Update it when the remaining format cutovers land. |
 
