@@ -676,21 +676,19 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                            (gethash "q" (pg::database-publications database)))) :filter) '(:bool t))
        (ok (equal "0A000" (sqlstate-of (derived-query-rows "SELECT (pg_get_publication_tables('q')).*")))))))
 
-(deftest publication-oids-roundtrip-and-upgrade
-    (let* ((catalog (pg::make-catalog :next-oid 500))
-           (database (pg::make-database :name "postgres"))
-           (first (pg::make-pg-publication :name "a"))
-           (second (pg::make-pg-publication :name "b")))
-      (setf (gethash "postgres" (pg::catalog-databases catalog)) database
-            (gethash "b" (pg::database-publications database)) second
-            (gethash "a" (pg::database-publications database)) first)
-      (ok (pg::catalog-upgrade-publication-oids catalog))
-      (ok (= 500 (pg::pg-publication-oid first)))
-      (ok (= 501 (pg::pg-publication-oid second)))
-      (ok (= 502 (pg::catalog-next-oid catalog)))
-      (ok (null (pg::catalog-upgrade-publication-oids catalog)))
-      (ok (= 500 (pg::pg-publication-oid
-                  (pg::publication-from-sexp (pg::publication-to-sexp first)))))))
+(deftest publication-oids-roundtrip-and-reject-missing-identities
+    (let* ((publication (pg::make-pg-publication :name "a" :oid 500))
+           (encoded (pg::publication-to-sexp publication)))
+      (ok (= 500 (pg::pg-publication-oid (pg::publication-from-sexp encoded))))
+      (setf (getf encoded :oid) #x100000000)
+      (ok (= #x100000000 (pg::pg-publication-oid (pg::publication-from-sexp encoded))))
+      (dolist (invalid '(nil 0 -1 "500"))
+        (setf (getf encoded :oid) invalid)
+        (ok (handler-case (progn (pg::publication-from-sexp encoded) nil)
+              (error () t))))
+      (remf encoded :oid)
+      (ok (handler-case (progn (pg::publication-from-sexp encoded) nil)
+            (error () t)))))
 
 (deftest array-aggregate-spill-and-cleanup
     (let* ((directory (merge-pathnames (format nil "pg-array-agg-~a/" (gensym))
@@ -1590,7 +1588,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (dotimes (mask 16)
       (let* ((actions (loop for action in '(:insert :update :delete :truncate)
                             for bit from 0 when (logbitp bit mask) collect action))
-             (publication (pg::make-pg-publication :name "p" :publish-actions actions)))
+             (publication (pg::make-pg-publication :name "p" :oid 500 :publish-actions actions)))
         (ok (equal actions
                    (pg::pg-publication-publish-actions
                     (pg::publication-from-sexp (pg::publication-to-sexp publication))))))))
@@ -1605,16 +1603,16 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
     (ok (equal (getf ast :publish-actions) '(:insert :delete)))))
 
 (deftest publication-actions-persistence
-    (let* ((publication (pg::make-pg-publication :name "p" :publish-actions '(:insert)))
+    (let* ((publication (pg::make-pg-publication :name "p" :oid 500 :publish-actions '(:insert)))
            (encoded (pg::publication-to-sexp publication)))
       (ok (equal '(:insert)
                  (pg::pg-publication-publish-actions (pg::publication-from-sexp encoded))))
       (ok (equal '(:insert :update :delete :truncate)
                  (pg::pg-publication-publish-actions
-                  (pg::publication-from-sexp '(:name "legacy")))))
+                  (pg::publication-from-sexp '(:name "default" :oid 501)))))
       (ok (null
            (pg::pg-publication-publish-actions
-            (pg::publication-from-sexp '(:name "empty" :publish-actions nil)))))))
+            (pg::publication-from-sexp '(:name "empty" :oid 502 :publish-actions nil)))))))
 
 (deftest reference-version-advertisement
     (ok (string= pg::*server-version* "20devel"))

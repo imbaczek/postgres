@@ -1,8 +1,9 @@
 #!/bin/sh
-# Legacy publication identities are persisted before SQL admission and recovery.
+# Publication OIDs are required at startup and remain stable across recovery.
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+. "$BASE/t/test-support.sh"
 PORT=${PORT_BASE:-5685}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-publication-oids.XXXXXX")
 DATA=$TMP/data
@@ -23,16 +24,7 @@ stop_server() {
 start_server() {
     "$BASE/pg-lisp.sh" -p "$PORT" -D "$DATA" > "$TMP/$1.log" 2>&1 &
     SERVER_PID=$!
-    attempt=0
-    while [ "$attempt" -lt 200 ]; do
-        if sql '' >/dev/null 2>&1; then
-            return 0
-        fi
-        kill -0 "$SERVER_PID" 2>/dev/null || return 1
-        attempt=$((attempt + 1))
-        sleep 0.1
-    done
-    return 1
+    test_wait_owned_sql_server "$SERVER_PID" "$PORT" psql
 }
 
 on_exit() {
@@ -50,21 +42,31 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Serialized catalog data from the format preceding publication OIDs. Deliberate
-# reverse publication order checks that upgrade assigns identities by name.
-mkdir -p "$DATA/global"
+# Seed an old catalog without publication OIDs and verify startup rejects it.
+mkdir -m 700 "$DATA"
+mkdir "$DATA/global"
 printf '3\n' > "$DATA/global/pg_control"
+: >"$DATA/pg_xact"
 printf '%s\n' '(:cluster-identity "legacy-publication-oid-test" :next-oid 30000
  :databases ((:name "postgres" :oid 16384 :tables nil :indexes nil :sequences nil
- :publications ((:name "legacy_b" :all-tables nil :tables nil :sequences nil :generation 0)
-                (:name "legacy_a" :all-tables nil :tables nil :sequences nil :generation 0)))))' \
+   :publications ((:name "legacy_b" :all-tables nil :tables nil :sequences nil :generation 0)
+                  (:name "legacy_a" :all-tables nil :tables nil :sequences nil :generation 0)))))' \
     > "$DATA/global/pg_catalog.dat"
 
-start_server upgrade
+cp "$DATA/global/pg_catalog.dat" "$TMP/old-catalog"
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$DATA" >"$TMP/rejected.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -q 'invalid or missing publication OID in catalog' "$TMP/rejected.log"
+cmp "$TMP/old-catalog" "$DATA/global/pg_catalog.dat"
+sed -e 's/:next-oid 30000/:next-oid 30002/' \
+    -e 's/:name "legacy_a"/:oid 30000 :name "legacy_a"/' \
+    -e 's/:name "legacy_b"/:oid 30001 :name "legacy_b"/' \
+    "$TMP/old-catalog" >"$DATA/global/pg_catalog.dat"
+start_server native
 expected=$(printf 'legacy_a|30000\nlegacy_b|30001')
 test "$(sql 'SELECT pubname,oid FROM pg_catalog.pg_publication ORDER BY pubname')" = "$expected"
-# No intervening catalog-writing SQL: kill after read-only observation, proving
-# startup itself persisted the migration rather than relying on shutdown.
+# Crash after read-only observation to prove startup retained the stored OIDs.
 kill -KILL "$SERVER_PID"
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -83,4 +85,4 @@ test "$(sql "SELECT oid FROM pg_catalog.pg_publication WHERE pubname='fresh_publ
 sql 'DROP PUBLICATION fresh_publication; CREATE PUBLICATION fresh_publication FOR ALL TABLES' >/dev/null
 replacement=$(sql "SELECT oid FROM pg_catalog.pg_publication WHERE pubname='fresh_publication'")
 test "$replacement" -gt "$fresh"
-echo 'publication-oids: PASS (legacy upgrade, crash recovery, restart, replacement)'
+echo 'publication-oids: PASS (legacy rejection, crash recovery, restart, replacement)'

@@ -110,6 +110,11 @@ the checksum field. The checksum reader rejects that layout without
 rewriting the page. Indexes from that layout must be rebuilt from matching
 data before using the current reader.
 
+For B5, catalog decode requires a stored publication OID. Startup rejects
+missing OIDs without rewriting the catalog. The publication process test
+checks that stored OIDs survive a crash and restart, ALTER preserves them,
+and dropping and recreating a publication allocates a new OID.
+
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
 was itself the only caller of `stream-select-joined-environments`. The
