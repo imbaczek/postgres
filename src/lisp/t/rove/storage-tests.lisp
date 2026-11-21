@@ -470,7 +470,7 @@
       (rove:ok (expression-contains-column-p test))
       (rove:ok (not (expression-contains-column-p nested)))
       (rove:ok (analyzed-expression-volatile-p nested))
-      (dolist (opaque (list (list :const payload) (list :func "lower" nil :type payload)))
+      (dolist (opaque (list (list :const payload) (list :func "json_typeof" nil :type payload)))
         (rove:ok (not (expression-contains-column-p opaque)))
         (rove:ok (not (analyzed-expression-volatile-p opaque))))))
 
