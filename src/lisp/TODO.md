@@ -438,6 +438,13 @@ still has work outstanding.
   Removing proof after PID ownership caused the pre-WAL recheck to refuse
   startup without initializing WAL, slots, or the catalog. The continuation
   fence remained closed and the checked storage inputs were preserved.
+  In `aa31362cba3`, owned startup records its continuation archive by
+  device and inode while holding the host directory descriptor. Deletion
+  also records an archive observed beneath a fenced parent. A retained-root
+  regression attempts deletion before and after moving that archive and
+  confirms the object survives both attempts. All 34 strict retained-root
+  test heads passed. The instrumented restart and proof-loss cases passed
+  with startup recording enabled.
   Enabling GC still requires a deletion-time ownership and retention
   proof for the restored host and archive.
 
