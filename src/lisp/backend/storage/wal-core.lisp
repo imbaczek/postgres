@@ -2762,6 +2762,18 @@ Follow a symlink at DIRECTORY itself. Enumeration errors are reported."
            ;; version-aware xlogreader must decode WAL written by older servers.
            (>= version +wal-version-v3+))))
 
+(defun wal-record-header-valid-p (bytes version expected-lsn)
+  "Check native WAL header fields shared by complete and streaming readers.
+The caller supplies a complete header. Record length and checksum checks are
+specific to the reader's input boundary."
+  (and (= (aref bytes 0) (char-code #\P))
+       (= (aref bytes 1) (char-code #\G))
+       (= (aref bytes 2) (char-code #\W))
+       (= (aref bytes 3) (char-code #\L))
+       (<= +wal-version-v2+ version +wal-version+)
+       (= (wal-u64 bytes 12) expected-lsn)
+       (wal-valid-type-p (wal-u16 bytes 6) version)))
+
 (defun wal-record-crc32 (bytes)
   "Return the final CRC of a WAL record with its checksum field treated as zero.
 For a simple octet record of at least 32 bytes and a typed table, process bytes
@@ -2789,19 +2801,8 @@ The returned record owns a separate payload subsequence of BYTES."
   (let ((version (and (>= (length bytes) +wal-header-size+)
                       (wal-u16 bytes 4))))
     (unless (and (>= (length bytes) +wal-header-size+)
-                 (= (aref bytes 0) (char-code #\P))
-                 (= (aref bytes 1) (char-code #\G))
-                 (= (aref bytes 2) (char-code #\W))
-                 (= (aref bytes 3) (char-code #\L))
-                 (member version (list +wal-version-v2+
-                                       +wal-version-v3+
-                                       +wal-version-v4+
-                                       +wal-version-v5+
-                                       +wal-version-v6+ +wal-version-v7+
-                                       +wal-version+))
-                 (= (wal-u32 bytes 8) (length bytes))
-                 (= (wal-u64 bytes 12) expected-lsn)
-                 (wal-valid-type-p (wal-u16 bytes 6) version))
+                 (wal-record-header-valid-p bytes version expected-lsn)
+                 (= (wal-u32 bytes 8) (length bytes)))
       (error "invalid WAL record at LSN ~a" expected-lsn))
     (let ((saved-crc (wal-u32 bytes 28)))
       (unless (= saved-crc (wal-record-crc32 bytes))
