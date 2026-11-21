@@ -883,11 +883,14 @@
       (ok (intake-fails-p (lambda () (pg::wal-decode-record bytes 0))))))
 
 (deftest native-checkpoint-snapshot-survives-streaming-intake
-    (multiple-value-bind (bytes snapshot) (physical-test-checkpoint-record 0)
-      (let ((records (pg::physical-wal-decode-input (pg::make-physical-wal-decoder) 0 bytes)))
-        (ok (= 1 (length records)))
-        (ok (= pg::+wal-version+ (pg::wal-record-version (first records))))
-        (ok (equal snapshot (pg::wal-checkpoint-record-snapshot (first records)))))))
+    (let* ((snapshot (sample-checkpoint-snapshot
+                      :version 2 :start 0 :end (pg::wal-checkpoint-record-size) :redo 0))
+           (bytes (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 0
+                                         (pg::wal-encode-checkpoint-snapshot snapshot)))
+           (records (pg::physical-wal-decode-input (pg::make-physical-wal-decoder) 0 bytes)))
+      (ok (= 1 (length records)))
+      (ok (= pg::+wal-version+ (pg::wal-record-version (first records))))
+      (ok (equal snapshot (pg::wal-checkpoint-record-snapshot (first records))))))
 
 (deftest reservation-restartpoint-format-preserves-v3-proof-and-legacy-unknowns
     (call-with-restartpoint-fixture

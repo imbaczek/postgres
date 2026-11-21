@@ -71,7 +71,7 @@
             (setf (aref *wal-crc32-table* slot) (logxor 1 (aref *wal-crc32-table* slot))))))))
 
 (rove:deftest record-crc32-keeps-decoder-corruption-checks-and-payload-ownership
-    (dolist (size '(8 31 32 33 512))
+    (dolist (size '(8 63 64 65 512))
       (let* ((payload (make-array size :element-type '(unsigned-byte 8) :initial-element 173))
              (bytes (wal-encode-record +wal-record-pages+ 3 0 payload)))
         (wal-set-u32 bytes 28 (unit-record-crc32-copy-reference bytes))

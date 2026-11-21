@@ -1665,8 +1665,10 @@
      (lambda (root store)
        (declare (ignore root))
        (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
-       (let* ((text (store-history-text 1 216))
-              (view (list :source 2 :parent 1 :history-text text :fork 216
+       (let* ((checkpoint (physical-test-checkpoint-record 184))
+              (fork (+ 184 (length checkpoint)))
+              (text (store-history-text 1 fork))
+              (view (list :source 2 :parent 1 :history-text text :fork fork
                           :proof-kind :retained-timeline
                           :history (pg::timeline-parse-history 2 text)))
               (operation (pg::make-physical-follow-operation
@@ -1692,13 +1694,13 @@
                   store (pg::physical-recovery-verify-base-state) active))
              (pg::physical-store-input store 152
                                        (pg::wal-encode-record pg::+wal-record-batch-start+ 0 152 (empty-octets)))
-             (pg::physical-store-input store 184 (legacy-checkpoint-record 184))
+             (pg::physical-store-input store 184 checkpoint)
              (pg::physical-store-flush store)
              (ok (pg::physical-follow-check-active-state
                   store (pg::physical-recovery-verify-base-state) active))
              (let ((candidate (pg::physical-follow-copy-checked-store store)))
-               (setf (pg::physical-store-flushed-lsn candidate) 217
-                     (pg::physical-store-written-lsn candidate) 217)
+               (setf (pg::physical-store-flushed-lsn candidate) (1+ fork)
+                     (pg::physical-store-written-lsn candidate) (1+ fork))
                (ok (handler-case
                        (progn (pg::physical-follow-check-active-receive
                                candidate (pg::physical-recovery-verify-base-state) binding)
