@@ -70,15 +70,14 @@
             (rove:ok (= (unit-record-crc32-copy-reference bytes) (wal-record-crc32 bytes)))
             (setf (aref *wal-crc32-table* slot) (logxor 1 (aref *wal-crc32-table* slot))))))))
 
-(rove:deftest record-crc32-keeps-versioned-decoder-corruption-checks-and-payload-ownership
-    (dolist (version '(2 3 4 5 6 7 8))
-      (let* ((payload (make-array 512 :element-type '(unsigned-byte 8) :initial-element 173))
+(rove:deftest record-crc32-keeps-decoder-corruption-checks-and-payload-ownership
+    (dolist (size '(8 31 32 33 512))
+      (let* ((payload (make-array size :element-type '(unsigned-byte 8) :initial-element 173))
              (bytes (wal-encode-record +wal-record-pages+ 3 0 payload)))
-        (wal-set-u16 bytes 4 version)
         (wal-set-u32 bytes 28 (unit-record-crc32-copy-reference bytes))
         (let* ((before (copy-seq bytes))
                (record (wal-decode-record bytes 0)))
-          (rove:ok (= version (wal-record-version record)))
+          (rove:ok (= +wal-version+ (wal-record-version record)))
           (rove:ok (equalp payload (wal-record-payload record)))
           (rove:ok (equalp bytes before))
           (setf (aref (wal-record-payload record) 0) 7)

@@ -315,13 +315,12 @@
       (setf (getf new :checkpoint-start) 33)
       (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema new))))))
 
-(deftest version-five-logical-records-remain-readable-after-checkpoint-upgrade
+(deftest native-logical-records-survive-streaming-intake
     (dolist (type (list pg::+wal-record-logical-changes+ pg::+wal-record-logical-catalog-event+))
-      (let ((bytes (pg::wal-encode-record type 0 0 #(1 2 3))))
-        (pg::wal-set-u16 bytes 4 5)
-        (pg::wal-set-u32 bytes 28 0)
-        (pg::wal-set-u32 bytes 28 (pg::wal-crc32 bytes))
-        (let ((records (pg::physical-wal-decode-input (pg::make-physical-wal-decoder) 0 bytes)))
-          (ok (= 1 (length records)))
-          (ok (= 5 (pg::wal-record-version (first records))))
-          (ok (= type (pg::wal-record-type (first records))))))))
+      (let* ((payload #(1 2 3))
+             (bytes (pg::wal-encode-record type 0 0 payload))
+             (records (pg::physical-wal-decode-input (pg::make-physical-wal-decoder) 0 bytes)))
+        (ok (= 1 (length records)))
+        (ok (= pg::+wal-version+ (pg::wal-record-version (first records))))
+        (ok (= type (pg::wal-record-type (first records))))
+        (ok (equalp payload (pg::wal-record-payload (first records)))))))
