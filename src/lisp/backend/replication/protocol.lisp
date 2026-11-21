@@ -13,9 +13,10 @@
 (defstruct logical-replication-command
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
-(defparameter +logical-replication-type-oids+
-  '((:int2 . 21) (:int4 . 23) (:int8 . 20) (:varchar . 1043) (:text . 25) (:bytea . 17) (:json . 114) (:jsonb . 3802) (:numeric . 1700) (:float4 . 700) (:float8 . 701) (:date . 1082) (:time . 1083) (:timestamp . 1114) (:timestamptz . 1184) (:interval . 1186) (:timetz . 1266)
-    (:bytea-array . 1001) (:json-array . 199) (:jsonb-array . 3807)))
+(defparameter +logical-replication-types+
+  '(:int2 :int4 :int8 :varchar :text :bytea :json :jsonb :numeric :float4 :float8
+    :date :time :timestamp :timestamptz :interval :timetz :bytea-array :json-array :jsonb-array)
+  "SQL types supported by the pgoutput row encoder.")
 
 (defun replication-command-words (query)
   "Tokenize repl_scanner-style quoted words, C whitespace and command punctuation."
@@ -388,8 +389,9 @@ feedback message after READ-FRAME returns. Reserved XIDs become NIL."
     (send-replication-copy-data stream payload)))
 
 (defun pgoutput-type-oid (type)
-  (or (cdr (assoc type +logical-replication-type-oids+))
-      (error "unsupported pgoutput type ~a" type)))
+  (unless (member type +logical-replication-types+)
+    (error "unsupported pgoutput type ~a" type))
+  (type-oid type))
 
 (defun pgoutput-build-begin (transaction)
   ;; Compare with pgoutput_send_begin() and logicalrep_write_begin() in C.

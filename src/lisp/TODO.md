@@ -174,6 +174,11 @@ replacement operation handles TOAST reuse, successor linking, and logical
 update publication. UPDATE still supplies its lazy TOAST demand and returns
 the matched source row through its own RETURNING path.
 
+The first A8 slice moves SQL type OIDs and lengths into
+`utils/adt/sql-types.lisp`. The analyzer, catalog, extended query protocol,
+and pgoutput paths share those identities. The pgoutput encoder and
+subscriber share their supported type set while retaining their own codecs.
+
 For B18, new clusters and backups of those clusters use timeline-qualified
 WAL files. The bootstrap harness checks the control namespace and filename
 grammar on both source and copy. Startup still reads the existing control's

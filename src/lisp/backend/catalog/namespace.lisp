@@ -63,7 +63,7 @@
 
 (defun sql-varlena-array-element-oid (type)
   "Return the PostgreSQL element OID for supported variable-width arrays."
-  (ecase type (:bytea 17) (:json 114) (:jsonb 3802)))
+  (ecase type ((:bytea :json :jsonb) (type-oid type))))
 
 (defun sql-varlena-array-element-octets (value type)
   (ecase type
@@ -728,7 +728,7 @@ Capture policy and keep size once for every row in the snapshot."
 
 (defun sql-type-rows ()
   "Expose metadata for the type identifiers recognized by SQL expression analysis."
-  (loop for (type oid length) in (symbol-value '+sql-expression-types+)
+  (loop for (type oid length) in +sql-expression-types+
         collect (vector oid (sql-type-catalog-name type) 11 length
                         (char-code (sql-type-alignment-code type))
                         (char-code (sql-type-storage-code type)))))
