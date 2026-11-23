@@ -76,6 +76,22 @@
       (rove:ok (having-literal-expression-p expression))
       (rove:ok (equal (multiple-value-list (having-gate-value expression)) '(t t)))))
 
+(rove:deftest default-folding-preserves-opaque-operand-metadata
+    (let* ((metadata (list :binop "/" '(:const 1 :type :int4) '(:const 0 :type :int4)
+                           :type :int4))
+           (setting (list :func "current_setting"
+                          (list (list :cast '(:const "application_name" :type :name) :type :text :typmod -1))
+                          :type :text :saved metadata))
+           (branch (list (list :is-null setting nil :type :bool)
+                         '(:const "missing" :type :text) :saved metadata))
+           (expression (list :case (list branch) '(:const "found" :type :text) :type :text))
+           (folded (fold-column-default expression))
+           (retained (first (second folded)))
+           (folded-setting (second (first retained))))
+      (rove:ok (equal (third folded-setting) '((:const "application_name" :type :text :typmod -1))))
+      (rove:ok (eq (getf (cdddr folded-setting) :saved) metadata))
+      (rove:ok (eq (getf (cddr retained) :saved) metadata))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))

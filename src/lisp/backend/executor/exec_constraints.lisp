@@ -79,7 +79,7 @@ those arguments therefore occur before any row execution or sequence effects."
                          (cond ((constant-p condition)
                                 (when (eq (second condition) t)
                                   (setf default (second branch)) (return)))
-                               (t (push (list condition (fold (second branch))) branches)))))
+                               (t (push (list* condition (fold (second branch)) (cddr branch)) branches)))))
                      (let ((copy (copy-list node)))
                        (setf (second copy) (nreverse branches) (third copy) (fold default))
                        (if branches copy (third copy)))))
@@ -108,8 +108,8 @@ those arguments therefore occur before any row execution or sequence effects."
                 (unless (member (first node)
                                 '(:cast :unary :not :binop :concat :array-length :is-null :is-bool
                                   :array :func :any :all :in))
-                  (return-from fold (mapcar #'fold node)))
-                (let* ((copy (mapcar #'fold node))
+                  (return-from fold (map-local-expression-operands #'fold node)))
+                (let* ((copy (map-local-expression-operands #'fold node))
                        (strict-inputs
                          (case (first copy)
                            (:binop (list (third copy) (fourth copy)))

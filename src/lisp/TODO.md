@@ -539,6 +539,10 @@ lower bounds, and the array base in the existing fold order. The C
 differential checks a stored element default, text-cast slices with
 either bound omitted, and error precedence between the upper and lower
 bounds of a demanded default.
+Default folding uses the shared local operand mapper for ordinary
+expressions. It keeps conditional evaluation and strict NULL handling.
+A regression verifies that a constant call argument folds while the
+call and CASE branch retain opaque metadata.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
