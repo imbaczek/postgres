@@ -1,9 +1,12 @@
 ;;;; Source pin tests isolate retention decisions; placeholder segments are not replay fixtures.
 (in-package #:pg-physical-tests)
 
-(defun call-with-physical-source-fixture (function)
+(defun call-with-physical-source-fixture (function &key (namespace pg::*wal-segment-namespace*)
+                                                     (timeline pg::*wal-insert-timeline*))
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root)
+           (pg::*wal-segment-namespace* namespace)
+           (pg::*wal-insert-timeline* timeline)
            (pg::*catalog* (pg::make-catalog))
            (pg::*physical-source-pins* (make-hash-table :test #'equal))
            (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
@@ -74,8 +77,6 @@
        (let* ((pg::*wal-ready* t)
               (pg::*wal-archive-primary-scan* (pg::make-wal-archive-scan))
               (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
-              (pg::*wal-insert-timeline* 1)
-              (pg::*wal-segment-namespace* :legacy)
               (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
               (segment (pg::wal-segment-path 0))
               (name (file-namestring segment))
@@ -96,21 +97,21 @@
          (handler-bind ((warning #'muffle-warning))
            (ok (pg::wal-archiver-step-primary
                 "case \"%f\" in *.proof) exit 1;; esac; cp -- \"%p\" \"%f\"")))
-         (ok (probe-file (merge-pathnames "0000000000000001.wal" pg::*pgdata*)))
+         (ok (probe-file (merge-pathnames "000000010000000000000001.wal" pg::*pgdata*)))
          (ok (not (probe-file destination)))
          (let ((receipt (merge-pathnames (concatenate 'string "archive_status/" proof-name ".done")
                                          (pg::wal-directory))))
            (sb-posix:mkdir (namestring receipt) #o700)
            (handler-bind ((warning #'muffle-warning))
              (ok (pg::wal-archiver-step)))
-           (ok (probe-file (merge-pathnames "0000000000000002.wal" pg::*pgdata*)))
+           (ok (probe-file (merge-pathnames "000000010000000000000002.wal" pg::*pgdata*)))
            (sb-posix:rmdir (namestring receipt)))
          (ok (pg::wal-archiver-step-primary
               "case \"%f\" in *.proof) cp -- \"%p\" \"%f\";; *) exit 1;; esac"))
          (ok (= (length bytes)
                 (pg::wal-verify-archive-segment-proof
                  (pg::read-bounded-regular-file destination pg::+wal-archive-segment-proof-size+)
-                 (pg::catalog-system-identifier) 1 0 :legacy bytes)))
+                 (pg::catalog-system-identifier) 1 0 :timeline bytes)))
          (pg::wal-atomic-write-bytes
           segment (pg::wal-encode-record pg::+wal-record-maintenance+ 0 0 (empty-octets)))
          (ok (pg::wal-archive-attempt 0 "cp -- \"%p\" \"%f\""))
@@ -121,7 +122,7 @@
          (let* ((status (merge-pathnames "archive_status/" (pg::wal-directory)))
                 (segment-done (merge-pathnames (concatenate 'string name ".done") status))
                 (proof-done (merge-pathnames (concatenate 'string proof-name ".done") status))
-                (other-done (merge-pathnames "0000000000000001.wal.done" status)))
+                (other-done (merge-pathnames "000000010000000000000001.wal.done" status)))
            (ok (probe-file segment-done))
            (ok (probe-file proof-done))
            (ok (probe-file other-done))
@@ -131,8 +132,8 @@
            (ok (not (probe-file proof-done)))
            (ok (probe-file other-done))
            ;; Recreate the marker residue left when recycling stops after unlink.
-           (let ((partial-done (merge-pathnames "0000000000000000.wal.partial.done" status))
-                 (future-ready (merge-pathnames "0000000000000010.wal.ready" status)))
+           (let ((partial-done (merge-pathnames "000000010000000000000000.wal.partial.done" status))
+                 (future-ready (merge-pathnames "000000010000000000000010.wal.ready" status)))
              (dolist (marker (list segment-done proof-done partial-done future-ready))
                (pg::wal-atomic-write-bytes marker bytes))
              (pg::wal-archive-clean-retired-status)
@@ -157,7 +158,8 @@
            (pg::wal-archive-clean-retired-status)
            (ok (not (probe-file proof-done))))
          (ok (not (probe-file segment)))
-         (ok (not (probe-file proof)))))))
+         (ok (not (probe-file proof)))))
+     :namespace :timeline :timeline 1))
 
 (deftest primary-archive-drains-a-backlog-and-refreshes-its-scan
     (call-with-physical-source-fixture
@@ -165,8 +167,6 @@
        (let* ((count 96)
               (pg::*wal-ready* t)
               (pg::*wal-control-metadata* (list :db-state pg::+db-in-production+))
-              (pg::*wal-insert-timeline* 1)
-              (pg::*wal-segment-namespace* :legacy)
               (pg::*wal-durable-lsn* (* count pg::+wal-segment-size+))
               (pg::*wal-archive-primary-scan* (pg::make-wal-archive-scan))
               (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
@@ -193,7 +193,8 @@
            (ok (equal (loop for line = (read-line stream nil)
                             while line collect line)
                       (loop for segment from 0 to count
-                            collect (pg::wal-segment-filename segment 1 :legacy)))))))))
+                            collect (pg::wal-segment-filename segment 1 :timeline)))))))
+     :namespace :timeline :timeline 1))
 
 (deftest archive-restore-requires-matching-segment-proof
     (with-physical-store-directory (root)

@@ -354,6 +354,7 @@ with each source namespace, including startup refusal of an unproven pending
 promotion with its control extensions intact. Startup still reads the namespace in
 existing controls. The physical slot API fixtures use timeline-qualified WAL,
 with an explicit legacy namespace mutation for the recycling revalidation case.
+The archive rotation and backlog fixtures seed and publish timeline-qualified WAL.
 Retiring the legacy grammar requires recreating or
 retiring remaining development data, backups, and retained ancestral WAL.
 
