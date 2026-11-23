@@ -6,6 +6,7 @@
            #:type-oid #:sql-type-from-oid #:sql-expression-type-description
            #:sql-expression-type-length #:sql-varchar-assignment-value
            #:sql-varchar-cast-value #:sql-varchar-typmod
+           #:sql-numeric-typmod #:sql-numeric-typmod-components
            #:+sql-array-types+ #:sql-array-type #:sql-array-element-type
            #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name)
   (:export #:main))
@@ -18,10 +19,12 @@
                 #:type-oid #:sql-type-from-oid #:sql-expression-type-description
                 #:sql-expression-type-length #:sql-varchar-assignment-value
                 #:sql-varchar-cast-value #:sql-varchar-typmod
+                #:sql-numeric-typmod #:sql-numeric-typmod-components
                 #:+sql-array-types+ #:sql-array-type #:sql-array-element-type
                 #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name)
   (:export #:type-oid #:sql-type-from-oid #:sql-expression-type-description
            #:sql-expression-type-length #:sql-varchar-assignment-value
            #:sql-varchar-cast-value #:sql-varchar-typmod
+           #:sql-numeric-typmod #:sql-numeric-typmod-components
            #:sql-array-type #:sql-array-element-type
            #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name))

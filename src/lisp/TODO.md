@@ -732,6 +732,10 @@ definitions and stored casts use the same renderer while keeping the
 explicit time-zone suffix in timestamp column definitions. The
 regressions check packed bytes, exact replay SQL, and a negative-scale
 default across a fresh server image.
+The numeric typmod codec is exported by independently loadable
+`pg/sql-types`. A clean REPL checked precision and signed-scale
+round trips and SQLSTATE 22023 without loading numeric arithmetic.
+The warm server image retained both existing typmod symbol identities.
 
 ### A17 follow-up evidence
 
