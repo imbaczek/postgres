@@ -173,6 +173,22 @@
     (unless (eq profile (logical-slot-imported-startup-recovery-profile root))
       (error "historical promotion profile changed before archive unlink"))))
 
+(defun logical-slot-imported-unlink-candidates (root archive-fd archive-key ownership proof primary reference deletion)
+  "Collect only unprotected, canonical objects while holding the archive mutex."
+  (let* ((directory (merge-pathnames "pg_physical_retained/" (physical-image-fd-path root)))
+         (candidates (if (eq deletion :collect)
+                         (physical-retained-root-collection-candidates directory archive-fd)
+                         (list deletion))))
+    (loop for (kind id) in candidates
+          unless (physical-retained-root-protected-under-lock directory kind id archive-key)
+            count (progn
+                    (postmaster-check-ownership ownership)
+                    (physical-image-check-target (postmaster-ownership-directory ownership) root)
+                    (logical-slot-imported-check-unlink-controls root proof primary reference)
+                    (physical-retained-root-unlink-under-lock directory archive-fd kind id))
+              into removed
+          finally (return (plusp removed)))))
+
 (defun logical-slot-imported-check-startup-retained (gate ownership proof selections &optional deletion)
   "Verify the restored selections and optionally unlink one unprotected (kind id).
 Keep postmaster and receive ownership through the archive operation."
@@ -208,14 +224,5 @@ Keep postmaster and receive ownership through the archive operation."
                               archive-key (remove nil (list (list token (getf reference :root-id))
                                                             primary receive)))
                              (when deletion
-                               (destructuring-bind (kind id) deletion
-                                 (let ((directory (merge-pathnames "pg_physical_retained/"
-                                                                   (physical-image-fd-path root))))
-                                   (unless (physical-retained-root-protected-under-lock
-                                            directory kind id archive-key)
-                                     (postmaster-check-ownership ownership)
-                                     (physical-image-check-target
-                                      (postmaster-ownership-directory ownership) root)
-                                     (logical-slot-imported-check-unlink-controls root proof primary reference)
-                                     (physical-retained-root-unlink-under-lock
-                                      directory archive-fd kind id))))))))))))))))))))))
+                               (logical-slot-imported-unlink-candidates
+                                root archive-fd archive-key ownership proof primary reference deletion)))))))))))))))))))

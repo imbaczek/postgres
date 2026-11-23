@@ -76,7 +76,7 @@
 (when (equal "1" (uiop:getenv "PG_NATIVE_MAIN_CHECK_RETAINED_UNLINK"))
   (let ((original (symbol-function 'logical-slot-imported-check-startup-retained)))
     (setf (symbol-function 'logical-slot-imported-check-startup-retained)
-          (lambda (gate ownership proof selections)
+          (lambda (gate ownership proof selections deletion)
             (let* ((archive (physical-recovery-retained-directory))
                    (candidate (physical-retained-object-path archive :inventory 0))
                    (certificate (getf (logical-slot-copy-check-source-proof proof) :certificate))
@@ -101,8 +101,17 @@
                                    (error () t)))
                          (assert (probe-file candidate)))
                     (sb-posix:rename saved control))))
-              (assert (funcall original gate ownership proof selections '(:inventory 0)))
-              (assert (not (probe-file candidate)))
+              (assert (eq deletion :collect))
+              (let ((unrelated (merge-pathnames "inventory-0000000000000000.index.tmp" archive)))
+                (with-open-file (stream unrelated :direction :output :if-exists :error)
+                  (write-char #\x stream))
+                (unwind-protect
+                     (progn
+                       (assert (funcall original gate ownership proof selections deletion))
+                       (assert (not (probe-file candidate)))
+                       (assert (probe-file unrelated))
+                       (assert (probe-file (physical-retained-object-path archive :inventory root))))
+                  (delete-file unrelated)))
               (format t "~&IMPORTED-MAIN-RETAINED-UNLINK-PASS~%"))))))
 
 (let ((original (symbol-function 'catalog-init)))

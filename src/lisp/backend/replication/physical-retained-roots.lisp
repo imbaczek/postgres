@@ -539,6 +539,29 @@ retains protection until readback reconciliation or durable retirement."
                      (not (gethash owner *physical-retained-root-updates*)))
           (error "required retained WAL root is absent, rebound, or uncertain"))))))
 
+(defun physical-retained-root-collection-candidates (directory fd)
+  "Find canonical, regular retained objects through the held archive directory."
+  (physical-retained-root-require-lock)
+  (loop for name in (slot-state-directory-entries fd)
+        for candidate =
+                      (loop for (kind prefix suffix) in '((:extent "extent-" ".wal")
+                                                          (:inventory "inventory-" ".index")
+                                                          (:overlap "overlap-" ".wal"))
+                            for start = (length prefix)
+                            for end = (+ start 16)
+                              thereis (when (and (= (length name) (+ end (length suffix)))
+                                                 (string= prefix name :end2 start))
+                                        (let ((id (parse-integer name :start start :end end :radix 16 :junk-allowed t)))
+                                          (when (and (typep id '(unsigned-byte 64))
+                                                     (string= name (file-namestring
+                                                                    (physical-retained-object-path directory kind id))))
+                                            (list kind id)))))
+        when (and candidate
+                  (let ((stat (slot-state-lstat (slot-state-fd-path fd name))))
+                    (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                         (= (sb-posix:stat-nlink stat) 1))))
+          collect candidate))
+
 (defun physical-retained-root-unlink-under-lock (directory fd kind id)
   "Unlink an already checked candidate and sync its held archive directory."
   (physical-retained-root-require-lock)

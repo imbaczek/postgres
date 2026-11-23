@@ -487,8 +487,13 @@ still has work outstanding.
   historical promotion control matches the permanent origin proof.
   The native observer replaced the historical control and verified that
   the candidate survived, then restored the control and verified unlink.
-  Production scheduling and verification of its candidate selection
-  remain open.
+  Imported primary startup now collects canonical, regular retained
+  objects after slot restoration and feedback validation. Collection
+  skips any object protected by a registered reference or hold and
+  rechecks the durable selectors before each unlink. All 36 strict
+  retained-root tests passed. Three native boots each with two slots
+  and with no slots removed the test candidate and preserved the
+  selected root and unrelated file. Both proof-loss cases refused startup.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
