@@ -155,8 +155,15 @@ The shared slot fixture mocks the logger and leaves control metadata unset."
             (case failure
               (:missing (delete-file (wal-control-path)))
               (:namespace
-               (wal-atomic-write-bytes (wal-control-path)
-                                       (string->bytes (format nil "PGWAL6 0 0 1 1 legacy - 748566CF~%"))))
+               (let* ((fields (with-open-file (stream (wal-control-path))
+                                (wal-split-fields (read-line stream))))
+                      (prefix (progn
+                                (setf (sixth fields) "legacy")
+                                (format nil "~{~a~^ ~}" (butlast fields))))
+                      (crc (wal-crc32 (string->bytes prefix))))
+                 (wal-atomic-write-bytes
+                  (wal-control-path)
+                  (string->bytes (format nil "~a ~8,'0X~%" prefix crc)))))
               (otherwise
                (destructuring-bind (checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)
                    (multiple-value-list (wal-read-control-fields))
