@@ -471,8 +471,13 @@ still has work outstanding.
   test heads passed, including missing-owner and mount mismatch cases.
   Both the two-slot and zero-slot layouts passed three instrumented
   boots and the proof-loss refusal case.
-  Enabling GC still requires carrying the live host and receive ownership
-  through the archive unlink and rechecking those registrations there.
+  In `7f623f09353`, the post-restoration check runs with the receive spool
+  locked and verifies the full durable control before and after checking
+  the archive registrations. All 36 strict retained-root tests passed.
+  Native restart and proof-loss cases passed with both a surviving
+  receive spool and a fixture with the spool absent.
+  Enabling GC still requires carrying these ownership checks through
+  the archive unlink.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
