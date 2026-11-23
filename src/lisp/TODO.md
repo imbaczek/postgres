@@ -1202,6 +1202,14 @@ Sixty-six strict physical tests passed, covering checkpoint, control data,
 and standby control boundaries. The live checkpoint suite passed crash cuts,
 checkpoint identity, standby replay and restartpoint, and retired-format refusal.
 
+The Milestone 4 review traced the scan and control moves to their original
+definitions, checked ASDF load order, and verified that durable checkpoint
+control still precedes recycling under the WAL lock. At `621ea35ed35`,
+all 315 selected WAL, checkpoint, receipt, and slot unit heads passed with
+fresh strict compilation in 53.71 seconds. The live WAL crash suite passed.
+The timing ledger retains the selection and logs under
+`architecture-wal-components`. Live wall time was unmeasured.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
