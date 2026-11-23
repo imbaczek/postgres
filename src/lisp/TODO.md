@@ -61,7 +61,7 @@ spans in the 127 production Lisp files changed since `6bcf82cf717`.
 All measured spans fit within 120 lines.
 
 The Milestone 3A polish review checked the temporal, SELECT source, and interval
-extractions against their raw results. The strict batches took 36.12, 38.58,
+extractions against their raw results. The unit batches took 36.12, 38.58,
 and 40.45 seconds respectively. Test-system loading took 22.88–26.38 seconds
 per batch. Overall milestone wall time and peak process count were unmeasured.
 The timing ledger and compressed logs under
@@ -663,13 +663,13 @@ key-slot and parent-frame regressions, and live LIMIT checks passed.
 Callback scans and portal heap, index, and virtual scans now share source-order
 row and datum-origin placement. A REPL probe over 100,000 rows matched the
 previous allocation in all three cases: zero for borrowed vectors, one array
-per reordered row, and a second array when origins were present. All 82 strict
+per reordered row, and a second array when origins were present. All 82 selected
 scan, origin, presence, and join selections passed, along with the live C DML
 differential, resumed portal checks, and native TOAST DML.
 SELECT preparation now resolves FROM and JOIN sources in a dedicated function.
 The remaining preparation function is 104 lines. Source order, JOIN/ON frame
 selection, LATERAL visibility, and USING output slots are preserved. The
-131 strict tests, 108 C DML comparisons, 24 controlled DML concurrency cases,
+131 selected unit tests, 108 C DML comparisons, 24 controlled DML concurrency cases,
 and 112 C subquery comparisons passed. The known semijoin EPQ difference
 also reproduced.
 
@@ -684,7 +684,7 @@ store-point check. The 56-head strict selection includes rejection of an
 independently supplied wrong timeline and of a position inside a record.
 The proof scans and both standby redo paths now validate any supplied FPW
 and logical seeds against one resolved history at their starting boundary.
-With both seeds absent they skip history resolution. All 56 strict physical
+With both seeds absent they skip history resolution. All 56 selected physical
 checks passed again, and native and C hot standby passed replay, reload,
 restart, and promotion.
 
@@ -721,7 +721,7 @@ transition.
 | A16. Settings metadata | Read-only descriptors in `63085c92361`. The config-output test verified include files, CLI overrides, base units, C metadata and binary numeric parity, and no storage initialization. The numeric and rollback session tests passed, and the application-name C differential verified startup, SQL, wire status, transaction-local restoration, and live reload. The full_page_writes process test passed startup, session context rejection, unchanged and changed SIGHUP reloads, invalid reload rollback, and cold reconciliation. Its probe in `054535a1613` uses the reload timeout when SIGHUP forces code recompilation. SHOW now takes numeric units from the same descriptor used for startup parsing and `pg_settings`. The Rove metadata check passed, and live C comparison matched all seven unit-bearing startup settings through SHOW, `current_setting`, and `pg_settings`, including the receiver interval. |
 | A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. WAL namespace and restartpoint process tests share a stopped-source fixture conversion. In `03c8c542470`, receiver exit, physical replay and retention share native launch and checked control calls while keeping their own cleanup and readiness policies. All three process tests passed. The retention fixture pauses replay explicitly and installs restartpoint thresholds and slot retention through configuration, then verifies local recycling, cold restart and durable pin loss. In `c10f5055bef`, online promotion and ordinary crash restarts use the same fixture helpers, and instrumented startups retain their crash hooks. The crash suite compares recovered rows with the current seed and uses one short control socket path. Online promotion and the expanded crash suite passed, including seven crash cuts, startup signal handling and an unterminated receive batch. In `c7ec1f1ebb9`, namespace migration and automatic restartpoint also share launch and control helpers while retaining the namespace control timeout. Both namespace layouts passed restartpoint recovery and rejected an unproven promotion without changing storage. The migration suite passed its crash and retry boundaries, byte preservation, continued follow and qualified bootstrap. Audit the remaining fault scenarios. |
 | A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. `t/run-unit-tests.sh --list` uses Rove registration and the legacy execution declarations. The inventory at `723300f29b4` lists 1,642 unique Rove heads and 166 unique legacy cases without running them. Its Rove names match the individual heads reported by the combined run at `e527a279ea1`. The legacy listing follows invocation order, including the named VACUUM failpoint variant, and the combined run passed 1,172 legacy checks. |
-| A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. The source XID reservation, membership transitions, and checkpoint reservation derivation now live in the replay fact component as well. The component explicitly depends on the recovery manifest accessor. Warm reload resolved all four functions from their new file. All 61 selected strict physical heads and live standby redo passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Package `PG.METADATA-LITERAL` owns the physical manifest literal codec and its eligibility checks. ASDF orders the codec before bootstrap and recovery. A warm reload preserved symbol identity, eight strict unit heads passed including the allocation probes, and the live physical bootstrap fixture passed. |
+| A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. The source XID reservation, membership transitions, and checkpoint reservation derivation now live in the replay fact component as well. The component explicitly depends on the recovery manifest accessor. Warm reload resolved all four functions from their new file. All 61 selected physical heads and live standby redo passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Package `PG.METADATA-LITERAL` owns the physical manifest literal codec and its eligibility checks. ASDF orders the codec before bootstrap and recovery. A warm reload preserved symbol identity, eight strict unit heads passed including the allocation probes, and the live physical bootstrap fixture passed. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. The producer inventory in `bfb3acb33bf` records current B-tree and catalog reader requirements and links to the extracted slot encoder. The [current legacy primary procedure](PHYSICAL-HA.md#legacy-primary-cutover) records the tested migration revision, cold restart, replacement backups, and qualified archive ancestry. |
 
 ### A3 follow-up evidence
@@ -995,13 +995,13 @@ and direct TOAST projection checks. See the A17 fixture evidence below.
 
 Temporal arithmetic analysis now has its own function. The binary operator
 analyzer is 104 lines and keeps the existing comparison and coercion order.
-All 138 selected strict tests passed. Live C comparisons matched ten value
+All 138 selected unit tests passed. Live C comparisons matched ten value
 queries and two SQLSTATE checks. C also resolves TIME multiplication through
 an implicit interval cast and reports TIME plus TIME as ambiguous. The current
 native analyzer reports 42883 for both expressions.
 Interval input now delegates ISO numeric token handling and compact field
 expansion to separate functions. The ISO parser is 113 lines and the
-PostgreSQL-style parser is 100 lines. Both strict interval metadata checks
+PostgreSQL-style parser is 100 lines. Both interval metadata checks
 passed. The 1,487-case C differential passed, including compact ISO
 date and time fields, exponents, hex and subnormal values, error cases,
 and stored interval typmods after restart.
@@ -3085,7 +3085,7 @@ differential regressions verify the grouped value and comparison result.
   to two test declarations. The staging observer's file binding and the
   continuation contract's loop index are ignorable in the source body and
   used by the macro expansions. Recompiling both files removed those warnings.
-  Both strict test heads passed, including the 200-trial property. Dependency
+  Both test heads passed, including the 200-trial property. Dependency
   warnings still appear from the test toolchain.
 
 - [x] Preserve ownership revocation across live reloads. The stream and directory
