@@ -198,18 +198,23 @@ For B12, `64002cfb17e` requires PGRPGEN2 and metadata version 4. The
 `t/xid-reservation.sh` fixture exercises startup rejection of retired
 generations and checks that their control files are unchanged.
 
-For B13, restart the Lisp server across the gate representation cutover.
+For B13, restart the Lisp server across the gate representation cutover in
+`87b987c4be0`.
 The admission gate now closes and reopens with the current quiescence owner
-token. The load-time bridge for ownerless gates has been removed.
+token. The load-time bridge for ownerless gates has been removed. Six current
+strict physical tests passed, including borrowed admission, unwind, canceled
+reload drain and the terminal shutdown fence.
 
-For B14, restart the Lisp server across the backend layout change. Commit
-preflights logical row changes through the transaction spool, and the
-snapshot-handoff and rollback tests check that transaction cleanup releases it.
+For B14, restart the Lisp server across the backend layout change in
+`509bc1c6992`. Commit preflights logical row changes through the transaction
+spool. The live capture fixture passed spill cleanup on rollback and disconnect,
+restart recovery, and rejection of corruption after the first durable fragment.
 
 For B17, restart the Lisp server across the portal and statement layout
-change. Portal result metadata and prepared result signatures now live on
-their owners. The SELECT and DML execution registries still track executable
-portal state for cleanup and suspension.
+change in `0ebd131b2eb`. Portal result metadata and prepared result signatures
+live on their owners. The SELECT and DML execution registries track executable
+portal state for cleanup and suspension. The live portal lifecycle fixture
+passed snapshot retention, reload exclusion and cleanup after suspension.
 
 The first A1 slice shares physical row projection between the callback and
 iterator drivers. It preserves deferred sort expressions, ProjectSet
