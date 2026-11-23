@@ -44,7 +44,10 @@
   "Identify the executable operand layout for an analyzed expression tag."
   (case tag
     ((:const :bool :scalar-array-const :col :sort-output :window-ref) :leaf)
-    ((:func :set-func :single-record :whole-row) :third)
+    ((:cast :not :is-null :is-bool :join-relabel :record-field :array :coalesce) '(1))
+    ((:func :set-func :single-record :whole-row :unary) '(2))
+    ((:and :or :concat :join-coalesce :array-length) '(1 2))
+    ((:binop :any :all) '(2 3))
     (:outer-ref :outer-ref)
     (:subplan :subplan)
     (:in :in)
@@ -64,25 +67,24 @@
   "Visit local expression nodes until PREDICATE succeeds.
 PREDICATE receives the node and may call the walker before returning.
 Its second value can suppress descent without stopping the walk.
-Subplans expose their test without entering the prepared query. Calls and
-records expose their executable inputs. Follow the operand of an outer
-reference conservatively, as it is evaluated in the outer frame. Other forms
-may still contain expression lists and are traversed structurally."
+Subplans expose their test without entering the prepared query. Outer
+references expose the operand evaluated in the outer frame."
   (labels ((walk (form)
              (when (consp form)
                (multiple-value-bind (found skip-children-p)
                    (funcall predicate form #'walk)
                  (or found
                      (unless skip-children-p
-                       (ecase (local-expression-operand-shape (first form))
-                         (:leaf nil)
-                         (:in (some-analyzed-in-operand #'walk form))
-                         (:subplan
-                          (let ((subplan (second form)))
-                            (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                         ((:third :outer-ref)
-                          (walk (third form)))
-                         (:structural (or (walk (car form)) (walk (cdr form)))))))))))
+                       (let ((shape (local-expression-operand-shape (first form))))
+                         (case shape
+                           (:leaf nil)
+                           (:in (some-analyzed-in-operand #'walk form))
+                           (:subplan
+                            (let ((subplan (second form)))
+                              (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
+                           (:outer-ref (walk (third form)))
+                           (:structural (or (walk (car form)) (walk (cdr form))))
+                           (otherwise (some (lambda (position) (walk (nth position form))) shape))))))))))
     (declare (dynamic-extent #'walk))
     (not (null (walk expression)))))
 
@@ -91,15 +93,15 @@ may still contain expression lists and are traversed structurally."
 
 (defun map-local-expression-operands (function form)
   "Copy FORM's local expression operands. Callers handle outer refs and subplans."
-  (ecase (local-expression-operand-shape (first form))
-    ((:leaf :outer-ref :subplan)
-     (copy-list form))
-    (:third
-     (let ((copy (copy-list form)))
-       (setf (third copy) (funcall function (third form)))
-       copy))
-    (:in (map-analyzed-in-operands function form))
-    (:structural (mapcar function form))))
+  (let ((shape (local-expression-operand-shape (first form))))
+    (case shape
+      ((:leaf :outer-ref :subplan) (copy-list form))
+      (:in (map-analyzed-in-operands function form))
+      (:structural (mapcar function form))
+      (otherwise
+       (let ((copy (copy-list form)))
+         (dolist (position shape copy)
+           (setf (nth position copy) (funcall function (nth position form)))))))))
 
 (defun claim-query-rewrite (node seen)
   "Claim an owned mutable query node once for this rewrite."

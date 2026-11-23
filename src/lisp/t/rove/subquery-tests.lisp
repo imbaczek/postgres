@@ -72,6 +72,26 @@
       (rove:ok (eq reference (caar (getf (cddddr source) :comparisons))))
       (rove:ok (eq metadata (getf (cddddr mapped) :saved)))))
 
+(rove:deftest scalar-operator-walks-keep-metadata-opaque
+    (let ((operand (list :col 1 :type :int4))
+          (metadata (list :col 99 :type :int4)))
+      (dolist (expression (list (list :cast operand :type :int8 :saved metadata)
+                                (list :binop "+" '(:const 1) operand :type :int4 :saved metadata)
+                                (list :any "=" operand '(:const #(1)) :type :bool :saved metadata)
+                                (list :and operand '(:bool t) :type :bool :saved metadata)))
+        (flet ((has-node-p (target)
+                 (some-local-plan-expression
+                  (lambda (form walk) (declare (ignore walk)) (eq form target))
+                  expression)))
+          (rove:ok (has-node-p operand))
+          (rove:ok (not (has-node-p metadata))))
+        (let ((mapped (map-local-expression-operands
+                       (lambda (form) (if (member form (list operand metadata) :test #'eq) :mapped form))
+                       expression)))
+          (rove:ok (member :mapped mapped))
+          (rove:ok (eq (car (last mapped)) metadata))
+          (rove:ok (member operand expression :test #'eq))))))
+
 (rove:deftest lateral-legality-inspects-unused-cte-without-rewriting
     (let* ((predicate (list :bool t))
            (outer (list :outer-ref 2 '(:col 1 :type :int4)))

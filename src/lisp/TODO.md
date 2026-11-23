@@ -515,6 +515,16 @@ Window sort-key classification checks each call's volatility as it
 walks the key, avoiding repeated scans under nested calls. The Rove
 regression covers fixed and correlated subplans, outer references, and
 nested immutable calls.
+The local visitor and mapper share explicit operand positions for casts,
+scalar operators, quantified comparisons, and array/coalesce inputs.
+The TOAST demand walk uses those positions for its supported operators.
+The regression checks that operator metadata remains opaque to both
+inspection and rewriting.
+Strict units, all 112 C subquery comparisons, and live TOAST DML passed.
+The subquery harness reproduced the known semijoin EPQ difference.
+An isolated SBCL probe measured zero bytes per call before and after
+for the local visitor and TOAST walker on nested AND, cast, and binary
+operator expressions.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
