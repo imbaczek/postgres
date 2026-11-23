@@ -409,6 +409,9 @@ window in the right-hand subquery.
 Window key substitution preserves whole-expression slot matching and uses
 the same mapper for nested operands. A Rove check verifies slot reuse in the
 partition and target while preserving matching literal and call metadata.
+The read-only visitor and the rewriting mapper now share one operand layout
+table. The visitor can inspect subplan tests and outer-reference operands.
+The mapper preserves both boundary nodes for callers that own the rewrite.
 
 ## Open development tasks
 

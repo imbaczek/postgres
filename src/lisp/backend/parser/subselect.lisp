@@ -40,6 +40,15 @@
   ;; already rewritten to group output slots, avoiding a second slot rewrite.
   kind prepared plan test depths grouped-contexts)
 
+(defun local-expression-operand-shape (tag)
+  "Identify the executable operand layout for an analyzed expression tag."
+  (case tag
+    ((:const :bool :scalar-array-const :col :sort-output :window-ref) :leaf)
+    ((:func :set-func :single-record :whole-row) :third)
+    (:outer-ref :outer-ref)
+    (:subplan :subplan)
+    (otherwise :structural)))
+
 (defun some-local-plan-expression (predicate expression)
   "Visit local expression nodes until PREDICATE succeeds.
 PREDICATE receives the node and the walker for explicitly resolved references.
@@ -54,14 +63,14 @@ may still contain expression lists and are traversed structurally."
                    (funcall predicate form #'walk)
                  (or found
                      (unless skip-children-p
-                       (case (first form)
-                         ((:const :bool :scalar-array-const :col :sort-output :window-ref) nil)
+                       (ecase (local-expression-operand-shape (first form))
+                         (:leaf nil)
                          (:subplan
                           (let ((subplan (second form)))
                             (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                         ((:func :set-func :single-record :whole-row :outer-ref)
+                         ((:third :outer-ref)
                           (walk (third form)))
-                         (otherwise (or (walk (car form)) (walk (cdr form)))))))))))
+                         (:structural (or (walk (car form)) (walk (cdr form)))))))))))
     (not (null (walk expression)))))
 
 (defun subquery-expression-p (expression)
@@ -69,14 +78,14 @@ may still contain expression lists and are traversed structurally."
 
 (defun map-local-expression-operands (function form)
   "Copy FORM's local expression operands. Callers handle outer refs and subplans."
-  (case (first form)
-    ((:const :bool :scalar-array-const :col :sort-output :window-ref)
+  (ecase (local-expression-operand-shape (first form))
+    ((:leaf :outer-ref :subplan)
      (copy-list form))
-    ((:func :set-func :single-record :whole-row)
+    (:third
      (let ((copy (copy-list form)))
        (setf (third copy) (funcall function (third form)))
        copy))
-    (otherwise (mapcar function form))))
+    (:structural (mapcar function form))))
 
 (defun map-prepared-query-expressions (function prepared &optional (depth 0) query-function)
   "Visit executable expressions with nesting depth, excluding saved raw ASTs.

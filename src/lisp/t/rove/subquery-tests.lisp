@@ -36,6 +36,24 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest local-expression-mapper-leaves-scope-transitions-to-callers
+    (let* ((column '(:col 2 :type :int4))
+           (descriptor (make-sql-subplan :test column))
+           (metadata '(:col 99 :type :int4))
+           (subplan (list :subplan descriptor :saved metadata))
+           (outer (list :outer-ref 1 column :type :int4)))
+      (dolist (expression (list subplan outer))
+        (rove:ok (equal expression
+                        (map-local-expression-operands
+                         (lambda (operand) (declare (ignore operand)) :unexpected)
+                         expression)))
+        (rove:ok (some-local-plan-expression
+                  (lambda (operand walk) (declare (ignore walk)) (eq operand column))
+                  expression)))
+      (rove:ok (not (some-local-plan-expression
+                     (lambda (operand walk) (declare (ignore walk)) (eq operand metadata))
+                     subplan)))))
+
 (rove:deftest project-set-visits-only-local-executable-operands
     (let* ((opaque '(:set-func "opaque" nil :type :text))
            (literal (list :const opaque :type :text))
