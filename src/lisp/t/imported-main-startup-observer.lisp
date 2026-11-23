@@ -86,6 +86,21 @@
               (assert (probe-file (physical-retained-object-path archive :inventory root)))
               (with-open-file (stream candidate :direction :output :if-exists :error)
                 (write-char #\x stream))
+              (let* ((control (merge-pathnames "physical-recovery.control" *pgdata*))
+                     (saved (merge-pathnames "physical-recovery.control.unlink-test" *pgdata*)))
+                (when (probe-file control)
+                  (sb-posix:rename control saved)
+                  (unwind-protect
+                       (progn
+                         (with-open-file (stream control :direction :output :if-exists :error)
+                           (write-char #\x stream))
+                         (assert (handler-case
+                                     (progn
+                                       (funcall original gate ownership proof selections '(:inventory 0))
+                                       nil)
+                                   (error () t)))
+                         (assert (probe-file candidate)))
+                    (sb-posix:rename saved control))))
               (assert (funcall original gate ownership proof selections '(:inventory 0)))
               (assert (not (probe-file candidate)))
               (format t "~&IMPORTED-MAIN-RETAINED-UNLINK-PASS~%"))))))

@@ -151,6 +151,28 @@
               (call-with-logical-slot-imported-receive-retained
                root proof (lambda (selection check) (funcall check) selection))))))))
 
+(defun logical-slot-imported-check-unlink-controls (root proof primary origin-reference)
+  "Require the durable primary and historical promotion selections at unlink."
+  (let* ((metadata (let ((*pgdata* (physical-image-fd-path root)))
+                     (nth-value 6 (wal-read-control-fields))))
+         (id (getf (getf metadata :retained-reference) :root-id))
+         (profile (logical-slot-imported-startup-recovery-profile root)))
+    (unless (and (equalp metadata *wal-control-metadata*) (eql id (second primary)))
+      (error "primary retained root changed during imported startup"))
+    (when (eq profile :original)
+      (let* ((facts (logical-slot-copy-check-source-proof proof))
+             (expected (getf (getf facts :evidence) :control)))
+        (unless (equal (getf (getf facts :certificate) :retained-reference) origin-reference)
+          (error "historical promotion root differs from the restored origin"))
+        (call-with-logical-slot-copy-source-proof-fd
+         root "physical-recovery.control" nil
+         (lambda (fd file-facts)
+           (declare (ignore file-facts))
+           (unless (equalp expected (logical-slot-copy-import-control-read-fd fd (length expected)))
+             (error "historical promotion control changed before archive unlink"))))))
+    (unless (eq profile (logical-slot-imported-startup-recovery-profile root))
+      (error "historical promotion profile changed before archive unlink"))))
+
 (defun logical-slot-imported-check-startup-retained (gate ownership proof selections &optional deletion)
   "Verify the restored selections and optionally unlink one unprotected (kind id).
 Keep postmaster and receive ownership through the archive operation."
@@ -194,5 +216,6 @@ Keep postmaster and receive ownership through the archive operation."
                                      (postmaster-check-ownership ownership)
                                      (physical-image-check-target
                                       (postmaster-ownership-directory ownership) root)
+                                     (logical-slot-imported-check-unlink-controls root proof primary reference)
                                      (physical-retained-root-unlink-under-lock
                                       directory archive-fd kind id))))))))))))))))))))))

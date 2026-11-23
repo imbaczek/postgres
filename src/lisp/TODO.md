@@ -482,6 +482,11 @@ still has work outstanding.
   `PG_NATIVE_MAIN_CHECK_RETAINED_UNLINK=1`, the native observer verified
   that the protected root survives and an unreferenced candidate is
   removed on each of three boots. Proof-loss refusal passed.
+  The unlink check verifies that the primary control on the held host
+  still selects the registered primary root and that a surviving
+  historical promotion control matches the permanent origin proof.
+  The native observer replaced the historical control and verified that
+  the candidate survived, then restored the control and verified unlink.
   Production scheduling and verification of its candidate selection
   remain open.
 
