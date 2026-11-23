@@ -661,6 +661,11 @@ arity checks use the supported signatures directly. The 1,480 C
 comparisons include reordered random bounds, a positional seed, and
 rejection of a named seed. Exact diagnostic comparisons also cover
 qualified random lookup and argument-error precedence.
+The nullary replication-slot iterator selects catalog argument checking
+from its descriptor. Invalid calls still analyze arguments in caller
+order before checking named notation and resolving the zero-input
+signature. The C differential checks unknown and duplicate names and a
+positional argument after a named argument.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

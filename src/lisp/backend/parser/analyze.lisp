@@ -594,7 +594,8 @@ exist\" messages."
                                         :defer-decorated-coercion-p nil
                                         :evaluator '(:iterator make-rewind-directory-result-iterator))
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type '(:record . +replication-slot-result-fields+)
-                                        :volatility :stable :evaluator '(:iterator make-replication-slot-result-iterator))
+                                        :volatility :stable :implicit-arguments-p :catalog-nullary
+                                        :evaluator '(:iterator make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
                                         :result-type '(:record . +publication-table-result-fields+) :volatility :stable :strict-p t
                                         :evaluator '(:iterator make-publication-table-result-iterator analyze-publication-table-call))
@@ -1331,7 +1332,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
   (let ((parameters (scalar-builtin-named-parameters name)))
     (cond (parameters
            (analyze-named-builtin-arguments name arguments table variadic parameters))
-          ((string= name "pg_get_replication_slots")
+          ((scalar-builtin-call-policy-p name '(:catalog-nullary))
            (analyze-catalog-call-inputs arguments table))
           ((scalar-builtin-call-policy-p name '(:random))
            (analyze-random-arguments arguments table name schema))
