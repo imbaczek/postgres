@@ -599,6 +599,11 @@ construction exits before returning an iterator. Sixty-one strict unit heads
 covered LATERAL, subqueries and sorted set expansion. The live numeric LIMIT
 test passed on both wire protocols, and the child-opening fault regression
 verified cache release and restoration of the parent frame binding.
+Both Append drivers share UNION ALL coercion and origin projection. The
+pull driver keeps each arm's presence binding through projection and close.
+Seventy-nine strict unit heads and the live C subquery differential passed.
+A REPL probe preserved the projected row's shared value vector, datum
+origins, and source presence at the existing allocation rate.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

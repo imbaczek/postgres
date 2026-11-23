@@ -225,17 +225,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
            (declare (ignore toast))
            (let ((*query-row-presence* presence))
              (if present
-                 (let ((values (make-array (length coercions)))
-                       (result-origins (and *datum-origin-capture*
-                                            (make-array (length coercions) :initial-element nil))))
-                   (loop for expression in coercions for i from 0
-                         do (multiple-value-bind (value origin)
-                                (if *datum-origin-capture*
-                                    (eval-expr-with-origin expression (car row) origins)
-                                    (values (eval-expr expression (car row)) nil))
-                              (setf (aref values i) value)
-                              (when result-origins (setf (aref result-origins i) origin))))
-                   (return (values (cons values values) t result-origins nil presence)))
+                 (multiple-value-bind (projected result-origins)
+                     (project-append-row coercions (car row) origins)
+                   (return (values projected t result-origins nil presence)))
                  (progn (close-sql-iterator input) (setf input nil)))))))
      (lambda () (close-sql-iterator input)))))
 

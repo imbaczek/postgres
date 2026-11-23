@@ -1678,24 +1678,30 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
    (mapcar (lambda (call) (make-sql-set-function-iterator call environment)) calls)
    callback))
 
+(defun project-append-row (coercions environment input-origins)
+  "Apply one UNION ALL arm's coercions and return its owned output row and origins."
+  (let* ((width (length coercions))
+         (values (make-array width))
+         (origins (and *datum-origin-capture* (make-array width :initial-element nil))))
+    (loop for expression in coercions for i from 0
+          do (multiple-value-bind (value origin)
+                 (if *datum-origin-capture*
+                     (eval-expr-with-origin expression environment input-origins)
+                     (values (eval-expr expression environment) nil))
+               (setf (aref values i) value)
+               (when origins (setf (aref origins i) origin))))
+    (values (cons values values) origins)))
+
 (defun stream-union-all (arms emit run-child)
   "An arm's LIMIT ends that arm; only a consumer stop ends the Append."
   (let ((stopped-p nil))
     (dolist (arm arms)
       (funcall run-child (second arm)
                (lambda (row)
-                 (let ((values (make-array (length (first arm))))
-                       (origins (and *datum-origin-capture*
-                                     (make-array (length (first arm)) :initial-element nil))))
-                   (loop for expression in (first arm) for i from 0
-                         do (multiple-value-bind (value origin)
-                                (if *datum-origin-capture*
-                                    (eval-expr-with-origin expression (car row) *query-row-origins*)
-                                    (values (eval-expr expression (car row)) nil))
-                              (setf (aref values i) value)
-                              (when origins (setf (aref origins i) origin))))
+                 (multiple-value-bind (projected origins)
+                     (project-append-row (first arm) (car row) *query-row-origins*)
                    (let ((*query-row-origins* origins))
-                     (when (eq (funcall emit (cons values values)) :stop)
+                     (when (eq (funcall emit projected) :stop)
                        (setf stopped-p t)
                        :stop)))))
       (when stopped-p (return :stop)))))
