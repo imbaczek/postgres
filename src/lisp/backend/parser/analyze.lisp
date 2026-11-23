@@ -578,6 +578,21 @@ exist\" messages."
                                         :evaluator 'sql-logical-sequence-state)
                    (make-scalar-builtin :name "pg_lisp_replication_bootstrap" :result-type :varchar
                                         :evaluator 'sql-logical-replication-bootstrap)
+                   ;; The rewind evaluators check grants before honoring SQL NULL.
+                   (make-scalar-builtin :name "pg_read_binary_file" :argument-types '(:text)
+                                        :result-type :bytea :volatility :volatile :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil :evaluator 'sql-rewind-read-binary-file)
+                   (make-scalar-builtin :name "pg_read_binary_file" :argument-types '(:text :int8 :int8 :bool)
+                                        :result-type :bytea :volatility :volatile :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil :evaluator 'sql-rewind-read-binary-file)
+                   (make-scalar-builtin :name "pg_stat_file" :argument-types '(:text :bool)
+                                        :result-type '(:record . +rewind-stat-file-result-fields+)
+                                        :volatility :volatile :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil :evaluator 'sql-rewind-stat-file)
+                   (make-scalar-builtin :name "pg_ls_dir" :argument-types '(:text :bool :bool)
+                                        :result-type :text :volatility :volatile :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil
+                                        :evaluator '(:iterator . make-rewind-directory-result-iterator))
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type '(:record . +replication-slot-result-fields+)
                                         :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
@@ -909,6 +924,11 @@ The supported ambiguous bit and bytea overloads have no text candidate."
 (defun analyze-scalar-builtin (name candidates arguments decorated-p)
   "Resolve a scalar signature and apply its constant coercion policy.
 Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
+  (when (and (scalar-builtin-iterator (first candidates))
+             (eq (scalar-builtin-result-type (first candidates)) :text)
+             (or (not *select-set-functions-allowed-p*) *inside-aggregate-input-p*
+                 (some #'analyzed-expression-contains-set-p arguments)))
+    (ereport "0A000" "set-returning functions are not allowed in this context"))
   (let* ((builtin (resolve-scalar-builtin name candidates arguments))
          (*defer-function-constant-coercion-p*
            (ecase (scalar-builtin-defer-decorated-coercion-p builtin)
@@ -926,8 +946,10 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
           (result (scalar-builtin-result-type builtin)))
       (cond
         ((scalar-builtin-iterator builtin)
-         (check-record-set-call-context)
-         (make-record-set-call builtin inputs))
+         (if (consp result)
+             (progn (check-record-set-call-context)
+                    (make-record-set-call builtin inputs))
+             (list :set-func name inputs :type result :typmod -1)))
         ;; Preserve the allocation-free evaluator and the stored expression shape.
         ((eq (scalar-builtin-evaluator builtin) 'sql-array-length)
          (list :array-length (first inputs) (second inputs) :type result :typmod -1))
@@ -1601,35 +1623,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
         (with-write-lock (check-relation))))
   name)
 
-(defun coerce-rewind-function-arguments (name arguments types)
-  (unless (and types (= (length arguments) (length types))
-               (every (lambda (argument type)
-                        (or (in-unknown-constant-p argument)
-                            (sql-implicit-coercion-p (expr-type argument) type)))
-                      arguments types))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (mapcar #'coerce-common-expression arguments types))
-
-(defun analyze-utility-function-call (name args)
-  "Analyze the supported utility calls or report an unresolved function."
-  (cond
-    ((string= name "pg_read_binary_file")
-     (let ((types (case (length args) (1 '(:text)) (4 '(:text :int8 :int8 :bool)))))
-       (list :func name (coerce-rewind-function-arguments name args types) :type :bytea :typmod -1)))
-    ((string= name "pg_stat_file")
-     (list :func name (coerce-rewind-function-arguments name args '(:text :bool))
-           :type :record :typmod -1 :fields +rewind-stat-file-result-fields+))
-    ((string= name "pg_ls_dir")
-     (unless (and *select-set-functions-allowed-p*
-                  (not (and (boundp '*inside-aggregate-input-p*) *inside-aggregate-input-p*))
-                  (not (some #'analyzed-expression-contains-set-p args)))
-       (ereport "0A000" "set-returning functions are not allowed in this context"))
-     (list :set-func name (coerce-rewind-function-arguments name args '(:text :bool :bool))
-           :type :text :typmod -1))
-    (t
-     (ereport "42883" "function ~a(~a) does not exist"
-              name (call-signature args)))))
-
 (defun analyze-json-constructor (name candidates args variadic)
   "Resolve a variadic-any JSON constructor while retaining the caller's argument types."
   (let ((arity (length args)))
@@ -1687,7 +1680,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-scalar-builtin name builtins args
                                (or (getf (cdddr expr) :call-distinct)
                                    (getf (cdddr expr) :call-order))))
-      (t (analyze-utility-function-call name args)))))
+      (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args))))))
 
 (defun expression-contains-column-p (form)
   "Detect row references in local executable operands, including IN lists."
@@ -3482,9 +3475,8 @@ candidate selection."
   (unless (eq (first raw) :func)
     (ereport "42809" "expression is not a supported composite type"))
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
-    (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
-          ((scalar-builtin-record-fields (first (gethash name *scalar-builtin-descriptors*))))
-          (t (ereport "42809" "expression is not a supported composite type")))))
+    (or (scalar-builtin-record-fields (first (gethash name *scalar-builtin-descriptors*)))
+        (ereport "42809" "expression is not a supported composite type"))))
 
 (defun qualified-star-targets (qualifier scope)
   (multiple-value-bind (relation depth) (resolve-select-qualified-relation scope qualifier)
@@ -4575,12 +4567,9 @@ the full 64-bit ID as a signed value."
 
 (defun eval-func (name args &optional first-argument call)
   (let ((builtin (scalar-builtin-for-call name args first-argument)))
-    (when builtin (return-from eval-func (eval-scalar-builtin builtin args first-argument call))))
-  (cond
-    ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
-    ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
-    (t
-     (ereport "42883" "function ~a(...) does not exist" name))))
+    (if builtin
+        (eval-scalar-builtin builtin args first-argument call)
+        (ereport "42883" "function ~a(...) does not exist" name))))
 
 (defun eval-in-expression (expr env)
   "Evaluate C-style array groups followed by short-circuit row comparisons."

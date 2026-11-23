@@ -644,6 +644,11 @@ their noncoercing arguments, catalog locks, and snapshot inputs.
 Subscription acquisition keeps volatile sort projection and
 connection-owned release. The native SQL smoke verified all six
 helpers, including sequence changes and reacquisition after disconnect.
+The supported rewind read, stat, and directory functions use registry
+signatures, including record fields and set-returning behavior. The
+evaluators retain their file scope and check grants before handling NULL
+arguments. The 1,475 C comparisons included a binary read, stat field
+projection, a NULL read, and a directory call with a NULL argument.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

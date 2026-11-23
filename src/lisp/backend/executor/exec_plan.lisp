@@ -1645,8 +1645,6 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
              (lambda ()
                (if pending (progn (setf pending nil) (values value t))
                    (values nil nil)))))
-          ((string= (second call) "pg_ls_dir")
-           (apply #'make-rewind-directory-result-iterator arguments))
           (iterator (apply iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
 
@@ -1777,14 +1775,8 @@ Expressions wrapping a set result must remain in a separate projection."
   (some-local-plan-expression
    (lambda (form walk)
      (declare (ignore walk))
-     (when (eq (first form) :func)
-       (let ((name (second form)))
-         (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
-           (if registered-p
-               (eq volatility :volatile)
-               (member name
-                       '("pg_read_binary_file" "pg_stat_file")
-                       :test #'string=))))))
+     (and (eq (first form) :func)
+          (eq (scalar-builtin-family-volatility (second form)) :volatile)))
    expression))
 
 (defun project-set-expression-dependent-p (expression width count targets)

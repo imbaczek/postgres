@@ -7,6 +7,10 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT octet_length(pg_catalog.pg_read_binary_file('PG_VERSION',0,1,false)) = 1",
+    "SELECT (pg_catalog.pg_stat_file('base',false)).isdir",
+    "SELECT pg_read_binary_file(NULL::text) IS NULL",
+    "SELECT count(*) FROM pg_catalog.pg_ls_dir(NULL::text,false,false)",
     "SELECT pg_catalog.pg_promote(wait_seconds=>NULL), pg_promote(false,NULL::integer)",
     "SELECT pg_promote(wait=>false)",
     "SELECT pg_promote('bad', wait_seconds=>1::bigint)",
