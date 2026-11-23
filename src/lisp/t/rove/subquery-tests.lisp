@@ -92,6 +92,33 @@
           (rove:ok (eq (car (last mapped)) metadata))
           (rove:ok (member operand expression :test #'eq))))))
 
+(rove:deftest array-access-walks-keep-bounds-and-metadata-distinct
+    (let ((base (list :col 1 :type :int4-array))
+          (lower (list :col 2 :type :int4))
+          (upper (list :col 3 :type :int4))
+          (source (list :col 4 :type :int4-array))
+          (metadata (list :col 99 :type :int4)))
+      (dolist (expression (list (list :array-subscript base (list lower upper) :saved metadata)
+                                (list :array-slice base (list (list nil upper) (list lower nil)) :saved metadata)
+                                (list :array-slice-assign base (list (list nil upper) (list lower nil))
+                                      source :saved metadata)))
+        (flet ((has-node-p (target)
+                 (some-local-plan-expression
+                  (lambda (form walk) (declare (ignore walk)) (eq form target))
+                  expression)))
+          (rove:ok (every #'has-node-p (list base lower upper)))
+          (rove:ok (not (has-node-p metadata)))
+          (when (eq (first expression) :array-slice-assign)
+            (rove:ok (has-node-p source))))
+        (let ((mapped (map-local-expression-operands
+                       (lambda (form) (if (eq form metadata) :unexpected (list :mapped form)))
+                       expression)))
+          (rove:ok (equal (second mapped) (list :mapped base)))
+          (rove:ok (equal (third mapped) (list :mapped (third expression))))
+          (when (eq (first expression) :array-slice-assign)
+            (rove:ok (equal (fourth mapped) (list :mapped source))))
+          (rove:ok (eq (car (last mapped)) metadata))))))
+
 (rove:deftest lateral-legality-inspects-unused-cte-without-rewriting
     (let* ((predicate (list :bool t))
            (outer (list :outer-ref 2 '(:col 1 :type :int4)))

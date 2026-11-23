@@ -525,6 +525,10 @@ The subquery harness reproduced the known semijoin EPQ difference.
 An isolated SBCL probe measured zero bytes per call before and after
 for the local visitor and TOAST walker on nested AND, cast, and binary
 operator expressions.
+Array element and slice reads and assignments now declare their operand
+positions in the same visitor and mapper. The regression checks the array
+base, present bounds, the assignment source, and opaque metadata. HAVING
+keeps its separate bound-folding order.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
