@@ -634,6 +634,10 @@ helpers.
   its K requirement for selected relations. The complete N-frame regression
   failed before the fix. All 24 focused heads passed with fresh strict
   compilation, and the live interior-ack crash and replay test passed.
+  The catalog and pgoutput archive retains the pre-fix failure, both
+  strict compiler receipts, and both live logs. The focused strict
+  batches took 44.89 and 45.12 seconds. The timing ledger records the
+  exact selections under `architecture-catalog-pgoutput`.
 
 ### Refactoring audit crosswalk
 
