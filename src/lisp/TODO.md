@@ -985,6 +985,12 @@ All 138 selected strict tests passed. Live C comparisons matched ten value
 queries and two SQLSTATE checks. C also resolves TIME multiplication through
 an implicit interval cast and reports TIME plus TIME as ambiguous. The current
 native analyzer reports 42883 for both expressions.
+Interval input now delegates ISO numeric token handling and compact field
+expansion to separate functions. The ISO parser is 113 lines and the
+PostgreSQL-style parser is 100 lines. Both strict interval metadata checks
+passed. The 1,487-case C differential passed, including compact ISO
+date and time fields, exponents, hex and subnormal values, error cases,
+and stored interval typmods after restart.
 
 The independently loadable `pg/sql-types` system supplies catalog type
 names, alignment, and storage codes. A warm load preserves their existing
