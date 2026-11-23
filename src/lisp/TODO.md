@@ -383,6 +383,11 @@ still has work outstanding.
 | A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Further package boundaries remain to audit. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. The producer inventory in `bfb3acb33bf` records current B-tree and catalog reader requirements and links to the extracted slot encoder. Update format support when the remaining cutovers land. |
 
+The A9 grouped-column rewriter and aggregate-signature builder now share the
+scoped operand mapper. A Rove regression supplies column-shaped literal and
+function metadata alongside real grouped and aggregate operands. Both C
+differential suites passed, with the existing semijoin EPQ difference reproduced.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup

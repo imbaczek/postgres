@@ -36,6 +36,27 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest grouped-column-rewrites-visit-operands-and-preserve-metadata
+    (let* ((literal '(:const (:col 99 :type :int4) :type :text))
+           (column (aggregate-output-ref 2 :int4))
+           (metadata '(:col 99 :type :int4))
+           (call (list :func "f" (list column literal) :type :int4 :metadata metadata))
+           (rewritten (rewrite-aggregate-columns call (list column))))
+      (rove:ok (equal (third rewritten)
+                      (list (aggregate-output-ref 1 :int4) literal)))
+      (rove:ok (eq (getf (cdddr rewritten) :metadata) metadata))
+      (let* ((*select-aggregate-analysis* (list :group-keys nil))
+             (metadata '(:col 99 :type :int4 :aggregate-output t))
+             (literal (list :const metadata :type :text))
+             (descriptor '(:kind :sum :input (:col 2 :type :int4)))
+             (aggregate (append (aggregate-output-ref 1 :int4) (list :aggregate-output t)))
+             (signature
+               (aggregate-expression-signature
+                (list :func "f" (list aggregate literal) :type :int4 :metadata metadata)
+                (vector descriptor))))
+        (rove:ok (equal (third signature) (list '(:aggregate :sum (:col 2 :type :int4)) literal)))
+        (rove:ok (eq (getf (cdddr signature) :metadata) metadata)))))
+
 (rove:deftest aggregate-owner-ignores-opaque-local-columns
     (let* ((column '(:col 0 :type :int4))
            (outer (list :outer-ref 2 column))

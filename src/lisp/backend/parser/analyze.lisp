@@ -4013,8 +4013,8 @@ checks still apply."
      (let* ((offset (length (getf *select-aggregate-analysis* :group-keys)))
             (descriptor (aref descriptors (- (second form) offset 1))))
        (list :aggregate (getf descriptor :kind) (getf descriptor :input))))
-    (t (cons (aggregate-expression-signature (car form) descriptors)
-             (aggregate-expression-signature (cdr form) descriptors)))))
+    (t (map-local-expression-operands
+        (lambda (operand) (aggregate-expression-signature operand descriptors)) form))))
 
 (defun aggregate-input-column-name (expression scope)
   (if (typep scope 'select-scope)
@@ -4046,8 +4046,8 @@ checks still apply."
                       "column \"~a\" must appear in the GROUP BY clause or be used in an aggregate function"
                       (or (aggregate-input-column-name form scope) "?column?")))
            (aggregate-output-ref (1+ position) (expr-type form)))))
-    (t (cons (rewrite-aggregate-columns (car form) group-keys scope)
-             (rewrite-aggregate-columns (cdr form) group-keys scope)))))
+    (t (map-local-expression-operands
+        (lambda (operand) (rewrite-aggregate-columns operand group-keys scope)) form))))
 
 (defun analyze-aggregate-targets (raw-targets scope group-keys)
   "Analyze targets with query-owned descriptors, or a fresh standalone aggregate context."
