@@ -173,6 +173,8 @@ For B10, startup requires PGRSTAT3 for ordinary recovery or PGRSTAT4 for
 pending promotion. The signal harness checks rejection of both retired
 formats, preservation of their bytes and recovery data, and successful restart
 with the restored current control.
+The recovery-control unit test round-trips v3 across both ordinary phases
+and rejects both checksummed historical layouts.
 
 For B11, the backup and recovery readers require a version 3 manifest with
 an explicit checkpoint start. The schema rejects versions 1 and 2, missing
