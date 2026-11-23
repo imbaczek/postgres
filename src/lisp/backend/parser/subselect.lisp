@@ -139,6 +139,24 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
     (query prepared depth))
   prepared)
 
+(defun visit-prepared-query-local-expressions (function prepared)
+  "Visit expression roots in PREPARED without rewriting any query storage."
+  (unless (getf prepared :set-operation)
+    (funcall function (getf prepared :where))
+    (funcall function (getf prepared :having))
+    (dolist (key '(:group-keys :set-functions))
+      (mapc function (getf prepared key)))
+    (dolist (target (getf prepared :targets)) (funcall function (getf target :expr)))
+    (dolist (join (getf prepared :joins)) (funcall function (getf join :qual)))
+    (mapc function (getf prepared :window-keys))
+    (dolist (window (getf prepared :windows))
+      (funcall function (getf window :input))
+      (mapc function (getf window :partition))
+      (dolist (item (getf window :order)) (funcall function (car item))))
+    (dolist (aggregate (getf prepared :aggregates)) (funcall function (getf aggregate :input))))
+  (dolist (item (getf prepared :order)) (funcall function (car item)))
+  (values))
+
 (defun prepared-query-outer-depths (prepared)
   ;; Follow referenced producers only: these depths select runtime frame and
   ;; cache ownership, unlike the broader walk used for lateral legality.
@@ -164,15 +182,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
              (if (getf state :set-operation)
                  (progn (query (getf state :left) level) (query (getf state :right) level))
                  (progn
-                   (dolist (key '(:where :having :group-keys :set-functions :window-keys :order))
-                     (expression (getf state key) level))
-                   (dolist (target (getf state :targets)) (expression (getf target :expr) level))
-                   (dolist (join (getf state :joins)) (expression (getf join :qual) level))
-                   (dolist (aggregate (getf state :aggregates)) (expression (getf aggregate :input) level))
-                   (dolist (window (getf state :windows))
-                     (expression (getf window :input) level)
-                     (expression (getf window :partition) level)
-                     (expression (getf window :order) level))
+                   (visit-prepared-query-local-expressions
+                    (lambda (form) (expression form level)) state)
                    (dolist (relation (getf state :source-relations (getf state :relations)))
                      (cond ((getf relation :cte-worktable) nil)
                            ((getf relation :cte)

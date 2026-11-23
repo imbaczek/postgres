@@ -428,6 +428,10 @@ An SBCL REPL probe ran 200,000 recursive cache lookups with a subquery,
 target and sort key. The old walker allocated about 320 bytes per lookup.
 The shared traversal initially raised that to 864 bytes. Declaring the
 visitor closures dynamic extent brought the measured cost back to 320 bytes.
+Prepared subplan discovery and outer-depth analysis share a read-only
+expression-root visitor. Discovery preserves existing expression storage
+and leaves derived queries to their own planner pass. The regression checks
+root and sort-list identity and excludes descriptors under outer references.
 
 ## Open development tasks
 

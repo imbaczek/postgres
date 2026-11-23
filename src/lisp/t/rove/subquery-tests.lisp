@@ -36,6 +36,19 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest prepared-subplan-discovery-preserves-expression-storage
+    (let* ((hidden (list :subplan (make-sql-subplan :kind :scalar)))
+           (outer (list :outer-ref 1 hidden))
+           (where (list :bool t))
+           (targets (list (list :expr outer)))
+           (order (list (cons where :asc)))
+           (prepared (list :where where :targets targets :order order :sublinks (list (second hidden)))))
+      (rove:ok (eq prepared (plan-expression-subqueries prepared)))
+      (rove:ok (null (getf prepared :sublinks)))
+      (rove:ok (eq where (getf prepared :where)))
+      (rove:ok (eq outer (getf (first targets) :expr)))
+      (rove:ok (eq order (getf prepared :order)))))
+
 (rove:deftest physical-plan-discovers-only-executable-subplans
     (let* ((nested (make-sql-subplan :kind :scalar))
            (hidden (make-sql-subplan :kind :scalar))
