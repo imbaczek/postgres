@@ -68,6 +68,8 @@ acquisition and cleanup across history selection, partial selection, standby
 staging, and promotion staging. Five physical heads passed with a fresh
 strict compile in 71.73 seconds. The runner log and compiler receipt are
 archived under `architecture-current-acceptance`.
+On `f30383502ba`, `t/run-unit-tests.sh` passed all 1,642 Rove heads and
+1,172 legacy checks. The combined runner log is in the same archive.
 
 The Milestone 3A polish review checked the temporal, SELECT source, and interval
 extractions against their raw results. The unit batches took 36.12, 38.58,
