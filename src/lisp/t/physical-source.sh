@@ -3,7 +3,6 @@
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
-SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PORT=${PORT:-5864}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-physical-source.XXXXXX")
@@ -25,15 +24,12 @@ sql() {
         -d postgres -qAt -v ON_ERROR_STOP=1 "$@"
 }
 start() {
-    rm -f "$TMP/control.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" \
-        --control-socket "$TMP/control.sock" >>"$TMP/server.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/data" "$TMP/control.sock" "$TMP/server.log"
     SRV=$!
     test_wait_owned_sql_server "$SRV" "$PORT" "$PSQL"
 }
 control() {
-    printf '%s\n(quit)\n' "$1" |
-        "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock"
+    test_lisp_control "$TMP/control.sock" "$1"
 }
 start
 sql -c 'CREATE TABLE physical_pin_fixture (id integer PRIMARY KEY, payload varchar(120)); CHECKPOINT;'

@@ -21,13 +21,13 @@ trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 sql() { PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"; }
 start() {
-    rm -f "$CASE/control.sock"
     if [ -n "${PAUSE:-}" ]; then
+        rm -f "$CASE/control.sock"
         PG_CONTROL_PAUSE=$PAUSE PG_CONTROL_DATA="$CASE/data" PG_CONTROL_PORT="$PORT" \
             PG_CONTROL_SOCKET="$CASE/control.sock" PG_CONTROL_MARKER="$CASE/marker" \
             "$SBCL" --script "$BASE/t/control-data-native.lisp" >>"$CASE/server.log" 2>&1 &
     else
-        "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" --control-socket "$CASE/control.sock" >>"$CASE/server.log" 2>&1 &
+        test_launch_lisp_server "$PORT" "$CASE/data" "$CASE/control.sock" "$CASE/server.log"
     fi
     SERVER=$!
 }

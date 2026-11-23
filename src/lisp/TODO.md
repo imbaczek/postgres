@@ -56,6 +56,10 @@ functions longer than 120 lines. In the polish pass, check naming, vacuous
 assertions and error checks, unnecessary complexity, and duplication. Document
 why existing code could not meet the need when a new implementation is required.
 
+At `b7744cc1b88`, a tilth declaration scan measured 3,680 function and macro
+spans in the 127 production Lisp files changed since `6bcf82cf717`.
+All measured spans fit within 120 lines.
+
 ### Milestone 0 producer inventory
 
 | Audit item | Current writer | Compatibility evidence |
@@ -1045,6 +1049,12 @@ zero-character typmod from an unconstrained value and checks origin
 preservation for negative-scale widening, narrowing, and scale changes.
 
 ### A17 follow-up evidence
+
+The source-pin and control-data checks use the shared owned-server launcher.
+The source-pin check also uses the shared control client, with its existing
+assertion markers. Both live scripts passed. They exercised pin retention
+across crash, retired-pin rejection, primary shutdown signals, and
+instrumented control publication cuts.
 
 The physical reader, shutdown preparation, and shutdown signal fixtures use the
 shared owned-server launcher and control client. All three live scripts passed.
