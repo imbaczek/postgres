@@ -588,19 +588,13 @@ source itself.  Closing the result closes the sort and its source."
 (defun make-resumable-query-plan-iterator (plan relations)
   ;; Restore the plan's TOAST demand and instrumentation context for each pull;
   ;; the caller owns the returned iterator and closes it when the plan ends.
-  (let* ((physical (query-plan-physical plan))
-         (slice-plan (simple-select-toast-slice physical relations))
-         (demand (or (simple-select-toast-demand physical relations)
-                     (aggregate-toast-demand physical relations))))
-    (when (and slice-plan demand)
-      (setf demand (cons (car demand)
-                         (set-difference (cdr demand)
-                                         (mapcar #'cdr (cdr slice-plan))))))
+  (multiple-value-bind (demand slice-plan)
+      (select-plan-toast-access (query-plan-physical plan) relations)
     (let* ((*select-toast-demand* demand)
            (*select-toast-slice-plan* slice-plan)
            (*toast-slice-current* nil)
            (*cte-active-plan* plan)
-           (input (make-physical-plan-iterator physical relations)))
+           (input (make-physical-plan-iterator (query-plan-physical plan) relations)))
       (make-sql-iterator
        (lambda ()
          (let ((*select-toast-demand* demand)

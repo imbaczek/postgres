@@ -198,6 +198,10 @@ directly, with no temporary padding vectors.
 The live TOAST suite passed origin-sensitive inserts through LEFT,
 RIGHT, FULL, and LATERAL joins. The DML differential passed one-row
 portal resumption through outer joins.
+Callback execution and portals derive full-value TOAST demand and
+direct slice access through the same function. The callback clears
+scan-local access before delivery, and each portal pull restores its
+captured read context.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING

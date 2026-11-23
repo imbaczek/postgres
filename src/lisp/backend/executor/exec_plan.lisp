@@ -2296,70 +2296,77 @@ projection or filter forms fall back to ordinary full materialization."
                                      (nreverse slices))))
             (when eligible (cons (car demand) eligible))))))))
 
+(defun select-plan-toast-access (physical relations)
+  "Return the full-value demand and direct slice plan for PHYSICAL."
+  (let ((slice-plan (simple-select-toast-slice physical relations))
+        (demand (or (simple-select-toast-demand physical relations)
+                    (aggregate-toast-demand physical relations))))
+    (values (if (and slice-plan demand)
+                (cons (car demand)
+                      (set-difference (cdr demand) (mapcar #'cdr (cdr slice-plan))))
+                demand)
+            slice-plan)))
+
 (defun interpret-query-plan (plan registered-relations row-callback)
   "Reference interpreter for physical S-expression plans."
-  (let* ((*cte-active-plan* plan)
-         (metadata-map (query-plan-metadata plan))
-         (*select-toast-slice-plan* (simple-select-toast-slice (query-plan-physical plan) registered-relations))
-         (*toast-slice-current* nil)
-         (*select-toast-demand* (or (simple-select-toast-demand (query-plan-physical plan) registered-relations)
-                                    (aggregate-toast-demand (query-plan-physical plan) registered-relations)))
-         (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*)))
-    (when (and *select-toast-slice-plan* *select-toast-demand*)
-      (setf *select-toast-demand*
-            (cons (car *select-toast-demand*)
-                  (set-difference (cdr *select-toast-demand*)
-                                  (mapcar #'cdr (cdr *select-toast-slice-plan*))))))
-    (when (and *query-plan-instrumentation-p* (= *subquery-instrumentation-depth* 1))
-      (reset-query-plan-tree-instrumentation plan))
-    (labels ((run-node (node callback &optional outer-environment)
-               (let ((metadata (gethash node metadata-map))
-                     (emitted 0)
-                     (started (when *query-plan-instrumentation-p*
-                                (get-internal-real-time)))
-                     (startup-time nil)
-                     (callback-time 0)
-                     (child-total-time 0))
-                 (labels ((emit (row)
-                            (incf emitted)
-                            (when (and started (null startup-time))
-                              (setf startup-time
-                                    (- (get-internal-real-time) started)))
-                            (if started
-                                (let ((callback-start (get-internal-real-time)))
-                                  (unwind-protect
-                                       (funcall callback row)
-                                    (incf callback-time
-                                          (- (get-internal-real-time)
-                                             callback-start))))
-                                (funcall callback row)))
-                          (run-child (child child-callback &optional environment)
-                            (let* ((child-metadata (gethash child metadata-map))
-                                   (old-total-time
-                                     (if child-metadata
-                                         (plan-node-metadata-actual-total-time-ticks
-                                          child-metadata)
-                                         0)))
-                              (unwind-protect
-                                   (run-node child child-callback environment)
-                                (when (and started child-metadata)
-                                  (incf child-total-time
-                                        (- (plan-node-metadata-actual-total-time-ticks
+  (multiple-value-bind (demand slice-plan)
+      (select-plan-toast-access (query-plan-physical plan) registered-relations)
+    (let* ((*cte-active-plan* plan)
+           (metadata-map (query-plan-metadata plan))
+           (*select-toast-demand* demand)
+           (*select-toast-slice-plan* slice-plan)
+           (*toast-slice-current* nil)
+           (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*)))
+      (when (and *query-plan-instrumentation-p* (= *subquery-instrumentation-depth* 1))
+        (reset-query-plan-tree-instrumentation plan))
+      (labels ((run-node (node callback &optional outer-environment)
+                 (let ((metadata (gethash node metadata-map))
+                       (emitted 0)
+                       (started (when *query-plan-instrumentation-p*
+                                  (get-internal-real-time)))
+                       (startup-time nil)
+                       (callback-time 0)
+                       (child-total-time 0))
+                   (labels ((emit (row)
+                              (incf emitted)
+                              (when (and started (null startup-time))
+                                (setf startup-time
+                                      (- (get-internal-real-time) started)))
+                              (if started
+                                  (let ((callback-start (get-internal-real-time)))
+                                    (unwind-protect
+                                         (funcall callback row)
+                                      (incf callback-time
+                                            (- (get-internal-real-time)
+                                               callback-start))))
+                                  (funcall callback row)))
+                            (run-child (child child-callback &optional environment)
+                              (let* ((child-metadata (gethash child metadata-map))
+                                     (old-total-time
+                                       (if child-metadata
+                                           (plan-node-metadata-actual-total-time-ticks
                                             child-metadata)
-                                           old-total-time)))))))
-                   (unwind-protect
-                        (execute-physical-plan-node
-                         node registered-relations outer-environment
-                         #'emit #'run-child #'run-node)
-                     (record-query-plan-node-instrumentation
-                      metadata started emitted startup-time callback-time
-                      child-total-time))))))
-      (run-node (query-plan-physical plan)
-                (lambda (row)
-                  (let ((*select-toast-demand* nil)
-                        (*select-toast-slice-plan* nil)
-                        (*toast-slice-current* nil))
-                    (funcall row-callback row)))))))
+                                           0)))
+                                (unwind-protect
+                                     (run-node child child-callback environment)
+                                  (when (and started child-metadata)
+                                    (incf child-total-time
+                                          (- (plan-node-metadata-actual-total-time-ticks
+                                              child-metadata)
+                                             old-total-time)))))))
+                     (unwind-protect
+                          (execute-physical-plan-node
+                           node registered-relations outer-environment
+                           #'emit #'run-child #'run-node)
+                       (record-query-plan-node-instrumentation
+                        metadata started emitted startup-time callback-time
+                        child-total-time))))))
+        (run-node (query-plan-physical plan)
+                  (lambda (row)
+                    (let ((*select-toast-demand* nil)
+                          (*select-toast-slice-plan* nil)
+                          (*toast-slice-current* nil))
+                      (funcall row-callback row))))))))
 
 (register-query-plan-backend :interpreter :executor #'interpret-query-plan)
 
