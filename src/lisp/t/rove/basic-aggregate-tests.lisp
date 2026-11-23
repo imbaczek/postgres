@@ -45,6 +45,22 @@
         (rove:ok (having-pushdown-safe-p
                   (list :func "lower" (list literal) :saved operand))))))
 
+(rove:deftest having-constant-in-checks-typed-operands
+    (let* ((literal '(:const 1 :type :int4))
+           (column '(:col 1 :type :int4))
+           (expression (list :in literal (list literal) nil
+                             :array-left literal :array-items (list literal)
+                             :comparisons (list (list literal literal))
+                             :metadata column)))
+      (rove:ok (having-literal-expression-p expression))
+      (dolist (option (list (cons :array-left column)
+                            (cons :array-items (list column))
+                            (cons :comparisons (list (list literal column)))))
+        (let ((copy (copy-list expression)))
+          (setf (getf (cddddr copy) (car option)) (cdr option))
+          (rove:ok (not (having-literal-expression-p copy)))
+          (rove:ok (not (nth-value 1 (having-gate-value (having-gate-skeleton copy)))))))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))

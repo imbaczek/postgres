@@ -475,6 +475,10 @@ subplan stays eligible without walking the child query. The Rove check
 covers opaque call metadata, correlated subplans, and volatile calls.
 The C differential checks that a false stable `txid_current()` gate
 skips a source that would otherwise advance a sequence.
+HAVING literal detection shares the analyzed IN operand visitor with
+other local inspections. The regression checks that a row reference in
+each typed operand slot prevents constant evaluation, while opaque
+metadata is ignored.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and

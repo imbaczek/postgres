@@ -921,8 +921,9 @@ Mark direct scalar function sources through their aliases."
                   (having-literal-expression-p (third expression))))
          ((:array-subscript :array-slice) nil)
          (:in
-          (and (having-literal-expression-p (second expression))
-               (every #'having-literal-expression-p (third expression))))
+          (not (some-analyzed-in-operand
+                (lambda (operand) (not (having-literal-expression-p operand)))
+                expression)))
          (:func
           (and (having-immutable-function-p (second expression))
                (every #'having-literal-expression-p (third expression))))
