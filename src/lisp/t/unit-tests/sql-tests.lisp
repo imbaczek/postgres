@@ -48,9 +48,11 @@
          (relations (getf (query-plan-prepared plan) :relations))
          (rows '()))
     (setf (gethash "view_slot" *wal-replication-slots*) slot)
-    (with-registered-select-relations (registered relations)
-      (execute-query-plan plan registered
-                          (lambda (row) (push row rows))))
+    (unwind-protect
+         (with-registered-select-relations (registered relations)
+           (execute-query-plan plan registered
+                               (lambda (row) (push row rows))))
+      (reset-backend-transaction *backend*))
     (setf rows (nreverse rows))
     (check (= (length rows) 1)
            "pg_catalog.pg_replication_slots returns live slot rows")

@@ -403,7 +403,7 @@ still has work outstanding.
   `41774ee2b32`. Archive-backed rewind passed with the corrected fixture in
   `72cc65a1a5b`, and the SCRAM lifecycle passed rewind and read-only rejoin.
 
-- [ ] Bind all retained-root references and deletion decisions to checked archive
+- [x] Bind all retained-root references and deletion decisions to checked archive
   and host identities before permitting GC after continuation restoration.
   In `3e17f23fb17`, deletion uses a held archive descriptor and rechecks its
   named binding before unlink. The active host's fence also covers bind aliases
@@ -502,13 +502,15 @@ still has work outstanding.
   B-to-A-to-DROP schema chain pass. Code is in `c992a20a742`; evidence is in
   `/home/imbaczek/proj/pg-ha-artifacts/wal-writer-policy/ddl-publication-scope/`.
 
-- [ ] Audit legacy fixtures that leave virtual reader owners behind.
+- [x] Audit legacy fixtures that leave virtual reader owners behind.
   A full Rove-plus-legacy run reached wraparound with no real XIDs or retained
   snapshots in its fixture, but still waited for readers from earlier fixtures.
   The isolated wraparound fixtures now bind their own virtual reader registry.
-  Identify the producers at test boundaries and end their owned backend scopes;
-  do not clear live owners globally to make the suite pass. The interrupted run
-  and its wait-for-no-active-xids backtrace are archived with the DDL evidence.
+  Per-fixture tracing identified the replication-slot catalog view test.
+  It now resets its own backend transaction on exit. The instrumented
+  Rove-plus-legacy run found no surviving readers and passed all 1,172
+  legacy checks. The interrupted run and its wait-for-no-active-xids
+  backtrace are archived with the DDL evidence.
 
 - [ ] Qualify native CRC32C on physical ARM hardware.
   Native WAL and storage checksums now use Castagnoli CRC32C, without an IEEE
