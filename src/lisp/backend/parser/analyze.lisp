@@ -561,6 +561,23 @@ exist\" messages."
                     '(:record . +physical-slot-advance-result-fields+) 'sql-advance-replication-slot)
                    (make-named-volatile-builtin
                     "pg_drop_replication_slot" '((nil :name :required)) :void 'sql-drop-replication-slot)
+                   (make-scalar-builtin :name "pg_lisp_acquire_subscription" :argument-types '(:text)
+                                        :result-type :bool :volatility :volatile :implicit-arguments-p :identity
+                                        :evaluator 'logical-acquire-subscription-owner)
+                   (make-scalar-builtin :name "pg_lisp_replica_identity_columns" :argument-types '(:any)
+                                        :result-type :varchar :implicit-arguments-p :identity
+                                        :evaluator 'sql-logical-replica-identity-columns)
+                   (make-scalar-builtin :name "pg_lisp_publication_definition" :argument-types '(:any)
+                                        :result-type :varchar :implicit-arguments-p :identity
+                                        :evaluator 'sql-logical-publication-definition)
+                   (make-scalar-builtin :name "pg_lisp_table_definition" :argument-types '(:any)
+                                        :result-type :varchar :implicit-arguments-p :identity
+                                        :evaluator 'sql-logical-table-definition)
+                   (make-scalar-builtin :name "pg_lisp_sequence_state" :argument-types '(:any)
+                                        :result-type :varchar :implicit-arguments-p :identity
+                                        :evaluator 'sql-logical-sequence-state)
+                   (make-scalar-builtin :name "pg_lisp_replication_bootstrap" :result-type :varchar
+                                        :evaluator 'sql-logical-replication-bootstrap)
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type '(:record . +replication-slot-result-fields+)
                                         :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
@@ -844,6 +861,7 @@ exist\" messages."
                always (cond ((eq policy :admin) (admin-arg-coercible-p argument type))
                             ((and (eq policy :sequence) (zerop position))
                              (eq (expr-type argument) :text))
+                            ((eq policy :identity) (or (eq type :any) (eq (expr-type argument) type)))
                             ((in-unknown-constant-p argument) t)
                             ((eq type :anyelement) t)
                             ((eq type :anyarray)
@@ -899,7 +917,7 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              (:always t))))
     (let ((inputs
             (case (scalar-builtin-implicit-arguments-p builtin)
-              (:admin arguments)
+              ((:admin :identity) arguments)
               (:sequence (coerce-sequence-builtin-arguments arguments
                                                             (scalar-builtin-argument-types builtin)))
               (otherwise
@@ -1543,38 +1561,6 @@ so a nested argument error keeps its own diagnostics."
              :hint (when (> (length order) 1)
                      "Perhaps you misplaced ORDER BY; ORDER BY must appear after all regular arguments of the aggregate."))))
 
-(defun logical-helper-function-p (name)
-  (member name '("pg_lisp_acquire_subscription" "pg_lisp_replica_identity_columns"
-                 "pg_lisp_publication_definition" "pg_lisp_table_definition"
-                 "pg_lisp_sequence_state" "pg_lisp_replication_bootstrap")
-          :test #'string=))
-
-(defun analyze-logical-helper-function (name args)
-  (cond
-    ((string= name "pg_lisp_acquire_subscription")
-     (unless (and (= (length args) 1) (eq (expr-type (first args)) :text))
-       (ereport "42883" "pg_lisp_acquire_subscription requires one text key"))
-     (list :func name args :type :bool :typmod -1))
-    ((string= name "pg_lisp_replica_identity_columns")
-     (unless (= (length args) 1)
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :varchar :typmod -1))
-    ((member name '("pg_lisp_publication_definition"
-                    "pg_lisp_table_definition"
-                    "pg_lisp_sequence_state")
-             :test #'string=)
-     (unless (= (length args) 1)
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :varchar :typmod -1))
-    ((string= name "pg_lisp_replication_bootstrap")
-     (unless (null args)
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :varchar :typmod -1))
-    ))
-
 (defun check-qualified-numeric-function-call (expr table)
   (let ((schema (getf (cdddr expr) :schema))
         (name (second expr)))
@@ -1701,7 +1687,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-scalar-builtin name builtins args
                                (or (getf (cdddr expr) :call-distinct)
                                    (getf (cdddr expr) :call-order))))
-      ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       (t (analyze-utility-function-call name args)))))
 
 (defun expression-contains-column-p (form)
@@ -4457,53 +4442,48 @@ Stop at the first difference, leaving later field types and counts unchecked."
   (let ((timestamp (or *last-replay-xact-timestamp* 0)))
     (if (zerop timestamp) +null+ timestamp)))
 
-(defun eval-logical-helper-function (name args)
-  "Evaluate a supported logical helper, taking the write lock for catalog reads."
-  (cond
-    ((string= name "pg_lisp_acquire_subscription")
-     (logical-acquire-subscription-owner (first args)))
-    ((string= name "pg_lisp_replica_identity_columns")
-     (with-write-lock
-       (let* ((table-name (first args))
-              (table (and (stringp table-name) (lookup-table table-name))))
-         (unless table
-           (ereport "42P01" "relation \"~a\" does not exist" table-name))
-         (format nil "~{~d~^,~}"
-                 (sort (copy-list (logical-table-replica-identity table)) #'<)))))
-    ((string= name "pg_lisp_publication_definition")
-     (with-write-lock
-       (let* ((publication (lookup-publication (first args)))
-              (db (current-database)))
-         (unless publication
-           (ereport "42704" "publication \"~a\" does not exist" (first args)))
-         (catalog-readable-data-string
-          (publication-definition-data publication db)))))
-    ((string= name "pg_lisp_table_definition")
-     (with-write-lock
-       (let ((table (lookup-table (first args))))
-         (unless table
-           (ereport "42P01" "table \"~a\" does not exist" (first args)))
-         (catalog-table-definition-sql table))))
-    ((string= name "pg_lisp_sequence_state")
-     (with-write-lock
-       (let ((sequence (lookup-sequence (first args))))
-         (unless sequence
-           (ereport "42P01" "sequence \"~a\" does not exist" (first args)))
-         (catalog-readable-data-string
-          (list :name (pg-sequence-name sequence)
-                :oid (pg-sequence-oid sequence)
-                :start (pg-sequence-start-value sequence)
-                :increment (pg-sequence-increment sequence)
-                :min (pg-sequence-min-value sequence)
-                :max (pg-sequence-max-value sequence)
-                :last (pg-sequence-last-value sequence)
-                :called (pg-sequence-called-p sequence))))))
-    ((string= name "pg_lisp_replication_bootstrap")
-     (with-write-lock
-       (catalog-readable-data-string
-        (catalog-replication-bootstrap-data
-         (current-database) *current-snapshot*))))
-    (t (ereport "42883" "function ~a(...) does not exist" name))))
+(defun sql-logical-replica-identity-columns (table-name)
+  (with-write-lock
+    (let ((table (and (stringp table-name) (lookup-table table-name))))
+      (unless table
+        (ereport "42P01" "relation \"~a\" does not exist" table-name))
+      (format nil "~{~d~^,~}"
+              (sort (copy-list (logical-table-replica-identity table)) #'<)))))
+
+(defun sql-logical-publication-definition (name)
+  (with-write-lock
+    (let ((publication (lookup-publication name))
+          (db (current-database)))
+      (unless publication
+        (ereport "42704" "publication \"~a\" does not exist" name))
+      (catalog-readable-data-string (publication-definition-data publication db)))))
+
+(defun sql-logical-table-definition (name)
+  (with-write-lock
+    (let ((table (lookup-table name)))
+      (unless table
+        (ereport "42P01" "table \"~a\" does not exist" name))
+      (catalog-table-definition-sql table))))
+
+(defun sql-logical-sequence-state (name)
+  (with-write-lock
+    (let ((sequence (lookup-sequence name)))
+      (unless sequence
+        (ereport "42P01" "sequence \"~a\" does not exist" name))
+      (catalog-readable-data-string
+       (list :name (pg-sequence-name sequence)
+             :oid (pg-sequence-oid sequence)
+             :start (pg-sequence-start-value sequence)
+             :increment (pg-sequence-increment sequence)
+             :min (pg-sequence-min-value sequence)
+             :max (pg-sequence-max-value sequence)
+             :last (pg-sequence-last-value sequence)
+             :called (pg-sequence-called-p sequence))))))
+
+(defun sql-logical-replication-bootstrap ()
+  (with-write-lock
+    (catalog-readable-data-string
+     (catalog-replication-bootstrap-data (current-database) *current-snapshot*))))
 
 (defun sql-integer-gcd-lcm (left right type lcm-p)
   "Compute integer GCD or LCM, checking the result against TYPE's range."
@@ -4599,8 +4579,6 @@ the full 64-bit ID as a signed value."
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
-    ((logical-helper-function-p name)
-     (eval-logical-helper-function name args))
     (t
      (ereport "42883" "function ~a(...) does not exist" name))))
 

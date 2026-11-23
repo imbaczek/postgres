@@ -1783,7 +1783,7 @@ Expressions wrapping a set result must remain in a separate projection."
            (if registered-p
                (eq volatility :volatile)
                (member name
-                       '("pg_read_binary_file" "pg_stat_file" "pg_lisp_acquire_subscription")
+                       '("pg_read_binary_file" "pg_stat_file")
                        :test #'string=))))))
    expression))
 

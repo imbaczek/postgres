@@ -639,6 +639,11 @@ analysis, FROM analysis, and field expansion use those bindings.
 The 1,471 C comparisons included qualified field projection from
 publication and slot records. Focused physical tests check the
 supported field lists and snapshot ownership.
+The six native logical helpers use registry dispatch and preserve
+their noncoercing arguments, catalog locks, and snapshot inputs.
+Subscription acquisition keeps volatile sort projection and
+connection-owned release. The native SQL smoke verified all six
+helpers, including sequence changes and reacquisition after disconnect.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
