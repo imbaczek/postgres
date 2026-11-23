@@ -70,6 +70,11 @@ retain the selected heads, comparison results, and two failed exploratory
 probes. Live durations were unmeasured. Reuse verified compilation for
 repeated selections against the same frozen source and runtime.
 
+At `50ae5032885`, a fresh disk-backed `--strict` run passed all 267
+selected Milestone 3A unit heads in 47.63 seconds. The strict compiler
+passed in 17.90 seconds and ran concurrently with the normal test load.
+The timing ledger retains both logs and the exact selection.
+
 ### Milestone 0 producer inventory
 
 | Audit item | Current writer | Compatibility evidence |
@@ -688,6 +693,13 @@ With both seeds absent they skip history resolution. All 56 selected physical
 checks passed again, and native and C hot standby passed replay, reload,
 restart, and promotion.
 
+At `50ae5032885`, a fresh disk-backed `--strict` run passed all 61
+selected physical heads in 79.82 seconds. It covers replay policy seeds,
+selected end-of-recovery, source reservation and membership, and follow
+proofs. The strict compiler passed in 16.94 seconds and ran concurrently
+with the normal test load. The timing ledger retains both logs under
+`/home/imbaczek/proj/pg-ha-artifacts/architecture-replay-facts/`.
+
 The replay fact consumers use the following boundaries. Each scan carries
 provisional facts until a validated terminal or a selected end-of-recovery
 transition.
@@ -695,7 +707,7 @@ transition.
 | Consumer | Seed and required coverage | Stop or publish rule |
 |---|---|---|
 | [Drop proof](backend/replication/physical-history.lisp) | Validate the starting store point. Explicit checkpoint and observed XID seeds must travel together. A requested applied LSN must be the starting point or a complete terminal. | Scan through the permitted prefix and return drops, fork resets, and the first complete CLOG reset. |
-| [Resource proof](backend/replication/physical-replay.lisp) | Validate the store point and any resource and policy seeds against their source timeline. | Return at the exact requested terminal. Reject an interior position or an earlier end of the permitted prefix. |
+| [Resource proof](backend/replication/physical-replay.lisp) | Validate the store point and any resource and policy seeds against their source timeline. | For an empty interval, return the validated seeds. Otherwise return at the exact requested terminal. Reject an interior position or an earlier end of the permitted prefix. |
 | [Follow validation](backend/replication/physical-follow.lisp) | Use the verified base and explicit replay seeds. Check both the applied and required boundaries, and match a historical witness when supplied. | Return copied facts and the disposition. An explicit caller opt-in allows an unfinished group beyond the required boundaries. Logical import consumes the applied-boundary facts. |
 | [Online promotion check](backend/replication/physical-promotion-online.lisp) | Start at the applied terminal with its checkpoint, observed XID, allocation reservation, and policy facts. Validate child transitions over the durable suffix. | Wait while the selected child lacks its initialization checkpoint. Recheck after the workers' final flush. |
 | [Quiescent standby redo](backend/replication/physical-replay.lisp) | Live redo starts at the last applied LSN. Cold startup starts from the verified base or restartpoint and checks the saved required replay pair after redo. Validate candidate terminal facts before applying redo. | Publish only completed redo, dispatch selected end-of-recovery separately, and stop before the next record on a resource pause. |
