@@ -1255,7 +1255,10 @@ compiler receipt are archived under `architecture-physical-delta`.
 The physical ASDF system has the same 196 test components at the full baseline
 and at this rerun. Comparing the 30 changed components with the rerun log
 identified 43 additional test heads, for 745 distinct test heads in those
-components. The 43-head complement is a separate current-checkout selection.
+components. The 43-head complement passed with a fresh strict compile
+in 103.13 seconds after the WAL archive polish. Comparing the two archived
+logs with the 30 components confirmed that each of their 745 test heads
+passed once across the two selections.
 
 ### A9 follow-up evidence
 
