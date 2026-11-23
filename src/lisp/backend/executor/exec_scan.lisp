@@ -963,10 +963,8 @@ Mark direct scalar function sources through their aliases."
               (reduce (lambda (left right) (list :and left right :type :bool :typmod -1))
                       (nreverse remaining))))))
 
-(defun %prepare-select-internal (ast)
-  ;; Group rewrites wait for nested analysis; DISTINCT ordering uses output slots.
-  (when (getf ast :set-operation)
-    (return-from %prepare-select-internal (prepare-union-select ast)))
+(defun prepare-select-sources (ast)
+  "Resolve the FROM and JOIN sources in order and return their completed scope."
   ;; Resolve all names on one catalog view. Reader registration below protects
   ;; that view from DDL before any heap or index page is scanned.
   (let* ((from-name (getf ast :from))
@@ -1019,7 +1017,13 @@ Mark direct scalar function sources through their aliases."
         (setf relations
               (append relations
                       (list source)))))
-    (setf joins (nreverse joins))
+    (values first-table scope relations (nreverse joins))))
+
+(defun %prepare-select-internal (ast)
+  ;; Group rewrites wait for nested analysis; DISTINCT ordering uses output slots.
+  (when (getf ast :set-operation)
+    (return-from %prepare-select-internal (prepare-union-select ast)))
+  (multiple-value-bind (first-table scope relations joins) (prepare-select-sources ast)
     (let* ((where (progn (setf (getf *select-analysis-frame* :kind) :where)
                          (when (getf ast :where)
                            (coerce-boolean-expression (analyze-expr (getf ast :where) scope) "WHERE"))))
