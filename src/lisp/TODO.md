@@ -529,6 +529,10 @@ Array element and slice reads and assignments now declare their operand
 positions in the same visitor and mapper. The regression checks the array
 base, present bounds, the assignment source, and opaque metadata. HAVING
 keeps its separate bound-folding order.
+The shared visitor and mapper enumerate CASE conditions, results, and
+the ELSE operand. HAVING uses those same rules for literal detection and
+gate construction. The regression verifies that a column reference in
+branch metadata does not prevent a literal CASE from folding.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and

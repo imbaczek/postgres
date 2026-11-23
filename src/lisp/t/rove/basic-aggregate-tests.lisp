@@ -61,6 +61,21 @@
           (rove:ok (not (having-literal-expression-p copy)))
           (rove:ok (not (nth-value 1 (having-gate-value (having-gate-skeleton copy)))))))))
 
+(rove:deftest having-case-folding-keeps-branch-metadata-opaque
+    (let* ((metadata (list :col 99 :type :bool))
+           (condition (list :col 1 :type :bool))
+           (expression (list :case (list (list condition '(:bool t) :saved metadata))
+                             '(:bool nil) :type :bool :saved metadata))
+           (skeleton (having-gate-skeleton expression)))
+      (rove:ok (expression-contains-column-p expression))
+      (rove:ok (equal (caar (second skeleton)) '(:having-opaque)))
+      (rove:ok (eq (getf (cddr (first (second skeleton))) :saved) metadata))
+      (rove:ok (not (nth-value 1 (having-gate-value skeleton))))
+      (setf (caar (second expression)) '(:bool t))
+      (rove:ok (not (expression-contains-column-p expression)))
+      (rove:ok (having-literal-expression-p expression))
+      (rove:ok (equal (multiple-value-list (having-gate-value expression)) '(t t)))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))

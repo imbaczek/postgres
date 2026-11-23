@@ -915,10 +915,9 @@ Mark direct scalar function sources through their aliases."
          ((:array :coalesce)
           (every #'having-literal-expression-p (second expression)))
          (:case
-             (and (every (lambda (branch)
-                           (every #'having-literal-expression-p branch))
-                         (second expression))
-                  (having-literal-expression-p (third expression))))
+             (not (some-analyzed-case-operand
+                   (lambda (operand) (not (having-literal-expression-p operand)))
+                   expression)))
          ((:array-subscript :array-slice) nil)
          (:in
           (not (some-analyzed-in-operand
@@ -931,41 +930,28 @@ Mark direct scalar function sources through their aliases."
 
 (defun having-gate-skeleton (expression)
   ;; Retain only the immutable expression structure needed for gate folding.
-  ;; Opaque leaves own no Vars, scopes or subplan descriptors.  Function argument
+  ;; Opaque leaves own no Vars, scopes or subplan descriptors. Function argument
   ;; skeletons retain constant errors without ever invoking a nonimmutable call.
   (when (having-literal-expression-p expression)
     (return-from having-gate-skeleton (copy-tree expression)))
-  (labels ((children (&rest positions)
-             (let ((copy (copy-list expression)))
-               (dolist (position positions copy)
-                 (setf (nth position copy)
-                       (having-gate-skeleton (nth position expression)))))))
-    (case (first expression)
-      ((:and :or :concat :array-length :join-coalesce) (children 1 2))
-      ((:binop :any :all) (children 2 3))
-      (:unary (children 2))
-      ((:not :is-null :is-bool :cast :join-relabel) (children 1))
-      ((:array :coalesce)
-       (let ((copy (copy-list expression)))
-         (setf (second copy) (mapcar #'having-gate-skeleton (second expression)))
-         copy))
-      (:case
-          (let ((copy (copy-list expression)))
-            (setf (second copy)
-                  (mapcar (lambda (branch) (mapcar #'having-gate-skeleton branch))
-                          (second expression))
-                  (third copy) (having-gate-skeleton (third expression)))
-            copy))
-      ((:array-slice :array-subscript)
-       (map-analyzed-array-access-operands #'having-gate-skeleton expression))
-      (:in (map-analyzed-in-operands #'having-gate-skeleton expression))
-      (:func
-       (if (having-immutable-function-p (second expression))
-           (let ((copy (copy-list expression)))
-             (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
-             copy)
-           (list :having-opaque (mapcar #'having-gate-skeleton (third expression)))))
-      (otherwise '(:having-opaque)))))
+  (case (first expression)
+    ((:and :or :concat :array-length :join-coalesce :binop :any :all
+      :unary :not :is-null :is-bool :cast :join-relabel :case)
+     (map-local-expression-operands #'having-gate-skeleton expression))
+    ((:array :coalesce)
+     (let ((copy (copy-list expression)))
+       (setf (second copy) (mapcar #'having-gate-skeleton (second expression)))
+       copy))
+    ((:array-slice :array-subscript)
+     (map-analyzed-array-access-operands #'having-gate-skeleton expression))
+    (:in (map-analyzed-in-operands #'having-gate-skeleton expression))
+    (:func
+     (if (having-immutable-function-p (second expression))
+         (let ((copy (copy-list expression)))
+           (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
+           copy)
+         (list :having-opaque (mapcar #'having-gate-skeleton (third expression)))))
+    (otherwise '(:having-opaque))))
 
 (defun having-pushdown-safe-p (expression)
   ;; planner.c keeps aggregate, volatile and subplan clauses above grouping.

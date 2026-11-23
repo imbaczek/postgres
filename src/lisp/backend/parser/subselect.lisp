@@ -52,6 +52,7 @@
     (:outer-ref :outer-ref)
     (:subplan :subplan)
     (:in :in)
+    (:case :case)
     (otherwise :structural)))
 
 (defun some-analyzed-in-operand (predicate form)
@@ -63,6 +64,14 @@
           (and left (funcall predicate left)))
         (some predicate (getf options :array-items))
         (some (lambda (pair) (some predicate pair)) (getf options :comparisons)))))
+
+(defun some-analyzed-case-operand (predicate form)
+  "Visit the WHEN conditions, THEN values, and ELSE value."
+  (or (some (lambda (branch)
+              (or (funcall predicate (first branch))
+                  (funcall predicate (second branch))))
+            (second form))
+      (funcall predicate (third form))))
 
 (defun some-local-plan-expression (predicate expression)
   "Visit local expression nodes until PREDICATE succeeds.
@@ -80,6 +89,7 @@ references expose the operand evaluated in the outer frame."
                          (case shape
                            (:leaf nil)
                            (:in (some-analyzed-in-operand #'walk form))
+                           (:case (some-analyzed-case-operand #'walk form))
                            (:subplan
                             (let ((subplan (second form)))
                               (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
@@ -98,6 +108,16 @@ references expose the operand evaluated in the outer frame."
     (case shape
       ((:leaf :outer-ref :subplan) (copy-list form))
       (:in (map-analyzed-in-operands function form))
+      (:case
+          (let ((copy (copy-list form)))
+            (setf (second copy)
+                  (mapcar (lambda (branch)
+                            (list* (funcall function (first branch))
+                                   (funcall function (second branch))
+                                   (cddr branch)))
+                          (second form))
+                  (third copy) (funcall function (third form)))
+            copy))
       (:structural (mapcar function form))
       (otherwise
        (let ((copy (copy-list form)))
