@@ -132,6 +132,10 @@ Fresh cluster construction still generates and persists an identity,
 and existing identities still use the same system identifier projection.
 The read path no longer generates a replacement identity.
 Replay, adoption and slot checks compare stored identities directly.
+The live publication fixture checks startup rejection of missing and
+empty identities, and compares every fixture file after each rejected
+catalog. It verifies the stored identity through the SQL builtin before
+and after crash recovery and a later clean restart.
 
 For B7, logical slot decode rejects PGSLOT1–3. PGSLOT4/5 remain supported
 because current writers emit them, alongside the provenance and child owner
