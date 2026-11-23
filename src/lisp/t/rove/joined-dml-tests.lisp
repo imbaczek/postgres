@@ -1,5 +1,18 @@
 (in-package #:pg)
 
+(rove:deftest joined-dml-source-shifts-only-local-column-operands
+    (let* ((source '(:col 2 :type :int4))
+           (literal (list :const source :type :text))
+           (outer (list :outer-ref 1 source))
+           (expression (list :func "f" (list source literal outer) :saved source))
+           (shifted (shift-dml-source-expression expression 3)))
+      (destructuring-bind (column unchanged-literal unchanged-outer) (third shifted)
+        (rove:ok (equal column '(:col 5 :type :int4)))
+        (rove:ok (= 2 (second source)))
+        (rove:ok (eq source (second unchanged-literal)))
+        (rove:ok (eq source (third unchanged-outer)))
+        (rove:ok (eq source (getf (cdddr shifted) :saved))))))
+
 (rove:deftest joined-dml-parser
     (dolist (sql '("UPDATE dst d SET v=s.v FROM src s WHERE d.id=s.id RETURNING d.*,s.*"
                    "DELETE FROM dst d USING src s WHERE d.id=s.id RETURNING *"))

@@ -370,7 +370,7 @@ still has work outstanding.
 | A6. Progress journals | Shared installation prefix parsing in `b0a0b5b0c2d`. The Milestone 1 selection exercises partial tails and publication cuts. |
 | A7. Claimed-tuple replacement | Shared physical replacement tail in `5c3796e612e`. The DML differential passed 106 cases and 24 controlled concurrency cases, plus resumable RETURNING and restart checks for committed heap and index updates. The logical unchanged-TOAST test passed UPDATE, ON CONFLICT, primary-key change, source crash recovery, and subscriber restart and resume with the exact 40 MiB value. In `880626a7106`, the DML test inspects actual heap tuples before and after restart. It verified the UPDATE and ON CONFLICT successor block and offset, matching predecessor xmax and successor xmin, and the current tuple's self-link. The expanded DML differential passed all 108 SQL cases and 24 controlled concurrency cases. |
 | A8. Type and coercion duplication | Shared SQL identities and varchar assignment in `61c670dd78b` and `8bbad6498a0`. In `62e99598bc8`, DDL and casts share varchar typmod validation and the C diagnostic wording, and assignment and cast share character clipping with explicit truncation policy. The independent type system and 1,308 C differential cases passed, including multibyte casts, INSERT and UPDATE, and typmod bounds. In `6aa8c210b1e`, the shared type registry also supplies both directions of array type lookup. The standalone system verified all 24 existing pairs and their array OID round trips. The combined unit suite, 1,308 C differential cases, and ten JSON array diagnostic comparisons passed. In `eeaaeaf6fde`, array catalog alignment derives from element alignment and array storage classification uses the shared array mapping. The PostgreSQL C peer matched all 54 exposed `typalign` rows, including the corrected `oid8` row, and all 1,309 cases in the expanded differential. Audit other coercion contexts and preserve wire and heap representations. |
-| A9. Expression and plan walkers | Scope-aware traversal in `5360608bb51` also serves analyzed column and aggregate-volatility checks in `2c77fccce5a`. The Rove regression checks executable IN operands, SubPlan tests, opaque literal payloads, and nested-query boundaries. The subquery and aggregate C differentials passed, with the existing semijoin EPQ difference reproduced. In `ddd2079c05e`, prepared-query and aggregate rebasing rewrites share local operand mapping. The Rove regression distinguishes executable outer references from identically shaped literal payloads and call metadata. Combined units and both C differential suites passed with the same known semijoin EPQ difference. In `e24abd8fca2`, correlation depth analysis shares the local expression visitor and follows only referenced CTE producers. The Rove regression checks SubPlan test and child depth, referenced versus unused CTEs, and opaque metadata. Combined units and 108 subquery C differential cases passed. In `12d763cbf66`, aggregate owner selection also uses the local visitor. Rove verified nearest-level ownership through a sublink, whole-row ownership, and immunity to opaque column-shaped data. Both C differential suites and combined units passed. Audit remaining scope-changing walkers. |
+| A9. Expression and plan walkers | Scope-aware traversal in `5360608bb51` also serves analyzed column and aggregate-volatility checks in `2c77fccce5a`. The Rove regression checks executable IN operands, SubPlan tests, opaque literal payloads, and nested-query boundaries. The subquery and aggregate C differentials passed, with the existing semijoin EPQ difference reproduced. In `ddd2079c05e`, prepared-query and aggregate rebasing rewrites share local operand mapping. The Rove regression distinguishes executable outer references from identically shaped literal payloads and call metadata. Combined units and both C differential suites passed with the same known semijoin EPQ difference. In `e24abd8fca2`, correlation depth analysis shares the local expression visitor and follows only referenced CTE producers. The Rove regression checks SubPlan test and child depth, referenced versus unused CTEs, and opaque metadata. Combined units and 108 subquery C differential cases passed. In `12d763cbf66`, aggregate owner selection also uses the local visitor. Rove verified nearest-level ownership through a sublink, whole-row ownership, and immunity to opaque column-shaped data. Both C differential suites and combined units passed. See [A9 follow-up evidence](#a9-follow-up-evidence) for subsequent slices and open work. |
 | A10. Catalog snapshot and restore | `715e6eb9f3a` uses the catalog field schema for serialization, owned snapshot copies, and in-place restore. Two strict Rove heads verify table, index, sequence, and publication identity and restoration of independent TOAST and catalog fields. The live catalog durability fault script passed. Virtual relation descriptors in `b6aa35de135` cover catalog view metadata. |
 | A11. B-tree equality traversal | Shared child range in `f1439ac21cd`. Separator, lease, and DROP INDEX handoff tests cover equality routing and canonical reader ownership. |
 | A12. pgoutput dual parsers | Shared decoder in `970941ce5cd` and final dispatch adapter removal in `265909bd238`. See the pgoutput verification above for independent wire fixtures and live replay. |
@@ -383,15 +383,17 @@ still has work outstanding.
 | A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Further package boundaries remain to audit. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. The producer inventory in `bfb3acb33bf` records current B-tree and catalog reader requirements and links to the extracted slot encoder. Update format support when the remaining cutovers land. |
 
-The A9 grouped-column rewriter and aggregate-signature builder now share the
+### A9 follow-up evidence
+
+The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
 function metadata alongside real grouped and aggregate operands. Both C
 differential suites passed, with the existing semijoin EPQ difference reproduced.
-ProjectSet detection and lifting also share local operand traversal. The
+ProjectSet detection and lifting in `031e78d64a0` also share local operand traversal. The
 regression checks opaque payloads, local result slots, and subplan and outer
 reference boundaries. The ProjectSet attempt test passed on C and native
 servers in Simple Query and extended protocol, including a suspended portal.
-`ANY` and `ALL` sublinks now reject a set-returning comparison during
+`ANY` and `ALL` sublinks in `ffc2b0f8ece` reject a set-returning comparison during
 analysis with C's 42804 diagnostic. The 111-case C differential verifies
 both rejections and a valid SRF target in the separate subquery scope.
 CTE volatility uses the local visitor for executable call operands and
@@ -402,21 +404,21 @@ Window reference lowering now rewrites only executable local operands,
 while CTE window key selection uses the shared ProjectSet predicate.
 The Rove regression checks slot numbers, literal and call metadata, and
 query boundaries. The C differentials passed 168 window and 114 CTE cases.
-Window lowering now visits the caller-side `ANY`/`ALL` comparison without
+Window lowering in `45a84094649` visits the caller-side `ANY`/`ALL` comparison without
 rewriting the prepared subquery. The expanded 171-case C window differential
 covers the single-row reproducer, changing caller rows, and an independent
 window in the right-hand subquery.
 Window key substitution preserves whole-expression slot matching and uses
 the same mapper for nested operands. A Rove check verifies slot reuse in the
 partition and target while preserving matching literal and call metadata.
-The read-only visitor and the rewriting mapper now share one operand layout
+The read-only visitor and the rewriting mapper in `8c61659d291` share one operand layout
 table. The visitor can inspect subplan tests and outer-reference operands.
 The mapper preserves both boundary nodes for callers that own the rewrite.
-CTE filter pushdown uses these same rules for both eligibility and column
+CTE filter pushdown in `36a31ef5e43` uses these rules for eligibility and column
 substitution. The regression checks out-of-scope and volatile operands,
 owned copies of substituted expressions, and unchanged literal and call
 metadata. The 114-case CTE differential passed.
-Physical plan subplan discovery uses the shared visitor for execution-owner
+Physical plan subplan discovery in `000e3a4313f` uses the shared visitor for execution-owner
 table registration and plan instrumentation. The regression checks discovery
 order, deduplication, comparison subplans, and opaque call and literal data.
 The 111-case subquery and 114-case CTE differentials passed.
@@ -428,7 +430,7 @@ An SBCL REPL probe ran 200,000 recursive cache lookups with a subquery,
 target and sort key. The old walker allocated about 320 bytes per lookup.
 The shared traversal initially raised that to 864 bytes. Declaring the
 visitor closures dynamic extent brought the measured cost back to 320 bytes.
-Prepared subplan discovery and outer-depth analysis share a read-only
+Prepared subplan discovery and outer-depth analysis in `5bbcb777fbe` share a read-only
 expression-root visitor. Discovery preserves existing expression storage
 and leaves derived queries to their own planner pass. The regression checks
 root and sort-list identity and excludes descriptors under outer references.
@@ -439,12 +441,19 @@ Recursive cache lookup now uses the same expression roots, including window
 inputs, partitions and order keys. A regression distinguishes a window
 partition's subplan from an opaque descriptor field. The 200,000-lookup SBCL
 probe still measured about 320 bytes per lookup.
-Lateral-reference legality and recursive aggregate validation now use a
+Lateral-reference legality and recursive aggregate validation in `6cba952b37c` use a
 read-only traversal of prepared query scopes. The lateral regression checks
 nesting depth through an unused CTE and preserves its original sort list.
-Aggregate ownership analysis now uses the same read-only traversal for
+Aggregate ownership analysis in `13308d63e26` uses the same read-only traversal for
 nested queries. Its regression checks the nearest referenced scope and
 preserves the nested query's sort list.
+Joined DML source slot shifting uses the mapper for local column operands.
+The regression checks slot offsets, source identity, and unchanged literal
+payloads, call metadata and outer-reference operands.
+
+The broader A9 audit still needs to classify constant folding, HAVING
+gate skeleton construction and semantic-key encoding, whose walks also
+apply pass-specific expression rules.
 
 ## Open development tasks
 

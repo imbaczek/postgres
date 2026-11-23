@@ -12,7 +12,8 @@
   (cond ((atom expression) expression)
         ((eq (first expression) :col)
          (let ((copy (copy-tree expression))) (incf (second copy) offset) copy))
-        (t (mapcar (lambda (part) (shift-dml-source-expression part offset)) expression))))
+        (t (map-local-expression-operands
+            (lambda (part) (shift-dml-source-expression part offset)) expression))))
 
 (defun extend-dml-source-scope (base source offset)
   (if (null source) base
