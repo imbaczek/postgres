@@ -372,15 +372,18 @@ the namespace in flight to check that stale reads and feedback are rejected.
 The logical recovery base fixtures use timeline-qualified checkpoint files and
 matching WAL controls, including the case with a separate witness segment.
 Restartpoint and promotion fixtures use qualified base files by default.
-The live restartpoint seed also defaults to qualified WAL. The dual-namespace
-promotion commit scenario explicitly requests a legacy seed for its first
-case. Live restartpoint tests passed with the new default and explicit legacy
-selection. The default seed also passed the online promotion crash suite.
+The live restartpoint seed also defaults to qualified WAL. Live restartpoint
+tests passed with the new default and explicit legacy selection. The default
+seed also passed the online promotion crash suite.
 The automatic promotion commit suite passed with both seed namespaces. Its
 owned fixture installs startup resource capacity and verifies durable follow
 cleanup transfer before restarting the crashed process. The oversized
 checkpoint fixture appends one byte to the exact staged record and checks
 startup refusal without file mutation.
+The automatic promotion commit matrix now defaults to qualified WAL for the
+full set of crash cuts. The live matrix passed using the qualified seed.
+Retained overlap, inventory, and projection fixtures also use qualified WAL
+for ordinary success. Fifty selected strict heads passed.
 Promotion fixtures pass the requested namespace to base setup, including
 explicit legacy cases, so the base is written under the selected name from
 the start.

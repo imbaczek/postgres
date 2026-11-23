@@ -1,6 +1,6 @@
 (in-package #:pg-physical-tests)
 
-(defun overlap-test-metadata (base bytes &key (timeline 1) (namespace :legacy))
+(defun overlap-test-metadata (base bytes &key (timeline 1) (namespace :timeline))
   (list :version 1 :system-id 123 :base-timeline timeline :base base :manifest-digest 77
         :checkpoint-start (- base (pg::wal-checkpoint-record-size)) :namespace namespace
         :file (list (concatenate 'string "pg_wal/"
@@ -81,14 +81,17 @@
                                            (metadata (overlap-test-metadata base bytes))
                                            (entry (getf metadata :file))
                                            (state (list :version 3 :system-id 123 :timeline 1 :checkpoint base :end base
-                                                        :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :legacy
+                                                        :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :timeline
                                                         :manifest-digest 77 :files (list entry)))
                                            (path (merge-pathnames (first entry) root)))
         (pg::wal-atomic-write-bytes path bytes)
         (let ((unverified (copy-list state)))
           (remf unverified :wal-namespace)
-          (ok (intake-fails-p
-               (lambda () (pg::physical-retained-overlap-capture unverified root)))))
+          (ok (handler-case
+                  (progn (pg::physical-retained-overlap-capture unverified root) nil)
+                (error (condition)
+                  (search "invalid immutable base overlap coordinates"
+                          (princ-to-string condition))))))
         (multiple-value-bind (loaded captured) (pg::physical-retained-overlap-capture state root)
           (let ((image (pg::physical-retained-overlap-encode loaded captured)))
             (delete-file path)
@@ -258,7 +261,7 @@
           (let* ((base pg::+wal-segment-size+) (bytes (overlap-test-bytes base))
                                                (metadata (overlap-test-metadata base bytes)) (entry (getf metadata :file))
                                                (state (list :version 3 :system-id 123 :timeline 1 :checkpoint base :end base
-                                                            :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :legacy
+                                                            :checkpoint-start (getf metadata :checkpoint-start) :wal-namespace :timeline
                                                             :manifest-digest 77 :files (list entry)))
                                                (identity (list :system-id 123 :base-timeline 1 :base base :manifest-digest 77))
                                                (owner (gensym)) (selected nil) (overlap nil)
