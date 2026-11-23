@@ -385,6 +385,11 @@ The archive transition fixture now supplies a timeline-qualified ancestor
 partial and matching proof when end-of-recovery rotates into the next
 segment. Three strict archive heads passed, covering transition evidence,
 history discovery, and bounded partial restore.
+Promotion now produces timeline-qualified ancestor partials and proofs even
+when source WAL itself uses the legacy namespace. Four strict heads passed,
+covering byte-identical retries, conflicting bytes and hard links, committed
+child matching, and proof retry after child WAL recycling. Previously staged
+legacy partials still use the existing reader and archiver validation.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

@@ -633,7 +633,7 @@ The same check permits a cold promotion retry."
   (when (startup-primary-wal-archive-enabled-p)
     (wal-archive-stage-promotion-partial
      (physical-recovery-replay-timeline state) (getf state :applied)
-     prefix (physical-promotion-parent-namespace state))))
+     prefix)))
 
 (defun physical-promotion-install-prefix ()
   "Install the verified pending child prefix before history/EOR; never admit writes.

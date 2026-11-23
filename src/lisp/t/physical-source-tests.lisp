@@ -480,23 +480,24 @@
 (deftest promotion-archive-partial-stages-only-the-verified-fork-prefix
     (call-with-physical-source-fixture
      (lambda ()
-       (let* ((prefix (make-array 5 :element-type '(unsigned-byte 8)
+       (let* ((pg::*wal-segment-namespace* :legacy)
+              (prefix (make-array 5 :element-type '(unsigned-byte 8)
                                     :initial-contents '(1 2 3 4 5)))
               (different (make-array 5 :element-type '(unsigned-byte 8)
                                        :initial-element 0))
-              (name "0000000000000000.wal.partial")
+              (name "000000010000000000000000.wal.partial")
               (path (merge-pathnames name (pg::wal-directory))))
          (ok (null (pg::wal-archive-stage-promotion-partial
-                    1 pg::+wal-segment-size+ #() :legacy)))
-         (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy)))
+                    1 pg::+wal-segment-size+ #())))
+         (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix)))
          (ok (equalp prefix (pg::read-bounded-regular-file path 5)))
          (let ((facts (pg::physical-image-file-facts -100 (namestring path))))
-           (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy)))
+           (ok (string= name (pg::wal-archive-stage-promotion-partial 1 5 prefix)))
            (ok (equal facts (pg::physical-image-file-facts -100 (namestring path)))))
-         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 different :legacy) 'error))
+         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 different) 'error))
          (sb-posix:link (namestring path)
                         (namestring (merge-pathnames "partial-hardlink" pg::*pgdata*)))
-         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy) 'error))
+         (ok (signals (pg::wal-archive-stage-promotion-partial 1 5 prefix) 'error))
          (ok (equalp prefix (pg::read-bounded-regular-file path 5)))))))
 
 (deftest primary-archiver-requires-partial-to-match-committed-child
@@ -508,7 +509,7 @@
               (pg::*wal-segment-namespace* :timeline)
               (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
               (prefix (make-array 5 :element-type '(unsigned-byte 8) :initial-element 7))
-              (name (pg::wal-archive-stage-promotion-partial 1 5 prefix :legacy))
+              (name (pg::wal-archive-stage-promotion-partial 1 5 prefix))
               (target (merge-pathnames (concatenate 'string "archive-" name) pg::*pgdata*)))
          (setf (getf (gethash "archive_mode" settings) :value) "on"
                (getf (gethash "archive_command" settings) :value) "cp -a -- \"%p\" \"archive-%f\"")
@@ -549,7 +550,7 @@
               (settings (pg::startup-configuration-settings pg::*startup-installed-configuration*))
               (prefix (sample-physical-record))
               (fork (length prefix))
-              (name (pg::wal-archive-stage-promotion-partial 1 fork prefix :legacy))
+              (name (pg::wal-archive-stage-promotion-partial 1 fork prefix))
               (leaf (pg::wal-archive-segment-proof-name name))
               (receipt (merge-pathnames (concatenate 'string "archive-" leaf) pg::*pgdata*))
               (copy "cp -- \"%p\" \"archive-%f\""))
@@ -569,7 +570,7 @@
          (ok (pg::wal-archiver-step))
          (ok (= fork (pg::wal-verify-archive-segment-proof
                       (pg::read-bounded-regular-file receipt pg::+wal-archive-segment-proof-size+)
-                      (pg::catalog-system-identifier) 1 0 :legacy prefix)))))))
+                      (pg::catalog-system-identifier) 1 0 :timeline prefix)))))))
 
 (deftest physical-source-pin-reader-rejects-retired-format
     (call-with-physical-source-fixture

@@ -126,9 +126,9 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
     (funcall check-directory directory-fd)
     name))
 
-(defun wal-archive-stage-promotion-partial (source-timeline fork prefix namespace)
-  "Stage the verified fork prefix as an archive partial when needed."
-  (let ((name (wal-archive-promotion-partial-name source-timeline fork namespace)))
+(defun wal-archive-stage-promotion-partial (source-timeline fork prefix)
+  "Stage the verified fork prefix under its timeline-qualified archive name."
+  (let ((name (wal-archive-promotion-partial-name source-timeline fork :timeline)))
     (when name
       (unless (and (typep prefix '(vector (unsigned-byte 8)))
                    (= (length prefix) (mod fork +wal-segment-size+)))
@@ -143,7 +143,7 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
                     wal-fd (wal-archive-segment-proof-name name)
                     (wal-encode-archive-segment-proof
                      (catalog-system-identifier) source-timeline
-                     (floor fork +wal-segment-size+) namespace fork prefix)
+                     (floor fork +wal-segment-size+) :timeline fork prefix)
                     #'wal-archive-check-wal-directory))
                  name)
             (sb-posix:close wal-fd)))))))
