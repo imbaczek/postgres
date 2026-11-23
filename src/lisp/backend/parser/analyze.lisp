@@ -426,8 +426,9 @@ exist\" messages."
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-lisp-runtime)
+                   ;; Keep the native cluster identity's planner classification open.
                    (make-scalar-builtin :name "pg_lisp_cluster_identity" :result-type :varchar
-                                        :volatility :volatile :strict-p t :evaluator 'sql-cluster-identity)
+                                        :strict-p t :evaluator 'sql-cluster-identity)
                    (make-scalar-builtin :name "pg_export_snapshot" :result-type :text
                                         :volatility :volatile :strict-p t :evaluator 'export-transaction-snapshot)
                    (make-scalar-builtin :name "current_database" :result-type :text

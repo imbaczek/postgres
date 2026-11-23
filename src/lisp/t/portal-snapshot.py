@@ -204,7 +204,7 @@ def check_snapshot_read_only_transition(reader, writer):
     writer.query("DROP TABLE export_transition")
 
 
-def check_sorted_volatile_slot_projection(connection):
+def check_sorted_volatile_projection(connection):
     rows = connection.query(
         "SELECT pg_create_logical_replication_slot('sort_slot','pgoutput') "
         "FROM (SELECT 2 AS k UNION ALL SELECT 1) AS source ORDER BY k LIMIT 1"
@@ -232,6 +232,14 @@ def check_sorted_volatile_slot_projection(connection):
         "WHERE slot_name IN ('slot_discarded','slot_retained')"
     ) == [["slot_retained"]]
     connection.query("SELECT pg_drop_replication_slot('slot_retained')")
+
+    connection.query("SET application_name = ''")
+    assert connection.query(
+        "SELECT set_config('application_name', current_setting('application_name') || label, false) "
+        "FROM slot_sort_names ORDER BY k LIMIT 1"
+    ) == [["slot_retained"]]
+    assert connection.query("SHOW application_name") == [["slot_retained"]]
+    connection.query("RESET application_name")
 
 
 def check_sorted_file_projection(connection):
@@ -374,7 +382,7 @@ def run():
         check_repeatable_read_dml_bind(server, reader, writer)
         check_repeatable_read_select_bind(server, reader, writer)
         check_snapshot_read_only_transition(reader, writer)
-        check_sorted_volatile_slot_projection(writer)
+        check_sorted_volatile_projection(writer)
         check_sorted_file_projection(writer)
         check_ddl_skip_validation(writer)
         check_index_column_limit(writer)

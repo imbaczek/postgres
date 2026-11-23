@@ -434,6 +434,9 @@ Signature resolution uses the shared implicit casts.
 The C differential checks the returned value and session persistence.
 The live rollback test checks recovery of the prior value after failed
 statements and explicit transaction rollback.
+Sort projection reads declared volatility from the scalar registry for
+registered calls. The live portal test verifies that `set_config` runs
+only for the retained row of an ORDER BY with LIMIT.
 
 ### A9 follow-up evidence
 

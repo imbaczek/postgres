@@ -1798,26 +1798,24 @@ Expressions wrapping a set result must remain in a separate projection."
       child)))
 
 (defun sort-projection-volatile-p (expression)
-  ;; Only functions in the executor's set defer.
+  "Find calls whose declared volatility requires projection after sorting."
   (some-local-plan-expression
    (lambda (form walk)
      (declare (ignore walk))
-     (and (eq (first form) :func)
-          (member (second form)
-                  '("nextval" "currval" "setval" "random" "setseed"
-                    "set_config" "pg_cancel_backend" "pg_terminate_backend"
-                    "pg_promote" "pg_current_wal_lsn" "pg_current_wal_flush_lsn"
-                    "pg_export_snapshot" "pg_is_in_recovery"
-                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
-                    "pg_last_xact_replay_timestamp"
-                    "pg_wal_replay_pause" "pg_wal_replay_resume"
-                    "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
-                    "pg_reload_conf" "pg_reload_code"
-                    "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
-                    "pg_replication_slot_advance" "pg_control_checkpoint"
-                    "pg_read_binary_file" "pg_stat_file"
-                    "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
-                  :test #'string=)))
+     (when (eq (first form) :func)
+       (let* ((name (second form))
+              (builtins (gethash name *scalar-builtin-descriptors*)))
+         (if builtins
+             (some (lambda (builtin) (eq (scalar-builtin-volatility builtin) :volatile)) builtins)
+             (member name
+                     '("nextval" "currval" "setval" "random" "setseed"
+                       "pg_cancel_backend" "pg_terminate_backend" "pg_promote"
+                       "pg_reload_conf" "pg_reload_code"
+                       "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
+                       "pg_replication_slot_advance" "pg_control_checkpoint"
+                       "pg_read_binary_file" "pg_stat_file"
+                       "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
+                     :test #'string=)))))
    expression))
 
 (defun project-set-expression-dependent-p (expression width count targets)
