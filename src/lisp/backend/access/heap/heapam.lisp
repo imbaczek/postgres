@@ -148,21 +148,22 @@
   (when (member type '(:bytea-array :json-array :jsonb-array))
     (sql-array-element-type type)))
 
-(defun column-align (col)
-  (case (pg-column-type col)
-    ((:int8 :float8 :time :timestamp :timestamptz :interval :timetz) 8)
-    (:int2 2)
-    ((:int4 :oid :numeric :varchar :text :json :jsonb :bytea :bytea-array :json-array :jsonb-array :float4 :date) 4)
-    (t 1)))
+(defmacro define-heap-column-layout (types)
+  "Compile registry metadata for the heap codec's fixed-width scalar types."
+  `(progn
+     (defun column-align (col)
+       (let ((type (pg-column-type col)))
+         (case type
+           ,@(loop for type in types
+                   collect (list type (ecase (sql-type-alignment-code type)
+                                        (#\s 2) (#\i 4) (#\d 8))))
+           (otherwise (if (heap-varlena-type-p type) 4 1)))))
+     (defun column-fixed-size (col)
+       (case (pg-column-type col)
+         ,@(loop for type in types collect (list type (sql-expression-type-length type)))))))
 
-(defun column-fixed-size (col)
-  (case (pg-column-type col)
-    (:interval 16)
-    (:timetz 12)
-    (:int2 2)
-    ((:int4 :oid :float4 :date) 4)
-    ((:int8 :float8 :time :timestamp :timestamptz) 8)
-    (t nil)))
+(define-heap-column-layout
+    (:int2 :int4 :int8 :oid :float4 :float8 :date :time :timetz :timestamp :timestamptz :interval))
 
 (defconstant +vartag-ondisk-oid+ 18)
 

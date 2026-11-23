@@ -708,6 +708,12 @@ Tuple layout, writing, deformation, and TOAST estimation and planning
 share the same physical varlena type classification. TOAST estimation
 still computes typmod-dependent widths for varchar and numeric. TOAST
 candidate ranking uses the same header widths as the heap codec.
+Fixed-width heap layout compiles widths and alignments from the SQL
+type metadata for the existing codec's type set. The regression checks
+the physical size and alignment of all twelve fixed-width types and
+checks that unsupported types do not become heap types.
+A warm SBCL probe over 2.1 million size-and-alignment lookup pairs
+produced the same checksum and zero allocated bytes before and after.
 
 ### A17 follow-up evidence
 

@@ -857,6 +857,17 @@
                                   columns) 0))
                "NULL bytea survives the tuple codec")))
 
+(rove:deftest heap-column-layout-preserves-physical-type-widths
+    (dolist (fixture '((:int2 2 2) (:int4 4 4) (:int8 8 8) (:oid 4 4)
+                       (:float4 4 4) (:float8 8 8) (:date 4 4) (:time 8 8)
+                       (:timetz 12 8) (:timestamp 8 8) (:timestamptz 8 8) (:interval 16 8)
+                       (:bytea nil 4) (:jsonb-array nil 4) (:numeric nil 4)
+                       (:bool nil 1) (:oid8 nil 1) (:int4-array nil 1)))
+      (destructuring-bind (type width alignment) fixture
+        (let ((column (make-pg-column :type type)))
+          (rove:ok (eql width (column-fixed-size column)))
+          (rove:ok (= alignment (column-align column)))))))
+
 (rove:deftest heap-varlena-header-boundary-matches-layout-and-disk
     (dolist (fixture '((126 nil 26 1) (127 nil 28 4) (126 #\p 28 4)))
       (destructuring-bind (payload-size storage offset header-size) fixture
