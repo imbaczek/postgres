@@ -544,6 +544,11 @@ nullary `random`, and the supported integer and numeric range overloads.
 The existing named binder preserves caller-order analysis and diagnostic
 signatures. The C differential verified seeded values, session isolation,
 rollback, exact lookup diagnostics, and draws after sorting and limiting.
+`scale`, `min_scale`, `trim_scale`, and `factorial` use the registry for
+coercion and strict immutable evaluation. The numeric diagnostic path
+still reports lookup errors from the caller's types and rejects scalar
+decorations before converting their literals. The 1,412 C comparisons
+covered these diagnostics, scale for special values, and factorial limits.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

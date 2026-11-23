@@ -544,6 +544,8 @@ CASES = (
     "SELECT scale(0.0000::numeric),min_scale(0.0000::numeric),trim_scale(0.0000::numeric)",
     "SELECT scale('NaN'::numeric),min_scale('Infinity'::numeric),trim_scale('-Infinity'::numeric)",
     "SELECT scale(1),min_scale('1.200'),trim_scale('001.200'),scale(NULL::numeric)",
+    "SELECT pg_catalog.min_scale(DISTINCT 'bad')",
+    "SELECT pg_catalog.factorial('bad' ORDER BY 1)",
     "SELECT scale(1::float8)",
     "SELECT div(7::numeric,2::numeric),div((-7)::numeric,2::numeric),numeric_div_trunc(7,2),mod((-7),3)",
     "SELECT mod(1::smallint,2::smallint),mod(5::bigint,3::integer),mod(5::integer,2::smallint)",

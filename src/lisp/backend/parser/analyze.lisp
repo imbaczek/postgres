@@ -509,6 +509,18 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "scale" :argument-types '(:numeric)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-finite-numeric-scale :implicit-arguments-p :numeric)
+                   (make-scalar-builtin :name "min_scale" :argument-types '(:numeric)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-finite-numeric-min-scale :implicit-arguments-p :numeric)
+                   (make-scalar-builtin :name "trim_scale" :argument-types '(:numeric)
+                                        :result-type :numeric :volatility :immutable :strict-p t
+                                        :evaluator 'sql-numeric-trim-scale :implicit-arguments-p :numeric)
+                   (make-scalar-builtin :name "factorial" :argument-types '(:int8)
+                                        :result-type :numeric :volatility :immutable :strict-p t
+                                        :evaluator 'sql-factorial :implicit-arguments-p :numeric)
                    (make-scalar-builtin :name "random" :result-type :float8
                                         :volatility :volatile :strict-p t :evaluator 'sql-random-float)
                    (make-scalar-builtin :name "random" :argument-types '(:int4 :int4)
@@ -961,10 +973,11 @@ names and unknown types.  setseed has no catalog argument names."
 
 (defun numeric-function-p (name)
   "Recognize the supported mathematical catalog functions without argument names."
-  (or (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+  (or (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p)
+      (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
-                     "scale" "min_scale" "trim_scale" "width_bucket") :test #'string=)
+                     "width_bucket") :test #'string=)
       (trig-function-p name)
       (float-catalog-alias name)
       (integer-catalog-alias-p name)
@@ -984,7 +997,7 @@ names and unknown types.  setseed has no catalog argument names."
         ((numeric-helper-function-p name)
          (= count (if (member name '("numeric_inc" "numeric_uminus" "numeric_uplus")
                               :test #'string=) 1 2)))
-        ((or (and (numeric-arithmetic-function-p name) (not (string= name "factorial")))
+        ((or (numeric-arithmetic-function-p name)
              (member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
                             "atan2" "atan2d") :test #'string=))
          (= count 2))
@@ -1216,14 +1229,11 @@ include different type categories."
                         (rest args)))
           :type type :typmod -1)))
 
-(defun analyze-numeric-scale-function (name args)
-  "Resolve numeric scale inspection and trimming functions."
-  (unless (and (= (length args) 1)
-               (or (in-unknown-constant-p (first args))
-                   (sql-implicit-coercion-p (expr-type (first args)) :numeric)))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (list :func name (list (coerce-common-expression (first args) :numeric))
-        :type (if (string= name "trim_scale") :numeric :int4) :typmod -1))
+(defun sql-finite-numeric-scale (value)
+  (if (sql-numeric-special-p value) +null+ (sql-numeric-scale value)))
+
+(defun sql-finite-numeric-min-scale (value)
+  (if (sql-numeric-special-p value) +null+ (sql-numeric-min-scale value)))
 
 (defun numeric-helper-function-p (name)
   (member name '("numeric_eq" "numeric_ne" "numeric_gt" "numeric_ge"
@@ -1268,7 +1278,7 @@ Selecting the argument itself preserves its display scale."
 (defun numeric-arithmetic-function-p (name)
   "Recognize immutable numeric arithmetic function names."
   (member name '("div" "mod" "numeric_div_trunc" "numeric_mod"
-                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div" "gcd" "lcm" "factorial")
+                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div" "gcd" "lcm")
           :test #'string=))
 
 (defun analyze-numeric-arithmetic-function (name args)
@@ -1293,15 +1303,6 @@ ambiguous. The other names resolve to numeric, subject to implicit coercion."
       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
     (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
           :type type :typmod -1)))
-
-(defun analyze-factorial-function (name args)
-  "Resolve factorial's single bigint argument and numeric result."
-  (unless (and (= (length args) 1)
-               (or (in-unknown-constant-p (first args))
-                   (sql-implicit-coercion-p (expr-type (first args)) :int8)))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (list :func name (list (coerce-common-expression (first args) :int8))
-        :type :numeric :typmod -1))
 
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
@@ -1561,7 +1562,7 @@ so a nested argument error keeps its own diagnostics."
              (report-numeric-function-resolution-error name args :schema schema))
            (list :func name (list (coerce-common-expression (first args) type))
                  :type type :typmod -1)))
-        ((member name '("random" "setseed") :test #'string=)
+        ((gethash name *scalar-builtin-descriptors*)
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
         ((trig-function-p name) (analyze-trig-function name args))
@@ -1574,9 +1575,6 @@ so a nested argument error keeps its own diagnostics."
          (analyze-log-function name args))
         ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
          (analyze-power-function name args))
-        ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
-         (analyze-numeric-scale-function name args))
-        ((string= name "factorial") (analyze-factorial-function name args))
         ((numeric-helper-function-p name) (analyze-numeric-helper-function name args))
         ((numeric-arithmetic-function-p name) (analyze-numeric-arithmetic-function name args)))
     (pg-error (condition)
@@ -3911,7 +3909,7 @@ still requires deferred sort projection."
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
-                     "scale" "min_scale" "trim_scale" "width_bucket")
+                     "width_bucket")
               :test #'string=)))
 
 (defun analyzed-function-volatile-p (name)
@@ -4654,8 +4652,7 @@ DIV truncates toward zero, integer MOD uses integer remainder, and the numeric
 aliases share the corresponding numeric operator implementation."
   (when (member +null+ args) (return-from eval-numeric-arithmetic-function +null+))
   (let ((left (first args)) (right (second args)))
-    (cond ((string= name "factorial") (sql-factorial left))
-          ((member name '("gcd" "lcm") :test #'string=)
+    (cond ((member name '("gcd" "lcm") :test #'string=)
            (if (eq type :numeric)
                (sql-numeric-gcd-lcm left right (string= name "lcm"))
                (sql-integer-gcd-lcm left right type (string= name "lcm"))))
@@ -5066,13 +5063,6 @@ expression identity has been resolved."
     ((numeric-helper-function-p name) (eval-numeric-helper-function name arguments))
     ((numeric-arithmetic-function-p name)
      (eval-numeric-arithmetic-function name arguments type))
-    ((member name '("scale" "min_scale" "trim_scale") :test #'string=)
-     (let ((value (first arguments)))
-       (cond ((eq value +null+) +null+)
-             ((string= name "trim_scale") (sql-numeric-trim-scale value))
-             ((sql-numeric-special-p value) +null+)
-             ((string= name "scale") (sql-numeric-scale value))
-             (t (sql-numeric-min-scale value)))))
     ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
