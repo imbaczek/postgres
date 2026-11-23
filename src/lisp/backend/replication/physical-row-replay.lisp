@@ -158,12 +158,9 @@ A violation is an error; the outer replay path fences recovery."
                                *physical-receive-store* *physical-recovery-state*)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
-      (when fpw-fact
-        (physical-fpw-check-fact fpw-fact (funcall history) *last-replay-lsn*
-                                 (physical-recovery-replay-timeline)))
-      (when logical-fact
-        (physical-logical-check-fact logical-fact (funcall history) *last-replay-lsn*
-                                     (physical-recovery-replay-timeline)))
+      (when (or fpw-fact logical-fact)
+        (physical-replay-check-policy-seeds
+         fpw-fact logical-fact history *last-replay-lsn* (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*

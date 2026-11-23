@@ -664,6 +664,11 @@ promotion passed.
 Drop and resource proofs now reuse the verified prefix timeline from the
 store-point check. The 56-head strict selection includes rejection of an
 independently supplied wrong timeline and of a position inside a record.
+The proof scans and both standby redo paths now validate any supplied FPW
+and logical seeds against one resolved history at their starting boundary.
+With both seeds absent they skip history resolution. All 56 strict physical
+checks passed again, and native and C hot standby passed replay, reload,
+restart, and promotion.
 
 The replay fact consumers use the following boundaries. Each scan carries
 provisional facts until a validated terminal or a selected end-of-recovery

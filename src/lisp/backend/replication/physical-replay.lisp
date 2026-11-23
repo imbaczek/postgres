@@ -557,12 +557,9 @@ Stop before the next record when a published terminal causes a resource pause."
                                *physical-receive-store* *physical-recovery-state*)))
           (source-xids (copy-tree (getf *physical-recovery-state* :source-xids)))
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
-      (when fpw-fact
-        (physical-fpw-check-fact fpw-fact (funcall resource-history) start-lsn
-                                 (physical-recovery-replay-timeline)))
-      (when logical-fact
-        (physical-logical-check-fact logical-fact (funcall resource-history) start-lsn
-                                     (physical-recovery-replay-timeline)))
+      (when (or fpw-fact logical-fact)
+        (physical-replay-check-policy-seeds
+         fpw-fact logical-fact resource-history start-lsn (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*

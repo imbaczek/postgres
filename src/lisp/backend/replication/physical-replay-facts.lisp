@@ -163,11 +163,16 @@ The caller must establish the checkpoint and its place in the selected history."
         (if fact (physical-logical-merge-checkpoint-interval fact expected) expected))
       fact))
 
+(defun physical-replay-check-policy-seeds (fpw logical history start timeline)
+  "Check both supplied facts at one prefix in the same selected history."
+  (when (or fpw logical)
+    (let ((selected (funcall history)))
+      (when fpw (physical-fpw-check-fact fpw selected start timeline))
+      (when logical (physical-logical-check-fact logical selected start timeline)))))
+
 (defun physical-recovery-scan-policy-seeds (store state checkpoint start timeline fpw logical)
   "Validate private policy seeds and refine them from the starting checkpoint."
-  (when fpw
-    (physical-fpw-check-fact fpw (physical-recovery-resource-history store state) start timeline))
-  (when logical
-    (physical-logical-check-fact logical (physical-recovery-resource-history store state) start timeline))
+  (physical-replay-check-policy-seeds
+   fpw logical (lambda () (physical-recovery-resource-history store state)) start timeline)
   (values (physical-recovery-scan-checkpoint-fpw checkpoint fpw start timeline)
           (physical-recovery-scan-checkpoint-logical checkpoint logical start timeline)))
