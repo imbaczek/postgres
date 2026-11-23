@@ -168,6 +168,8 @@ The live physical replay fixture projects an unreclaimed receive store
 into the checksummed 52-byte PGPHYS02 format. A cold standby rejects it
 without rewriting it. Restoring PGPHYS03 permits an owned restart,
 successful replay, and recovery across the restartpoint crash cuts.
+The physical store unit tests cover rejected v2 bytes and writable v3 reopen.
+The obsolete restartpoint test expecting in-place v2 migration was removed.
 
 For B10, startup requires PGRSTAT3 for ordinary recovery or PGRSTAT4 for
 pending promotion. The signal harness checks rejection of both retired

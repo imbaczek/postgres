@@ -492,31 +492,6 @@
       (setf (getf pg::*physical-recovery-state* :required-applied) 169)
       (ok (intake-fails-p (lambda () (pg::physical-restartpoint-prepare-storage store))))))
 
-(deftest physical-store-v2-control-migrates-without-changing-bootstrap
-    (with-physical-store-directory (root)
-      (let ((store (pg::physical-store-open root 123 1 :create t)))
-        (unwind-protect
-             (progn
-               (pg::physical-store-input store 0 (sample-physical-record))
-               (pg::physical-store-flush store))
-          (pg::physical-store-close store)))
-      (let* ((path (merge-pathnames "receive.control" root))
-             (v3 (pg::recovery-read-bytes path))
-             (v2 (make-array 52 :element-type '(unsigned-byte 8) :initial-element 0)))
-        (replace v2 v3 :end2 48)
-        (setf (aref v2 7) 50)
-        (pg::wal-set-u32 v2 48 (pg::wal-crc32 v2))
-        (pg::wal-atomic-write-bytes path v2))
-      (let ((store (pg::physical-store-open root 123 1)))
-        (unwind-protect
-             (progn
-               (ok (= 0 (pg::physical-store-base-lsn store) (pg::physical-store-floor-lsn store)))
-               (ok (= 32 (pg::physical-store-flushed-lsn store)))
-               (pg::physical-store-input store 32 (sample-physical-record 32))
-               (pg::physical-store-flush store)
-               (ok (= 68 (length (pg::recovery-read-bytes (merge-pathnames "receive.control" root))))))
-          (pg::physical-store-close store)))))
-
 (cl-spec:defproperty restartpoint-scheduling-is-translation-invariant
     ((floor (range integer 0 4611686018427387903))
      (offset (range integer 0 4611686018427387903))
