@@ -19,8 +19,7 @@ sql() {
     PGCONNECT_TIMEOUT=2 psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -c "$1"
 }
 start_server() {
-    rm -f "$TMP/control.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" -c wal_level=logical --control-socket "$TMP/control.sock" >>"$TMP/server.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/data" "$TMP/control.sock" "$TMP/server.log" -c wal_level=logical
     SERVER=$!
     test_wait_owned_sql_server "$SERVER" "$PORT" psql 300
 }
@@ -48,9 +47,8 @@ spill_count() {
 }
 start_server
 sql 'CREATE TABLE spool_rows (id integer PRIMARY KEY, value text)' >/dev/null
-printf '%s\n(quit)\n' "(progn (setf *logical-capture-memory-bytes* 0) (setf (symbol-function 'logical-spool-events-in-order) (lambda (spool) (declare (ignore spool)) (error \"unexpected whole-spool materialization\"))))" |
-    sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control.log"
-if grep -q ';; error:' "$TMP/control.log"; then cat "$TMP/control.log" >&2; exit 1; fi
+test_lisp_control_checked "$TMP/control.sock" \
+    "(progn (setf *logical-capture-memory-bytes* 0) (setf (symbol-function 'logical-spool-events-in-order) (lambda (spool) (declare (ignore spool)) (error \"unexpected whole-spool materialization\"))))" "$TMP/control.log"
 start_client
 printf '%s\n' 'BEGIN;' "INSERT INTO spool_rows VALUES (1, 'first');" "INSERT INTO spool_rows VALUES (2, 'second');" "SELECT 'captured';" >&7
 wait_for_line captured
@@ -83,14 +81,12 @@ start_server
 [ "$(sql 'SELECT id,value FROM spool_rows ORDER BY id')" = "$(printf '1|first\n2|second')" ]
 # Preserve the original failure even if fast shutdown closes the SQL connection
 # before it can report the checksum error.
-printf '%s\n(quit)\n' '(let ((original (symbol-function '\''wal-fail-stop))) (setf (symbol-function '\''wal-fail-stop) (lambda (condition) (ignore-errors (with-open-file (out "'"$TMP"'/wal-failure.log" :direction :output :if-exists :append :if-does-not-exist :create) (format out "~a~%" condition))) (funcall original condition))))' |
-    sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control-failure.log"
-if grep -q ';; error:' "$TMP/control-failure.log"; then cat "$TMP/control-failure.log" >&2; exit 1; fi
+test_lisp_control_checked "$TMP/control.sock" \
+    '(let ((original (symbol-function '\''wal-fail-stop))) (setf (symbol-function '\''wal-fail-stop) (lambda (condition) (ignore-errors (with-open-file (out "'"$TMP"'/wal-failure.log" :direction :output :if-exists :append :if-does-not-exist :create) (format out "~a~%" condition))) (funcall original condition))))' "$TMP/control-failure.log"
 # Corrupt the second event only after the first fragment is in WAL. The reader
 # must detect the changed spool and leave the transaction without a terminal.
-printf '%s\n(quit)\n' '(progn (setf *logical-capture-memory-bytes* 0) (setf *logical-spool-test-after-wal-record* (lambda (spool index) (cond ((= index 1) (wal-flush) (let* ((stream (logical-spool-stream spool)) (resume (file-position stream))) (file-position stream 0) (let* ((first-size (logical-spool-read-u32 stream)) (position (+ 16 first-size))) (file-position stream position) (let ((byte (read-byte stream))) (file-position stream position) (write-byte (logxor byte 255) stream) (finish-output stream))) (file-position stream resume))) ((= index 2) (setf *logical-spool-test-after-wal-record* nil) (wal-flush) (with-open-file (out "'"$TMP"'/fragment-durable" :direction :output :if-exists :supersede) (write-line "durable" out)))))))' |
-    sbcl --script "$BASE/t/control-client.lisp" unix "$TMP/control.sock" >"$TMP/control-fault.log"
-if grep -q ';; error:' "$TMP/control-fault.log"; then cat "$TMP/control-fault.log" >&2; exit 1; fi
+test_lisp_control_checked "$TMP/control.sock" \
+    '(progn (setf *logical-capture-memory-bytes* 0) (setf *logical-spool-test-after-wal-record* (lambda (spool index) (cond ((= index 1) (wal-flush) (let* ((stream (logical-spool-stream spool)) (resume (file-position stream))) (file-position stream 0) (let* ((first-size (logical-spool-read-u32 stream)) (position (+ 16 first-size))) (file-position stream position) (let ((byte (read-byte stream))) (file-position stream position) (write-byte (logxor byte 255) stream) (finish-output stream))) (file-position stream resume))) ((= index 2) (setf *logical-spool-test-after-wal-record* nil) (wal-flush) (with-open-file (out "'"$TMP"'/fragment-durable" :direction :output :if-exists :supersede) (write-line "durable" out)))))))' "$TMP/control-fault.log"
 awk 'BEGIN { print "BEGIN; INSERT INTO spool_rows VALUES (10, \047first fragment\047);"; printf "INSERT INTO spool_rows VALUES (11, \047"; for (i=0;i<16778240;i++) printf "x"; print "\047); COMMIT;" }' >"$TMP/corrupt.sql"
 if PGCONNECT_TIMEOUT=2 psql -X -qAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -f "$TMP/corrupt.sql" >"$TMP/corrupt.out" 2>&1; then
     echo 'logical-capture-spill: corrupted spool unexpectedly committed' >&2

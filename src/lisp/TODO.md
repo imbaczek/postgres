@@ -986,6 +986,11 @@ to exercise the publication barrier before the worker join. The signal fixture's
 control inspector validates the original checksummed image, including the logical
 policy extension used by current writers.
 
+The checkpoint snapshot and logical capture spill fixtures also share the
+launcher and checked control calls. Both live suites passed, including
+checkpoint crash and retired-format refusal, spool rollback and disconnect,
+and recovery from a corrupted transaction spool.
+
 A focused backend trace located the TOAST rewrite fixture wait in
 `ACQUIRE-SCHEMA-WRITE-LOCK`. The repeatable-read session held a schema
 read lock while the fixture waited synchronously for `VACUUM FULL`.
