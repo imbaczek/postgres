@@ -101,7 +101,7 @@
     (sb-posix:chmod (namestring root) #o700)
     (with-open-file (stream (merge-pathnames ".pg_lisp.lock" root)
                             :direction :output :if-exists :error)
-      (declare (ignore stream)))
+      (declare (ignorable stream)))
     (sb-posix:chmod (namestring (merge-pathnames ".pg_lisp.lock" root)) #o600)
     (funcall function root)))
 

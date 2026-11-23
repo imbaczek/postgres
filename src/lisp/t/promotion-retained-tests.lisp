@@ -1941,7 +1941,7 @@
                          "logical-slot-copy.source-proof" "logical-slot-copy.source-proof.tmp"))
            (let ((path (merge-pathnames name root)) (events nil))
              (with-open-file (out path :direction :output :if-exists :error)
-               (declare (ignore out)))
+               (declare (ignorable out)))
              (unwind-protect
                   (call-with-current-promotion-owner
                    (lambda ()

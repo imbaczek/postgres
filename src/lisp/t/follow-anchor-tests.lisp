@@ -191,7 +191,7 @@
       (setf history (with-output-to-string (out)
                       (write-string history out)
                       (dotimes (index (ceiling padding 10))
-                        (declare (ignore index))
+                        (declare (ignorable index))
                         (write-line "# padding" out)))
             (getf anchor :history-text) history))
     (let* ((selection (pg::physical-store-history-candidate

@@ -684,7 +684,7 @@
                (dolist (node '(901 903))
                  (with-open-file (stream (pg::relation-file-path node :visibility)
                                          :direction :output :if-does-not-exist :create)
-                   (declare (ignore stream))))
+                   (declare (ignorable stream))))
                (pg::catalog-remove-orphan-relations)
                (dolist (node '(900 901 902))
                  (ok (probe-file (pg::relation-file-path node))))

@@ -144,6 +144,7 @@
 
 (deftest current-timeline-policy-uses-required-and-authoritative-restartpoint-progress
     (with-restartpoint-fixture (root store)
+      (declare (ignore root))
       (pg::clog-init)
       (unwind-protect
            (progn

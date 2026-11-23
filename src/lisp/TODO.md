@@ -3150,6 +3150,10 @@ differential regressions verify the grouped value and comparison result.
   used by the macro expansions. Recompiling both files removed those warnings.
   Both test heads passed, including the 200-trial property. Dependency
   warnings still appear from the test toolchain.
+  The cold physical load exposed the same macro declaration issue in six
+  fixture files and one unused restartpoint parameter. Correcting those
+  declarations removed the fixture warnings. All eight affected physical
+  heads passed after recompilation.
 
 - [x] Preserve ownership revocation across live reloads. The stream and directory
   proof modules retain their weak revocation tables and mutexes for the lifetime
