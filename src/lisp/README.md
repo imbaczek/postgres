@@ -291,7 +291,7 @@ restartpoint rejection.
 
 WAL control v6 records filename namespace separately from insertion and
 checkpoint timelines. Server startup requires 24-digit timeline-qualified names.
-Use the [prior build's migration procedure](PHYSICAL-HA.md#timeline-qualified-native-wal-namespace)
+Use the [legacy primary cutover procedure](PHYSICAL-HA.md#legacy-primary-cutover)
 for a stopped legacy primary, then shut it down before upgrading.
 `./t/wal-namespace.sh` verifies qualified restart and legacy rejection before
 PID repair or storage changes.
@@ -1063,9 +1063,9 @@ use the SQL temporary-file quota. Recovery validation avoids retaining decoded
 text, varchar, JSON text, or bytea values, but still constructs JSONB and
 numeric values. The scoped slot sender stages committed changes in a
 transaction spool, spilling above 4 MiB without the SQL temporary-file quota.
-For legacy WAL chunks, the scoped reader validates each event and stages its
-original encoded bytes, avoiding re-encoding and retaining decoded text or
-bytea values during staging. For fragmented events, the scoped reader validates
+For WAL chunks containing complete events, the scoped reader validates each
+event and stages its original encoded bytes without re-encoding or retaining
+decoded text or bytea values. For fragmented events, the scoped reader validates
 the complete event and copies its original bytes into the transaction spool in
 bounded blocks. Validation avoids materializing text and bytea, but may still
 construct JSONB and numeric values; later output decoding can materialize

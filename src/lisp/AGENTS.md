@@ -447,9 +447,9 @@ appropriate instead of replacing the native C peer or adding a message relay.
   fields through the actual serialization/parser pair.
 - When changing the native WAL version, retain the introduction versions of
   existing record types, update physical stream negotiation, and check independent
-  test inspectors. Stored legacy WAL readability does not imply live mixed-version
-  peer compatibility. Crash tests must inspect the durable checkpoint copy both
-  before data sync and after control publication.
+  test inspectors. Check the [supported native formats](PHYSICAL-HA.md#supported-native-formats)
+  for both stored WAL and stream compatibility. Crash tests must inspect the
+  durable checkpoint copy both before data sync and after control publication.
 - A shutdown streaming oracle must distinguish checkpoint record start from its
   end. `pg_controldata` reports the start; an earlier WAL record can reach that
   position without delivering the checkpoint. Capture the source's durable
