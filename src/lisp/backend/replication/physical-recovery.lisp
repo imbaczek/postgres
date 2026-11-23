@@ -872,14 +872,17 @@ installing the recovery store."
                (not *wal-output-stream*) (not *wal-ready*)
                (zerop (hash-table-count *relation-streams*)))
     (error "recovery storage requires cold resources"))
-  (let ((store nil) (finished nil))
+  (let ((namespace (getf *physical-recovery-state* :wal-namespace))
+        (store nil) (finished nil))
+    (unless (member namespace '(:legacy :timeline))
+      (error "physical recovery requires a verified WAL namespace"))
     (unwind-protect
          (progn
            (wal-replace-storage-incarnation)
            (wal-ensure-directory-durable (merge-pathnames "base/" *pgdata*))
            (let ((streaming (= 2 (getf *physical-recovery-state* :phase))))
              (setf (getf *physical-recovery-state* :replay-timeline) (getf *physical-recovery-state* :timeline)
-                   *wal-segment-namespace* (getf *physical-recovery-state* :wal-namespace :legacy)
+                   *wal-segment-namespace* namespace
                    *wal-insert-timeline* (getf *physical-recovery-state* :timeline)
                    *wal-checkpoint-timeline* (getf *physical-recovery-state* :timeline)
                    *wal-checkpoint-snapshot* (copy-tree (getf *physical-recovery-state* :source-checkpoint))

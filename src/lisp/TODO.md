@@ -432,6 +432,10 @@ complete segment and admission of the same bytes under the qualified name.
 The restore helper has no legacy namespace argument. Five strict heads
 passed, covering proof validation, qualified receipt, and migration of
 retained legacy proofs to qualified names.
+Standby storage requires the WAL namespace established by verified recovery
+preparation. A cold process with that field missing refused before rotating
+storage or writing control and succeeded after the verified field was
+restored. Both strict cold recovery heads and live static standby passed.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

@@ -253,7 +253,7 @@
     (check-cold-recovery-storage-cuts '(:clog-open (:static :clog-open)) '(:error :throw)))
 
 (defun cold-recovery-guard-child-form (root marker boundary kind)
-  `(let ((pg::*pgdata* ,root) (borrowed nil) (rotations 0)
+  `(let ((pg::*pgdata* ,root) (borrowed nil) (rotations 0) (namespace nil)
                               (admission (symbol-function 'pg::physical-follow-check-startup-admission))
                               (rotate (symbol-function 'pg::wal-replace-storage-incarnation)))
      (labels ((release ()
@@ -279,6 +279,9 @@
                   (pg::with-live-operation-quiescence
                     (pg::physical-recovery-prepare)
                     (case ,boundary
+                      (:namespace
+                       (setf namespace (getf pg::*physical-recovery-state* :wal-namespace))
+                       (assert (remf pg::*physical-recovery-state* :wal-namespace)))
                       (:catalog (setf borrowed (pg::load-catalog) pg::*catalog* borrowed))
                       (:clog (setf borrowed (open (pg::clog-path) :element-type '(unsigned-byte 8))
                                    pg::*clog-stream* borrowed))
@@ -306,8 +309,11 @@
                                                  (handler-case (progn (pg::physical-recovery-open-storage) nil)
                                                    (error (condition)
                                                      (let ((text (princ-to-string condition)))
-                                                       (or (search "recovery storage requires cold resources" text)
-                                                           (search "injected startup admission rejection" text))))))
+                                                       (search (case ,boundary
+                                                                 (:namespace "physical recovery requires a verified WAL namespace")
+                                                                 (:admission "injected startup admission rejection")
+                                                                 (otherwise "recovery storage requires cold resources"))
+                                                               text)))))
                                                (result
                                                  (list (not (null exit))
                                                        (not pg::*physical-recovery-failed-p*)
@@ -327,6 +333,8 @@
                                     (list
                                      (when (every #'identity result)
                                        (release)
+                                       (when (eq ,boundary :namespace)
+                                         (setf (getf pg::*physical-recovery-state* :wal-namespace) namespace))
                                        (pg::physical-recovery-open-storage)
                                        (and (not pg::*physical-recovery-failed-p*)
                                             (pg::physical-store-check-held-lock pg::*physical-receive-store*)
@@ -342,7 +350,7 @@
 (deftest cold-recovery-storage-rejects-borrowed-resources-before-mutation
     (call-with-physical-store-directory
      (lambda (cache-root)
-       (dolist (boundary '(:catalog :clog :receive :wal-output :wal-ready :relations :admission))
+       (dolist (boundary '(:catalog :clog :receive :wal-output :wal-ready :relations :admission :namespace))
          (testing (symbol-name boundary)
                   (call-with-cold-recovery-image
                    (lambda (root driver)
