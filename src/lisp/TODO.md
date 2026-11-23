@@ -973,6 +973,13 @@ and direct TOAST projection checks. See the A17 fixture evidence below.
 
 ### A8 and A19 type metadata evidence
 
+Temporal arithmetic analysis now has its own function. The binary operator
+analyzer is 104 lines and keeps the existing comparison and coercion order.
+All 138 selected strict tests passed. Live C comparisons matched ten value
+queries and two SQLSTATE checks. C also resolves TIME multiplication through
+an implicit interval cast and reports TIME plus TIME as ambiguous. The current
+native analyzer reports 42883 for both expressions.
+
 The independently loadable `pg/sql-types` system supplies catalog type
 names, alignment, and storage codes. A warm load preserves their existing
 server symbol identities. The physical heap array codec uses the shared
