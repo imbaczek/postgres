@@ -310,7 +310,7 @@
                                                    (error (condition)
                                                      (let ((text (princ-to-string condition)))
                                                        (search (case ,boundary
-                                                                 (:namespace "physical recovery requires a verified WAL namespace")
+                                                                 (:namespace "physical recovery requires a timeline-qualified WAL namespace")
                                                                  (:admission "injected startup admission rejection")
                                                                  (otherwise "recovery storage requires cold resources"))
                                                                text)))))

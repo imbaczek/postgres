@@ -82,7 +82,7 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest adoption-attempt-codec-rejects-incoherent-private-records
-    (dolist (mode '(:unknown :duplicate :version :phase :wal :capture :stage :request
+    (dolist (mode '(:unknown :duplicate :version :phase :wal :namespace :capture :stage :request
                     :history :origin :partial-proof :wrong-proof :wrong-anchor :nested-stage :stage-parent :auth-name :auth-limit :auth-empty))
       (let ((record (adoption-attempt-codec-fixture :phase :proved)))
         (ecase mode
@@ -91,6 +91,7 @@
           (:version (setf (getf record :version) 2))
           (:phase (setf (getf record :phase) :unknown-phase))
           (:wal (setf (getf (getf record :local) :wal-control) '(:bytes "00")))
+          (:namespace (setf (getf (getf record :local) :namespace) :legacy))
           (:capture (setf (third (getf (getf record :local) :capture)) '(0 99)))
           (:stage (setf (getf (getf record :stage) :next-xid) 1003))
           (:nested-stage (setf (getf (getf record :stage) :directory)
@@ -105,7 +106,10 @@
           (:partial-proof (setf (getf record :proof) nil))
           (:wrong-proof (incf (getf (getf record :proof) :end-digest)))
           (:wrong-anchor (incf (getf (getf record :anchor) :manifest-digest))))
-        (ok (intake-fails-p (lambda () (pg::physical-adoption-attempt-image record)))))))
+        (ok (handler-case (progn (pg::physical-adoption-attempt-image record) nil)
+              (error (condition)
+                (or (not (eq mode :namespace))
+                    (search "invalid adoption local facts" (princ-to-string condition)))))))))
 
 (deftest adoption-attempt-envelope-refuses-damage-extra-forms-and-oversize
     (let* ((record (adoption-attempt-codec-fixture))

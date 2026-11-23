@@ -334,15 +334,11 @@ retries and cleanup requests; it is not authentication."
                            (getf (physical-follow-pin-anchor pin) :history-text))))
 
 (defun physical-follow-pin-check-source (pin)
-  "Check PIN against the current source identity, timeline and durable WAL.
-Legacy WAL names are accepted only for same-timeline follow on timeline 1."
+  "Check PIN against the current source identity, timeline and durable WAL."
+  (unless (eq *wal-segment-namespace* :timeline)
+    (wal-invalid-input "physical follow requires timeline-qualified source WAL"))
   (unless (and (= (physical-source-pin-system-id pin) (catalog-system-identifier))
                (= (physical-source-pin-timeline pin) *wal-insert-timeline*)
-               (or (eq *wal-segment-namespace* :timeline)
-                   (and (eq *wal-segment-namespace* :legacy)
-                        (= *wal-insert-timeline* 1)
-                        (eq :same-timeline (physical-follow-anchor-kind
-                                            (physical-follow-pin-anchor pin)))))
                (<= (or (physical-source-pin-confirmed-lsn pin)
                        (physical-source-pin-consistent-lsn pin))
                    *wal-durable-lsn*))

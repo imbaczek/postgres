@@ -1660,23 +1660,20 @@
          (ok (not pg::*wal-poisoned*)))
        1)))
 
-(deftest legacy-source-namespace-is-limited-to-same-timeline-one
-    (call-with-follow-anchor-source
-     (lambda (root anchor eor)
-       (declare (ignore root eor))
-       (let ((pg::*wal-segment-namespace* :legacy))
-         (ok (intake-fails-p
-              (lambda () (pg::physical-source-follow-reserve "legacy_descendant" anchor))))
-         (ok (zerop (hash-table-count pg::*physical-source-pins*))))))
-  (call-with-same-timeline-follow-source
-   (lambda (root anchor wal)
-     (declare (ignore root wal))
-     (let ((pg::*wal-segment-namespace* :legacy))
-       (ok (intake-fails-p
-            (lambda () (pg::physical-source-follow-prepare
-                        "legacy_two" (follow-anchor-receiver-request anchor)))))
-       (ok (zerop (hash-table-count pg::*physical-source-pins*)))))
-   2))
+(deftest follow-source-refuses-legacy-wal-before-reserving-a-pin
+    (dolist (timeline '(1 2))
+      (call-with-same-timeline-follow-source
+       (lambda (root anchor wal)
+         (declare (ignore root wal))
+         (let ((pg::*wal-segment-namespace* :legacy))
+           (ok (handler-case
+                   (progn
+                     (pg::physical-source-follow-prepare "legacy_source" (follow-anchor-receiver-request anchor))
+                     nil)
+                 (error (condition)
+                   (search "requires timeline-qualified source WAL" (princ-to-string condition)))))
+           (ok (zerop (hash-table-count pg::*physical-source-pins*)))))
+       timeline)))
 
 (defun follow-anchor-receiver-request (request)
   (loop for (key value) on request by #'cddr

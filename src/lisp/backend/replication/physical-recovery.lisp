@@ -872,8 +872,9 @@ installing the recovery store."
     (error "recovery storage requires cold resources"))
   (let ((namespace (getf *physical-recovery-state* :wal-namespace))
         (store nil) (finished nil))
-    (unless (member namespace '(:legacy :timeline))
-      (error "physical recovery requires a verified WAL namespace"))
+    (unless (eq namespace :timeline)
+      (error "physical recovery requires a timeline-qualified WAL namespace"))
+    (wal-require-qualified-segment-names)
     (unwind-protect
          (progn
            (wal-replace-storage-incarnation)

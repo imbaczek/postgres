@@ -488,9 +488,16 @@ The primary control codec and `pg_ctl` also require the `timeline` namespace.
 WAL initialization refuses legacy segment names before replacing the storage
 incarnation. The serving build removes the migration command and startup alias
 reconciliation. The live cutover check confirmed legacy refusal, unchanged
-storage and stale PID, and successful qualified restart. Use the prior build's
+storage and stale PID, and successful qualified restart. The cutover in
+`d43e943a27c` passed 1,640 unit heads, 136 strict physical heads, and the
+live promotion crash and restart matrix. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.
+Use a cold start for the cutover. Direct recovery open checks the prepared
+namespace and legacy segment names before installing runtime state. Follow
+reservation rejects legacy sources before allocating a pin, and adoption
+journal admission requires qualified local facts. The focused strict suite
+passed 41 heads across these boundaries.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
