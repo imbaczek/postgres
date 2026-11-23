@@ -13,7 +13,7 @@ when each recorded check ran.
 | --- | --- |
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
 | Primary WAL control and checkpoint payload | `PGWAL6` with the `timeline` namespace and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
-| Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Use the [previous build's namespace migration operation](#timeline-qualified-native-wal-namespace) with `archive_mode=off` for a stopped legacy primary. Recreate legacy backups and reseed standbys. The receive spool has its own naming contract. |
+| Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Follow the [legacy primary cutover procedure](#legacy-primary-cutover) to qualify an existing development primary. The receive spool has its own naming contract. |
 | Archived WAL ancestry | Full segments use timeline-qualified `.wal` names and fork prefixes use timeline-qualified `.wal.partial` names. Restore requires the matching qualified archive proof. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
@@ -30,6 +30,22 @@ binary and data copy for rollback. Restart the Lisp server across changes to
 the live reload gate, backend, portal, or prepared-statement layouts.
 The [format cutover inventory](TODO.md#milestone-0-producer-inventory)
 records the migration and verification for each supported format.
+
+### Legacy primary cutover
+
+1. Stop the legacy primary and save a matching binary and data copy for rollback.
+2. Start the development primary with build `b91e9f92423`, `archive_mode=off`,
+   and a private control socket. On that running server, evaluate
+   `(wal-migrate-timeline-namespace)` through its control socket and check that
+   the command succeeded.
+3. Shut the migration build down cleanly. Start the qualified-only server and
+   verify SQL access before taking a new physical backup.
+4. Replace legacy physical backups and reseed standbys from the qualified source.
+   Restore ancestry only from qualified archive artifacts with matching proofs.
+   Use a fresh base if the required qualified ancestry is unavailable.
+
+The [migration record](#timeline-qualified-native-wal-namespace) describes the
+older build's checks and crash recovery behavior.
 
 ## Goal closeout check
 

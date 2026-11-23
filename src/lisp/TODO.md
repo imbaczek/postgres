@@ -72,7 +72,7 @@ why existing code could not meet the need when a new implementation is required.
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
 | B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | Standby publication and logical-copy source proof emit PGRPGEN2 with metadata version 4. The XID process fixture constructs retired generations independently to test startup rejection. |
-| B18 | [WAL initialization](backend/storage/wal-core.lisp) | Fresh clusters select timeline-qualified filenames. A physical base copy inherits the source WAL control and namespace. |
+| B18 | [WAL initialization](backend/storage/wal-core.lisp) | Fresh and existing serving clusters require qualified filenames. A physical base copy preserves the source control and copies qualified WAL entries. |
 
 For B15, `0dbafd57add` removes the ownerless CLOG staging, materialization,
 and synchronous wrapper after migrating their last Rove callers. Owned
@@ -522,9 +522,9 @@ incarnation. The serving build removes the migration command and startup alias
 reconciliation. The live cutover check confirmed legacy refusal, unchanged
 storage and stale PID, and successful qualified restart. The cutover in
 `d43e943a27c` passed 1,640 unit heads, 136 strict physical heads, and the
-live promotion crash and restart matrix. Use the prior build's
-namespace migration operation for stopped legacy primaries. Regenerate legacy
-base backups or reseed affected standbys before moving them to the cutover build.
+live promotion crash and restart matrix. The
+[legacy primary cutover procedure](PHYSICAL-HA.md#legacy-primary-cutover)
+specifies the tested migration build, clean restart and standby reseeding.
 Use a cold start for the cutover. Direct recovery open checks the prepared
 namespace and legacy segment names before installing runtime state. Follow
 reservation rejects legacy sources before allocating a pin, and adoption
