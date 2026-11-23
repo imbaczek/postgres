@@ -402,9 +402,10 @@ Window reference lowering now rewrites only executable local operands,
 while CTE window key selection uses the shared ProjectSet predicate.
 The Rove regression checks slot numbers, literal and call metadata, and
 query boundaries. The C differentials passed 168 window and 114 CTE cases.
-The local `ANY`/`ALL` comparison still needs window lowering. The C
-server returns true for `row_number() OVER () = ANY (SELECT 1::bigint)`;
-Lisp currently reaches the evaluator with an unresolved window reference.
+Window lowering now visits the caller-side `ANY`/`ALL` comparison without
+rewriting the prepared subquery. The expanded 171-case C window differential
+covers the single-row reproducer, changing caller rows, and an independent
+window in the right-hand subquery.
 
 ## Open development tasks
 

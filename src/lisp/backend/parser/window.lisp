@@ -220,7 +220,14 @@
         ((eq (first expression) :window-ref)
          (append (list :col (+ width 1 (second expression)))
                  (cddr expression) (list :window-output t)))
-        ((member (first expression) '(:subplan :outer-ref)) expression)
+        ((eq (first expression) :outer-ref) expression)
+        ((subquery-expression-p expression)
+         ;; The comparison executes against the caller's row. The prepared
+         ;; subquery has already lowered its own window references.
+         (let ((descriptor (second expression)))
+           (setf (sql-subplan-test descriptor)
+                 (lower-window-references (sql-subplan-test descriptor) width)))
+         expression)
         (t (map-local-expression-operands
             (lambda (part) (lower-window-references part width)) expression))))
 
