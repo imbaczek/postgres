@@ -424,6 +424,10 @@ Recursive generation-cache discovery shares operand traversal and enters
 executable subquery scopes explicitly. The regression checks nearest active
 generation selection and ignores subqueries present only in literal data
 or metadata. The 137-case recursive CTE differential passed.
+An SBCL REPL probe ran 200,000 recursive cache lookups with a subquery,
+target and sort key. The old walker allocated about 320 bytes per lookup.
+The shared traversal initially raised that to 864 bytes. Declaring the
+visitor closures dynamic extent brought the measured cost back to 320 bytes.
 
 ## Open development tasks
 

@@ -55,6 +55,7 @@
                               (pushnew (getf relation :cte) found :test #'eq)))
                            ((getf relation :cte) (query (sql-cte-prepared (getf relation :cte))))
                            ((getf relation :subquery-prepared) (query (getf relation :subquery-prepared))))))))))
+      (declare (dynamic-extent #'visit-subplan))
       (query prepared))
     (loop for binding in *recursive-cte-generation-caches*
           when (member (car binding) found :test #'eq) return (cdr binding))))

@@ -51,7 +51,7 @@
 
 (defun some-local-plan-expression (predicate expression)
   "Visit local expression nodes until PREDICATE succeeds.
-PREDICATE receives the node and the walker for explicitly resolved references.
+PREDICATE receives the node and may call the walker before returning.
 Its second value can suppress descent without stopping the walk.
 Subplans expose their test without entering the prepared query. Calls and
 records expose their executable inputs. Follow the operand of an outer
@@ -71,6 +71,7 @@ may still contain expression lists and are traversed structurally."
                          ((:third :outer-ref)
                           (walk (third form)))
                          (:structural (or (walk (car form)) (walk (cdr form)))))))))))
+    (declare (dynamic-extent #'walk))
     (not (null (walk expression)))))
 
 (defun subquery-expression-p (expression)
