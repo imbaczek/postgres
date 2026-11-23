@@ -60,6 +60,16 @@ At `b7744cc1b88`, a tilth declaration scan measured 3,680 function and macro
 spans in the 127 production Lisp files changed since `6bcf82cf717`.
 All measured spans fit within 120 lines.
 
+The Milestone 3A polish review checked the temporal, SELECT source, and interval
+extractions against their raw results. The strict batches took 36.12, 38.58,
+and 40.45 seconds respectively. Test-system loading took 22.88–26.38 seconds
+per batch. Overall milestone wall time and peak process count were unmeasured.
+The timing ledger and compressed logs under
+`/home/imbaczek/proj/pg-ha-artifacts/architecture-query-type-polish/`
+retain the selected heads, comparison results, and two failed exploratory
+probes. Live durations were unmeasured. Reuse verified compilation for
+repeated selections against the same frozen source and runtime.
+
 ### Milestone 0 producer inventory
 
 | Audit item | Current writer | Compatibility evidence |
