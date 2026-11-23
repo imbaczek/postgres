@@ -2129,10 +2129,12 @@ still has work outstanding.
   would otherwise collide after stripping their respective `t/` prefixes.
   Quicklisp-sensitive dependency cache reuse remains open.
 
-- [ ] Test ownership revocation across live ASDF reloads with the same streams
-  and owner tokens. The stream and directory proof modules keep their weak
-  revocation tables in top-level `LET` forms. Check that reloading cannot make
-  an observed lock loss reusable after the lock is reacquired.
+- [x] Preserve ownership revocation across live reloads. The stream and directory
+  proof modules retain their weak revocation tables and mutexes for the lifetime
+  of the image. The regression releases each flock, observes its loss, reacquires
+  the lock on the same descriptor and reloads the ASDF-built module. The new
+  definitions reject the old proofs, including a directory-owner copy made
+  before revocation and the original owner after its active flag is restored.
 
 - [ ] Audit destructive sequence operations on quoted or shared lists, including
   `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation

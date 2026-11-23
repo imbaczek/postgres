@@ -173,13 +173,17 @@ callers needing a coherent view across publications must compare control images.
                    (sb-posix:stat-ino after)))))
       (if stream (close stream) (when fd (sb-posix:close fd))))))
 
+(defvar *physical-file-flock-revocation-state*
+  (list (make-hash-table :test #'eq :weakness :key)
+        (sb-thread:make-mutex :name "file lock revocation"))
+  "Keep observed flock loss and its mutex across live reloads.")
+
 ;; The weak registry retains observed lock loss while its stream or owner lives.
 ;; Rechecking an already revoked owner does not mark a replacement stream.
 ;; Registry updates use the mutex with interrupts deferred.  The descriptor
 ;; probe permits local interrupts, then latches a failed observation before an
 ;; interrupt can escape.  Checks on both sides of the probe see concurrent loss.
-(let ((revoked (make-hash-table :test #'eq :weakness :key))
-      (lock (sb-thread:make-mutex :name "file lock revocation")))
+(destructuring-bind (revoked lock) *physical-file-flock-revocation-state*
   (defun physical-file-revoke-flock (stream &optional owner)
     (sb-sys:without-interrupts
       (sb-thread:with-mutex (lock)

@@ -113,8 +113,12 @@ This context is invalid after its enclosing call exits."
 ;; Check the common thread, root and lock identities.
 ;; Callers that need role authority must also perform the role check.
 
-(let ((revoked (make-hash-table :test #'eq :weakness :key))
-      (revocation-lock (sb-thread:make-mutex :name "offline owner revocation")))
+(defvar *physical-directory-flock-revocation-state*
+  (list (make-hash-table :test #'eq :weakness :key)
+        (sb-thread:make-mutex :name "offline owner revocation"))
+  "Keep observed flock loss and its mutex across live reloads.")
+
+(destructuring-bind (revoked revocation-lock) *physical-directory-flock-revocation-state*
   (defun physical-directory-check-owner-common (owner)
     (unless (and (physical-adoption-owner-p owner)
                  (physical-adoption-owner-active-p owner)

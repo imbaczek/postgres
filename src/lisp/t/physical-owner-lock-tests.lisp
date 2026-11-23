@@ -378,6 +378,42 @@
     (ok (handler-case (funcall healthy) (error () nil))
         "an interrupted successful inspection does not revoke ownership")))
 
+(deftest offline-owner-flock-revocation-survives-module-reload
+    (flet ((reload-proof (module function)
+             (let ((before (symbol-function function)))
+               (load (asdf:apply-output-translations
+                      (compile-file-pathname (asdf:system-relative-pathname "pg" module))))
+               (ok (not (eq before (symbol-function function)))))))
+      (owner-lock-test-call-proof
+       :stream
+       (lambda (check healthy fd)
+         (ok (funcall healthy))
+         (ok (zerop (pg::physical-store-flock fd 8)))
+         (ok (signals (funcall check) 'error))
+         (ok (zerop (pg::physical-store-flock fd 6)))
+         (ok (pg::physical-file-holds-exclusive-flock-p fd))
+         (reload-proof "port/sbcl/files.lisp" 'pg::physical-file-check-exclusive-flock)
+         (ok (signals (funcall check) 'error))))
+      (with-physical-store-directory (root)
+        (sb-posix:chmod (namestring root) #o700)
+        (pg::wal-atomic-write-bytes (merge-pathnames ".pg_lisp.lock" root)
+                                    (make-array 0 :element-type '(unsigned-byte 8)))
+        (pg::call-with-physical-adoption-owner
+         root
+         (lambda (owner)
+           (let* ((copy (copy-structure owner))
+                  (fd (sb-sys:fd-stream-fd (pg::physical-adoption-owner-lock owner))))
+             (ok (eq owner (pg::physical-directory-check-owner-common owner)))
+             (ok (zerop (pg::physical-store-flock fd 8)))
+             (ok (signals (pg::physical-directory-check-owner-common owner) 'error))
+             (ok (zerop (pg::physical-store-flock fd 6)))
+             (ok (pg::physical-file-holds-exclusive-flock-p fd))
+             (reload-proof "backend/replication/physical-adoption.lisp"
+                           'pg::physical-directory-check-owner-common)
+             (ok (signals (pg::physical-directory-check-owner-common copy) 'error))
+             (setf (pg::physical-adoption-owner-active-p owner) t)
+             (ok (signals (pg::physical-directory-check-owner-common owner) 'error))))))))
+
 (deftest offline-stream-flock-preserves-backend-interruptions-without-revocation
     (dolist (proof '(:stream :directory :store :scope))
       (dolist (delivery '(:synchronous :asynchronous))
