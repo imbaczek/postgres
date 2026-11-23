@@ -18,6 +18,12 @@
         (ok (eq :bool (pg::expr-type expression)))
         (ok (equal '(t 60) (mapcar #'second (third expression)))))))
 
+(deftest sql-promotion-named-parameters-infer-catalog-types
+    (let ((pg::*query-parameter-types* (vector nil nil)))
+      (let ((expression (promotion-sql-expression "SELECT pg_promote(wait_seconds=>$1,wait=>$2)")))
+        (ok (equalp #(:int4 :bool) pg::*query-parameter-types*))
+        (ok (equal '(:bool :int4) (mapcar #'pg::expr-type (third expression)))))))
+
 (deftest sql-promotion-signature-errors-match-c
     (dolist (case '(("SELECT pg_promote(VARIADIC wait_seconds=>1)" "42883")
                     ("SELECT pg_promote('bad',1::bigint)" "42883")
@@ -58,7 +64,7 @@
 
 (cl-spec:defproperty promotion-call-notation-preserves-argument-values
     ((wait (range integer 0 1)) (seconds (range integer -100 100)) (style (range integer 0 4)))
-  (:about pg::analyze-promotion-arguments)
+  (:about pg::analyze-named-builtin-arguments)
   (:trials (:normal 200))
   (let* ((boolean (if (zerop wait) "false" "true"))
          (arguments (case style

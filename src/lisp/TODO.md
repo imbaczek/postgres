@@ -495,10 +495,11 @@ Catalog inventory and DDL validation share the stored sequence
 dependency walk. It recognizes sequence calls through the builtin
 registry and visits executable operands, including inactive CASE
 branches. A NULL sequence name contributes no dependency.
-`pg_promote` uses the scalar registry for its resolved signature and
-execution, with the existing named binder supplying defaults and
-preserving coercion and evaluation order. Strictness and sort
-volatility now come from that descriptor.
+`pg_promote` shares registry parameter binding with slot management.
+Its descriptor supplies the true and 60 defaults, infers prepared
+parameter types, and preserves coercion and evaluation order. The
+live promotion contract and the 1,469 C comparisons covered defaults,
+NULL handling, and the primary recovery guard.
 The scalar registry also supplies signatures, evaluators, and C catalog
 volatility for `pg_stat_get_wal_receiver` and `pg_control_checkpoint`.
 Scalar and expanded projections share their fixed record field definitions.

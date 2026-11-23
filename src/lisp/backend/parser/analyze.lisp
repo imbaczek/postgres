@@ -457,8 +457,8 @@ exist\" messages."
                                                 (declare (ignore call))
                                                 (sql-minmax better-p arguments)))))
 
-(defun make-slot-management-builtin (name parameters result-type evaluator)
-  "Describe a strict volatile slot call and its named binding parameters."
+(defun make-named-volatile-builtin (name parameters result-type evaluator)
+  "Describe a strict volatile call and its named binding parameters."
   (make-scalar-builtin :name name :argument-types (mapcar #'second parameters) :result-type result-type
                        :volatility :volatile :strict-p t
                        :evaluator (list* :named evaluator parameters)))
@@ -546,20 +546,20 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
-                   (make-slot-management-builtin
+                   (make-named-volatile-builtin
                     "pg_create_physical_replication_slot"
                     '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil))
                     :record 'sql-create-physical-slot)
-                   (make-slot-management-builtin
+                   (make-named-volatile-builtin
                     "pg_create_logical_replication_slot"
                     '(("slot_name" :name :required) ("plugin" :name :required)
                       ("temporary" :bool nil) ("twophase" :bool nil) ("failover" :bool nil))
                     :record 'sql-create-logical-slot)
-                   (make-slot-management-builtin
+                   (make-named-volatile-builtin
                     "pg_replication_slot_advance"
                     '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required))
                     :record 'sql-advance-replication-slot)
-                   (make-slot-management-builtin
+                   (make-named-volatile-builtin
                     "pg_drop_replication_slot" '((nil :name :required)) :void 'sql-drop-replication-slot)
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type :record
                                         :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
@@ -579,9 +579,8 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_control_checkpoint" :result-type :record
                                         :volatility :volatile :strict-p t
                                         :evaluator 'native-control-checkpoint-result)
-                   (make-scalar-builtin :name "pg_promote" :argument-types '(:bool :int4)
-                                        :result-type :bool :volatility :volatile :strict-p t
-                                        :evaluator 'pg-promote)
+                   (make-named-volatile-builtin
+                    "pg_promote" '(("wait" :bool t) ("wait_seconds" :int4 60)) :bool 'pg-promote)
                    (make-scalar-builtin :name "pg_reload_conf" :result-type :bool
                                         :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
                    (make-scalar-builtin :name "pg_reload_code" :result-type :bool
@@ -1095,49 +1094,6 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
 (defun make-record-set-call (name arguments)
   (list :set-func name arguments :type :record :typmod -1 :fields (scalar-record-builtin-fields name)))
 
-(defun analyze-promotion-arguments (arguments table &optional variadic)
-  "Bind pg_promote arguments in parameter order and supply defaults.
-Check the signature before coercion, including named and VARIADIC arguments.
-Convert supplied expressions in source order, then return them in parameter order."
-  (let* ((analyzed
-           (mapcar (lambda (argument)
-                     (if (eq (first argument) :named-arg)
-                         (list :named-arg (second argument) (analyze-expr (third argument) table))
-                         (analyze-expr argument table)))
-                   arguments))
-         (names nil)
-         (slots (vector (list :const t :type :bool :typmod -1)
-                        (list :const 60 :type :int4 :typmod -1)))
-         (assigned (vector nil nil))
-         (position 0)
-         (bindings nil))
-    (dolist (argument analyzed)
-      (if (eq (first argument) :named-arg)
-          (progn
-            (when (member (second argument) names :test #'equal)
-              (ereport "42601" "argument name ~s used more than once" (second argument)))
-            (push (second argument) names))
-          (when names (ereport "42601" "positional argument cannot follow named argument"))))
-    (dolist (argument analyzed)
-      (let* ((named-p (eq (first argument) :named-arg))
-             (index (if named-p (position (second argument) '("wait" "wait_seconds") :test #'equal)
-                        (prog1 position (incf position))))
-             (expression (if named-p (third argument) argument))
-             (type (if (eql index 0) :bool :int4)))
-        (unless (and index (< index 2) (not (aref assigned index))
-                     (or (in-unknown-constant-p expression)
-                         (if (eq type :bool) (eq (expr-type expression) :bool)
-                             (member (expr-type expression) '(:int2 :int4)))))
-          (ereport "42883" "function pg_promote(...) does not exist"))
-        (push (list index expression type) bindings)
-        (setf (aref assigned index) t)))
-    (when (and variadic names (/= (caar bindings) (1- (length analyzed))))
-      (ereport "42883" "function pg_promote(...) does not exist"))
-    (dolist (binding (nreverse bindings))
-      (destructuring-bind (index expression type) binding
-        (setf (aref slots index) (coerce-common-expression expression type))))
-    (coerce slots 'list)))
-
 (defun random-call-signature (arguments &optional names)
   "Describe the caller's argument types before overload coercion.
 Unknown literals retain PostgreSQL's unknown type in random/setseed errors;
@@ -1282,8 +1238,8 @@ then argument types. Only ambiguity and type failures carry the cast hint."
         (when name (push name names))))
     (values analyzed names)))
 
-(defun analyze-replication-slot-arguments (name arguments table variadic signature)
-  "Bind supported replication slot arguments and defaults to the catalog signature."
+(defun analyze-named-builtin-arguments (name arguments table variadic signature)
+  "Bind supplied arguments and defaults using the catalog parameter order."
   (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table signature)
     (let* ((assigned (make-array (length signature) :initial-element nil))
            (slots (make-array (length signature) :initial-element nil))
@@ -1335,11 +1291,9 @@ then argument types. Only ambiguity and type failures carry the cast hint."
   "Analyze call arguments, binding supported named arguments."
   (let ((parameters (scalar-builtin-named-parameters name)))
     (cond (parameters
-           (analyze-replication-slot-arguments name arguments table variadic parameters))
+           (analyze-named-builtin-arguments name arguments table variadic parameters))
           ((string= name "pg_get_replication_slots")
            (analyze-catalog-call-inputs arguments table))
-          ((string= name "pg_promote")
-           (analyze-promotion-arguments arguments table variadic))
           ((member name '("random" "setseed") :test #'string=)
            (analyze-random-arguments arguments table name schema))
           ((and (numeric-function-p name)

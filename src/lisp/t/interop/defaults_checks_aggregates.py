@@ -7,6 +7,9 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.pg_promote(wait_seconds=>NULL), pg_promote(false,NULL::integer)",
+    "SELECT pg_promote(wait=>false)",
+    "SELECT pg_promote('bad', wait_seconds=>1::bigint)",
     "SELECT slot_name, lsn IS NULL AS unreserved FROM pg_catalog.pg_create_physical_replication_slot(temporary=>false, slot_name=>'dc_registry_slot')",
     "SELECT count(*) FROM pg_get_replication_slots() WHERE slot_name = 'dc_registry_slot'",
     "SELECT pg_drop_replication_slot('dc_registry_slot')",
