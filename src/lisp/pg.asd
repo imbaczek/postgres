@@ -52,6 +52,7 @@
                    (:file "wal-crc32-arm.hot" :if-feature :arm64)
                    (:file "wal-record" :depends-on ("wal-core.hot"))
                    (:file "wal" :pathname "wal-core" :depends-on ("wal-record"))
+                   (:file "wal-scan" :depends-on ("wal"))
                    (:file "wal-page-publication" :depends-on ("wal"))
                    (:file "wal-transaction-publication" :depends-on ("wal-page-publication"))
                    (:file "wal-catalog-publication" :depends-on ("wal-page-publication"))

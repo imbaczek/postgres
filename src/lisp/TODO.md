@@ -1048,6 +1048,11 @@ XID, snapshot and slot tables, a REPL probe of 10,000 pairs of calculations
 measured 40,972,752 bytes consed before the change and zero afterward. Both
 versions returned the same two segment floors.
 
+The primary scanner and tail repair now load as a separate WAL storage
+component. The six moved definitions match their previous source. Five strict
+scanner tests passed, covering legal rotation, exact segment boundaries,
+invalid gaps and the durable tail repair boundary.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
