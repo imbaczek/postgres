@@ -41,6 +41,7 @@
      (lambda (lock phase)
        (ecase phase
          (:before-pid
+          (wal-check-serving-namespace-before-pid)
           (setf before
                 (physical-reseed-follow-check-terminal-startup
                  (physical-reseed-follow-startup-observation lock phase)))

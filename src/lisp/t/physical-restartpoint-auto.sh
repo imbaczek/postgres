@@ -64,19 +64,7 @@ compare() {
 mkdir -m 700 "$TMP/copy"
 start_source
 sql "$PORT" 'CREATE TABLE data (id integer); INSERT INTO data VALUES (1)'
-namespace=${SOURCE_WAL_NAMESPACE:-timeline}
-case "$namespace" in
-    timeline) : ;;
-    legacy)
-        kill -INT "$SOURCE"
-        wait "$SOURCE"
-        SOURCE=
-        python3 "$BASE/t/interop/wal-namespace-fixture.py" "$TMP/source"
-        start_source
-        ;;
-    *) echo 'invalid SOURCE_WAL_NAMESPACE' >&2; exit 1 ;;
-esac
-checked source "(assert (eq *wal-segment-namespace* :$namespace))" source-namespace
+checked source '(assert (eq *wal-segment-namespace* :timeline))' source-namespace
 checked source "(load \"$BASE/t/physical-replay-native.lisp\")" source-hooks
 checked source "(physical-base-backup \"$TMP/copy/\" \"auto_r\")" backup
 start_target

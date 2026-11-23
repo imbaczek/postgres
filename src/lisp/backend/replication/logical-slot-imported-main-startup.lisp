@@ -77,6 +77,7 @@
        (logical-slot-imported-startup-check-policy)
        (ecase phase
          (:before-pid
+          (wal-check-serving-namespace-before-pid)
           (setf before (logical-slot-imported-startup-observation lock phase)))
          (:owned-pid
           (setf after (logical-slot-imported-startup-observation lock phase before))))

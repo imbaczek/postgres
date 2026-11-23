@@ -23,7 +23,7 @@ trap 'exit 130' HUP INT TERM
 if [ -n "${PROMOTION_SEED:-}" ]; then
     SEED=$PROMOTION_SEED
 else
-    SOURCE_WAL_NAMESPACE=timeline PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/seed.log" 2>&1
+    PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/seed.log" 2>&1
     SEED=$(sed -n 's/^physical-restartpoint-auto: artifacts=//p' "$TMP/seed.log")
 fi
 if [ -n "${PROMOTION_PENDING_SEED:-}" ]; then
@@ -197,7 +197,7 @@ done
 if [ -n "${PROMOTION_QUALIFIED_SEED:-}" ]; then
     QUALIFIED=$PROMOTION_QUALIFIED_SEED
 else
-    SOURCE_WAL_NAMESPACE=timeline PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/qualified-seed.log" 2>&1
+    PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/qualified-seed.log" 2>&1
     QUALIFIED=$(sed -n 's/^physical-restartpoint-auto: artifacts=//p' "$TMP/qualified-seed.log")
 fi
 CASE=$TMP/qualified-source

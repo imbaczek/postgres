@@ -113,7 +113,7 @@ runners. No additional framework conversion is needed.
 | [wal-namespace-tests.lisp](wal-namespace-tests.lisp) | Already Rove/cl-spec: timeline-qualified identities, namespace validation, migration/reconciliation and recycling fixtures. |
 | [wal-namespace-failpoints.lisp](wal-namespace-failpoints.lisp) | Retain process-owned namespace migration fault hooks. |
 | [wal-namespace-startup-crash.lisp](wal-namespace-startup-crash.lisp) | Retain process-owned startup/crash helper. |
-| [wal-namespace.sh](wal-namespace.sh) | Retain migration/crash/native-peer process acceptance. |
+| [wal-namespace.sh](wal-namespace.sh) | Qualified restart and refusal of legacy WAL before stale PID repair. The migration crash matrix is pinned at `b91e9f92423`. |
 | [interop/wal-namespace-inspect.py](interop/wal-namespace-inspect.py) | Retain independent filename, control and digest inspector. |
 
 Rebase validation passes: **78 unit Rove tests**, **1,131 deferred legacy checks**,

@@ -2210,6 +2210,15 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
         (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
           (error condition))))))
 
+(defun wal-check-serving-namespace-before-pid ()
+  "Refuse legacy primary WAL under the startup flock before publishing PID state."
+  (when (or (some (lambda (name)
+                    (and (= 20 (length name))
+                         (wal-parse-segment-name (subseq name 0 16) :legacy)))
+                  (wal-segment-entry-names))
+            (eq :legacy (nth-value 5 (wal-read-control-fields))))
+    (error "startup requires timeline-qualified WAL; migrate the data with the previous build")))
+
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
   "Save WAL positions and retain any known primary identity and lifecycle state.
 Refresh its modification time. Update memory only after atomic publication."

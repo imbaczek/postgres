@@ -1059,6 +1059,7 @@ Consume the archive_mode=on and archive_command=false overrides."
 (defun offline-primary-recovery-check-before-pid ()
   "Under the directory lock, admit only an initialized ordinary primary.
 Check recovery control, recovery signals and startup fences before changing PID metadata."
+  (wal-check-serving-namespace-before-pid)
   (when (or (physical-recovery-read-signal-mode)
             (physical-adoption-path-present-p (physical-recovery-control-path)))
     (error "offline primary recovery requires no standby or promotion recovery state"))

@@ -13,7 +13,7 @@ when each recorded check ran.
 | --- | --- |
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
 | Primary WAL control and checkpoint payload | `PGWAL6` and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
-| Primary WAL filenames | Fresh clusters use 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. A primary with archiving enabled requires timeline-qualified names. Start a legacy primary with `archive_mode=off` to use the [namespace migration operation](#timeline-qualified-native-wal-namespace). Backup still honors the namespace recorded in `PGWAL6`. The receive spool has its own naming contract. |
+| Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Use the [previous build's namespace migration operation](#timeline-qualified-native-wal-namespace) with `archive_mode=off` for a stopped legacy primary. Recreate legacy backups and reseed standbys. The receive spool has its own naming contract. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
 | Physical receive control | `PGPHYS03`, with the current base, history-selection, and retained-root forms. |
@@ -3567,6 +3567,10 @@ No coordination or C physical compatibility is added.
 
 ### Timeline-qualified native WAL namespace
 
+This section records migration behavior in the previous build at
+`b91e9f92423`. Use that build for migration and clean shutdown before starting
+the qualified-only server.
+
 This milestone records the original namespace migration. See
 [Supported native formats](#supported-native-formats) for current startup rules.
 
@@ -3610,7 +3614,7 @@ passed (`/tmp/pg-wal-namespace-manual.xXzJOW`). Unit tests cover stale destinati
 different inodes with equal bytes, symlinks, retryable same-inode aliases, control
 rename followed by directory-sync failure, and nonlocal exits before memory adoption.
 
-`t/wal-namespace.sh` builds three retained segments with 2,200 committed updates,
+At revision `b91e9f92423`, `t/wal-namespace.sh` builds three retained segments with 2,200 committed updates,
 then kills the actual server after partial linking, link sync, control rename,
 durable control before memory adoption, memory adoption and partial cleanup. It
 also kills startup during rollback/cleanup and verifies repeated recovery. The

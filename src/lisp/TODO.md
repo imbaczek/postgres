@@ -466,9 +466,13 @@ namespace fields. Migrate positive legacy fixtures to qualified names and
 keep independently generated legacy bytes for rejection checks. Verify that
 startup refuses legacy artifacts before writing controls, renaming files, or
 changing the selected timeline.
-Apply the startup check under PGDATA ownership before PID repair or startup
-reconciliation. Cover ordinary, imported, and single-user startup. Tighten
-the primary and pending control codecs, backup manifest inventory, and retained
+The serving startup check runs under PGDATA ownership before PID repair or
+startup reconciliation in ordinary, imported, and single-user startup. Live
+ordinary and single-user refusal preserved the entire stopped fixture and
+stale PID, including independent legacy control and dangling filename cases.
+Qualified startup committed a row and recovered both rows after restart.
+The previous migration crash matrix is pinned at `b91e9f92423`.
+Tighten the primary and pending control codecs, backup manifest inventory, and retained
 overlap metadata for callers outside server startup. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.

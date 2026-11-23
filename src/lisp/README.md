@@ -289,12 +289,12 @@ visibility. `./t/xid-reservation.sh` exercises control-file crash windows,
 reader-only allocation, checkpoint-only counter progress, and retired
 restartpoint rejection.
 
-WAL control v6 records filename namespace separately from insertion/checkpoint
-timelines. Fresh clusters use 24-digit timeline-qualified names. On an existing
-native primary with 16-digit legacy names, `(wal-migrate-timeline-namespace)`
-selects qualified names. Startup reconciles interrupted migration before writes
-or recycling. `./t/wal-namespace.sh` covers multi-segment migration and startup
-crashes, continued follow, and qualified replica bootstrap.
+WAL control v6 records filename namespace separately from insertion and
+checkpoint timelines. Server startup requires 24-digit timeline-qualified names.
+Use the [prior build's migration procedure](PHYSICAL-HA.md#timeline-qualified-native-wal-namespace)
+for a stopped legacy primary, then shut it down before upgrading.
+`./t/wal-namespace.sh` verifies qualified restart and legacy rejection before
+PID repair or storage changes.
 
 ## Hot reload and control REPL
 
