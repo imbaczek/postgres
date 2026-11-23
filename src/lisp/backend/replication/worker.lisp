@@ -1548,7 +1548,9 @@ Invalid scalars fall back to the encoder and retain its error behavior."
          (ecase kind
            (#\I (unless (char= tag #\N) (error "pgoutput INSERT lacks a new tuple"))
             (list kind oid (logical-wire-tuple cursor columns)))
-           (#\D (list kind oid (logical-wire-tuple cursor columns) tag))
+           (#\D (unless (member tag '(#\K #\O))
+                  (error "pgoutput DELETE requires a K or O tuple tag, got ~s" tag))
+            (list kind oid (logical-wire-tuple cursor columns) tag))
            (#\U (let ((old nil) (initial tag))
                   (when (member tag '(#\K #\O))
                     (setf old (logical-wire-tuple cursor columns) tag (code-char (logical-wire-byte cursor))))

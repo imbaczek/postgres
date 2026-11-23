@@ -397,6 +397,12 @@
                        (list #\U 7 nil #() #\N)))
       (rove:ok (equalp (logical-pgoutput-read-operation runtime #(68 0 0 0 7 75 0 0))
                        (list #\D 7 #() #\K)))
+      (rove:ok (equalp (logical-pgoutput-read-operation runtime #(68 0 0 0 7 79 0 0))
+                       (list #\D 7 #() #\O)))
+      ;; Validate the tag even when the runtime has no mapping for the relation.
+      (rove:ok (rove:signals
+                (logical-pgoutput-read-operation runtime #(68 0 0 0 7 78 0 0))
+                'error))
       (dolist (payload '(#(73 0 0 0 7 78 0 0 1)
                          #(85 0 0 0 7 78 0 0 1)
                          #(68 0 0 0 7 75 0 0 1)
