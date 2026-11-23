@@ -1067,17 +1067,30 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
             (toast-fetch-text-slice toast pointer snapshot offset count
                                     :index-reader #'select-toast-index-reader))))))
 
-(defun eval-toast-length (expression context)
+(defun toast-length-mode (expression)
+  "Identify the TOAST length operation shared by projection planning and evaluation."
+  (let ((name (second expression))
+        (arguments (third expression)))
+    (when (and arguments (null (rest arguments)))
+      (let ((type (expr-type (first arguments))))
+        (cond
+          ((string= name "octet_length")
+           (when (member type '(:text :varchar :bytea)) :octets))
+          ((eq type :bytea)
+           (when (string= name "length") :octets))
+          ((and (member type '(:text :varchar))
+                (member name '("length" "char_length" "character_length") :test #'string=))
+           :characters))))))
+
+(defun eval-toast-length (mode context)
   "Evaluate a direct external length projection without materializing the value."
   (destructuring-bind (toast pointer snapshot environment) context
     (declare (ignore environment))
     (unless toast (ereport "XX001" "external value has no owning TOAST relation"))
-    (let ((type (expr-type (first (third expression))))
-          (name (second expression)))
-      (if (or (eq type :bytea) (string= name "octet_length"))
-          (toast-raw-value-size toast pointer snapshot)
-          (toast-map-text-characters toast pointer snapshot nil
-                                     :index-reader #'select-toast-index-reader)))))
+    (ecase mode
+      (:octets (toast-raw-value-size toast pointer snapshot))
+      (:characters (toast-map-text-characters toast pointer snapshot nil
+                                              :index-reader #'select-toast-index-reader)))))
 
 (defun scalar-builtin-record-fields (builtin)
   "Resolve a record field binding at use time so reloads see the current fields."
@@ -5001,10 +5014,11 @@ truncate and interpret the result at TYPE's signed width."
     (:func
      (let ((slice (assoc expr *toast-slice-current* :test #'eq)))
        (when (and slice (eq env (fourth (cdr slice))))
-         (return-from eval-expr
-           (if (member (second expr) '("length" "octet_length" "char_length" "character_length") :test #'string=)
-               (eval-toast-length expr (cdr slice))
-               (eval-toast-substring (third expr) (cdr slice) (expr-type expr))))))
+         (let ((mode (toast-length-mode expr)))
+           (return-from eval-expr
+             (if mode
+                 (eval-toast-length mode (cdr slice))
+                 (eval-toast-substring (third expr) (cdr slice) (expr-type expr)))))))
      (let ((arguments (mapcar (lambda (argument) (eval-expr argument env)) (third expr))))
        (eval-func (second expr) arguments (first (third expr)) expr)))
     (t

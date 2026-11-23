@@ -913,6 +913,7 @@ run -c 'alter table toast_two_slices alter column w set storage external' >/dev/
 binary_hex_other="11$binary_hex"
 run -c "insert into toast_two_slices values (1, '\\x$binary_hex', '\\x$binary_hex_other')" >/dev/null
 [ "$(run -c 'select length(v) from toast_bytes where id = 1')" = 3000 ]
+[ "$(run -c 'select length(v), octet_length(v) from toast_bytes where id + 0 = 1')" = '3000|3000' ]
 [ "$(run -c "select v = '\\x$binary_hex' from toast_bytes where id = 1")" = t ]
 [ "$(run -c "select length(v || '\\x00'::bytea), length('\\xff'::bytea || v) from toast_bytes where id = 1")" = '3001|3001' ]
 [ "$(run -c "select v || '\\x00'::bytea = '\\x${binary_hex}00'::bytea from toast_bytes where id = 1")" = t ]
@@ -1013,6 +1014,10 @@ run -c 'alter table toast_text alter column v set storage external' >/dev/null
 [ "$(run -c "select a.attstorage from pg_attribute a join pg_class c on a.attrelid = c.oid where c.relname = 'toast_text' and a.attname = 'v'")" = e ]
 [ "$(run -c "select v = '$big' from toast_text where id = 1")" = t ]
 run -c "insert into toast_text values (2, '$big')" >/dev/null
+multibyte=$("${PYTHON:-python3}" -c 'print("\u00e9" * 3000)')
+run -c "insert into toast_text values (3, '$multibyte')" >/dev/null
+[ "$(run -c 'select length(v), char_length(v), character_length(v), octet_length(v) from toast_text where id + 0 = 3')" = '3000|3000|3000|6000' ]
+run -c 'delete from toast_text where id = 3' >/dev/null
 run -c 'alter table toast_text alter column v set storage plain' >/dev/null
 [ "$(run -c "select v = '$big' from toast_text where id = 2")" = t ]
 run -c 'alter table toast_text alter column v set storage default' >/dev/null

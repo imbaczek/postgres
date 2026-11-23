@@ -2241,12 +2241,7 @@ projection or filter forms fall back to ordinary full materialization."
                              (member (expr-type column) '(:text :varchar)))
                          (every (lambda (argument) (and (consp argument) (eq (first argument) :const)))
                                 (rest args)))
-                    (and (= (length args) 1)
-                         (member (expr-type column) '(:text :varchar :bytea))
-                         (member (second expression) '("length" "octet_length" "char_length" "character_length")
-                                 :test #'string=)
-                         (or (not (eq (expr-type column) :bytea))
-                             (member (second expression) '("length" "octet_length") :test #'string=)))))
+                    (toast-length-mode expression)))
               (push (cons expression (second column)) slices)
               (push target ordinary))))
       (let ((demand (and slices
