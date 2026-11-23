@@ -437,6 +437,9 @@ statements and explicit transaction rollback.
 Sort projection reads declared volatility from the scalar registry for
 registered calls. The live portal test verifies that `set_config` runs
 only for the retained row of an ORDER BY with LIMIT.
+The registry resolves both reload commands as volatile nullary calls and
+routes them to the same asynchronous SIGHUP operation. The shutdown
+suite verifies that each SQL call requests and completes a reload.
 
 ### A9 follow-up evidence
 

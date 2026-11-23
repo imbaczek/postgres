@@ -422,6 +422,10 @@ exist\" messages."
                    (make-scalar-builtin :name "set_config" :argument-types '(:text :text :bool)
                                         :result-type :text :volatility :volatile
                                         :evaluator 'set-config-value :implicit-arguments-p t)
+                   (make-scalar-builtin :name "pg_reload_conf" :result-type :bool
+                                        :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
+                   (make-scalar-builtin :name "pg_reload_code" :result-type :bool
+                                        :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
                    (make-scalar-builtin :name "version" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
@@ -1693,11 +1697,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                   (admin-arg-coercible-p (first args) :int4)
                   (or (= (length args) 1)
                       (admin-arg-coercible-p (second args) :int8)))
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :bool :typmod -1))
-    ((member name '("pg_reload_conf" "pg_reload_code") :test #'string=)
-     (when args
        (ereport "42883" "function ~a(~a) does not exist"
                 name (call-signature args)))
      (list :func name args :type :bool :typmod -1))
@@ -4758,10 +4757,6 @@ the full 64-bit ID as a signed value."
                               (if (rest args)
                                   (admin-timeout-arg (second args))
                                   0)))
-    ((string= name "pg_reload_conf")
-     (admin-reload-conf))
-    ((string= name "pg_reload_code")
-     (admin-reload-code))
     ((member name '("length" "char_length" "character_length" "octet_length")
              :test #'string=)
      (sql-strict-let ((value (first args)))

@@ -7,6 +7,7 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.pg_reload_conf(1)",
     "SELECT pg_catalog.set_config('application_name'::name, 'registry'::varchar, 'false')",
     "SELECT current_setting('application_name')",
     "SELECT set_config('application_name', 'registry null scope', NULL)",

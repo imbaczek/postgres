@@ -570,13 +570,3 @@ caller can leave operation admission."
     (error (condition)
       (warning-notice "failed to send signal to postmaster: ~a" condition)
       nil)))
-
-(defun admin-reload-conf ()
-  "Request the existing SIGHUP reload of code and startup settings.
-True means the signal was accepted, not that reload completed or settings are valid."
-  (admin-request-reload))
-
-(defun admin-reload-code ()
-  "Request the existing SIGHUP reload of code and startup settings.
-True means the signal was accepted, not that reload completed or settings are valid."
-  (admin-request-reload))

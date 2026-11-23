@@ -1810,7 +1810,6 @@ Expressions wrapping a set result must remain in a separate projection."
              (member name
                      '("nextval" "currval" "setval" "random" "setseed"
                        "pg_cancel_backend" "pg_terminate_backend" "pg_promote"
-                       "pg_reload_conf" "pg_reload_code"
                        "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
                        "pg_replication_slot_advance" "pg_control_checkpoint"
                        "pg_read_binary_file" "pg_stat_file"
