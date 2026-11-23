@@ -430,6 +430,26 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_walfile_name" :argument-types '(:pg-lsn)
                                         :result-type :text :volatility :immutable :strict-p t
                                         :evaluator 'sql-wal-filename :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "version" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'sql-version)
+                   (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'sql-lisp-runtime)
+                   (make-scalar-builtin :name "pg_lisp_cluster_identity" :result-type :varchar
+                                        :volatility :volatile :strict-p t :evaluator 'sql-cluster-identity)
+                   (make-scalar-builtin :name "pg_export_snapshot" :result-type :text
+                                        :volatility :volatile :strict-p t :evaluator 'export-transaction-snapshot)
+                   (make-scalar-builtin :name "current_database" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'sql-current-database)
+                   (make-scalar-builtin :name "current_catalog" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'sql-current-database)
+                   (make-scalar-builtin :name "current_schema" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'current-schema-name)
+                   (make-scalar-builtin :name "current_user" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'current-user-name)
+                   (make-scalar-builtin :name "session_user" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'current-user-name)
+                   (make-scalar-builtin :name "user" :result-type :text
+                                        :volatility :stable :strict-p t :evaluator 'current-user-name)
                    (make-scalar-builtin :name "chr" :argument-types '(:int4) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-chr
                                         :implicit-arguments-p t)
@@ -1062,14 +1082,6 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                      (when (eq (first argument) :named-arg)
                        (ereport "0A000" "named arguments are not supported for function ~a" name))
                      (analyze-expr argument table)) arguments))))
-
-(defun analyze-nullary-function (name args)
-  "Check that a supported nullary function has no arguments and assign its result type."
-  (when args
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (list :func name args
-        :type (if (string= name "pg_lisp_cluster_identity") :varchar :text)
-        :typmod -1))
 
 (defun analyze-trig-function (name args)
   "Resolve the float8-only mathematical functions."
@@ -1791,12 +1803,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
        (analyze-metadata-function name args))
-      ((member name '("version" "pg_lisp_runtime"
-                      "pg_lisp_cluster_identity" "pg_export_snapshot"
-                      "current_database" "current_schema"
-                      "current_catalog" "current_user" "session_user" "user")
-               :test #'string=)
-       (analyze-nullary-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       ((member name '("nextval" "currval" "setval") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
@@ -3923,9 +3929,7 @@ checks still apply."
            (numeric-arithmetic-function-p name)
            (numeric-helper-function-p name)
            (member name
-                   '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                     "current_catalog" "current_user" "session_user" "user"
-                     "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
+                   '("jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                      "jsonb_build_array" "jsonb_build_object"
                      "substr" "substring" "length" "char_length" "character_length" "octet_length"
                      "array_to_string" "string_to_array" "greatest" "least"
@@ -4687,6 +4691,18 @@ the full 64-bit ID as a signed value."
   (let ((xid (get-current-xid)))
     (if (logbitp 63 xid) (- xid (ash 1 64)) xid)))
 
+(defun sql-version ()
+  (format nil "PostgreSQL ~a (pg-lisp 0.1)" *server-version*))
+
+(defun sql-lisp-runtime ()
+  (format nil "~a ~a" (lisp-implementation-type) (lisp-implementation-version)))
+
+(defun sql-cluster-identity ()
+  (catalog-cluster-identity *catalog*))
+
+(defun sql-current-database ()
+  (backend-database *backend*))
+
 (defun eval-func (name args &optional first-argument)
   (let* ((candidates (gethash name *scalar-builtin-descriptors*))
          (builtin (if (rest candidates)
@@ -4721,14 +4737,6 @@ the full 64-bit ID as a signed value."
        (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported")))
     ((string= name "pg_get_replica_identity_index")
      (sql-strict-let ((oid (first args))) (sql-replica-identity-index oid)))
-    ((string= name "version")
-     (format nil "PostgreSQL ~a (pg-lisp 0.1)" *server-version*))
-    ((string= name "pg_lisp_runtime")
-     (format nil "~a ~a" (lisp-implementation-type)
-             (lisp-implementation-version)))
-    ((string= name "pg_lisp_cluster_identity")
-     (catalog-cluster-identity *catalog*))
-    ((string= name "pg_export_snapshot") (export-transaction-snapshot))
     ((string= name "nextval")
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "nextval expects one sequence name string"))
@@ -4751,13 +4759,6 @@ the full 64-bit ID as a signed value."
                       (if (= (length args) 3) (third args) t)))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
-    ((string= name "current_database")
-     (backend-database *backend*))
-    ((string= name "current_schema") (current-schema-name))
-    ((member name '("current_user" "session_user" "user") :test #'string=)
-     (current-user-name))
-    ((string= name "current_catalog")
-     (backend-database *backend*))
     ((string= name "pg_cancel_backend")
      (admin-cancel-backend (admin-pid-arg (first args))))
     ((string= name "pg_terminate_backend")

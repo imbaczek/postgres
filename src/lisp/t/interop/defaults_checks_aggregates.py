@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.version() IS NOT NULL, pg_catalog.current_database() = CURRENT_CATALOG",
+    "SELECT pg_catalog.current_schema() IS NOT NULL, CURRENT_USER = SESSION_USER, USER = CURRENT_USER",
+    "SELECT version(1)",
+    "SELECT pg_catalog.current_database(1)",
+    "SELECT pg_catalog.pg_export_snapshot(1)",
     "SELECT pg_catalog.pg_wal_lsn_diff('FFFFFFFF/FFFFFFFF', '0/0')",
     "SELECT pg_wal_lsn_diff(NULL::pg_lsn, '0/1'), pg_wal_lsn_diff('0/1', '0/2')",
     "SELECT pg_wal_lsn_diff(1, 2)",

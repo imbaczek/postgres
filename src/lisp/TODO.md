@@ -413,6 +413,12 @@ through the registry. The physical suite checks exact unsigned LSN
 arithmetic and antisymmetry. The C differential checks qualified calls,
 unknown input coercion, NULLs, signed differences, filename length, and
 signature errors.
+The remaining nullary identity, version, runtime, and snapshot-export
+calls use the registry. The identity functions retain their existing
+SQL result types, and snapshot export retains volatile evaluation.
+The C differential checks qualified calls, SQL identity syntax, and
+wrong arity. The live portal suite checks snapshot export and the native
+runtime string.
 
 ### A9 follow-up evidence
 

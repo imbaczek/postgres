@@ -368,6 +368,8 @@ def run():
     try:
         server.start()
         writer, reader = Connection(server.port), Connection(server.port)
+        [[runtime]] = writer.query("SELECT pg_catalog.pg_lisp_runtime()")
+        assert runtime.startswith("SBCL "), runtime
         check_dml_bind(reader, writer)
         check_repeatable_read_dml_bind(server, reader, writer)
         check_repeatable_read_select_bind(server, reader, writer)
