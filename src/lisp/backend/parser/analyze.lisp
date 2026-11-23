@@ -447,13 +447,13 @@ exist\" messages."
 (defun make-json-constructor-builtin (name argument-types result-type)
   "Register a non-strict constructor that needs its analyzed argument types and VARIADIC marker."
   (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
-                       :volatility :stable :evaluator '(:call . eval-json-constructor)))
+                       :volatility :stable :evaluator '(:call eval-json-constructor analyze-json-constructor)))
 
 (defun make-minmax-builtin (name better-p)
   "Register MinMaxExpr evaluation while keeping the syntax outside function lookup."
   (make-scalar-builtin :name name :argument-types '(:common-type) :result-type :common-type
                        :volatility :immutable :implicit-arguments-p :syntax-only
-                       :evaluator (cons :call (lambda (call arguments)
+                       :evaluator (list :call (lambda (call arguments)
                                                 (declare (ignore call))
                                                 (sql-minmax better-p arguments)))))
 
@@ -592,20 +592,20 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_ls_dir" :argument-types '(:text :bool :bool)
                                         :result-type :text :volatility :volatile :implicit-arguments-p t
                                         :defer-decorated-coercion-p nil
-                                        :evaluator '(:iterator . make-rewind-directory-result-iterator))
+                                        :evaluator '(:iterator make-rewind-directory-result-iterator))
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type '(:record . +replication-slot-result-fields+)
-                                        :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
+                                        :volatility :stable :evaluator '(:iterator make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
                                         :result-type '(:record . +publication-table-result-fields+) :volatility :stable :strict-p t
-                                        :evaluator '(:iterator . make-publication-table-result-iterator))
+                                        :evaluator '(:iterator make-publication-table-result-iterator analyze-publication-table-call))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array :oid)
                                         :result-type '(:record . +publication-table-result-fields+) :volatility :stable :strict-p t
-                                        :evaluator '(:iterator . make-publication-table-result-iterator))
+                                        :evaluator '(:iterator make-publication-table-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_wal_senders" :result-type '(:record . +wal-sender-result-fields+)
-                                        :volatility :stable :evaluator '(:iterator . make-wal-sender-result-iterator))
+                                        :volatility :stable :evaluator '(:iterator make-wal-sender-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type '(:record . +activity-result-fields+)
                                         :volatility :stable :implicit-arguments-p t
-                                        :evaluator '(:iterator . make-activity-result-iterator))
+                                        :evaluator '(:iterator make-activity-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type '(:record . +wal-receiver-result-fields+)
                                         :volatility :stable :evaluator 'wal-receiver-result)
                    (make-scalar-builtin :name "pg_control_checkpoint" :result-type '(:record . +control-checkpoint-result-fields+)
@@ -855,7 +855,7 @@ exist\" messages."
   (when builtin
     (let ((evaluator (scalar-builtin-evaluator builtin)))
       (when (and (consp evaluator) (eq (car evaluator) :iterator))
-        (cdr evaluator)))))
+        (second evaluator)))))
 
 (defun eval-scalar-builtin (builtin arguments first-argument call)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
@@ -864,7 +864,7 @@ exist\" messages."
         (if (consp evaluator)
             (ecase (car evaluator)
               (:typed-first (apply (cdr evaluator) (expr-type first-argument) arguments))
-              (:call (funcall (cdr evaluator) call arguments))
+              (:call (funcall (second evaluator) call arguments))
               (:named (apply (second evaluator) arguments)))
             (apply evaluator arguments)))))
 
@@ -1638,6 +1638,12 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (list :func name args :type (scalar-builtin-result-type builtin) :typmod -1
                             :variadic variadic))))
 
+(defun scalar-builtin-variadic-analyzer (builtin)
+  "Find the input-packing policy for a registered variadic evaluator."
+  (let ((evaluator (scalar-builtin-evaluator builtin)))
+    (when (and (consp evaluator) (member (first evaluator) '(:call :iterator)))
+      (third evaluator))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (check-qualified-numeric-function-call expr table)
@@ -1650,6 +1656,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
     (ereport "42601" "invalid GREATEST or LEAST syntax"))
   (let* ((name (builtin-function-name (second expr) (getf (cdddr expr) :schema)))
          (builtins (gethash name *scalar-builtin-descriptors*))
+         (prepare-call (some #'scalar-builtin-variadic-analyzer builtins))
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
                    (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic)
@@ -1659,11 +1666,8 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
     (when (member name '("row_number" "rank" "dense_rank") :test #'string=)
       (when args (ereport "42883" "function ~a with these arguments does not exist" name))
       (ereport "42809" "window function ~a requires an OVER clause" name))
-    ;; C ParseFuncOrColumn clears explicit VARIADIC for a nonvariadic match.
-    (when (string= name "pg_get_publication_tables")
-      (return-from analyze-function-expression
-        (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
+      (prepare-call (funcall prepare-call name builtins args (getf (cdddr expr) :variadic)))
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
@@ -1672,8 +1676,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
-      ((find '(:variadic-any) builtins :key #'scalar-builtin-argument-types :test #'equal)
-       (analyze-json-constructor name builtins args (getf (cdddr expr) :variadic)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
       ((and builtins (not (eq (scalar-builtin-implicit-arguments-p (first builtins)) :syntax-only)))
@@ -3549,7 +3551,8 @@ checks still apply."
              (member (first node) '(:subplan :outer-ref))))
    form))
 
-(defun analyze-publication-table-call (name arguments variadic)
+(defun analyze-publication-table-call (name candidates arguments variadic)
+  "Pack the text variadic input before constructing the registered record call."
   (check-record-set-call-context)
   (when (some #'analyzed-expression-contains-set-p arguments)
     (ereport "0A000" "nested set-returning functions are not supported"))
@@ -3580,7 +3583,8 @@ checks still apply."
               (list :array arguments :type :text-array :typmod -1)))))
     (let ((inputs (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
                       (list array))))
-      (make-record-set-call (scalar-builtin-for-call name inputs (first inputs)) inputs))))
+      (make-record-set-call (scalar-builtin-for-evaluation candidates (length inputs) (first inputs))
+                            inputs))))
 
 (defun analyze-record-field (raw scope)
   (let* ((record (analyze-expr (second raw) scope))

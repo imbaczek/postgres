@@ -649,6 +649,12 @@ signatures, including record fields and set-returning behavior. The
 evaluators retain their file scope and check grants before handling NULL
 arguments. The 1,475 C comparisons included a binary read, stat field
 projection, a NULL read, and a directory call with a NULL argument.
+The publication record iterator and JSON constructors declare their
+variadic argument analysis in the registry. Publication calls resolve
+the normalized inputs against the same candidates used during analysis.
+This preserves the descriptor's SBCL structure layout for warm reload.
+The 1,477 C comparisons include scalar variadic expansion, explicit array
+passing, filtered publication lookup, and rejection without inputs.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
