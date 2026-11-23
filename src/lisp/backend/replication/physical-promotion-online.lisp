@@ -134,13 +134,11 @@ rechecks after their final flush."
        store
        (lambda (record raw)
          (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-             (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
-                   (getf *physical-recovery-state* :replay-timeline) timeline)
+             (setf timeline (physical-history-cross-eor store record raw terminal timeline))
              (progn
-               (physical-replay-check-child-initialization record next fpw-fact logical-fact)
-               (setf next (physical-replay-observed-next-xid record next))
-               (physical-history-accept-record
-                record (getf *physical-recovery-state* :cluster-identity) removed)
+               (setf next (physical-history-observe-record
+                           record next fpw-fact logical-fact
+                           (getf *physical-recovery-state* :cluster-identity) removed))
                (when (= (wal-record-type record) +wal-record-checkpoint+)
                  (setf (getf *physical-recovery-state* :source-checkpoint)
                        (wal-checkpoint-record-snapshot record)))))

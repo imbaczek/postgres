@@ -617,9 +617,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                  map-records
                  (lambda (record raw)
                    (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                       (setf timeline (physical-replay-check-selected-eor
-                                       candidate record raw terminal timeline)
-                             (getf *physical-recovery-state* :replay-timeline) timeline
+                       (setf timeline (physical-history-cross-eor candidate record raw terminal timeline)
                              reservation (physical-source-reservation-next reservation record next)
                              source-xids (physical-source-xids-next source-xids record next))
                        (progn

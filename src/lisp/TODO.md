@@ -110,9 +110,9 @@ suite passed.
 For B2, primary WAL control and the independent checkpoint reader require
 PGWAL6. The checksummed PGWAL2–5 fixtures are rejected at decode, and the
 live checkpoint suite rejects a stopped copy with PGWAL5 before exercising
-PGWAL6 crash recovery and standby restartpoints. Both segment namespaces
-and the current lifecycle, retained, resource, logical evidence, page
-checksum and CLOG extent fields retain their existing checks.
+PGWAL6 crash recovery and standby restartpoints. That fixture exercised both
+segment namespaces before B18. The current lifecycle, retained, resource,
+logical evidence, page checksum and CLOG extent fields remain covered.
 
 For B3, the checkpoint codec and independent inspection tools require
 PGCKPT02. The base snapshot can still omit optional facts. Exhausted
@@ -604,6 +604,13 @@ pull driver keeps each arm's presence binding through projection and close.
 Seventy-nine strict unit heads and the live C subquery differential passed.
 A REPL probe preserved the projected row's shared value vector, datum
 origins, and source presence at the existing allocation rate.
+
+For A4, the drop and resource proofs share private stage construction and
+record validation with promotion where they use the same ordering. Follow
+and promotion share the selected EOR transition with both proofs. Each
+caller retains its terminal coverage rules. Fifty-five strict physical
+heads, five unit stage heads, and live standby reload, restart, replay and
+promotion passed.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

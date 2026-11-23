@@ -65,13 +65,18 @@ HISTORY may resolve lazily so unknown facts do not require a history read."
     (if selection (getf selection :history)
         (timeline-read-history (getf state :timeline)))))
 
-(defun physical-recovery-scan-stage (store start state checkpoint next)
-  "Build private replay state for the proven stage at START.
+(defun physical-recovery-scan-stage (store start state checkpoint next &key (stage-proven-p t)
+                                                                         (timeline (physical-store-prefix-timeline store start)))
+  "Build private replay state at START, clearing the checkpoint for an unproven stage.
 CHECKPOINT and NEXT must describe that prefix, never a later checkpoint or
 observed XID. A NIL checkpoint with a known NEXT can describe a child awaiting
-its initialization checkpoint."
-  (let ((timeline (physical-store-prefix-timeline store start))
-        (private (copy-tree state)))
+its initialization checkpoint. Callers that already resolved the store's prefix
+timeline at START may pass it to avoid repeating the history lookup."
+  (let ((private (copy-tree state)))
+    (unless stage-proven-p
+      (setf (getf private :source-checkpoint) nil
+            (getf private :replay-timeline) timeline)
+      (return-from physical-recovery-scan-stage private))
     (unless (or (null next) (typep next '(integer 3 18446744073709551616)))
       (error "suffix scan has an invalid observed XID seed"))
     (if checkpoint

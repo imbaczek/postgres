@@ -30,12 +30,8 @@ explicit NIL. Otherwise preserve the two-value interface."
            (observed (or next 3))
            (*physical-receive-store* store)
            (*physical-recovery-state*
-             (if stage-proven-p
-                 (physical-recovery-scan-stage store start state checkpoint next)
-                 (let ((private (copy-tree state)))
-                   (setf (getf private :source-checkpoint) nil
-                         (getf private :replay-timeline) timeline)
-                   private)))
+             (physical-recovery-scan-stage store start state checkpoint next
+                                           :stage-proven-p stage-proven-p :timeline timeline))
            (*physical-history-reset-forks* nil)
            (removed (make-hash-table :test #'eql)))
       (when fact
@@ -59,15 +55,10 @@ explicit NIL. Otherwise preserve the two-value interface."
              (when (> (wal-record-end record) end)
                (error "resource proof boundary is not a complete terminal"))
              (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                 (progn
-                   (unless (and stage-proven-p next)
-                     (error "suffix scan cannot cross EOR without proven starting stage and XID"))
-                   (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
-                         (getf *physical-recovery-state* :replay-timeline) timeline))
-                 (progn
-                   (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
-                   (setf observed (physical-replay-observed-next-xid record observed))
-                   (physical-history-accept-record record (getf state :cluster-identity) removed)))
+                 (setf timeline (physical-history-cross-eor
+                                 store record raw terminal timeline (and stage-proven-p next)))
+                 (setf observed (physical-history-observe-record
+                                 record observed fpw-fact logical-fact (getf state :cluster-identity) removed)))
              (unless *wal-recovery-group-active*
                (unless (= (wal-record-type record) +wal-record-end-of-recovery+)
                  (setf fact (physical-resource-fact-next

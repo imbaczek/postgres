@@ -55,6 +55,9 @@
       (let ((private (physical-recovery-scan-stage store 240 state checkpoint 3)))
         (rove:ok (= 2 (physical-recovery-replay-timeline private)))
         (rove:ok (= 1 (getf (getf private :source-checkpoint) :timeline))))
+      (let ((private (physical-recovery-scan-stage store 240 state nil nil :stage-proven-p nil)))
+        (rove:ok (= 2 (physical-recovery-replay-timeline private)))
+        (rove:ok (null (getf private :source-checkpoint))))
       (rove:ok (equal state before))))
 
 (rove:deftest suffix-scan-stage-generated-private-state-contract

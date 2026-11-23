@@ -137,6 +137,21 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 (declaim (ftype function physical-replay-check-selected-eor
                 physical-replay-check-child-initialization physical-recovery-check-store-point))
 
+(defun physical-history-observe-record (record observed fpw-fact logical-fact identity removed)
+  "Check child initialization, track source XIDs, then validate the batch record."
+  (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
+  (let ((next (physical-replay-observed-next-xid record observed)))
+    (physical-history-accept-record record identity removed)
+    next))
+
+(defun physical-history-cross-eor (store record raw terminal timeline &optional (proven-xid t))
+  "Advance a selected timeline boundary in the private scan state.
+A scan that cannot establish its starting stage and XID passes NIL."
+  (unless proven-xid
+    (error "WAL proof cannot cross EOR without proven starting stage and XID"))
+  (setf (getf *physical-recovery-state* :replay-timeline)
+        (physical-replay-check-selected-eor store record raw terminal timeline)))
+
 (defun physical-recovery-proven-drops (store identity
                                        &key (start-lsn (physical-store-floor-lsn store))
                                          required-lsn (policy (getf *physical-recovery-state* :timeline-policy))
@@ -160,12 +175,8 @@ may use scratch files. The scan applies no database changes."
       (let* ((timeline (physical-store-prefix-timeline store start-lsn))
              (*physical-receive-store* store)
              (*physical-recovery-state*
-               (if stage-proven-p
-                   (physical-recovery-scan-stage store start-lsn state checkpoint next)
-                   (let ((private (copy-tree state)))
-                     (setf (getf private :source-checkpoint) nil
-                           (getf private :replay-timeline) timeline)
-                     private)))
+               (physical-recovery-scan-stage store start-lsn state checkpoint next
+                                             :stage-proven-p stage-proven-p :timeline timeline))
              (observed (or next 3))
              (fpw-fact (physical-fpw-copy-fact fpw-seed))
              (logical-fact (physical-logical-copy-fact logical-seed)))
@@ -184,15 +195,10 @@ may use scratch files. The scan applies no database changes."
              store
              (lambda (record raw)
                (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                   (progn
-                     (unless (and stage-proven-p next)
-                       (error "drop proof cannot cross EOR without proven starting stage and XID"))
-                     (setf timeline (physical-replay-check-selected-eor store record raw terminal timeline)
-                           (getf *physical-recovery-state* :replay-timeline) timeline))
-                   (progn
-                     (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
-                     (setf observed (physical-replay-observed-next-xid record observed))
-                     (physical-history-accept-record record identity removed)))
+                   (setf timeline (physical-history-cross-eor
+                                   store record raw terminal timeline (and stage-proven-p next)))
+                   (setf observed (physical-history-observe-record
+                                   record observed fpw-fact logical-fact identity removed)))
                (unless *wal-recovery-group-active*
                  (multiple-value-setq (fpw-fact logical-fact)
                    (physical-replay-policy-facts-next
