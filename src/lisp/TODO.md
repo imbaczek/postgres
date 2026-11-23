@@ -446,6 +446,17 @@ differential covers a demanded default that folds a strict
 that must execute with a NULL value to reset the session setting.
 An overloaded `get_bit` default also returns NULL without advancing
 the sequence referenced by its other argument.
+Text and bytea length calls use the scalar registry. Unknown unary inputs
+prefer text, following the string-category preference in C's
+`func_select_candidate`. Stored calls can retain their varchar or name
+inputs. The TOAST projection recognizes the binary-compatible varchar
+cast inserted by signature resolution.
+HAVING recognizes overloaded names when every registered signature is
+immutable. The C differential checks error precedence for an invalid
+`get_bit` input on either side of a false conjunct.
+The live TOAST run passed the varchar length assertion and proceeded to
+the later snapshot rewrite fixture, where it stalled at
+`VACUUM FULL rewrite_snapshot`. The full TOAST run remains unverified.
 
 ### A9 follow-up evidence
 

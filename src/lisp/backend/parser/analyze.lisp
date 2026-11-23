@@ -347,6 +347,9 @@ exist\" messages."
        (list :func name (list node (coerce-catalog-oid-argument (second arguments) name))
              :type :text :typmod -1)))))
 
+(defun sql-text-octet-length (text)
+  (length (string->bytes text)))
+
 (defun sql-lower-c (value)
   "Match formatting.c:asc_tolower for the supported C/POSIX collation."
   (map 'string (lambda (character)
@@ -409,6 +412,24 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_walfile_name" :argument-types '(:pg-lsn)
                                         :result-type :text :volatility :immutable :strict-p t
                                         :evaluator 'sql-wal-filename :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "length" :argument-types '(:text)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'length :implicit-arguments-p t)
+                   (make-scalar-builtin :name "length" :argument-types '(:bytea)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'length)
+                   (make-scalar-builtin :name "octet_length" :argument-types '(:text)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-text-octet-length :implicit-arguments-p t)
+                   (make-scalar-builtin :name "octet_length" :argument-types '(:bytea)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'length)
+                   (make-scalar-builtin :name "char_length" :argument-types '(:text)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'length :implicit-arguments-p t)
+                   (make-scalar-builtin :name "character_length" :argument-types '(:text)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'length :implicit-arguments-p t)
                    (make-scalar-builtin :name "lower" :argument-types '(:text)
                                         :result-type :text :volatility :immutable :strict-p t
                                         :evaluator 'sql-lower-c :implicit-arguments-p t)
@@ -479,12 +500,6 @@ exist\" messages."
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
-(defun find-scalar-builtin (name)
-  "Find a builtin whose name alone identifies its signature."
-  (let ((candidates (gethash name *scalar-builtin-descriptors*)))
-    (unless (rest candidates)
-      (first candidates))))
-
 (defun eval-scalar-builtin (builtin arguments)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
       +null+
@@ -500,9 +515,8 @@ exist\" messages."
                           (funcall matches-p (expr-type argument) type))))))
 
 (defun resolve-scalar-builtin (name candidates arguments)
-  "Use C's exact-match count for the supported overload families.
-The bit/bytea alternatives have different nonpreferred input categories, so
-after this step any surviving tie is ambiguous."
+  "Use C's exact-match count and prefer text for unknown unary inputs.
+The bit/bytea alternatives have different non-string categories and stay ambiguous."
   (let ((best nil) (best-count -1) (tied-p nil))
     (dolist (candidate candidates)
       (when (scalar-builtin-match-p candidate arguments)
@@ -514,6 +528,8 @@ after this step any surviving tie is ambiguous."
                 ((= count best-count) (setf tied-p t))))))
     (cond ((not best)
            (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+          ((and tied-p (null (rest arguments)) (in-unknown-constant-p (first arguments))
+                (find '(:text) candidates :key #'scalar-builtin-argument-types :test #'equal)))
           (tied-p
            (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
           (t best))))
@@ -1677,15 +1693,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (ereport "0A000" "set-returning functions are not allowed in this context"))
      (list :set-func name (coerce-rewind-function-arguments name args '(:text :bool :bool))
            :type :text :typmod -1))
-    ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
-     (unless (and (= (length args) 1)
-                  (or (member (expr-type (first args)) '(:text :varchar :name :char))
-                      (and (member name '("length" "octet_length") :test #'string=)
-                           (eq (expr-type (first args)) :bytea))))
-       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-     (when (eq (expr-type (first args)) :char)
-       (setf args (list (list :cast (first args) :type :text :typmod -1))))
-     (list :func name args :type :int4 :typmod -1))
     ((string= name "pg_cancel_backend")
      (unless (and (= (length args) 1)
                   (admin-arg-coercible-p (first args) :int4))
@@ -3916,7 +3923,7 @@ checks still apply."
            (member name
                    '("jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                      "jsonb_build_array" "jsonb_build_object"
-                     "substr" "substring" "length" "char_length" "character_length" "octet_length"
+                     "substr" "substring"
                      "array_to_string" "string_to_array" "greatest" "least"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4692,11 +4699,16 @@ the full 64-bit ID as a signed value."
   "Resolve by arity, then by the first analyzed input for same-arity overloads."
   (let ((first-type (expr-type first-argument))
         (match nil)
+        (implicit-match nil)
         (ambiguous-p nil))
-    (dolist (candidate candidates (unless ambiguous-p match))
+    (dolist (candidate candidates (if ambiguous-p implicit-match match))
       (let ((types (scalar-builtin-argument-types candidate)))
         (when (= arity (length types))
           (when (eq first-type (first types)) (return candidate))
+          ;; Stored unary text calls can still carry their original varchar or name input.
+          (when (and (= arity 1) (member first-type '(:varchar :name))
+                     (eq (first types) :text) (scalar-builtin-implicit-arguments-p candidate))
+            (setf implicit-match candidate))
           (when match (setf ambiguous-p t))
           (setf match candidate))))))
 
@@ -4757,12 +4769,6 @@ the full 64-bit ID as a signed value."
                               (if (rest args)
                                   (admin-timeout-arg (second args))
                                   0)))
-    ((member name '("length" "char_length" "character_length" "octet_length")
-             :test #'string=)
-     (sql-strict-let ((value (first args)))
-       (if (and (string= name "octet_length") (stringp value))
-           (length (string->bytes value))
-           (length value))))
     (t
      (ereport "42883" "function ~a(...) does not exist" name))))
 

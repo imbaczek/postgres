@@ -2270,7 +2270,7 @@ projection or filter forms fall back to ordinary full materialization."
                              (member (expr-type column) '(:text :varchar)))
                          (every (lambda (argument) (and (consp argument) (eq (first argument) :const)))
                                 (rest args)))
-                    (and (= (length args) 1) (eq input column)
+                    (and (= (length args) 1)
                          (member (expr-type column) '(:text :varchar :bytea))
                          (member (second expression) '("length" "octet_length" "char_length" "character_length")
                                  :test #'string=)

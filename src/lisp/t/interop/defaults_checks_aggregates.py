@@ -7,6 +7,12 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.length('éΣ'), octet_length('éΣ'), char_length('éΣ'::varchar), character_length('éΣ'::name)",
+    "SELECT length('éΣ'::varchar), octet_length('éΣ'::name), length(NULL), octet_length(NULL::bytea)",
+    "SELECT length('\\x0001ff'::bytea), octet_length('\\x0001ff'::bytea)",
+    "SELECT char_length('\\x00'::bytea)",
+    "SELECT 1 HAVING get_bit('\\x00'::bytea, 8) = 0 AND false",
+    "SELECT 1 HAVING false AND get_bit('\\x00'::bytea, 8) = 0",
     "CREATE TABLE dc_registry_default(k int, s text DEFAULT current_setting(NULL, true), v text DEFAULT set_config('application_name', NULL, false))",
     "SELECT set_config('application_name', 'before default', false)",
     "INSERT INTO dc_registry_default(k) VALUES (1) RETURNING s, v",
