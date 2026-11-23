@@ -589,6 +589,16 @@ origin metadata. The presence regression checks that distinction with
 origin capture enabled, in memory and on disk. The push driver keeps one
 match flag per join execution. An SBCL REPL probe over 100,000 left rows
 and an empty right input measured about 1.6 MB less allocation.
+The ordinary pull LIMIT and the sorted set-returning path share their LIMIT
+iterator expansion. An unstarted ordinary LIMIT defers opening its child, and
+closing the sorted wrapper releases its existing input. REPL probes measured
+approximately 144 bytes per lazy wrapper and 112 per eager wrapper before and
+after the change. Push and pull derived-table scans now share frame setup and
+source presence identity. The pull scan releases its CTE cache if child
+construction exits before returning an iterator. Sixty-one strict unit heads
+covered LATERAL, subqueries and sorted set expansion. The live numeric LIMIT
+test passed on both wire protocols, and the child-opening fault regression
+verified cache release and restoration of the parent frame binding.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

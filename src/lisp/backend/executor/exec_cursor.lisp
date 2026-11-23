@@ -319,6 +319,20 @@ all sets are empty and no row is emitted.  Closing the result closes INPUT."
        (lambda (environment)
          (values (cons attempt-values environment) t attempt-origins))))))
 
+(defmacro make-limit-sql-iterator (count input &optional prepare-input)
+  "Validate COUNT on pull and forward the input row and its metadata.
+Expand at the call site so an existing input needs no lazy-child captures."
+  (let ((remaining (gensym "LIMIT-")))
+    `(let ((,remaining ,count))
+       (make-sql-iterator
+        (lambda ()
+          (check-select-limit ,remaining)
+          (when (plusp ,remaining)
+            ,prepare-input
+            (decf ,remaining)
+            (sql-iterator-next ,input)))
+        (lambda () (close-sql-iterator ,input))))))
+
 (defun make-sorted-project-set-iterator (node project set-node width calls relations &key source-streamer)
   "Sort source rows before expansion when no sort key depends on a set result.
 
@@ -439,14 +453,7 @@ source itself.  Closing the result closes the sort and its source."
                          (finish-sort-project-row (cons cache environment) targets deferred)
                        (values row t origins)))))))))
     (if (eq (first node) :top-n)
-        (let ((remaining (third node)))
-          (make-sql-iterator
-           (lambda ()
-             (check-select-limit remaining)
-             (when (plusp remaining)
-               (decf remaining)
-               (sql-iterator-next output)))
-           (lambda () (close-sql-iterator output))))
+        (make-limit-sql-iterator (third node) output)
         output)))
 
 (defun make-lateral-join-iterator (join left right-factory)
@@ -616,23 +623,26 @@ source itself.  Closing the result closes the sort and its source."
        (lambda () (close-sql-iterator input))))))
 
 (defun make-subquery-scan-iterator (node relations)
-  (let* ((relation (physical-scan-relation node relations))
-         (lateral-p (getf relation :lateral-dependent))
-         (presence (vector (ensure-select-source-identity relation)))
-         (frame (make-subquery-parameter-frame
-                 (if lateral-p *lateral-outer-environment* #())
-                 :capture-p lateral-p))
-         (frames (cons frame *subquery-outer-frames*))
-         (input (let ((*subquery-outer-frames* frames))
-                  (make-physical-plan-iterator (fourth node) relations))))
-    (make-sql-iterator
-     (lambda ()
-       (let ((*subquery-outer-frames* frames))
-         (multiple-value-bind (row present origins) (sql-iterator-next input)
-           (values (car row) present origins nil (and present presence)))))
-     (lambda ()
-       (close-sql-iterator input)
-       (close-cte-frame-cache (cdr frame))))))
+  (multiple-value-bind (frame presence)
+      (make-physical-subquery-scan-frame node relations *lateral-outer-environment*)
+    (let ((frames (cons frame *subquery-outer-frames*))
+          (input nil)
+          (iterator nil))
+      (flet ((close-input (owned)
+               (unwind-protect (close-sql-iterator owned)
+                 (close-cte-frame-cache (cdr frame)))))
+        (unwind-protect
+             (let ((*subquery-outer-frames* frames))
+               (setf input (make-physical-plan-iterator (fourth node) relations))
+               (let ((owned input))
+                 (setf iterator
+                       (make-sql-iterator
+                        (lambda ()
+                          (let ((*subquery-outer-frames* frames))
+                            (multiple-value-bind (row present origins) (sql-iterator-next owned)
+                              (values (car row) present origins nil (and present presence)))))
+                        (lambda () (close-input owned))))))
+          (unless iterator (close-input input)))))))
 
 (defun make-physical-join-iterator (node relations)
   ;; A parameterized index scan needs a new key and iterator for each left
@@ -695,15 +705,9 @@ source itself.  Closing the result closes the sort and its source."
             input (second node) (cdr *query-project-set*) (fourth node))
            (make-project-set-iterator input (second node)))))
     (:limit
-     (let ((remaining (second node)) (input nil))
-       (make-sql-iterator
-        (lambda ()
-          (check-select-limit remaining)
-          (when (plusp remaining)
-            (unless input (setf input (make-physical-plan-iterator (third node) relations)))
-            (decf remaining)
-            (sql-iterator-next input)))
-        (lambda () (close-sql-iterator input)))))
+     (let ((input nil))
+       (make-limit-sql-iterator (second node) input
+                                (unless input (setf input (make-physical-plan-iterator (third node) relations))))))
     (:nested-loop-join (make-physical-join-iterator node relations))
     ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct :sorted-distinct)
      (let ((child (physical-buffered-node-child node)))

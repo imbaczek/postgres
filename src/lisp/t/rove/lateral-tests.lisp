@@ -70,3 +70,25 @@
                (rove:ok (equal '(1) closes)))
           (close-sql-iterator iterator))
         (rove:ok (equal '(2 1) closes) "early stop closes the current right invocation"))))
+
+(rove:deftest subquery-scan-releases-frame-when-child-opening-fails
+    (let ((close-cache (symbol-function 'close-cte-frame-cache))
+          (closed nil)
+          (*subquery-outer-frames* nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'close-cte-frame-cache)
+                   (lambda (cache)
+                     (push cache closed)
+                     (funcall close-cache cache)))
+             (rove:ok
+              (handler-case
+                  (progn
+                    (make-subquery-scan-iterator
+                     '(:subquery-scan 0 42 (:unsupported))
+                     (list (list :table (make-pg-class :oid 42))))
+                    nil)
+                (pg-error (condition) (string= "0A000" (pg-error-sqlstate condition)))))
+             (rove:ok (and (= 1 (length closed)) (hash-table-p (first closed))))
+             (rove:ok (null *subquery-outer-frames*)))
+        (setf (symbol-function 'close-cte-frame-cache) close-cache))))

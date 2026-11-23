@@ -1892,21 +1892,27 @@ ROW's source environment.  Only final target origins leave this projection."
                       environment))))
      outer-environment)))
 
-(defun execute-physical-subquery-scan (node registered-relations outer-environment emit run-child)
-  (let* ((relation (physical-scan-relation node registered-relations))
+(defun make-physical-subquery-scan-frame (node relations outer-environment)
+  "Capture this scan's outer frame and the source identity of its output rows."
+  (let* ((relation (physical-scan-relation node relations))
          (lateral-p (getf relation :lateral-dependent))
-         (presence (vector (ensure-select-source-identity relation)))
-         (parent-frames *subquery-outer-frames*)
-         (frame (make-subquery-parameter-frame
-                 (if lateral-p outer-environment #()) :capture-p lateral-p))
-         (*subquery-outer-frames* (cons frame parent-frames)))
-    (unwind-protect
-         (funcall run-child (fourth node)
-                  (lambda (row)
-                    (let ((*subquery-outer-frames* parent-frames)
-                          (*query-row-presence* presence))
-                      (funcall emit (car row)))))
-      (close-cte-frame-cache (cdr frame)))))
+         (presence (vector (ensure-select-source-identity relation))))
+    (values (make-subquery-parameter-frame
+             (if lateral-p outer-environment #()) :capture-p lateral-p)
+            presence)))
+
+(defun execute-physical-subquery-scan (node registered-relations outer-environment emit run-child)
+  (multiple-value-bind (frame presence)
+      (make-physical-subquery-scan-frame node registered-relations outer-environment)
+    (let* ((parent-frames *subquery-outer-frames*)
+           (*subquery-outer-frames* (cons frame parent-frames)))
+      (unwind-protect
+           (funcall run-child (fourth node)
+                    (lambda (row)
+                      (let ((*subquery-outer-frames* parent-frames)
+                            (*query-row-presence* presence))
+                        (funcall emit (car row)))))
+        (close-cte-frame-cache (cdr frame))))))
 
 (defun project-physical-row (environment targets deferred set-node)
   "Return the projected row and its origins for either execution driver."
