@@ -453,6 +453,9 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_promote" :argument-types '(:bool :int4)
+                                        :result-type :bool :volatility :volatile :strict-p t
+                                        :evaluator 'pg-promote)
                    (make-scalar-builtin :name "pg_reload_conf" :result-type :bool
                                         :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
                    (make-scalar-builtin :name "pg_reload_code" :result-type :bool
@@ -1770,7 +1773,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-jsonb-set-function name args)))
-      ((string= name "pg_promote") (list :func name args :type :bool :typmod -1))
       ((string= name "pg_stat_get_wal_receiver")
        (analyze-nullary-record-function name args +wal-receiver-result-fields+))
       ((string= name "pg_control_checkpoint")
@@ -4759,7 +4761,6 @@ the full 64-bit ID as a signed value."
              :test #'string=)
      (if (member +null+ args) +null+
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
-    ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))

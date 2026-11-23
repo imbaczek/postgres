@@ -26,8 +26,7 @@
       ;; while ordinary execution converts it to PID or timeout zero.
       ((member name '("pg_cancel_backend" "pg_terminate_backend") :test #'string=) t)
       (builtins (every #'scalar-builtin-strict-p builtins))
-      (t (or (having-immutable-function-p name)
-             (string= name "pg_promote"))))))
+      (t (having-immutable-function-p name)))))
 
 (defun fold-column-default (expression)
   "Copy a demanded default, folding immutable parts before row execution.
