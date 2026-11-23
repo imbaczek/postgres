@@ -419,6 +419,9 @@ exist\" messages."
                                         :result-type :text :volatility :stable :strict-p t
                                         :evaluator 'sql-setting-value :implicit-arguments-p t
                                         :defer-decorated-coercion-p :always)
+                   (make-scalar-builtin :name "set_config" :argument-types '(:text :text :bool)
+                                        :result-type :text :volatility :volatile
+                                        :evaluator 'set-config-value :implicit-arguments-p t)
                    (make-scalar-builtin :name "version" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
@@ -1669,14 +1672,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (ereport "0A000" "set-returning functions are not allowed in this context"))
      (list :set-func name (coerce-rewind-function-arguments name args '(:text :bool :bool))
            :type :text :typmod -1))
-    ((string= name "set_config")
-     (unless (and (= (length args) 3)
-                  (eq (expr-type (first args)) :text)
-                  (eq (expr-type (second args)) :text)
-                  (or (eq (expr-type (third args)) :bool)
-                      (equal (third args) (list :const +null+ :type :text :typmod -1))))
-       (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-     (list :func name args :type :text :typmod -1))
     ((member name '("length" "char_length" "character_length" "octet_length") :test #'string=)
      (unless (and (= (length args) 1)
                   (or (member (expr-type (first args)) '(:text :varchar :name :char))
@@ -4743,8 +4738,6 @@ the full 64-bit ID as a signed value."
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "currval expects one sequence name string"))
      (sequence-currval (check-sequence-function-relation (first args) t)))
-    ((string= name "set_config")
-     (set-config-value (first args) (second args) (third args)))
     ((string= name "setval")
      (unless (and (member (length args) '(2 3))
                   (stringp (first args))

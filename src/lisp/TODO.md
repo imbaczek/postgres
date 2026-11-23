@@ -427,6 +427,13 @@ literals. The existing physical test and the C differential exercise
 strict NULL handling, missing settings, and C/POSIX case conversion.
 Both calls use the C catalog's implicit `pg_node_tree` to `text` cast
 and are eligible for sharing identical aggregate and window inputs.
+`set_config(text, text, bool)` also uses the registry. Its descriptor
+keeps it volatile and non-strict, allowing the session setter to reject a
+NULL name, reset a NULL value, and treat a NULL scope as session scope.
+Signature resolution uses the shared implicit casts.
+The C differential checks the returned value and session persistence.
+The live rollback test checks recovery of the prior value after failed
+statements and explicit transaction rollback.
 
 ### A9 follow-up evidence
 
