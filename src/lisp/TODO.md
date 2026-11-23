@@ -73,6 +73,12 @@ restaged WAL after a cold restart, and archived WAL and fork proofs across
 two promotions. The archive-to-stream run cleaned up an interrupted restore
 stage, replayed 2,006 rows while the source was offline, and resumed
 streaming on `follow_one`. Both logs are in the same archive.
+A final Sol high review of `c946b71c14f..1bdb6e1b2e9` confirmed the
+four descriptor lifetimes and interrupt scopes, the ASDF load order, and
+the cursor fixture's namespace-only change with a recomputed CRC. The
+review also matched both physical selections against all 30 changed
+test components. The timing ledger now records both raw and archive
+digests for the 11 earlier entries whose hashes covered the raw logs.
 On `f30383502ba`, `t/run-unit-tests.sh` passed all 1,642 Rove heads and
 1,172 legacy checks. The combined runner log is in the same archive.
 
