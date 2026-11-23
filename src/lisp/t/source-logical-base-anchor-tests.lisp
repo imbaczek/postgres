@@ -43,7 +43,7 @@
          (fact (source-logical-anchor-test-fact enabled 0)))
     (unless anchored (setf (getf snapshot :logical-decoding-enabled) enabled))
     (let ((bytes (pg::wal-encode-control-image
-                  376 376 snapshot :metadata
+                  376 376 snapshot :namespace (getf local :namespace) :metadata
                   (pg::make-wal-control-metadata 42 pg::+db-shutdowned+ 100))))
       (setf (getf local :wal-control) (pg::physical-libpq-octets-datum bytes)
             (getf local :capture)

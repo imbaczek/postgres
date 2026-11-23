@@ -105,7 +105,8 @@
           (setf (getf metadata :system-id) 43
                 (logical-slot-copy-descriptor-source-control copy)
                 (wal-encode-control-image (first source) (second source) (third source)
-                                          :timeline 1 :namespace :legacy :metadata metadata))
+                                          :timeline (fourth source) :checkpoint-timeline (fifth source)
+                                          :namespace (sixth source) :metadata metadata))
           (rove:ok (rove:signals (logical-slot-copy-check-binding copy manifest digest) 'error)))
         (let ((copy (copy-logical-slot-copy-descriptor descriptor)))
           (setf (logical-slot-copy-descriptor-recovery-control copy)
@@ -117,7 +118,9 @@
                (metadata (copy-list (seventh fields))))
           (setf (getf metadata :state-time) 1
                 (logical-slot-copy-descriptor-base-control copy)
-                (wal-encode-control-image (first fields) (second fields) (third fields) :metadata metadata))
+                (wal-encode-control-image (first fields) (second fields) (third fields)
+                                          :timeline (fourth fields) :checkpoint-timeline (fifth fields)
+                                          :namespace (sixth fields) :metadata metadata))
           (let* ((bytes (logical-slot-copy-descriptor-base-control copy))
                  (row (find "global/pg_wal_control" (getf candidate :files) :key #'first :test #'equal))
                  (new-digest nil))

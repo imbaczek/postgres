@@ -371,6 +371,9 @@ the start.
 Clean-primary adoption fixtures write qualified base WAL and carry the verified
 namespace through the durable attempt record and staged backup. Shared setup
 creates the CLOG file required for an owned restart of the source.
+The WAL control encoder defaults to the timeline namespace. Production callers
+pass the current, source, or child namespace explicitly, and historical fixtures
+request legacy control images explicitly where they create legacy-named WAL.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

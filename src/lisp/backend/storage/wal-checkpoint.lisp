@@ -441,7 +441,7 @@ Return the copied metadata and whether any field was removed."
     (values copy (or removed-reference removed-logical-evidence removed-checksum removed-clog-extent))))
 
 (defun wal-encode-control-image (checkpoint durable snapshot
-                                 &key (timeline 1) (namespace :legacy) metadata
+                                 &key (timeline 1) (namespace :timeline) metadata
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
   "Encode a CRC-bound control image with independent insertion/checkpoint TLIs.
 
