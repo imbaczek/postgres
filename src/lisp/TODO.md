@@ -2115,6 +2115,14 @@ still has work outstanding.
   audit remains open.
   Ownership proof handlers now need `elog` before the port files; verify that
   dependency in fresh compilation rather than relying on a loaded macro.
+    Fresh compilation of `pg` passed the strict compiler, and all 1,600
+    unit heads passed in RAM. Both ASDF test systems loaded from an empty
+    cache without Quicklisp, then loaded in reverse order from the same
+    cache in a second fresh image without compiling. The cold test load
+    still emitted style and dependency warnings. The shell runner now
+    defaults an unset `TMPDIR` to its explicit run workspace. The 17
+    heads that had failed while accidentally using `/tmp` passed with
+    that fallback.
 
 - [ ] Test ownership revocation across live ASDF reloads with the same streams
   and owner tokens. The stream and directory proof modules keep their weak
