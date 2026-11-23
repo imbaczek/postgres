@@ -3654,10 +3654,13 @@ checks still apply."
           (t (list target)))))
 
 (defun analyzed-expression-contains-set-p (form)
-  (and (consp form)
-       (or (eq (first form) :set-func)
-           (analyzed-expression-contains-set-p (car form))
-           (analyzed-expression-contains-set-p (cdr form)))))
+  "Check for a set-producing operand in this ProjectSet scope."
+  (some-local-plan-expression
+   (lambda (node walk)
+     (declare (ignore walk))
+     (values (eq (first node) :set-func)
+             (member (first node) '(:subplan :outer-ref))))
+   form))
 
 (defun analyze-replication-slot-call (name arguments)
   "Resolve the nullary slot SRF and reject contexts that cannot accept a set."
@@ -3756,7 +3759,9 @@ checks still apply."
                       (vector-push-extend form calls))
                     (list :col (+ input-width position 1) :type (expr-type form)
                           :typmod -1 :table-oid 0 :attnum 0)))
-                 (t (cons (lift (car form) reuse-p) (lift (cdr form) reuse-p))))))
+                 ((member (first form) '(:subplan :outer-ref)) form)
+                 (t (map-local-expression-operands
+                     (lambda (operand) (lift operand reuse-p)) form)))))
       (let* ((result-targets
                (mapcar (lambda (target)
                          (let ((copy (copy-list target)))

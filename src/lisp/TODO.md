@@ -387,6 +387,13 @@ The A9 grouped-column rewriter and aggregate-signature builder now share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
 function metadata alongside real grouped and aggregate operands. Both C
 differential suites passed, with the existing semijoin EPQ difference reproduced.
+ProjectSet detection and lifting also share local operand traversal. The
+regression checks opaque payloads, local result slots, and subplan and outer
+reference boundaries. The ProjectSet attempt test passed on C and native
+servers in Simple Query and extended protocol, including a suspended portal.
+The existing `ANY`/`ALL` sublink test boundary still needs a parser check.
+An SRF on the left of `ANY (SELECT ...)` reaches the Lisp evaluator and
+raises XX000. C rejects that row comparison during analysis with 42804.
 
 ## Open development tasks
 
