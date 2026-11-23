@@ -1153,6 +1153,10 @@ The combined runner now invokes the Rove package suite used by `--list`.
 The rerun reported 1,642 individual Rove heads and 1,172 legacy checks,
 with both harnesses passing.
 
+The ASDF interoperability entry points now report their registered package
+heads individually. The independent protocol suite passed 205 heads.
+The two owned live peers passed all 22 apply and three native-stream heads.
+
 The direct Rove runner reports the type and message of caught conditions. An
 injected error printed its message, counted as a failure, and left the next
 selected test running. The runner still reports per-head timing and returns a

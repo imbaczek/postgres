@@ -17,7 +17,7 @@
                (:file "t/interop/property-tests"))
   :perform (asdf:test-op (operation component)
                          (declare (ignore operation component))
-                         (unless (uiop:symbol-call :rove :run :pg-interop-tests)
+                         (unless (uiop:symbol-call :rove :run-suite :pg-interop-tests)
                            (error "Logical interoperability contracts failed"))))
 
 (asdf:defsystem "pg-interop-tests/apply"
@@ -28,7 +28,7 @@
                (:file "t/interop/standard-wire-tests"))
   :perform (asdf:test-op (operation component)
                          (declare (ignore operation component))
-                         (unless (uiop:symbol-call :rove :run :pg-interop-tests/apply)
+                         (unless (uiop:symbol-call :rove :run-suite :pg-interop-apply-tests)
                            (error "Logical apply interoperability tests failed"))))
 
 (asdf:defsystem "pg-interop-tests/native"
@@ -38,5 +38,5 @@
   :components ((:file "t/interop/native-stream-tests"))
   :perform (asdf:test-op (operation component)
                          (declare (ignore operation component))
-                         (unless (uiop:symbol-call :rove :run :pg-interop-tests/native)
+                         (unless (uiop:symbol-call :rove :run-suite :pg-interop-native-tests)
                            (error "Native stream interoperability tests failed"))))
