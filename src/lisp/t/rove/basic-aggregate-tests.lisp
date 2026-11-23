@@ -1,5 +1,23 @@
 (in-package #:pg)
 
+(rove:deftest array-access-operand-mapping-preserves-fold-order
+    (dolist (case '(((:array-subscript base (i j) :type :int4)
+                     (i j base)
+                     (:array-subscript (:mapped base) ((:mapped i) (:mapped j)) :type :int4))
+                    ((:array-slice base ((lo hi) (nil last)) :type :int4-array)
+                     (hi last lo base)
+                     (:array-slice (:mapped base) (((:mapped lo) (:mapped hi)) (nil (:mapped last)))
+                      :type :int4-array))))
+      (destructuring-bind (original expected-order expected) case
+        (let* ((source (copy-tree original))
+               (visited nil)
+               (mapped (map-analyzed-array-access-operands
+                        (lambda (operand) (push operand visited) (list :mapped operand))
+                        source)))
+          (rove:ok (equal (reverse visited) expected-order))
+          (rove:ok (equal mapped expected))
+          (rove:ok (equal source original))))))
+
 (rove:deftest analyzed-in-operand-mapping-preserves-order-and-ownership
     (let* ((original '(:in a (b c) nil :type :bool :array-left d :array-items (e f)
                        :comparisons ((g h) (i j)) :metadata untouched))

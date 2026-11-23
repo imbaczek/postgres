@@ -955,16 +955,8 @@ Mark direct scalar function sources through their aliases."
                           (second expression))
                   (third copy) (having-gate-skeleton (third expression)))
             copy))
-      (:array-slice
-       (let ((copy (children 1)))
-         (setf (third copy)
-               (mapcar (lambda (pair) (mapcar (lambda (x) (when x (having-gate-skeleton x))) pair))
-                       (third expression)))
-         copy))
-      (:array-subscript
-       (let ((copy (children 1)))
-         (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
-         copy))
+      ((:array-slice :array-subscript)
+       (map-analyzed-array-access-operands #'having-gate-skeleton expression))
       (:in (map-analyzed-in-operands #'having-gate-skeleton expression))
       (:func
        (if (having-immutable-function-p (second expression))

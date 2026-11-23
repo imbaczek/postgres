@@ -1969,6 +1969,22 @@ JSON has no comparison operators, even though its stored value is text."
                   (getf options :comparisons)))
     copy))
 
+(defun map-analyzed-array-access-operands (function expression)
+  "Copy array access operands in HAVING fold order, preserving omitted bounds."
+  (let* ((copy (copy-list expression))
+         (indices (third expression))
+         (mapped
+           (ecase (first expression)
+             (:array-subscript (mapcar function indices))
+             (:array-slice
+              (flet ((map-bound (bound) (when bound (funcall function bound))))
+                (let* ((uppers (mapcar (lambda (pair) (map-bound (second pair))) indices))
+                       (lowers (mapcar (lambda (pair) (map-bound (first pair))) indices)))
+                  (mapcar #'list lowers uppers)))))))
+    (setf (third copy) mapped
+          (second copy) (funcall function (second expression)))
+    copy))
+
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)

@@ -458,8 +458,10 @@ HAVING gate construction and folding still need their own evaluation
 policy for lazy branches, unsupported functions, and ordered array bounds.
 The gate skeleton and folder now share the analyzed `IN` layout, including
 scalar operands, array operands and typed comparison pairs. The regression
-witnesses callback order and source ownership. Array bounds and the separate
-semantic-key encoder remain to audit.
+witnesses callback order and source ownership. Array access now also shares
+operand mapping, preserving the folder's upper-bounds, lower-bounds, then
+base order and keeping omitted bounds intact. The separate semantic-key
+encoder remains to audit.
 
 ## Open development tasks
 
