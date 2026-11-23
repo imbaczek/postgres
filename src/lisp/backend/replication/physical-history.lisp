@@ -144,10 +144,10 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
     (physical-history-accept-record record identity removed)
     next))
 
-(defun physical-history-cross-eor (store record raw terminal timeline &optional (proven-xid t))
+(defun physical-history-cross-eor (store record raw terminal timeline &optional (starting-stage-and-xid-proven-p t))
   "Advance a selected timeline boundary in the private scan state.
 A scan that cannot establish its starting stage and XID passes NIL."
-  (unless proven-xid
+  (unless starting-stage-and-xid-proven-p
     (error "WAL proof cannot cross EOR without proven starting stage and XID"))
   (setf (getf *physical-recovery-state* :replay-timeline)
         (physical-replay-check-selected-eor store record raw terminal timeline)))
@@ -166,14 +166,13 @@ parent scan can start with unknown seeds, but cannot cross EOR without a proven
 stage and XID. Return the deletion set, last terminal, and committed relation/fork
 resets and the first complete CLOG reset terminal, if any. Large catalog batches
 may use scratch files. The scan applies no database changes."
-  (let ((state (or *physical-recovery-state*
-                   (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store)))))
-    (physical-recovery-check-store-point store start-lsn (physical-store-prefix-timeline store start-lsn))
+  (let* ((state (or *physical-recovery-state*
+                    (list :timeline (physical-store-timeline store) :end (physical-store-base-lsn store))))
+         (timeline (physical-recovery-check-store-point store start-lsn)))
     (multiple-value-bind (checkpoint next stage-proven-p)
         (physical-recovery-scan-seeds state start-lsn checkpoint-seed checkpoint-seed-p
                                       next-xid-seed next-xid-seed-p)
-      (let* ((timeline (physical-store-prefix-timeline store start-lsn))
-             (*physical-receive-store* store)
+      (let* ((*physical-receive-store* store)
              (*physical-recovery-state*
                (physical-recovery-scan-stage store start-lsn state checkpoint next
                                              :stage-proven-p stage-proven-p :timeline timeline))

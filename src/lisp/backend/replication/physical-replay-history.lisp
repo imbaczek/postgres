@@ -21,17 +21,19 @@ A partial reference or a referenced selection missing from the chain is an error
                 return selection)
         (error "recovery history reference is absent from the receive chain"))))
 
-(defun physical-recovery-check-store-point (store point timeline)
-  "Check that POINT belongs to TIMELINE and retained durable receive history.
-Below the spool floor, the saved history proves timeline ownership; retained
-bytes also require an exact record boundary."
+(defun physical-recovery-check-store-point (store point &optional (expected-timeline nil timeline-supplied-p))
+  "Return POINT's timeline after verifying durable receive history.
+When supplied, EXPECTED-TIMELINE must match. Below the spool floor, saved
+history proves timeline ownership. Retained bytes require an exact boundary."
   (unless (and (typep point '(unsigned-byte 64))
-               (<= (physical-store-base-lsn store) point (physical-store-flushed-lsn store))
-               (eql timeline (physical-store-prefix-timeline store point)))
+               (<= (physical-store-base-lsn store) point (physical-store-flushed-lsn store)))
     (error "recovery position differs from its receive history"))
-  (when (>= point (physical-store-floor-lsn store))
-    (physical-store-prefix-digest store point))
-  timeline)
+  (let ((timeline (physical-store-prefix-timeline store point)))
+    (when (and timeline-supplied-p (not (eql expected-timeline timeline)))
+      (error "recovery position differs from its receive history"))
+    (when (>= point (physical-store-floor-lsn store))
+      (physical-store-prefix-digest store point))
+    timeline))
 
 (defun physical-recovery-attach-selected-store (state store)
   "Attach receive-history metadata after checking the immutable base identity.

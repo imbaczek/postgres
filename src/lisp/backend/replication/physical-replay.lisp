@@ -18,70 +18,69 @@ logical status as a third value only when LOGICAL-SEED was supplied, including
 explicit NIL. Otherwise preserve the two-value interface."
   (unless (<= (physical-store-floor-lsn store) start end (physical-store-flushed-lsn store))
     (error "resource proof prefix is unavailable; take a fresh base backup"))
-  (physical-recovery-check-store-point store start (physical-store-prefix-timeline store start))
-  (multiple-value-bind (checkpoint next stage-proven-p)
-      (physical-recovery-scan-seeds
-       state start checkpoint-seed checkpoint-seed-p next-xid-seed next-xid-seed-p)
-    (let* ((fact (wal-copy-control-resource-fields seed))
-           (fpw-fact (physical-fpw-copy-fact fpw-seed))
-           (logical-fact (physical-logical-copy-fact logical-seed))
-           (timeline (physical-store-prefix-timeline store start))
-           (terminal start)
-           (observed (or next 3))
-           (*physical-receive-store* store)
-           (*physical-recovery-state*
-             (physical-recovery-scan-stage store start state checkpoint next
-                                           :stage-proven-p stage-proven-p :timeline timeline))
-           (*physical-history-reset-forks* nil)
-           (removed (make-hash-table :test #'eql)))
-      (when fact
-        (unless (<= (getf fact :resource-lsn) start)
-          (error "resource seed is newer than its replay position"))
-        (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
-      (multiple-value-setq (fpw-fact logical-fact)
-        (physical-recovery-scan-policy-seeds store state checkpoint start timeline fpw-fact logical-fact))
-      (when (= start end)
-        (return-from physical-recovery-scan-resource-fact
-          (if logical-seed-p
-              (values fact (when fpw-seed-p fpw-fact) logical-fact)
-              (values fact (when fpw-seed-p fpw-fact)))))
-      (unless (or stage-proven-p (= timeline (getf state :timeline)))
-        (error "suffix scan lacks its child checkpoint and observed XID seeds"))
-      (with-physical-replay-staging ()
-        (block scan
-          (physical-recovery-map-permitted-records
-           store
-           (lambda (record raw)
-             (when (> (wal-record-end record) end)
-               (error "resource proof boundary is not a complete terminal"))
-             (if (= (wal-record-type record) +wal-record-end-of-recovery+)
-                 (setf timeline (physical-history-cross-eor
-                                 store record raw terminal timeline (and stage-proven-p next)))
-                 (setf observed (physical-history-observe-record
-                                 record observed fpw-fact logical-fact (getf state :cluster-identity) removed)))
-             (unless *wal-recovery-group-active*
-               (unless (= (wal-record-type record) +wal-record-end-of-recovery+)
-                 (setf fact (physical-resource-fact-next
-                             fact record timeline
-                             (lambda () (physical-recovery-resource-history store state)))))
-               (multiple-value-setq (fpw-fact logical-fact)
-                 (physical-replay-policy-facts-next
-                  fpw-fact logical-fact record timeline
-                  (lambda () (physical-recovery-resource-history store state))))
-               (when (= (wal-record-type record) +wal-record-checkpoint+)
-                 (setf (getf *physical-recovery-state* :source-checkpoint)
-                       (wal-checkpoint-record-snapshot record)))
-               (setf terminal (wal-record-end record))
-               (when (= terminal end)
-                 (return-from scan
-                   (if logical-seed-p
-                       (values (wal-copy-control-resource-fields fact)
-                               (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))
-                               (physical-logical-copy-fact logical-fact))
-                       (values (wal-copy-control-resource-fields fact)
-                               (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))))))))
-           :start-lsn start :policy (getf state :timeline-policy))
-          (error "resource proof did not reach its required boundary; take a fresh base backup"))))))
+  (let ((timeline (physical-recovery-check-store-point store start)))
+    (multiple-value-bind (checkpoint next stage-proven-p)
+        (physical-recovery-scan-seeds
+         state start checkpoint-seed checkpoint-seed-p next-xid-seed next-xid-seed-p)
+      (let* ((fact (wal-copy-control-resource-fields seed))
+             (fpw-fact (physical-fpw-copy-fact fpw-seed))
+             (logical-fact (physical-logical-copy-fact logical-seed))
+             (terminal start)
+             (observed (or next 3))
+             (*physical-receive-store* store)
+             (*physical-recovery-state*
+               (physical-recovery-scan-stage store start state checkpoint next
+                                             :stage-proven-p stage-proven-p :timeline timeline))
+             (*physical-history-reset-forks* nil)
+             (removed (make-hash-table :test #'eql)))
+        (when fact
+          (unless (<= (getf fact :resource-lsn) start)
+            (error "resource seed is newer than its replay position"))
+          (timeline-check-resource-origin fact (physical-recovery-resource-history store state)))
+        (multiple-value-setq (fpw-fact logical-fact)
+          (physical-recovery-scan-policy-seeds store state checkpoint start timeline fpw-fact logical-fact))
+        (when (= start end)
+          (return-from physical-recovery-scan-resource-fact
+            (if logical-seed-p
+                (values fact (when fpw-seed-p fpw-fact) logical-fact)
+                (values fact (when fpw-seed-p fpw-fact)))))
+        (unless (or stage-proven-p (= timeline (getf state :timeline)))
+          (error "suffix scan lacks its child checkpoint and observed XID seeds"))
+        (with-physical-replay-staging ()
+          (block scan
+            (physical-recovery-map-permitted-records
+             store
+             (lambda (record raw)
+               (when (> (wal-record-end record) end)
+                 (error "resource proof boundary is not a complete terminal"))
+               (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+                   (setf timeline (physical-history-cross-eor
+                                   store record raw terminal timeline (and stage-proven-p next)))
+                   (setf observed (physical-history-observe-record
+                                   record observed fpw-fact logical-fact (getf state :cluster-identity) removed)))
+               (unless *wal-recovery-group-active*
+                 (unless (= (wal-record-type record) +wal-record-end-of-recovery+)
+                   (setf fact (physical-resource-fact-next
+                               fact record timeline
+                               (lambda () (physical-recovery-resource-history store state)))))
+                 (multiple-value-setq (fpw-fact logical-fact)
+                   (physical-replay-policy-facts-next
+                    fpw-fact logical-fact record timeline
+                    (lambda () (physical-recovery-resource-history store state))))
+                 (when (= (wal-record-type record) +wal-record-checkpoint+)
+                   (setf (getf *physical-recovery-state* :source-checkpoint)
+                         (wal-checkpoint-record-snapshot record)))
+                 (setf terminal (wal-record-end record))
+                 (when (= terminal end)
+                   (return-from scan
+                     (if logical-seed-p
+                         (values (wal-copy-control-resource-fields fact)
+                                 (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))
+                                 (physical-logical-copy-fact logical-fact))
+                         (values (wal-copy-control-resource-fields fact)
+                                 (when fpw-seed-p (physical-fpw-copy-fact fpw-fact))))))))
+             :start-lsn start :policy (getf state :timeline-policy))
+            (error "resource proof did not reach its required boundary; take a fresh base backup")))))))
 
 (defun physical-recovery-spool-directory ()
   (merge-pathnames "pg_physical_receive/" *pgdata*))

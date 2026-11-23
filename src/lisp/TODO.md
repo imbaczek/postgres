@@ -625,6 +625,9 @@ and promotion share the selected EOR transition with both proofs. Each
 caller retains its terminal coverage rules. Fifty-five strict physical
 heads, five unit stage heads, and live standby reload, restart, replay and
 promotion passed.
+Drop and resource proofs now reuse the verified prefix timeline from the
+store-point check. The 56-head strict selection includes rejection of an
+independently supplied wrong timeline and of a position inside a record.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

@@ -35,6 +35,23 @@
   (list (list pg::+wal-record-batch-start+ (empty-octets))
         (list type payload xid)))
 
+(deftest proof-store-point-returns-timeline-and-checks-independent-expectations
+    (with-physical-store-directory (root)
+      (let ((store (pg::physical-store-open root 123 1 :create t))
+            (record (sample-physical-record)))
+        (unwind-protect
+             (progn
+               (pg::physical-store-input store 0 record)
+               (pg::physical-store-flush store)
+               (let ((end (length record)))
+                 (ok (= 1 (pg::physical-recovery-check-store-point store end)))
+                 (ok (= 1 (pg::physical-recovery-check-store-point store end 1)))
+                 (ok (intake-fails-p
+                      (lambda () (pg::physical-recovery-check-store-point store end 2))))
+                 (ok (intake-fails-p
+                      (lambda () (pg::physical-recovery-check-store-point store (1- end)))))))
+          (pg::physical-store-close store)))))
+
 (deftest physical-history-short-clog-requires-a-complete-reset
     (let ((payload (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
       (pg::wal-set-u64 payload 0 4294967299)
