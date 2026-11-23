@@ -718,6 +718,14 @@ Heap deformation also compiles fixed-width cursor advances from the
 registry and checks that grouped decoders agree on width. A mixed tuple
 regression verifies exact offsets, including an OID directly after
 the 12-byte timetz, and checks full and demand-driven decoding.
+Function lookup diagnostics and canonical stored-expression SQL share
+the type registry's SQL spellings. Replay keeps its own typmod handling,
+including the quoted unbounded bit type and the varchar and temporal
+syntax already used in stored definitions.
+Warm REPL comparison matched all 54 registered and two fallback
+spellings. A 200,000-iteration probe of scalar and array name lookups
+allocated zero bytes. The C differential compares exact error fields
+for array, quoted internal char, and time-zone type names.
 
 ### A17 follow-up evidence
 

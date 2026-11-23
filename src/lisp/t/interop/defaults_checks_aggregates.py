@@ -1219,6 +1219,9 @@ def check_numeric_prefix_errors(reference, native):
                 ("SELECT pg_catalog.int4mod('x',true)", "pg_catalog.int4mod(unknown, boolean)", False),
                 ("SELECT int2mod(7,2)", "int2mod(integer, integer)", False),
                 ("SELECT int8and('x',true)", "int8and(unknown, boolean)", False),
+                ('SELECT int4mod(ARRAY[1], NULL::"char")', 'int4mod(integer[], "char")', False),
+                ("SELECT int4mod(NULL::timestamp with time zone, true)",
+                 "int4mod(timestamp with time zone, boolean)", False),
                 ("SELECT int4mod()", "int4mod()", True)):
             expected = ("42883", f"function {signature} does not exist",
                         "No function of that name accepts the given number of arguments." if wrong_count else

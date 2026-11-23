@@ -1139,11 +1139,10 @@ from advancing the shared WAL generation between a failed save and rollback."
                     (format nil "numeric(~d,~d)" (ldb (byte 16 16) packed)
                             (- (logxor (logand packed #x7ff) #x400) #x400)))))
     (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
-    (:int2 "smallint") (:int4 "integer") (:int8 "bigint") (:float4 "real")
-    (:float8 "double precision") (:bool "boolean") (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea") (:name "name")
-    (:oid "oid") (:pg-lsn "pg_lsn") (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
-    (:char "\"char\"") (:int2vector "int2vector") (:text-array "text[]")
-    (:bytea-array "bytea[]") (:json-array "json[]") (:jsonb-array "jsonb[]")
+    (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
+    ((:int2 :int4 :int8 :float4 :float8 :bool :text :json :jsonb :bytea :name
+            :oid :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array)
+     (sql-type-display-name type))
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
 
 (defun catalog-temporal-value-text (value type)

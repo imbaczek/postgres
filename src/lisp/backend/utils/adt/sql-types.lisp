@@ -83,6 +83,36 @@
         (concatenate 'string "_" (sql-type-catalog-name element))
         (substitute #\_ #\- (string-downcase (symbol-name type))))))
 
+(defparameter *sql-type-display-names*
+  (let ((names (make-hash-table :test #'eq)))
+    (labels ((display-name (type)
+               (let ((element (sql-array-element-type type)))
+                 (if element
+                     (concatenate 'string (display-name element) "[]")
+                     (case type
+                       (:int2 "smallint")
+                       (:int4 "integer")
+                       (:int8 "bigint")
+                       (:time "time without time zone")
+                       (:timetz "time with time zone")
+                       (:timestamp "timestamp without time zone")
+                       (:timestamptz "timestamp with time zone")
+                       (:float4 "real")
+                       (:float8 "double precision")
+                       (:varchar "character varying")
+                       (:bool "boolean")
+                       (:char "\"char\"")
+                       ;; Keep the existing diagnostic fallback for catalog XIDs.
+                       (:xid "text")
+                       (otherwise (sql-type-catalog-name type)))))))
+      (dolist (entry +sql-expression-types+ names)
+        (let ((type (first entry)))
+          (setf (gethash type names) (display-name type)))))))
+
+(defun sql-type-display-name (type)
+  "Return a read-only type name without a typmod, or text for an unclassified expression."
+  (values (gethash type *sql-type-display-names* "text")))
+
 (defun sql-type-alignment-code (type)
   "Return the catalog typalign code. Arrays use at least integer alignment."
   (let ((element (sql-array-element-type type)))
