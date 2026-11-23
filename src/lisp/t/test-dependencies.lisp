@@ -2,10 +2,13 @@
 ;;;; Prefer configured ASDF systems; Quicklisp is only a fallback for missing ones.
 (in-package #:cl-user)
 
+(defvar *pg-test-load-wrapper* #'funcall
+  "Call the dependency loader in the current image's test cache context.")
+
 (defun load-pg-test-system (system)
   ;; Keep an active Quicklisp installation; only initialize one if ASDF misses.
   (handler-case
-      (asdf:load-system system)
+      (funcall *pg-test-load-wrapper* (lambda () (asdf:load-system system)))
     (asdf:missing-component (condition)
       (unless (find-package :ql)
         (let* ((quicklisp-home (uiop:getenv "QUICKLISP_HOME"))
@@ -28,7 +31,8 @@
         (error "Cannot find cl-spec/check-it. Install cl-spec in the active Quicklisp ~
                 local-projects directory or register its checkout with ASDF using ~
                 CL_SOURCE_REGISTRY. See src/lisp/README.md, Testing."))
-      (uiop:symbol-call :ql :quickload system :silent t))))
+      (funcall *pg-test-load-wrapper*
+               (lambda () (uiop:symbol-call :ql :quickload system :silent t))))))
 
 (defvar *pg-test-system* "pg-unit-tests")
 

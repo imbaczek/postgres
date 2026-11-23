@@ -2127,7 +2127,13 @@ still has work outstanding.
   components and their count under the compilation policy namespace. The
   ASDF translation regression covers two checkout roots with test paths that
   would otherwise collide after stripping their respective `t/` prefixes.
-  Quicklisp-sensitive dependency cache reuse remains open.
+  The campaign cache also separates dependency and test FASLs by the
+  Quicklisp reader feature. A fallback that initializes Quicklisp reselects
+  the mapping before retrying ASDF. Four fresh images alternated between
+  both feature contexts against one cache. The second Rove load in each
+  context reused its FASLs without compilation. Production FASL paths are
+  shared. Noncampaign ASDF cache configuration and the cold test style and
+  dependency warnings remain open.
 
 - [x] Preserve ownership revocation across live reloads. The stream and directory
   proof modules retain their weak revocation tables and mutexes for the lifetime
@@ -2135,6 +2141,8 @@ still has work outstanding.
   the lock on the same descriptor and reloads the ASDF-built module. The new
   definitions reject the old proofs, including a directory-owner copy made
   before revocation and the original owner after its active flag is restored.
+  Deploy this change with a fresh image. The previous closures' private
+  registries cannot be recovered by the first live load of these definitions.
 
 - [ ] Audit destructive sequence operations on quoted or shared lists, including
   `SORT`, `NREVERSE`, `NCONC` and the final argument to `APPEND`. Installation

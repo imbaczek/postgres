@@ -27,10 +27,17 @@
                                      (list (format nil "~d" (length source-components)))
                                      source-components)
                   :defaults base)))
-    (list :output-translations
-          (list (namestring (merge-pathnames "t/" source)) (namestring target))
-          (list "/" (namestring (merge-pathnames "common-lisp/" cache)))
-          :ignore-inherited-configuration)))
+    (let* ((production (merge-pathnames "common-lisp/" cache))
+           ;; Rove reads different code when Quicklisp is present. Keep that
+           ;; choice out of the shared production cache and other test images.
+           (context (if (member :quicklisp *features*) "quicklisp/" "plain/"))
+           (test-output (merge-pathnames context target)))
+      (list :output-translations
+            (list (namestring (merge-pathnames "t/" source)) (namestring test-output))
+            (list (namestring source)
+                  (namestring (merge-pathnames (uiop:enough-pathname source #p"/") production)))
+            (list "/" (namestring (merge-pathnames context (merge-pathnames "test-dependencies-v1/" production))))
+            :ignore-inherited-configuration))))
 
 (defun call-with-policy (profile thunk)
   ;; Scope these qualities to test compilation.  Default and production
@@ -51,7 +58,9 @@
          (*test-cache-context*
            (list profile (merge-pathnames "t/compile-policy-probe.fasl" source)
                  (merge-pathnames "compile-policy-probe.fasl" (second (second translations))))))
-    (progv (list (find-symbol "*OUTPUT-TRANSLATIONS*" :asdf/output-translations)) '(nil)
+    (progv (list (find-symbol "*OUTPUT-TRANSLATIONS*" :asdf/output-translations)
+                 (find-symbol "*OUTPUT-TRANSLATIONS-PARAMETER*" :asdf/output-translations))
+        '(nil nil)
       (asdf:initialize-output-translations translations)
       (funcall thunk))))
 

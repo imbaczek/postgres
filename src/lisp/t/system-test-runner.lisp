@@ -5,6 +5,8 @@
 
 (defvar *pg-test-system* "pg-unit-tests")
 
+(defvar *pg-test-load-wrapper*)
+
 (defun pg-test-phase (name function)
   ;; CPU time here belongs to this image; the compiler records its own time.
   (let ((start (get-internal-real-time)) (cpu (get-internal-run-time)))
@@ -233,15 +235,17 @@
            (pg-test-phase
             :test-load
             (lambda ()
-              (let ((*pg-test-system* system))
-                (flet ((load-tests () (load (merge-pathnames "t/test-dependencies.lisp" source))))
-                  (if (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
-                      (uiop:symbol-call
-                       :pg-test-compilation :call-with-cache
-                       (uiop:symbol-call :pg-test-compilation :profile)
-                       (uiop:ensure-directory-pathname (uiop:getenv "XDG_CACHE_HOME"))
-                       source #'load-tests)
-                      (load-tests))))))
+              (let ((*pg-test-system* system)
+                    (*pg-test-load-wrapper*
+                      (if (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
+                          (lambda (thunk)
+                            (uiop:symbol-call
+                             :pg-test-compilation :call-with-cache
+                             (uiop:symbol-call :pg-test-compilation :profile)
+                             (uiop:ensure-directory-pathname (uiop:getenv "XDG_CACHE_HOME"))
+                             source thunk))
+                          #'funcall)))
+                (load (merge-pathnames "t/test-dependencies.lisp" source)))))
            (let ((heads (pg-test-selected-heads suite names)))
              (when (uiop:getenv "PG_LISP_TEST_CAMPAIGN")
                (pg-test-record-suite-manifest suite heads))

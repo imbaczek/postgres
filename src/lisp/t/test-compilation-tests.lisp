@@ -17,8 +17,15 @@
          (equal (first config) :output-translations)
          (equal (first (second config)) (namestring (merge-pathnames "t/" source)))
          (search (if (= mode 2) "tests-fast-v2/" "tests-default-v2/") (second (second config)))
-         (equal (third config) (list "/" (namestring (merge-pathnames "common-lisp/" cache))))
-         (eq (fourth config) :ignore-inherited-configuration))))
+         (equal (first (third config)) (namestring source))
+         (equal (fourth config)
+                (list "/" (namestring
+                           (merge-pathnames
+                            (if (member :quicklisp *features*)
+                                "common-lisp/test-dependencies-v1/quicklisp/"
+                                "common-lisp/test-dependencies-v1/plain/")
+                            cache))))
+         (eq (fifth config) :ignore-inherited-configuration))))
 
 (deftest test-compilation-profile-generated-contract
     (let ((data (cl-spec:result-data
@@ -66,6 +73,7 @@
 
 (deftest test-compilation-cache-isolates-tests-and-shares-production
     (let ((variable (find-symbol "*OUTPUT-TRANSLATIONS*" :asdf/output-translations))
+          (*features* (remove :quicklisp *features*))
           (production nil))
       (dolist (profile '(:default :fast))
         (progv (list variable) '(nil)
@@ -76,8 +84,8 @@
                 (pg-path (asdf:apply-output-translations #p"/tmp/policy-source/probe.fasl")))
             (ok (equal test-path
                        (if (eq profile :fast)
-                           #p"/tmp/policy-cache/common-lisp/tests-fast-v2/2/tmp/policy-source/nested/probe.fasl"
-                           #p"/tmp/policy-cache/common-lisp/tests-default-v2/2/tmp/policy-source/nested/probe.fasl")))
+                           #p"/tmp/policy-cache/common-lisp/tests-fast-v2/2/tmp/policy-source/plain/nested/probe.fasl"
+                           #p"/tmp/policy-cache/common-lisp/tests-default-v2/2/tmp/policy-source/plain/nested/probe.fasl")))
             (pg-test-compilation:call-with-cache
              profile #p"/tmp/policy-cache/" #p"/tmp/policy-source/nested/"
              (lambda ()
@@ -86,13 +94,31 @@
                  (ok (equal other-path
                             (merge-pathnames
                              (if (eq profile :fast)
-                                 "tests-fast-v2/3/tmp/policy-source/nested/probe.fasl"
-                                 "tests-default-v2/3/tmp/policy-source/nested/probe.fasl")
+                                 "tests-fast-v2/3/tmp/policy-source/nested/plain/probe.fasl"
+                                 "tests-default-v2/3/tmp/policy-source/nested/plain/probe.fasl")
                              #p"/tmp/policy-cache/common-lisp/")))
                  (ok (not (equal other-path test-path))))))
             (ok (equal pg-path #p"/tmp/policy-cache/common-lisp/tmp/policy-source/probe.fasl"))
             (when production (ok (equal production pg-path)))
             (setf production pg-path))))))
+
+(deftest test-compilation-cache-tracks-reader-context
+    (flet ((outputs (quicklisp)
+             (let ((*features* (if quicklisp (adjoin :quicklisp *features*)
+                                   (remove :quicklisp *features*))))
+               (pg-test-compilation:call-with-cache
+                :default #p"/tmp/policy-cache/" #p"/tmp/policy-source/"
+                (lambda ()
+                  (mapcar #'asdf:apply-output-translations
+                          '(#p"/tmp/dependencies/rove/reporter.fasl"
+                            #p"/tmp/policy-source/t/probe.fasl"
+                            #p"/tmp/policy-source/probe.fasl")))))))
+      (destructuring-bind (plain-dependency plain-test plain-production) (outputs nil)
+        (destructuring-bind (ql-dependency ql-test ql-production) (outputs t)
+          (ok (not (equal plain-dependency ql-dependency)))
+          (ok (not (equal plain-test ql-test)))
+          (ok (equal plain-production ql-production))
+          (ok (equal (outputs nil) (list plain-dependency plain-test plain-production)))))))
 
 (deftest test-compilation-hook-preserves-warning-fatality
     (let ((variable (find-symbol "*OUTPUT-TRANSLATIONS*" :asdf/output-translations)))
