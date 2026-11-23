@@ -726,6 +726,12 @@ Warm REPL comparison matched all 54 registered and two fallback
 spellings. A 200,000-iteration probe of scalar and array name lookups
 allocated zero bytes. The C differential compares exact error fields
 for array, quoted internal char, and time-zone type names.
+Numeric typmod packing and signed-scale decoding are shared by parsing,
+coercion, catalog deparsing, and TOAST width estimation. Column
+definitions and stored casts use the same renderer while keeping the
+explicit time-zone suffix in timestamp column definitions. The
+regressions check packed bytes, exact replay SQL, and a negative-scale
+default across a fresh server image.
 
 ### A17 follow-up evidence
 

@@ -1135,9 +1135,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                    (format nil "\"interval\"(~d,~d)" (ldb (byte 15 16) typmod) (ldb (byte 16 0) typmod))
                    (format nil "interval~a" (sql-interval-typmod-sql typmod))))
     (:numeric (if (< typmod 4) "numeric"
-                  (let ((packed (- typmod 4)))
-                    (format nil "numeric(~d,~d)" (ldb (byte 16 16) packed)
-                            (- (logxor (logand packed #x7ff) #x400) #x400)))))
+                  (multiple-value-bind (precision scale) (sql-numeric-typmod-components typmod)
+                    (format nil "numeric(~d,~d)" precision scale))))
     (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
     (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     ((:int2 :int4 :int8 :float4 :float8 :bool :text :json :jsonb :bytea :name
@@ -1256,35 +1255,15 @@ from advancing the shared WAL generation between a failed save and rollback."
   (with-output-to-string (stream)
     (format stream "~a ~a"
             (catalog-sql-quote-ident (pg-column-name column))
-            (case (pg-column-type column)
-              (:date "date")
-              (:interval (let* ((typmod (pg-column-typmod column))
-                                (range (and (not (minusp typmod)) (ldb (byte 15 16) typmod)))
-                                (precision (and range (ldb (byte 16 0) typmod))))
-                           (if (and range (/= precision #xffff) (/= range 32767) (not (logbitp 12 range)))
-                               (format nil "\"interval\"(~d,~d)" range precision)
-                               (format nil "interval~a" (sql-interval-typmod-sql typmod)))))
-              (:timetz (format nil "time~a with time zone"
-                               (if (minusp (pg-column-typmod column)) "" (format nil "(~d)" (pg-column-typmod column)))))
-              ((:timestamp :timestamptz)
-               (format nil "timestamp~a~a"
-                       (if (minusp (pg-column-typmod column)) "" (format nil "(~d)" (pg-column-typmod column)))
-                       (if (eq (pg-column-type column) :timestamptz) " with time zone" " without time zone")))
-              (:time (if (minusp (pg-column-typmod column)) "time"
-                         (format nil "time(~d)" (pg-column-typmod column))))
-              (:float4 "real") (:float8 "double precision")
-              (:int2 "smallint") (:int4 "integer") (:int8 "bigint")
-              (:numeric (let ((typmod (pg-column-typmod column)))
-                          (if (< typmod 4) "numeric"
-                              (let* ((packed (- typmod 4))
-                                     (precision (ldb (byte 16 16) packed))
-                                     (scale (- (logxor (logand packed #x7ff) #x400) #x400)))
-                                (format nil "numeric(~d,~d)" precision scale)))))
-              (:text "text") (:json "json") (:jsonb "jsonb") (:bytea "bytea")
-              (:bytea-array "bytea[]") (:json-array "json[]") (:jsonb-array "jsonb[]")
-              (:varchar (if (< (pg-column-typmod column) 4) "varchar"
-                            (format nil "varchar(~a)" (- (pg-column-typmod column) 4))))
-              (otherwise (error "cannot publish unsupported type ~a" (pg-column-type column)))))
+            (let ((type (pg-column-type column))
+                  (typmod (pg-column-typmod column)))
+              (case type
+                (:timestamp
+                 (concatenate 'string (catalog-expression-type-sql type typmod) " without time zone"))
+                ((:date :interval :timetz :timestamptz :time :float4 :float8 :int2 :int4 :int8
+                  :numeric :text :json :jsonb :bytea :bytea-array :json-array :jsonb-array :varchar)
+                 (catalog-expression-type-sql type typmod))
+                (otherwise (error "cannot publish unsupported type ~a" type)))))
     (when (pg-column-notnull column) (write-string " NOT NULL" stream))
     (cond ((pg-column-default-sql column)
            (let* ((expression (pg-column-default-expression column))
@@ -1657,7 +1636,7 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
                         (and (>= typmod 4) (+ 4 (* 4 (- typmod 4)))))
                        (:numeric
                         (and (>= typmod 4)
-                             (+ 8 (* 2 (floor (+ (ldb (byte 16 16) (- typmod 4)) 6) 4)))))
+                             (+ 8 (* 2 (floor (+ (sql-numeric-typmod-components typmod) 6) 4)))))
                        (otherwise (unless varlena-p (column-fixed-size column))))))
                (if size (incf data-length size) (setf unknown t))))
     (let* ((per-page 4)

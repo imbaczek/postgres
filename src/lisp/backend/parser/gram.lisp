@@ -1633,12 +1633,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
              (numbers (mapcar (lambda (text) (sql-cast-integer-input text :int4)) strings)))
         (unless (<= 1 (length numbers) 2)
           (ereport "22023" "invalid NUMERIC type modifier"))
-        (let ((precision (first numbers)) (scale (or (second numbers) 0)))
-          (unless (<= 1 precision 1000)
-            (ereport "22023" "NUMERIC precision ~d must be between 1 and 1000" precision))
-          (unless (<= -1000 scale 1000)
-            (ereport "22023" "NUMERIC scale ~d must be between -1000 and 1000" scale))
-          (+ 4 (logior (ash precision 16) (logand scale #x7ff)))))
+        (sql-numeric-typmod (first numbers) (or (second numbers) 0)))
       -1))
 
 (defun parse-interval-generic-typmod (p)

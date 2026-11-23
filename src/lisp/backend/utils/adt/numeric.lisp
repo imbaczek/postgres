@@ -166,22 +166,33 @@ Finite values become SQL decimals; NaN and infinities pass through unchanged."
   (let ((scaled (* (sql-numeric-rational value) (expt 10 scale))))
     (* (signum scaled) (floor (+ (abs scaled) 1/2)))))
 
+(defun sql-numeric-typmod (precision scale)
+  "Validate and pack a declared numeric precision and signed scale."
+  (unless (<= 1 precision 1000)
+    (ereport "22023" "NUMERIC precision ~d must be between 1 and 1000" precision))
+  (unless (<= -1000 scale 1000)
+    (ereport "22023" "NUMERIC scale ~d must be between -1000 and 1000" scale))
+  (+ 4 (logior (ash precision 16) (logand scale #x7ff))))
+
+(defun sql-numeric-typmod-components (typmod)
+  "Return the precision and signed scale of a specified numeric typmod."
+  (let ((packed (- typmod 4)))
+    (values (ldb (byte 16 16) packed)
+            (- (logxor (logand packed #x7ff) #x400) #x400))))
+
 (defun sql-numeric-apply-typmod (value typmod)
   "Round and check a finite numeric value using PostgreSQL's packed typmod."
   (when (and (>= typmod 4) (sql-numeric-special-p value))
     (if (eq value :numeric-nan) (return-from sql-numeric-apply-typmod value)
         (ereport "22003" "numeric field overflow")))
   (if (< typmod 4) value
-      (let* ((packed (- typmod 4))
-             (precision (ldb (byte 16 16) packed))
-             (bits (logand packed #x7ff))
-             (scale (- (logxor bits #x400) #x400))
-             (rounded (sql-numeric-rounded-coefficient value scale)))
-        (when (>= (abs rounded) (expt 10 precision))
-          (ereport "22003" "numeric field overflow"))
-        (if (minusp scale)
-            (make-sql-decimal (* rounded (expt 10 (- scale))) 0)
-            (make-sql-decimal rounded scale)))))
+      (multiple-value-bind (precision scale) (sql-numeric-typmod-components typmod)
+        (let ((rounded (sql-numeric-rounded-coefficient value scale)))
+          (when (>= (abs rounded) (expt 10 precision))
+            (ereport "22003" "numeric field overflow"))
+          (if (minusp scale)
+              (make-sql-decimal (* rounded (expt 10 (- scale))) 0)
+              (make-sql-decimal rounded scale))))))
 
 (defun sql-numeric-leading-digit (value)
   "Return numeric.c's normalized base-10000 weight and first digit."

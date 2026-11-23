@@ -206,6 +206,17 @@
       (rove:ok (= 9 (pg-sequence-last-value sequence)))
       (rove:ok (equal '(("t")) (pg-publication-tables publication)))))
 
+(rove:deftest catalog-replay-keeps-numeric-and-timestamp-type-modifiers
+    (let* ((typmod (sql-numeric-typmod 9 -3))
+           (numeric (make-pg-column :name "n" :type :numeric :typmod typmod))
+           (timestamp (make-pg-column :name "t" :type :timestamp :typmod 2)))
+      (rove:ok (= typmod #x90801))
+      (rove:ok (equal '(9 -3) (multiple-value-list (sql-numeric-typmod-components typmod))))
+      (rove:ok (string= "numeric(9,-3)" (catalog-expression-type-sql :numeric typmod)))
+      (rove:ok (string= "\"n\" numeric(9,-3)" (catalog-column-definition-sql numeric)))
+      (rove:ok (string= "timestamp(2)" (catalog-expression-type-sql :timestamp 2)))
+      (rove:ok (string= "\"t\" timestamp(2) without time zone" (catalog-column-definition-sql timestamp)))))
+
 (rove:deftest test-toast-relation-eligibility
     (flet ((column (type &optional (typmod -1))
              (make-pg-column :name "x" :type type :typmod typmod :attnum 1)))
