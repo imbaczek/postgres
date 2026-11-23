@@ -626,6 +626,12 @@ Publication analysis still normalizes variadic names and the optional
 relation filter before selecting a set plan. The 1,460 C comparisons
 covered both publication shapes, NULL arrays, and empty slot results.
 Focused physical heads verify slot fields, snapshots, and CTE stability.
+Physical and logical slot creation, advance, and drop share registry
+parameter names, defaults, strictness, volatility, and evaluation.
+The existing lifecycle operations still own publication and durability.
+The 1,466 C comparisons covered named creation, slot lookup and drop,
+NULL handling, and missing required arguments. Focused physical heads
+exercise parameter inference, logical creation, and durable advance.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

@@ -457,6 +457,12 @@ exist\" messages."
                                                 (declare (ignore call))
                                                 (sql-minmax better-p arguments)))))
 
+(defun make-slot-management-builtin (name parameters result-type evaluator)
+  "Describe a strict volatile slot call and its named binding parameters."
+  (make-scalar-builtin :name name :argument-types (mapcar #'second parameters) :result-type result-type
+                       :volatility :volatile :strict-p t
+                       :evaluator (list* :named evaluator parameters)))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -540,6 +546,21 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-slot-management-builtin
+                    "pg_create_physical_replication_slot"
+                    '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil))
+                    :record 'sql-create-physical-slot)
+                   (make-slot-management-builtin
+                    "pg_create_logical_replication_slot"
+                    '(("slot_name" :name :required) ("plugin" :name :required)
+                      ("temporary" :bool nil) ("twophase" :bool nil) ("failover" :bool nil))
+                    :record 'sql-create-logical-slot)
+                   (make-slot-management-builtin
+                    "pg_replication_slot_advance"
+                    '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required))
+                    :record 'sql-advance-replication-slot)
+                   (make-slot-management-builtin
+                    "pg_drop_replication_slot" '((nil :name :required)) :void 'sql-drop-replication-slot)
                    (make-scalar-builtin :name "pg_get_replication_slots" :result-type :record
                                         :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
@@ -812,7 +833,8 @@ exist\" messages."
         (if (consp evaluator)
             (ecase (car evaluator)
               (:typed-first (apply (cdr evaluator) (expr-type first-argument) arguments))
-              (:call (funcall (cdr evaluator) call arguments)))
+              (:call (funcall (cdr evaluator) call arguments))
+              (:named (apply (second evaluator) arguments)))
             (apply evaluator arguments)))))
 
 (defun scalar-builtin-match-p (builtin arguments)
@@ -1059,7 +1081,10 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
         ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
         ((string= name "pg_stat_get_activity") +activity-result-fields+)
         ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
-        ((string= name "pg_get_publication_tables") +publication-table-result-fields+)))
+        ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
+        ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
+                 :test #'string=) +physical-slot-create-result-fields+)
+        ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)))
 
 (defun check-record-set-call-context ()
   (unless *select-set-functions-allowed-p*
@@ -1216,17 +1241,12 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      name analyzed :schema schema :named-p t
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
-(defun replication-slot-function-signature (name)
-  "Return the supported SQL replication slot parameters, types, and defaults."
-  (cond
-    ((string= name "pg_create_physical_replication_slot")
-     '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil)))
-    ((string= name "pg_create_logical_replication_slot")
-     '(("slot_name" :name :required) ("plugin" :name :required)
-       ("temporary" :bool nil) ("twophase" :bool nil) ("failover" :bool nil)))
-    ((string= name "pg_replication_slot_advance")
-     '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required)))
-    ((string= name "pg_drop_replication_slot") '((nil :name :required)))))
+(defun scalar-builtin-named-parameters (name)
+  (let ((builtin (first (gethash name *scalar-builtin-descriptors*))))
+    (when builtin
+      (let ((evaluator (scalar-builtin-evaluator builtin)))
+        (when (and (consp evaluator) (eq (car evaluator) :named))
+          (cddr evaluator))))))
 
 (defvar *query-parameter-types* nil)
 
@@ -1262,7 +1282,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
         (when name (push name names))))
     (values analyzed names)))
 
-(defun analyze-replication-slot-arguments (name arguments table variadic &optional (signature (replication-slot-function-signature name)))
+(defun analyze-replication-slot-arguments (name arguments table variadic signature)
   "Bind supported replication slot arguments and defaults to the catalog signature."
   (multiple-value-bind (analyzed names) (analyze-catalog-call-inputs arguments table signature)
     (let* ((assigned (make-array (length signature) :initial-element nil))
@@ -1290,57 +1310,45 @@ then argument types. Only ambiguity and type failures carry the cast hint."
           (setf (aref slots index) (coerce-common-expression expression type))))
       (coerce slots 'list))))
 
-(defun analyze-replication-slot-function (name arguments)
-  "Build the typed expression and result descriptor for a replication slot call."
-  (if (string= name "pg_drop_replication_slot")
-      (list :func name arguments :type :void :typmod -1)
-      (list :func name arguments :type :record :typmod -1
-                                 :fields (if (member name '("pg_create_physical_replication_slot"
-                                                            "pg_create_logical_replication_slot") :test #'string=)
-                                             +physical-slot-create-result-fields+ +physical-slot-advance-result-fields+))))
+(defun sql-create-physical-slot (name immediately-reserve temporary)
+  (let ((slot (wal-create-physical-replication-slot
+               name :immediately-reserve immediately-reserve :temporary temporary)))
+    (make-sql-record :fields +physical-slot-create-result-fields+
+                     :values (vector (wal-replication-slot-name slot)
+                                     (or (wal-replication-slot-restart-lsn slot) +null+)))))
 
-(defun eval-replication-slot-function (name arguments)
-  "Evaluate a replication slot call, applying strict NULL semantics first."
-  (if (some (lambda (argument) (eq argument +null+)) arguments)
-      +null+
-      (cond
-        ((string= name "pg_create_physical_replication_slot")
-         (let ((slot (wal-create-physical-replication-slot
-                      (first arguments) :immediately-reserve (second arguments)
-                      :temporary (third arguments))))
-           (make-sql-record
-            :fields +physical-slot-create-result-fields+
-            :values (vector (wal-replication-slot-name slot)
-                            (or (wal-replication-slot-restart-lsn slot) +null+)))))
-        ((string= name "pg_create_logical_replication_slot")
-         (let ((lsn (apply #'create-sql-logical-replication-slot arguments)))
-           (make-sql-record :fields +physical-slot-create-result-fields+
-                            :values (vector (first arguments) lsn))))
-        ((string= name "pg_replication_slot_advance")
-         (make-sql-record
-          :fields +physical-slot-advance-result-fields+
-          :values (vector (first arguments)
-                          (wal-advance-physical-replication-slot
-                           (first arguments) (second arguments) :allow-standby-logical t))))
-        (t (wal-drop-replication-slot (first arguments)) nil))))
+(defun sql-create-logical-slot (name plugin temporary twophase failover)
+  (make-sql-record :fields +physical-slot-create-result-fields+
+                   :values (vector name (create-sql-logical-replication-slot
+                                         name plugin temporary twophase failover))))
+
+(defun sql-advance-replication-slot (name lsn)
+  (make-sql-record :fields +physical-slot-advance-result-fields+
+                   :values (vector name (wal-advance-physical-replication-slot
+                                         name lsn :allow-standby-logical t))))
+
+(defun sql-drop-replication-slot (name)
+  (wal-drop-replication-slot name)
+  nil)
 
 (defun analyze-call-argument-list (name arguments table &optional variadic schema)
   "Analyze call arguments, binding supported named arguments."
-  (cond ((replication-slot-function-signature name)
-         (analyze-replication-slot-arguments name arguments table variadic))
-        ((string= name "pg_get_replication_slots")
-         (analyze-catalog-call-inputs arguments table))
-        ((string= name "pg_promote")
-         (analyze-promotion-arguments arguments table variadic))
-        ((member name '("random" "setseed") :test #'string=)
-         (analyze-random-arguments arguments table name schema))
-        ((and (numeric-function-p name)
-              (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
-         (analyze-numeric-call-arguments name arguments table schema))
-        (t (mapcar (lambda (argument)
-                     (when (eq (first argument) :named-arg)
-                       (ereport "0A000" "named arguments are not supported for function ~a" name))
-                     (analyze-expr argument table)) arguments))))
+  (let ((parameters (scalar-builtin-named-parameters name)))
+    (cond (parameters
+           (analyze-replication-slot-arguments name arguments table variadic parameters))
+          ((string= name "pg_get_replication_slots")
+           (analyze-catalog-call-inputs arguments table))
+          ((string= name "pg_promote")
+           (analyze-promotion-arguments arguments table variadic))
+          ((member name '("random" "setseed") :test #'string=)
+           (analyze-random-arguments arguments table name schema))
+          ((and (numeric-function-p name)
+                (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
+           (analyze-numeric-call-arguments name arguments table schema))
+          (t (mapcar (lambda (argument)
+                       (when (eq (first argument) :named-arg)
+                         (ereport "0A000" "named arguments are not supported for function ~a" name))
+                       (analyze-expr argument table)) arguments)))))
 
 (defun analyze-numeric-overload (name args first-type)
   "Use the preferred input type to select candidates and let the registry check the full signature."
@@ -1726,7 +1734,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
-      ((replication-slot-function-signature name) (analyze-replication-slot-function name args))
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
@@ -3541,9 +3548,6 @@ candidate selection."
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
           ((scalar-record-builtin-fields name))
-          ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
-                   :test #'string=) +physical-slot-create-result-fields+)
-          ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)
           (t (ereport "42809" "expression is not a supported composite type")))))
 
 (defun qualified-star-targets (qualifier scope)
@@ -4644,7 +4648,6 @@ the full 64-bit ID as a signed value."
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
-    ((replication-slot-function-signature name) (eval-replication-slot-function name args))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
     (t

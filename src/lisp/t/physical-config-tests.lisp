@@ -1316,13 +1316,13 @@
 
 (deftest replication-slot-functions-infer-unspecified-parameters
     (let ((pg::*query-parameter-types* (vector nil nil)))
-      (pg::analyze-replication-slot-arguments "pg_replication_slot_advance"
-                                              '((:parameter 1) (:parameter 2)) nil nil)
+      (pg::analyze-call-argument-list "pg_replication_slot_advance"
+                                      '((:parameter 1) (:parameter 2)) nil)
       (ok (equalp #(:name :pg-lsn) pg::*query-parameter-types*)))
   (let ((pg::*query-parameter-types* (vector nil nil)))
-    (pg::analyze-replication-slot-arguments "pg_replication_slot_advance"
-                                            '((:named-arg "upto_lsn" (:parameter 1))
-                                              (:named-arg "slot_name" (:parameter 2))) nil nil)
+    (pg::analyze-call-argument-list "pg_replication_slot_advance"
+                                    '((:named-arg "upto_lsn" (:parameter 1))
+                                      (:named-arg "slot_name" (:parameter 2))) nil)
     (ok (equalp #(:pg-lsn :name) pg::*query-parameter-types*))))
 
 (deftest scalar-array-all-matches-c-empty-and-null-identities

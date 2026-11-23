@@ -7,6 +7,12 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT slot_name, lsn IS NULL AS unreserved FROM pg_catalog.pg_create_physical_replication_slot(temporary=>false, slot_name=>'dc_registry_slot')",
+    "SELECT count(*) FROM pg_get_replication_slots() WHERE slot_name = 'dc_registry_slot'",
+    "SELECT pg_drop_replication_slot('dc_registry_slot')",
+    "SELECT count(*) FROM pg_get_replication_slots() WHERE slot_name = 'dc_registry_slot'",
+    "SELECT pg_create_physical_replication_slot(NULL) IS NULL",
+    "SELECT pg_replication_slot_advance(upto_lsn=>'bad')",
     "CREATE TABLE dc_registry_pub_table (id int PRIMARY KEY)",
     "CREATE PUBLICATION dc_registry_pub FOR TABLE dc_registry_pub_table",
     "SELECT count(*) FROM pg_catalog.pg_get_publication_tables('dc_registry_pub')",
