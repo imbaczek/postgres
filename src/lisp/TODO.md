@@ -614,6 +614,12 @@ shape are preserved. The 1,448 C comparisons covered constant HAVING
 and a demanded default that still evaluates `nextval` alongside NULL,
 including after restart. The recursive CTE differential covers quoted
 and qualified lookup failures and common-type diagnostics.
+`pg_stat_get_wal_senders` and `pg_stat_get_activity` use registry
+signatures and iterator dispatch. Their supported record fields are
+shared by scalar projection analysis and record expansion. The
+1,453 C comparisons covered qualified calls, a NULL activity filter,
+and lookup and decoration precedence. Focused physical heads verify
+sender fields and owned activity snapshots.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

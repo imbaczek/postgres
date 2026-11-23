@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pid = pg_backend_pid() AS own_pid FROM pg_catalog.pg_stat_get_activity(pg_backend_pid())",
+    "SELECT pid = pg_backend_pid() AS own_pid FROM pg_stat_get_activity(NULL) WHERE pid = pg_backend_pid()",
+    "SELECT count(*) FROM pg_catalog.pg_stat_get_wal_senders()",
+    "SELECT * FROM pg_stat_get_activity(1::bigint)",
+    "SELECT pg_stat_get_activity(DISTINCT 'bad')",
     "CREATE SEQUENCE dc_minmax_default_seq",
     "CREATE TABLE dc_minmax_default (v bigint DEFAULT greatest(NULL, nextval('dc_minmax_default_seq')), w numeric DEFAULT least(NULL,2.500,3))",
     "INSERT INTO dc_minmax_default DEFAULT VALUES RETURNING v,w",

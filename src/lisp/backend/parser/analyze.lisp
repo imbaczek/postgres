@@ -540,6 +540,11 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_stat_get_wal_senders" :result-type :record
+                                        :volatility :stable :evaluator '(:iterator . make-wal-sender-result-iterator))
+                   (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type :record
+                                        :volatility :stable :implicit-arguments-p t
+                                        :evaluator '(:iterator . make-activity-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type :record
                                         :volatility :stable :evaluator 'wal-receiver-result)
                    (make-scalar-builtin :name "pg_control_checkpoint" :result-type :record
@@ -786,6 +791,12 @@ exist\" messages."
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
+(defun scalar-builtin-iterator (builtin)
+  (when builtin
+    (let ((evaluator (scalar-builtin-evaluator builtin)))
+      (when (and (consp evaluator) (eq (car evaluator) :iterator))
+        (cdr evaluator)))))
+
 (defun eval-scalar-builtin (builtin arguments first-argument call)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
       +null+
@@ -866,12 +877,15 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
                (mapcar #'coerce-scalar-builtin-argument arguments
                        (scalar-builtin-argument-types builtin)))))
           (result-type (scalar-builtin-result-type builtin)))
-      ;; Preserve the allocation-free evaluator and the stored expression shape.
-      (if (eq (scalar-builtin-evaluator builtin) 'sql-array-length)
-          (list :array-length (first inputs) (second inputs) :type result-type :typmod -1)
-          (list* :func name inputs :type result-type :typmod -1
-                 (when (eq result-type :record)
-                   (list :fields (scalar-record-builtin-fields name))))))))
+      (cond
+        ((scalar-builtin-iterator builtin)
+         (analyze-record-set-call name inputs (scalar-record-builtin-fields name)))
+        ;; Preserve the allocation-free evaluator and the stored expression shape.
+        ((eq (scalar-builtin-evaluator builtin) 'sql-array-length)
+         (list :array-length (first inputs) (second inputs) :type result-type :typmod -1))
+        (t (list* :func name inputs :type result-type :typmod -1
+                  (when (eq result-type :record)
+                    (list :fields (scalar-record-builtin-fields name)))))))))
 
 (defun check-json-conversion-input (argument)
   "Keep the concrete SQL type for polymorphic JSON conversion."
@@ -1032,7 +1046,9 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
 
 (defun scalar-record-builtin-fields (name)
   (cond ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
-        ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)))
+        ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
+        ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
+        ((string= name "pg_stat_get_activity") +activity-result-fields+)))
 
 (defun analyze-record-set-call (name arguments fields)
   "Build a record-valued set call after checking its expression context."
@@ -1041,19 +1057,6 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
   (when *inside-aggregate-input-p*
     (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
   (list :set-func name arguments :type :record :typmod -1 :fields fields))
-
-(defun analyze-source-status-function (name arguments)
-  "Check sender or activity arguments and attach the supported result fields."
-  (let ((activity (string= name "pg_stat_get_activity")))
-    (unless (if activity
-                (and (= (length arguments) 1)
-                     (or (member (expr-type (first arguments)) '(:int2 :int4))
-                         (in-unknown-constant-p (first arguments))))
-                (null arguments))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (analyze-record-set-call
-     name (when activity (list (coerce-common-expression (first arguments) :int4)))
-     (if activity +activity-result-fields+ +wal-sender-result-fields+))))
 
 (defun analyze-promotion-arguments (arguments table &optional variadic)
   "Bind pg_promote arguments in parameter order and supply defaults.
@@ -1723,8 +1726,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
       ((find '(:variadic-any) builtins :key #'scalar-builtin-argument-types :test #'equal)
        (analyze-json-constructor name builtins args (getf (cdddr expr) :variadic)))
-      ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
-       (analyze-source-status-function name args))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
       ((and builtins (not (eq (scalar-builtin-implicit-arguments-p (first builtins)) :syntax-only)))
@@ -3530,8 +3531,6 @@ candidate selection."
     (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
           ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((scalar-record-builtin-fields name))
-          ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
-          ((string= name "pg_stat_get_activity") +activity-result-fields+)
           ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
           ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
                    :test #'string=) +physical-slot-create-result-fields+)
