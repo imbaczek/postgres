@@ -55,7 +55,7 @@
           (pg::*wal-lock* (sb-thread:make-mutex :name "export origin WAL fixture"))
           (pg::*wal-temp-cleanup-domain* nil)
           (pg::*wal-storage-incarnation* (gensym "ORIGIN-FIXTURE-"))
-          (pg::*wal-segment-namespace* :legacy)
+          (pg::*wal-segment-namespace* :timeline)
           (pg::*wal-insert-timeline* 1)
           (pg::*wal-durable-lsn* 64)
           (pg::*wal-poisoned* nil)
@@ -237,7 +237,7 @@
                              :manifest-digest (pg::physical-export-origin-manifest-digest origin))))
          (owner (pg::make-physical-sender
                  :name name :pin pin :backend pg::*backend*
-                 :system-id (pg::physical-export-origin-system-id origin) :timeline 1 :namespace :legacy)))
+                 :system-id (pg::physical-export-origin-system-id origin) :timeline 1 :namespace :timeline)))
     (setf (gethash name pg::*physical-source-pins*) pin
           (gethash name pg::*physical-source-senders*) owner
           (gethash pin pg::*wal-snapshot-retention-pins*) 32)
@@ -396,9 +396,8 @@
             (pg::with-wal-critical
               (ok (null (pg::physical-export-origin-start-proof name owner 64 96))))
             (setf (pg::physical-source-pin-timeline pin) 2
-                  (pg::physical-sender-timeline owner) 2
-                  (pg::physical-sender-namespace owner) :timeline)
-            (let ((pg::*wal-insert-timeline* 2) (pg::*wal-segment-namespace* :timeline))
+                  (pg::physical-sender-timeline owner) 2)
+            (let ((pg::*wal-insert-timeline* 2))
               (pg::with-wal-critical
                 (ok (null (pg::physical-export-origin-start-proof name owner 64 96)))))
             (ok (= 32 (pg::physical-export-origin-proven-lsn

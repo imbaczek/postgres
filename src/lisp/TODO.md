@@ -374,6 +374,9 @@ creates the CLOG file required for an owned restart of the source.
 The WAL control encoder defaults to the timeline namespace. Production callers
 pass the current, source, or child namespace explicitly, and historical fixtures
 request legacy control images explicitly where they create legacy-named WAL.
+The export-origin fixtures bind the current timeline-qualified namespace for
+the WAL and sender. All 17 strict heads passed, including stale timeline
+rejection and retained progress across publication failure.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
