@@ -1,12 +1,11 @@
 ;;;; Source pin tests isolate retention decisions; placeholder segments are not replay fixtures.
 (in-package #:pg-physical-tests)
 
-(defun call-with-physical-source-fixture (function &key (namespace pg::*wal-segment-namespace*)
-                                                     (timeline pg::*wal-insert-timeline*))
+(defun call-with-physical-source-fixture (function &key (namespace :timeline))
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root)
            (pg::*wal-segment-namespace* namespace)
-           (pg::*wal-insert-timeline* timeline)
+           (pg::*wal-insert-timeline* 1)
            (pg::*catalog* (pg::make-catalog))
            (pg::*physical-source-pins* (make-hash-table :test #'equal))
            (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
@@ -58,7 +57,7 @@
            (ok (= (length bytes)
                   (pg::wal-verify-archive-segment-proof
                    (pg::read-bounded-regular-file proof pg::+wal-archive-segment-proof-size+)
-                   (pg::catalog-system-identifier) 1 0 :legacy bytes))))
+                   (pg::catalog-system-identifier) 1 0 :timeline bytes))))
          (delete-file proof)
          (sb-posix:mkdir (namestring proof) #o700)
          (let ((pg::*wal-end-lsn* (length later))
@@ -158,8 +157,7 @@
            (pg::wal-archive-clean-retired-status)
            (ok (not (probe-file proof-done))))
          (ok (not (probe-file segment)))
-         (ok (not (probe-file proof)))))
-     :namespace :timeline :timeline 1))
+         (ok (not (probe-file proof)))))))
 
 (deftest primary-archive-drains-a-backlog-and-refreshes-its-scan
     (call-with-physical-source-fixture
@@ -193,8 +191,7 @@
            (ok (equal (loop for line = (read-line stream nil)
                             while line collect line)
                       (loop for segment from 0 to count
-                            collect (pg::wal-segment-filename segment 1 :timeline)))))))
-     :namespace :timeline :timeline 1))
+                            collect (pg::wal-segment-filename segment 1 :timeline)))))))))
 
 (deftest archive-restore-requires-matching-segment-proof
     (with-physical-store-directory (root)
@@ -240,9 +237,7 @@
 (deftest archive-proof-follows-wal-namespace-migration
     (call-with-physical-source-fixture
      (lambda ()
-       (let* ((pg::*wal-insert-timeline* 1)
-              (pg::*wal-segment-namespace* :legacy)
-              (old (pg::wal-segment-path 0 1 :legacy))
+       (let* ((old (pg::wal-segment-path 0 1 :legacy))
               (new (pg::wal-segment-path 0 1 :timeline))
               (old-proof (pg::wal-namespace-proof-path old))
               (new-proof (pg::wal-namespace-proof-path new))
@@ -272,7 +267,8 @@
          (let ((pg::*wal-segment-namespace* :timeline))
            (pg::wal-reconcile-namespace-at-startup))
          (ok (and (probe-file new) (probe-file new-proof)))
-         (ok (not (or (probe-file old) (probe-file old-proof))))))))
+         (ok (not (or (probe-file old) (probe-file old-proof))))))
+     :namespace :legacy))
 
 (deftest primary-archive-ready-follows-control-and-fences-recycling
     (call-with-physical-source-fixture

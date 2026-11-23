@@ -357,6 +357,15 @@ promotion with its control extensions intact. Startup still reads the namespace 
 existing controls. The physical slot API fixtures use timeline-qualified WAL,
 with an explicit legacy namespace mutation for the recycling revalidation case.
 The archive rotation and backlog fixtures seed and publish timeline-qualified WAL.
+The shared physical source fixture now also seeds timeline-qualified WAL for
+streaming, pin retention and archive tests. The stream revalidation test changes
+the namespace in flight to check that stale reads and feedback are rejected.
+The archive migration test selects legacy seed files explicitly, and promotion
+tests still cover legacy parent proofs. A read-only inventory of the repository
+tree and the documented
+`../pg-ha-artifacts` directory found no native WAL segments, partial files,
+proofs or archive status entries in either filename grammar. Other cluster
+directories and backups still need a separate inventory.
 Retiring the legacy grammar requires recreating or
 retiring remaining development data, backups, and retained ancestral WAL.
 
