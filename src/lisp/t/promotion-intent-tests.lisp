@@ -54,7 +54,6 @@
                                  (getf pg::*wal-control-metadata* :db-state)))
                       (assert (pg::postmaster-pid-owned-p))
                       (incf *promotion-test-writer-starts*)))
-              (when (eq namespace :timeline) (delete-file (pg::wal-segment-path 0 1 :legacy)))
               (pg::wal-atomic-write-bytes (merge-pathnames name root) base)
               (pg::wal-atomic-write-bytes (pg::wal-control-path) control)
               (setf (getf pg::*physical-recovery-state* :version) 3
@@ -97,7 +96,7 @@
               (funcall function root store))
          (setf (symbol-function 'pg::start-primary-wal-writer-under-lock) start-writer)
          (pg::physical-store-close store))))
-   :system-id system-id))
+   :system-id system-id :namespace namespace))
 
 (deftest promotion-fixture-isolates-the-current-shutdown-level
     (let ((pg::*shutdown* pg::+fast-shutdown+))

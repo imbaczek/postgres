@@ -5,7 +5,7 @@
       (call-with-restartpoint-fixture
        (lambda (root store)
          (let ((pg::*wal-insert-timeline* 1)
-               (pg::*wal-segment-namespace* :legacy))
+               (pg::*wal-segment-namespace* :timeline))
            (setf (getf pg::*physical-recovery-state* :phase) 2
                  (getf pg::*physical-recovery-state* :required-applied) replay
                  pg::*last-replay-lsn* replay
@@ -170,7 +170,7 @@
      (lambda (root store)
        (declare (ignore store))
        (let ((slot (physical-slot-test-object :restart 1 :system-id 123))
-             (path (merge-pathnames "pg_wal/0000000000000000.wal" root)))
+             (path (merge-pathnames "pg_wal/000000010000000000000000.wal" root)))
          (ok (pg::physical-slot-check-standby-slots (list slot) 123))
          (with-open-file (stream path :direction :io :element-type '(unsigned-byte 8)
                                       :if-exists :overwrite)
@@ -183,6 +183,6 @@
        (let ((unreserved (physical-slot-test-object :system-id 123))
              (lost (physical-slot-test-object :name "lost_physical" :restart 33 :system-id 123)))
          (setf (pg::wal-replication-slot-wal-status lost) :lost)
-         (delete-file (merge-pathnames "pg_wal/0000000000000000.wal" root))
+         (delete-file (merge-pathnames "pg_wal/000000010000000000000000.wal" root))
          (delete-file (pg::physical-store-segment-path store 0))
          (ok (pg::physical-slot-check-standby-slots (list unreserved lost) 123))))))

@@ -1,7 +1,7 @@
 ;;;; Restartpoint generations bind durable data to a validated receive suffix.
 (in-package #:pg-physical-tests)
 
-(defun call-with-restartpoint-fixture (function &key (system-id 123))
+(defun call-with-restartpoint-fixture (function &key (system-id 123) (namespace :timeline))
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root)
            (pg::*physical-recovery-state*
@@ -29,9 +29,9 @@
       (pg::wal-atomic-write-bytes (merge-pathnames "base/900" root)
                                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
       (let* ((base (sample-physical-record 0))
-             (name "pg_wal/0000000000000000.wal"))
+             (name (concatenate 'string "pg_wal/" (pg::wal-segment-filename 0 1 namespace))))
         (pg::wal-atomic-write-bytes (merge-pathnames name root) base)
-        (setf (getf pg::*physical-recovery-state* :wal-namespace) :legacy
+        (setf (getf pg::*physical-recovery-state* :wal-namespace) namespace
               (getf pg::*physical-recovery-state* :files)
               (list (list name 32 (pg::physical-store-update-digest #xCBF29CE484222325 base)))))
       (let ((store (pg::physical-store-open spool system-id 1 :create t :start-lsn 32)))

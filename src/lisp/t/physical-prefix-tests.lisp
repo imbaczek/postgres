@@ -17,7 +17,8 @@
       (multiple-value-bind (metadata catalog prefix) (pg::physical-restartpoint-read pg::*physical-recovery-state*)
         (declare (ignore catalog))
         (ok (= 4 (getf metadata :version))) (ok (= 96 (length prefix)))
-        (let* ((base-before (lineage-test-bytes (pg::wal-segment-path 0 1 :legacy)))
+        (let* ((base-path (pg::wal-segment-path 0 1 :timeline))
+               (base-before (lineage-test-bytes base-path))
                (suffix (prefix-test-append-terminal store 96))
                (path (pg::physical-store-segment-path store 0))
                (end (+ (length prefix) (length suffix))))
@@ -30,7 +31,7 @@
             (declare (ignore ignored))
             (ok (= end (getf next :lsn)))
             (ok (equalp captured (concatenate '(vector (unsigned-byte 8)) prefix suffix))))
-          (ok (equalp base-before (lineage-test-bytes (pg::wal-segment-path 0 1 :legacy))))))))
+          (ok (equalp base-before (lineage-test-bytes base-path)))))))
 
 (deftest restartpoint-prefix-pointer-ahead-of-floor-remains-a-valid-anchor
     (with-restartpoint-fixture (root store)
