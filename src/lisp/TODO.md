@@ -420,6 +420,10 @@ Physical plan subplan discovery uses the shared visitor for execution-owner
 table registration and plan instrumentation. The regression checks discovery
 order, deduplication, comparison subplans, and opaque call and literal data.
 The 111-case subquery and 114-case CTE differentials passed.
+Recursive generation-cache discovery shares operand traversal and enters
+executable subquery scopes explicitly. The regression checks nearest active
+generation selection and ignores subqueries present only in literal data
+or metadata. The 137-case recursive CTE differential passed.
 
 ## Open development tasks
 

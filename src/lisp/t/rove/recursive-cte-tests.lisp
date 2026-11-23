@@ -1,6 +1,23 @@
 ;;;; recursive-cte-tests.lisp -- recursive binding analysis and iterative results.
 (in-package #:pg)
 
+(rove:deftest recursive-cache-discovery-visits-executable-subquery-scopes
+    (let* ((nearest (make-sql-cte :name "nearest"))
+           (outer (make-sql-cte :name "outer"))
+           (*recursive-cte-generation-caches* (list (cons nearest :nearest) (cons outer :outer)))
+           (*recursive-cte-worktables* (list (cons nearest nil) (cons outer nil)))
+           (nearest-ref (list :cte nearest :cte-worktable t))
+           (outer-ref (list :cte outer :cte-worktable t))
+           (hidden (list :subplan (make-sql-subplan :prepared (list :relations (list nearest-ref)))))
+           (visible (list :subplan (make-sql-subplan :prepared (list :relations (list outer-ref)))))
+           (call (list :func "f" (list (list :const hidden) visible) :saved hidden)))
+      (rove:ok (eq :outer (prepared-query-worktable-cache (list :where call))))
+      (rove:ok (eq :nearest
+                   (prepared-query-worktable-cache
+                    (list :where (list :subplan
+                                       (make-sql-subplan :test hidden
+                                                         :prepared (list :relations (list outer-ref))))))))))
+
 (rove:deftest recursive-cte-counting-and-union
     (dolist (case '(("WITH RECURSIVE r(n) AS(SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n FROM r" ((1) (2) (3) (4)))
                     ("WITH RECURSIVE r(n) AS(SELECT 1 UNION SELECT n FROM r) SELECT n FROM r" ((1)))

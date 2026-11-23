@@ -43,7 +43,7 @@
            (expression (list :func "f"
                              (list (list :const (list :subplan hidden))
                                    (list :subplan visible)
-                                   (list :subplan nested))
+                                   (list :subplan visible))
                              :saved (list :subplan hidden)))
            (plan (%make-query-plan :physical (list :project (list (list :expr expression)) nil))))
       (rove:ok (equal (query-plan-expression-subplans plan) (list visible nested)))))
