@@ -18,14 +18,16 @@
                    (progn (walk (car node)) (walk (cdr node)))))))
     (walk form)))
 
-(defun default-strict-function-p (name)
-  "Use declared strictness for registered calls when folding a demanded default."
+(defun default-strict-function-p (name arguments)
+  "Use the analyzed signature's strictness when folding a demanded default."
   (let ((builtins (gethash name *scalar-builtin-descriptors*)))
     (cond
       ;; Stored defaults have historically folded NULL for these commands,
       ;; while ordinary execution converts it to PID or timeout zero.
       ((member name '("pg_cancel_backend" "pg_terminate_backend") :test #'string=) t)
-      (builtins (every #'scalar-builtin-strict-p builtins))
+      (builtins
+       (let ((builtin (scalar-builtin-for-evaluation builtins (length arguments) (first arguments))))
+         (and builtin (scalar-builtin-strict-p builtin))))
       (t (having-immutable-function-p name)))))
 
 (defun fold-column-default (expression)
@@ -95,7 +97,7 @@ those arguments therefore occur before any row execution or sequence effects."
                            ((:cast :not) (list (second copy)))
                            (:unary (list (third copy)))
                            (:func
-                            (when (default-strict-function-p (second copy))
+                            (when (default-strict-function-p (second node) (third node))
                               (third copy))))))
                   (if (some #'null-p strict-inputs) (constant +null+ copy)
                       (finish copy)))))))

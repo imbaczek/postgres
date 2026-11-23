@@ -530,7 +530,11 @@ for 100,000 evaluations of a typed length expression. The 1,402 C
 comparisons covered dimensions, diagnostics, and a fresh-process
 default using an empty `int2vector`. Array rendering also reads
 `int2vector` directly without copying it to an array.
-Default folding reads strictness from the scalar registry. The C
+Default folding reads strictness from the original analyzed signature
+in the scalar registry. The C differential verifies that the strict
+two-argument `array_to_string` default skips a volatile sequence input
+when its array is NULL, while the three-argument overload evaluates it.
+The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
 that must execute with a NULL value to reset the session setting.

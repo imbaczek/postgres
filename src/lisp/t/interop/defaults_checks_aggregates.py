@@ -7,6 +7,14 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE SEQUENCE dc_array_to_string_strict_seq",
+    "CREATE TABLE dc_array_to_string_strict (v text DEFAULT array_to_string(NULL::int[], nextval('dc_array_to_string_strict_seq')::text))",
+    "INSERT INTO dc_array_to_string_strict DEFAULT VALUES RETURNING v",
+    "SELECT nextval('dc_array_to_string_strict_seq')",
+    "CREATE TABLE dc_array_to_string_nonstrict (v text DEFAULT array_to_string(NULL::int[], nextval('dc_array_to_string_strict_seq')::text, NULL))",
+    "INSERT INTO dc_array_to_string_nonstrict DEFAULT VALUES RETURNING v",
+    "SELECT currval('dc_array_to_string_strict_seq')",
+    "SELECT nextval('dc_array_to_string_strict_seq')",
     "SELECT pg_catalog.array_length(ARRAY[[1,2],[3,4]], '2'), array_length(ARRAY[1], 1::smallint), array_length(ARRAY[1], 0), array_length(ARRAY[1], 2)",
     "SELECT array_length(''::int2vector, 1), array_length('1 2'::int2vector, 1), array_length(ARRAY[]::int[], 1), array_length(ARRAY[1], NULL)",
     "SELECT array_length(ARRAY[1], 1::bigint)",
