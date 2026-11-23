@@ -20,7 +20,7 @@
 (deftest promotion-fpw-cold-read-keeps-frozen-intent-without-recapture
     (dolist (source '(nil t :unknown))
       (dolist (desired '(nil t))
-        (dolist (namespace '(:legacy :timeline))
+        (let ((namespace :timeline))
           (call-with-promotion-fixture
            (lambda (root store)
              (declare (ignore root))

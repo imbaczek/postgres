@@ -472,7 +472,11 @@ ordinary and single-user refusal preserved the entire stopped fixture and
 stale PID, including independent legacy control and dangling filename cases.
 Qualified startup committed a row and recovered both rows after restart.
 The previous migration crash matrix is pinned at `b91e9f92423`.
-Tighten the primary and pending control codecs, backup manifest inventory, and retained
+Backup manifests and bundle intake require qualified WAL file entries. A
+checksummed version 3 manifest with a legacy entry reached file-entry
+rejection. Eighty-three strict recovery and promotion heads, three cold
+policy heads, and live qualified bootstrap passed.
+Tighten the primary and pending control codecs and retained
 overlap metadata for callers outside server startup. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.

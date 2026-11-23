@@ -513,8 +513,7 @@ Child images may include history files no newer than their selected timeline."
            (and (uiop:string-prefix-p "pg_wal/" name)
                 (uiop:string-suffix-p name ".wal")
                 (let ((stem (subseq name 7 (- (length name) 4))))
-                  (or (and (= timeline 1) (eql 1 (wal-parse-segment-name stem :legacy)))
-                      (eql timeline (wal-parse-segment-name stem :timeline))))))))
+                  (eql timeline (wal-parse-segment-name stem :timeline)))))))
 
 (defun physical-manifest-checkpoint-start (manifest)
   (getf manifest :checkpoint-start))

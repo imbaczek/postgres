@@ -387,7 +387,7 @@
         (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path root)))))))
 
 (deftest promotion-child-prefix-replaces-stale-files-without-changing-parent
-    (dolist (namespace '(:legacy :timeline))
+    (let ((namespace :timeline))
       (call-with-promotion-fixture
        (lambda (root store)
          (declare (ignore root store))
@@ -469,7 +469,7 @@
                           (lineage-test-bytes child)))))))))
 
 (cl-spec:defproperty child-installation-replaces-only-the-uncommitted-child
-    ((stale (range integer 0 255)) (qualified (member nil t)))
+    ((stale (range integer 0 255)))
   (:about pg::physical-promotion-install-prefix)
   (:trials (:normal 50))
   (call-with-promotion-fixture
@@ -484,7 +484,7 @@
        (and (equalp before (lineage-test-bytes parent))
             (equalp (getf pg::*physical-recovery-state* :wal-prefix-bytes) (lineage-test-bytes child))
             (= 1 pg::*wal-insert-timeline*) (not pg::*physical-recovery-failed-p*))))
-   :namespace (if qualified :timeline :legacy)))
+   :namespace :timeline))
 
 (deftest generated-promotion-child-prefix
     (let ((data (cl-spec:result-data
@@ -492,7 +492,7 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest promotion-intent-binds-the-selected-generation-without-changing-parent-wal
-    (dolist (namespace '(:legacy :timeline))
+    (let ((namespace :timeline))
       (call-with-promotion-fixture
        (lambda (root store)
          (declare (ignore root store))
@@ -634,7 +634,7 @@
         (ok (intake-fails-p (lambda () (pg::physical-promotion-select-child 1)))))))
 
 (cl-spec:defproperty pending-intent-references-the-selected-local-generation
-    ((histories (range integer 0 6)) (kind (range integer 0 1)))
+    ((histories (range integer 0 6)))
   (:about pg::physical-promotion-publish-intent)
   (:trials (:normal 50))
   (call-with-promotion-fixture
@@ -651,8 +651,8 @@
               (= 216 (getf pending :applied))
               (= 1 (getf pending :timeline))
               (equalp prefix (getf pending :wal-prefix-bytes))
-              (eq (nth kind '(:legacy :timeline)) (getf pending :promotion-source-namespace))))))
-   :namespace (nth kind '(:legacy :timeline))))
+              (eq :timeline (getf pending :promotion-source-namespace))))))
+   :namespace :timeline))
 
 (deftest generated-pending-intent-generation-binding
     (let ((data (cl-spec:result-data

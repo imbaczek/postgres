@@ -389,7 +389,17 @@
         (write-recovery-manifest-text root text)
         (ok (equal manifest (pg::recovery-check-manifest-schema
                              (pg::recovery-read-manifest root))))
-        (setf (getf manifest :version) 2)
+        (setf (getf manifest :files) '(("pg_wal/0000000000000000.wal" 152 9)))
+        (write-recovery-manifest-text root (pg::physical-bootstrap-manifest-text manifest))
+        (ok (handler-case
+                (progn
+                  (pg::recovery-check-manifest-schema (pg::recovery-read-manifest root))
+                  nil)
+              (error (condition)
+                (search "invalid or duplicate physical recovery file entry"
+                        (princ-to-string condition)))))
+        (setf (getf manifest :files) '(("PG_VERSION" 3 9))
+              (getf manifest :version) 2)
         (ok (intake-fails-p (lambda () (pg::recovery-check-manifest-schema manifest)))))))
 
 (cl-spec:defproperty recovery-manifest-dynamic-strings-roundtrip
@@ -410,9 +420,9 @@
 
 (deftest recovery-file-entries-reject-traversal-and-duplicates
     (dolist (name '("../pg_control" "/tmp/file" "base/../pg_control" "base/1.tmp"
-                    "base/*" "global/unknown" "pg_wal/../../file"))
+                    "base/*" "global/unknown" "pg_wal/../../file" "pg_wal/0000000000000000.wal"))
       (ok (not (pg::recovery-manifest-path-p name))))
-  (dolist (name '("base/16384" "base/16384.vm" "PG_VERSION" "pg_wal/0000000000000000.wal"))
+  (dolist (name '("base/16384" "base/16384.vm" "PG_VERSION" "pg_wal/000000010000000000000000.wal"))
     (ok (pg::recovery-manifest-path-p name)))
   (let ((manifest (sample-recovery-manifest)))
     (setf (getf manifest :files) '(("PG_VERSION" 3 9) ("PG_VERSION" 3 9)))

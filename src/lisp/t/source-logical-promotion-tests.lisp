@@ -103,7 +103,7 @@
 (deftest promotion-logical-pending-freezes-policy-across-cold-read-and-configuration-change
     (dolist (source '(:unknown nil t))
       (dolist (desired '(nil t))
-        (dolist (namespace '(:legacy :timeline))
+        (let ((namespace :timeline))
           (call-with-promotion-fixture
            (lambda (root store)
              (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
@@ -819,7 +819,7 @@
 
 (deftest source-logical-pending-promotion-keeps-frozen-source-on-cold-read
     (dolist (source '(:unknown nil t))
-      (dolist (namespace '(:legacy :timeline))
+      (let ((namespace :timeline))
         (call-with-promotion-fixture
          (lambda (root store)
            (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))

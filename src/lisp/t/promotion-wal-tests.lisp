@@ -6,7 +6,7 @@
   (call-with-promotion-exclusion #'pg::physical-promotion-install-prefix))
 
 (deftest promotion-history-eor-publication-is-idempotent-and-keeps-parent-control
-    (dolist (namespace '(:legacy :timeline))
+    (let ((namespace :timeline))
       (call-with-promotion-fixture
        (lambda (root store)
          (declare (ignore root store))
