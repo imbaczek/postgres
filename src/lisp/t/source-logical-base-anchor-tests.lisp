@@ -338,7 +338,7 @@
 (defun source-logical-anchor-test-manifest ()
   (list :version 3 :system-id 42 :cluster-identity "anchor-source" :timeline 1
         :checkpoint 376 :checkpoint-start 256 :end 376 :next-xid 42
-        :source-pin "anchor_copy" :files (list (list "pg_wal/0000000000000000.wal" 376 0))))
+        :source-pin "anchor_copy" :files (list (list "pg_wal/000000010000000000000000.wal" 376 0))))
 
 (defun call-with-source-logical-anchor-base (enabled function &key (system-id 123) (checkpoint-status :unknown) separate-witness-segment)
   (call-with-promotion-fixture
@@ -371,10 +371,10 @@
          (setf fact (pg::physical-logical-fact-next fact (pg::wal-decode-record bytes cursor) 1 history))
          (push bytes frames)
          (let* ((base-bytes (apply #'concatenate '(vector (unsigned-byte 8)) (nreverse frames)))
-                (wal-control (pg::wal-encode-control-image end end snapshot :namespace :legacy))
+                (wal-control (pg::wal-encode-control-image end end snapshot :namespace :timeline))
                 (manifest (nth-value 0 (pg::recovery-read-manifest root)))
                 (name (if separate-witness-segment
-                          (concatenate 'string "pg_wal/" (pg::wal-segment-filename 1 1 :legacy))
+                          (concatenate 'string "pg_wal/" (pg::wal-segment-filename 1 1 :timeline))
                           (first (first (getf manifest :files))))))
            (setf (first (first (getf manifest :files))) name)
            (setf (getf manifest :checkpoint) end (getf manifest :checkpoint-start) cursor
@@ -395,7 +395,7 @@
                2 (getf manifest :system-id) 1 digest end end 50 :logical-fact fact)))
            (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
            (funcall function root snapshot fact)))))
-   :applied 152 :system-id system-id))
+   :namespace :timeline :applied 152 :system-id system-id))
 
 (cl-spec:defgenerator source-logical-base-anchor-arguments ()
   (list (source-logical-anchor-test-fact (zerop (random 2)) (random 1000000))))

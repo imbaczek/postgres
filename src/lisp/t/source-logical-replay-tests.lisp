@@ -225,7 +225,7 @@
                                        (pg::wal-encode-record
                                         pg::+wal-record-checkpoint+ 0 32
                                         (pg::wal-encode-checkpoint-snapshot snapshot))))
-              (wal-control (pg::wal-encode-control-image 152 152 snapshot :namespace :legacy)))
+              (wal-control (pg::wal-encode-control-image 152 152 snapshot :namespace :timeline)))
          (pg::wal-atomic-write-bytes (merge-pathnames name root) base-bytes)
          (pg::wal-atomic-write-bytes (pg::wal-control-path) wal-control)
          (multiple-value-bind (manifest old-digest) (pg::recovery-read-manifest root)
@@ -244,7 +244,7 @@
                2 (getf manifest :system-id) 1 digest 152 end 50 :logical-fact required))))
          (pg::wal-atomic-write-bytes (pg::clog-path) (empty-octets))
          (funcall function root store snapshot seed required))))
-   :applied 152))
+   :namespace :timeline :applied 152))
 
 (deftest source-logical-verified-base-keeps-future-required-evidence-separate
     (dolist (enabled '(:unknown nil t))

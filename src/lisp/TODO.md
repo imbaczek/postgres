@@ -360,6 +360,8 @@ The archive rotation and backlog fixtures seed and publish timeline-qualified WA
 The shared physical source fixture now also seeds timeline-qualified WAL for
 streaming, pin retention and archive tests. The stream revalidation test changes
 the namespace in flight to check that stale reads and feedback are rejected.
+The logical recovery base fixtures use timeline-qualified checkpoint files and
+matching WAL controls, including the case with a separate witness segment.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
