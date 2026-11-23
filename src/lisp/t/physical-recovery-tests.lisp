@@ -452,12 +452,21 @@
 
 (deftest recovery-wal-functions-distinguish-base-and-receiver
     (let ((pg::*physical-recovery-state* (sample-recovery-manifest))
-          (pg::*last-replay-lsn* 32))
-      (ok (pg::eval-recovery-wal-function "pg_is_in_recovery"))
-      (ok (= 32 (pg::eval-recovery-wal-function "pg_last_wal_replay_lsn")))
-      (ok (eq pg::+null+ (pg::eval-recovery-wal-function "pg_last_wal_receive_lsn")))
-      (ok (equal "55000" (recovery-state-of
-                          (lambda () (pg::eval-recovery-wal-function "pg_current_wal_lsn")))))))
+          (pg::*last-replay-lsn* 32)
+          (pg::*last-replay-xact-timestamp* 0))
+      (ok (pg::eval-func "pg_is_in_recovery" nil))
+      (ok (= 32 (pg::eval-func "pg_last_wal_replay_lsn" nil)))
+      (ok (eq pg::+null+ (pg::eval-func "pg_last_wal_receive_lsn" nil)))
+      (ok (eq pg::+null+ (pg::eval-func "pg_last_xact_replay_timestamp" nil)))
+      (setf pg::*last-replay-xact-timestamp* 123)
+      (ok (= 123 (pg::eval-func "pg_last_xact_replay_timestamp" nil)))
+      (dolist (name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn"))
+        (ok (equal "55000" (recovery-state-of (lambda () (pg::eval-func name nil)))))))
+  (let ((pg::*physical-recovery-state* nil)
+        (pg::*wal-end-lsn* 64)
+        (pg::*wal-durable-lsn* 32))
+    (ok (= 64 (pg::eval-func "pg_current_wal_lsn" nil)))
+    (ok (= 32 (pg::eval-func "pg_current_wal_flush_lsn" nil)))))
 
 (deftest wal-lsn-difference-preserves-unsigned-range-and-numeric-type
     (let* ((expression (pg::analyze-function-expression

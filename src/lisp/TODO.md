@@ -390,6 +390,11 @@ result types, stability, and evaluators from the scalar builtin registry.
 The definitions match the nullary entries in C's `pg_proc.dat`.
 The differential checks qualified calls, transaction-local XID equality,
 and wrong-arity diagnostics.
+The registry also supplies the nullary primary and recovery WAL position,
+replay timestamp, and postmaster start timestamp signatures. Recovery
+checks exercise absent receiver and replay data, a recorded replay
+timestamp, and both primary-only WAL position guards through normal
+builtin dispatch.
 
 ### A9 follow-up evidence
 

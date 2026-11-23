@@ -322,10 +322,6 @@ exist\" messages."
 
 (defun analyze-metadata-function (name arguments)
   (cond
-    ((member name '("pg_postmaster_start_time" "pg_last_xact_replay_timestamp") :test #'string=)
-     (when arguments
-       (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-     (list :func name nil :type :timestamptz :typmod -1))
     ((string= name "array_length")
      (unless (and (= 2 (length arguments))
                   (or (eq (expr-type (first arguments)) :int2vector)
@@ -428,6 +424,20 @@ exist\" messages."
                                         :volatility :stable :strict-p t :evaluator 'sql-backend-pid)
                    (make-scalar-builtin :name "txid_current" :result-type :int8
                                         :volatility :stable :strict-p t :evaluator 'sql-txid-current)
+                   (make-scalar-builtin :name "pg_is_in_recovery" :result-type :bool
+                                        :volatility :volatile :strict-p t :evaluator 'recovery-in-progress-p)
+                   (make-scalar-builtin :name "pg_last_wal_receive_lsn" :result-type :pg-lsn
+                                        :volatility :volatile :strict-p t :evaluator 'sql-last-wal-receive-lsn)
+                   (make-scalar-builtin :name "pg_last_wal_replay_lsn" :result-type :pg-lsn
+                                        :volatility :volatile :strict-p t :evaluator 'sql-last-wal-replay-lsn)
+                   (make-scalar-builtin :name "pg_current_wal_lsn" :result-type :pg-lsn
+                                        :volatility :volatile :strict-p t :evaluator 'sql-current-wal-lsn)
+                   (make-scalar-builtin :name "pg_current_wal_flush_lsn" :result-type :pg-lsn
+                                        :volatility :volatile :strict-p t :evaluator 'sql-current-wal-flush-lsn)
+                   (make-scalar-builtin :name "pg_last_xact_replay_timestamp" :result-type :timestamptz
+                                        :volatility :volatile :strict-p t :evaluator 'sql-last-xact-replay-timestamp)
+                   (make-scalar-builtin :name "pg_postmaster_start_time" :result-type :timestamptz
+                                        :volatility :stable :strict-p t :evaluator 'postmaster-start-timestamp)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
@@ -1067,10 +1077,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
   (when args
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (list :func name args
-        :type (cond ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn"
-                                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn")
-                             :test #'string=) :pg-lsn)
-                    ((member name '("pg_is_in_recovery" "pg_is_wal_replay_paused") :test #'string=) :bool)
+        :type (cond ((string= name "pg_is_wal_replay_paused") :bool)
                     ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=) :void)
                     ((string= name "pg_lisp_cluster_identity") :varchar)
                     (t :text))
@@ -1796,12 +1803,9 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
-      ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index"
-                      "pg_postmaster_start_time" "pg_last_xact_replay_timestamp") :test #'string=)
+      ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
        (analyze-metadata-function name args))
-      ((member name '("version" "pg_lisp_runtime" "pg_current_wal_lsn"
-                      "pg_current_wal_flush_lsn" "pg_is_in_recovery"
-                      "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn"
+      ((member name '("version" "pg_lisp_runtime"
                       "pg_wal_replay_pause" "pg_wal_replay_resume"
                       "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
                       "pg_lisp_cluster_identity" "pg_export_snapshot"
@@ -3936,7 +3940,7 @@ checks still apply."
            (numeric-helper-function-p name)
            (member name
                    '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                     "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
+                     "current_catalog" "current_user" "session_user" "user"
                      "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                      "jsonb_build_array" "jsonb_build_object"
                      "substr" "substring" "length" "char_length" "character_length" "octet_length"
@@ -4577,16 +4581,23 @@ Stop at the first difference, leaving later field types and counts unchecked."
       (ereport "22003" "bigint out of range"))
     n))
 
-(defun eval-recovery-wal-function (name)
-  "Report actual recovery state; a base image has no walreceiver position."
-  (cond
-    ((string= name "pg_is_in_recovery") (recovery-in-progress-p))
-    ((string= name "pg_last_wal_receive_lsn")
-     (or (getf *physical-recovery-state* :receive-lsn) +null+))
-    ((string= name "pg_last_wal_replay_lsn") (or *last-replay-lsn* +null+))
-    (t
-     (prevent-recovery-primary-operation name)
-     (if (string= name "pg_current_wal_flush_lsn") *wal-durable-lsn* *wal-end-lsn*))))
+(defun sql-last-wal-receive-lsn ()
+  (or (getf *physical-recovery-state* :receive-lsn) +null+))
+
+(defun sql-last-wal-replay-lsn ()
+  (or *last-replay-lsn* +null+))
+
+(defun sql-current-wal-lsn ()
+  (prevent-recovery-primary-operation "pg_current_wal_lsn")
+  *wal-end-lsn*)
+
+(defun sql-current-wal-flush-lsn ()
+  (prevent-recovery-primary-operation "pg_current_wal_flush_lsn")
+  *wal-durable-lsn*)
+
+(defun sql-last-xact-replay-timestamp ()
+  (let ((timestamp (or *last-replay-xact-timestamp* 0)))
+    (if (zerop timestamp) +null+ timestamp)))
 
 (defun eval-logical-helper-function (name args)
   "Evaluate a supported logical helper, taking the write lock for catalog reads."
@@ -4715,10 +4726,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_promote") (pg-promote (first args) (second args)))
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
-    ((string= name "pg_postmaster_start_time") (postmaster-start-timestamp))
-    ((string= name "pg_last_xact_replay_timestamp")
-     (let ((timestamp (or *last-replay-xact-timestamp* 0)))
-       (if (zerop timestamp) +null+ timestamp)))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((member name '("chr" "array_to_string") :test #'string=)
      (eval-render-function name args))
@@ -4738,10 +4745,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_lisp_runtime")
      (format nil "~a ~a" (lisp-implementation-type)
              (lisp-implementation-version)))
-    ;; xlogfuncs.c returns the current WAL write location as a pg_lsn value.
-    ((member name '("pg_current_wal_lsn" "pg_current_wal_flush_lsn" "pg_is_in_recovery"
-                    "pg_last_wal_receive_lsn" "pg_last_wal_replay_lsn") :test #'string=)
-     (eval-recovery-wal-function name))
     ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume"
                     "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state") :test #'string=)
      (physical-replay-pause-command name))
