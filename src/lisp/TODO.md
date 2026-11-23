@@ -202,6 +202,10 @@ Callback execution and portals derive full-value TOAST demand and
 direct slice access through the same function. The callback clears
 scan-local access before delivery, and each portal pull restores its
 captured read context.
+SELECT and UPDATE share the conservative TOAST demand expression walk.
+Each caller retains its accepted expression forms and column-slot policy.
+UPDATE still maps OLD and NEW in RETURNING to the underlying table
+columns. The SELECT probe uses the physical IndexScan parameter accessor.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING
