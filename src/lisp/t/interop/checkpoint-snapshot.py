@@ -91,18 +91,18 @@ def check_stopped(pgdata):
     raise AssertionError("fixture conversion requires a stopped, owned test server")
 
 
-def convert_fixture(pgdata, facts, payload, *, retired_wal, retired_control, unsupported_insertion):
+def convert_fixture(pgdata, facts, payload, fixture):
     """Only the shell regression calls this, after killing and waiting its PID."""
     check_stopped(pgdata)
     assert facts["timeline"] == facts["previous"] == 1
     control = pgdata / "global/pg_wal_control"
     fields = control.read_text().split()[:-1]
     assert int(fields[1]) == int(fields[2]) == facts["end"]
-    if unsupported_insertion:
+    if fixture == "unsupported-insertion":
         fields[3] = "2"
-    elif retired_control:
+    elif fixture == "retired-control":
         fields = ["PGWAL5", *fields[1:5], payload]
-    elif retired_wal:
+    elif fixture == "retired-wal":
         segment = checkpoint_segment(pgdata, facts, fields[5])
         offset = facts["start"] % 16777216
         with segment.open("r+b") as stream:
@@ -118,7 +118,19 @@ def convert_fixture(pgdata, facts, payload, *, retired_wal, retired_control, uns
         return
     else:
         data = bytearray.fromhex(payload)
-        struct.pack_into("<q", data, 56, facts["time"] + 1)
+        if fixture == "retired-snapshot":
+            assert data[:8] == b"PGCKPT02"
+            # PGCKPT01 used only the base payload, with no presence flags.
+            del data[88:]
+            struct.pack_into("<I", data, 84, 0)
+            end = facts["start"] + 32 + len(data)
+            struct.pack_into("<Q", data, 16, end)
+            assert checkpoint(data)["end"] == end
+            fields[1] = str(end)
+            data[:8] = b"PGCKPT01"
+        else:
+            assert fixture == "corrupt-copy"
+            struct.pack_into("<q", data, 56, facts["time"] + 1)
         fields[6] = data.hex().upper()
     prefix = " ".join(fields)
     with control.open("wb") as stream:
@@ -134,17 +146,13 @@ def main():
     parser.add_argument("--expect", type=Path)
     parser.add_argument("--hex", action="store_true")
     fixture = parser.add_mutually_exclusive_group()
-    fixture.add_argument("--retired-wal-fixture", action="store_true")
-    fixture.add_argument("--retired-control-fixture", action="store_true")
-    fixture.add_argument("--corrupt-copy-fixture", action="store_true")
-    fixture.add_argument("--unsupported-insertion-fixture", action="store_true")
+    for kind in ("retired-wal", "retired-control", "retired-snapshot", "corrupt-copy",
+                 "unsupported-insertion"):
+        fixture.add_argument(f"--{kind}-fixture", dest="fixture", action="store_const", const=kind)
     args = parser.parse_args()
     facts, payload = read_copy(args.pgdata)
-    if any((args.retired_wal_fixture, args.retired_control_fixture,
-            args.corrupt_copy_fixture, args.unsupported_insertion_fixture)):
-        convert_fixture(pgdata=args.pgdata, facts=facts, payload=payload, retired_wal=args.retired_wal_fixture,
-                        retired_control=args.retired_control_fixture,
-                        unsupported_insertion=args.unsupported_insertion_fixture)
+    if args.fixture:
+        convert_fixture(args.pgdata, facts, payload, args.fixture)
         return
     if args.expect:
         assert facts == json.loads(args.expect.read_text())

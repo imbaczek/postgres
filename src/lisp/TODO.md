@@ -111,6 +111,11 @@ For B3, the checkpoint codec and independent inspection tools require
 PGCKPT02. The base snapshot can still omit optional facts. Exhausted
 FullXIDs, resource facts, commit timestamp counters, Boolean policy facts
 and logical ON intervals retain their existing encodings.
+The live checkpoint suite independently constructs an 88-byte PGCKPT01
+payload with no extension flags and matching record coordinates. A
+checksummed PGWAL6 envelope carrying that payload fails at the nested
+snapshot decoder, and the rejected control bytes remain unchanged.
+The original current-format image still replays and reaches restartpoint.
 
 For B4, buffer reads no longer move a historical B-tree type byte out of
 the checksum field. The checksum reader rejects that layout without

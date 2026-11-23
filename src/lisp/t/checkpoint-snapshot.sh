@@ -66,6 +66,15 @@ result=0
 timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/retired-control" >"$TMP/retired-control-start.log" 2>&1 || result=$?
 test "$result" -eq 1
 grep -q 'corrupt WAL control image' "$TMP/retired-control-start.log"
+cp -a "$TMP/source" "$TMP/retired-snapshot"
+python3 "$BASE/t/interop/checkpoint-snapshot.py" "$TMP/retired-snapshot" --retired-snapshot-fixture
+cp "$TMP/retired-snapshot/global/pg_wal_control" "$TMP/retired-snapshot.before"
+result=0
+timeout 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/retired-snapshot" \
+    >"$TMP/retired-snapshot-start.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -Fq 'corrupt or unsupported native checkpoint snapshot' "$TMP/retired-snapshot-start.log"
+cmp "$TMP/retired-snapshot.before" "$TMP/retired-snapshot/global/pg_wal_control"
 start_source
 test "$(sql "$PORT" 'SELECT count(*) FROM cp_data')" = 1
 probe --save "$TMP/old.json" >"$TMP/restarted-initial-copy.json"
