@@ -352,7 +352,9 @@ restartpoint fixtures share a stopped, TLI-1 legacy conversion that checks
 the control coordinates and WAL bytes. The restartpoint process suite passed
 with each source namespace, including startup refusal of an unproven pending
 promotion with its control extensions intact. Startup still reads the namespace in
-existing controls. Retiring the legacy grammar requires recreating or
+existing controls. The physical slot API fixtures use timeline-qualified WAL,
+with an explicit legacy namespace mutation for the recycling revalidation case.
+Retiring the legacy grammar requires recreating or
 retiring remaining development data, backups, and retained ancestral WAL.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.

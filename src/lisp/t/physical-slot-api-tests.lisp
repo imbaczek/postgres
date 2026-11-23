@@ -23,7 +23,7 @@
           (pg::*expired-exported-logical-snapshots* (make-hash-table :test #'equal))
           (pg::*wal-durable-lsn* 100)
           (pg::*wal-insert-timeline* 1)
-          (pg::*wal-segment-namespace* :legacy)
+          (pg::*wal-segment-namespace* :timeline)
           (pg::*backend* (pg::make-backend :pid 1234)))
       (declare (special pg::*max-replication-slots*))
       (pg::wal-ensure-directory-durable (pg::wal-replication-slot-directory))
@@ -569,7 +569,7 @@
                         (:checkpoint (incf pg::*wal-checkpoint-lsn*))
                         (:registry (setf pg::*wal-replication-slots* (make-hash-table :test #'equal)))
                         (:timeline (incf pg::*wal-insert-timeline*))
-                        (:namespace (setf pg::*wal-segment-namespace* :timeline))
+                        (:namespace (setf pg::*wal-segment-namespace* :legacy))
                         (:root (setf pg::*wal-control-metadata* (list :retained-reference '(1 2 3)))))))))
            (pg::wal-remove-checkpointed-segments checkpoint)
            (ok (zerop requests))
@@ -577,7 +577,7 @@
            (when replacement
              (ok (eq :reserved (pg::wal-replication-slot-wal-status replacement))))
            (when (member change '(:owner :generation :native-policy :control-system :recovery :failed :checkpoint :registry :timeline :namespace :root))
-             (let ((pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy))
+             (let ((pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :timeline))
                (ok (probe-file (pg::wal-segment-path 0))))))))))
 
 (deftest standard-slot-recycling-defers-inherited-resources
