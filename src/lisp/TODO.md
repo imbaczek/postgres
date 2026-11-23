@@ -1226,6 +1226,11 @@ and segment bytes and started the backup in recovery. The timing ledger
 retains these logs under `architecture-current-acceptance` and the page
 codec compiler and replay logs under `architecture-wal-components`.
 
+The current retention and automatic restartpoint process tests passed at
+`d3ba433c79e`. The restartpoint inspector verified the exact prefix after
+restart. It also confirmed that an unproven pending promotion left 28
+storage files unchanged. Both live logs are in the current acceptance archive.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
