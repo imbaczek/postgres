@@ -39,6 +39,17 @@ Only constant names can be tracked for persisted expressions and replication."
       (walk form))
     names))
 
+(defun default-strict-function-p (name)
+  "Use declared strictness for registered calls when folding a demanded default."
+  (let ((builtins (gethash name *scalar-builtin-descriptors*)))
+    (if builtins
+        (every #'scalar-builtin-strict-p builtins)
+        (or (having-immutable-function-p name)
+            (member name '("nextval" "currval" "setval" "pg_promote"
+                           "pg_get_expr" "pg_get_replica_identity_index"
+                           "pg_cancel_backend" "pg_terminate_backend")
+                    :test #'string=)))))
+
 (defun fold-column-default (expression)
   "Copy a demanded default, folding immutable parts before row execution.
 Conditional forms visit only live branches. Strict operators still fold every
@@ -118,11 +129,7 @@ those arguments therefore occur before any row execution or sequence effects."
                            ((:cast :not) (list (second copy)))
                            (:unary (list (third copy)))
                            (:func
-                            (when (or (having-immutable-function-p (second copy))
-                                      (member (second copy) '("nextval" "currval" "setval" "current_setting" "pg_promote"
-                                                              "pg_get_expr" "pg_get_replica_identity_index"
-                                                              "pg_cancel_backend" "pg_terminate_backend")
-                                              :test #'string=))
+                            (when (default-strict-function-p (second copy))
                               (third copy))))))
                   (if (some #'null-p strict-inputs) (constant +null+ copy)
                       (finish copy)))))))

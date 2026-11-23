@@ -7,6 +7,14 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE TABLE dc_registry_default(k int, s text DEFAULT current_setting(NULL, true), v text DEFAULT set_config('application_name', NULL, false))",
+    "SELECT set_config('application_name', 'before default', false)",
+    "INSERT INTO dc_registry_default(k) VALUES (1) RETURNING s, v",
+    "SELECT current_setting('application_name')",
+    "CREATE SEQUENCE dc_registry_strict_seq",
+    "CREATE TABLE dc_registry_strict_default(v int DEFAULT get_bit(NULL::bytea, nextval('dc_registry_strict_seq')))",
+    "INSERT INTO dc_registry_strict_default DEFAULT VALUES RETURNING v",
+    "SELECT nextval('dc_registry_strict_seq')",
     "SELECT pg_catalog.pg_reload_conf(1)",
     "SELECT pg_catalog.set_config('application_name'::name, 'registry'::varchar, 'false')",
     "SELECT current_setting('application_name')",
@@ -1231,7 +1239,7 @@ def check(reference, native):
             for sql in CASES:
                 if sql.startswith("CREATE TABLE "):
                     peer.observe("DROP TABLE IF EXISTS " + sql.split("(")[0].split()[2])
-            for name in ("dc_seq", "dc_order_seq"):
+            for name in ("dc_seq", "dc_order_seq", "dc_registry_strict_seq"):
                 peer.observe("DROP SEQUENCE IF EXISTS " + name)
         for index, sql in enumerate(CASES, 1):
             outcomes = [peer.observe(sql) for peer in peers]
