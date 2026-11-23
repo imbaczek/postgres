@@ -390,6 +390,9 @@ when source WAL itself uses the legacy namespace. Four strict heads passed,
 covering byte-identical retries, conflicting bytes and hard links, committed
 child matching, and proof retry after child WAL recycling. Previously staged
 legacy partials still use the existing reader and archiver validation.
+The live standby archive scenario passed with Patroni 4.1.5 and the matching
+C client library. It covered cold restart, archive retries, promoted-writer
+handoff, and an exact timeline-qualified fork proof after a second promotion.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
