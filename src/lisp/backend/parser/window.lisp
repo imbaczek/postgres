@@ -271,7 +271,7 @@
                        ((or (atom expression)
                             (member (first expression) '(:subplan :outer-ref :window-ref)))
                         expression)
-                       (t (mapcar #'key-reference expression))))))
+                       (t (map-local-expression-operands #'key-reference expression))))))
       (dolist (descriptor (coerce *select-window-functions* 'list))
         (setf (getf descriptor :input) (key-reference (getf descriptor :input))
               (getf descriptor :partition) (mapcar #'key-reference (getf descriptor :partition))

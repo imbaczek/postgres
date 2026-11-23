@@ -406,6 +406,9 @@ Window lowering now visits the caller-side `ANY`/`ALL` comparison without
 rewriting the prepared subquery. The expanded 171-case C window differential
 covers the single-row reproducer, changing caller rows, and an independent
 window in the right-hand subquery.
+Window key substitution preserves whole-expression slot matching and uses
+the same mapper for nested operands. A Rove check verifies slot reuse in the
+partition and target while preserving matching literal and call metadata.
 
 ## Open development tasks
 

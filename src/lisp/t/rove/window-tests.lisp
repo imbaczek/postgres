@@ -46,6 +46,26 @@
     (rove:ok (not (analyzed-expression-contains-set-p
                    (list :const record :type :text) :include-single-record t)))))
 
+(rove:deftest window-key-slots-replace-operands-without-changing-payloads
+    (let* ((key (aggregate-output-ref 2 :int4))
+           (literal (list :const key :type :text))
+           (call (list :func "f" (list key literal) :type :int4 :saved key))
+           (target (list :expr call))
+           (*cte-definition-analysis-p* nil)
+           (*select-window-functions* (vector (list :partition (list key)))))
+      (multiple-value-bind (order width keys unused)
+          (finalize-query-windows (list target) nil nil nil nil 2)
+        (rove:ok (null order))
+        (rove:ok (= width 3))
+        (rove:ok (equal keys (list key)))
+        (rove:ok (null unused)))
+      (rove:ok (equal (getf (aref *select-window-functions* 0) :partition)
+                      '((:col 3 :type :int4 :typmod -1))))
+      (let ((planned (getf target :expr)))
+        (rove:ok (equal (first (third planned)) '(:col 3 :type :int4 :typmod -1)))
+        (rove:ok (eq key (second (second (third planned)))))
+        (rove:ok (eq key (getf (cdddr planned) :saved))))))
+
 (rove:deftest window-ranking-contracts
     (let ((data (cl-spec:result-data
                  (cl-spec:check-function 'window-rank-step :trials 300 :seed 42))))
