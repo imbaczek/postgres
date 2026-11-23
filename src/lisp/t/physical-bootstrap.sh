@@ -25,8 +25,12 @@ cleanup() {
     exit "$status"
 }
 control() {
-    printf '%s\n(quit)\n' "$1" |
-        "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/source.sock"
+    test_lisp_control "$TMP/source.sock" "$1"
+}
+start_source() {
+    test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
+    SRV=$!
+    test_wait_owned_sql_server "$SRV" "$PORT" "$PSQL"
 }
 wait_file() {
     attempt=0
@@ -44,10 +48,7 @@ sql() {
         -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" \
-    --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
-SRV=$!
-test_wait_owned_sql_server "$SRV" "$PORT" "$PSQL"
+start_source
 sql "CREATE TABLE bootstrap_data (id integer PRIMARY KEY, label varchar(32)); INSERT INTO bootstrap_data VALUES (1,'base'),(2,'copy'); CREATE SEQUENCE standby_seq START WITH 7;"
 mkdir "$TMP/rejected"
 mkfifo "$TMP/transaction.fifo"
@@ -167,11 +168,7 @@ test "$crash_status" -eq 137
 SRV=
 test -f "$TMP/interrupted/recovery.required"
 test ! -f "$TMP/interrupted/physical-backup.manifest"
-rm -f "$TMP/source.sock"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" \
-    --control-socket "$TMP/source.sock" >>"$TMP/source.log" 2>&1 &
-SRV=$!
-test_wait_owned_sql_server "$SRV" "$PORT" "$PSQL"
+start_source
 test "$(sql 'SELECT count(*) FROM bootstrap_data;')" = 3
 control '(progn (assert (gethash "base_copy" pg::*physical-source-pins*)) (assert (gethash "broken_copy" pg::*physical-source-pins*)) (format t "CRASH-PINS-RESTORED~%"))' >"$TMP/restored.log"
 grep -q 'CRASH-PINS-RESTORED$' "$TMP/restored.log"

@@ -30,9 +30,7 @@ repl() {
         -qAt -v ON_ERROR_STOP=1 "$@"
 }
 start() {
-    rm -f "$TMP/standby.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/copy" \
-        --control-socket "$TMP/standby.sock" >>"$TMP/standby.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/copy" "$TMP/standby.sock" "$TMP/standby.log"
     SRV=$!
     test_wait_owned_sql_server "$SRV" "$PORT" "$PSQL"
 }
@@ -105,7 +103,7 @@ test "$sequence_before" = "$(sql -c "SELECT pg_lisp_sequence_state('standby_seq'
 if PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d missing_database \
         -c '' >"$TMP/missing-database.log" 2>&1; then exit 1; fi
 grep -q 'does not exist' "$TMP/missing-database.log"
-printf '(reload)\n(quit)\n' | "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/standby.sock" >"$TMP/reload.log"
+test_lisp_control_checked "$TMP/standby.sock" '(reload)' "$TMP/reload.log"
 grep -q 'reload complete' "$TMP/reload.log"
 test "$(sql -c 'SELECT pg_is_in_recovery();')" = t
 reject 25006 "INSERT INTO bootstrap_data VALUES (9,'after-reload')"

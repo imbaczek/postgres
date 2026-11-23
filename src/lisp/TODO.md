@@ -378,8 +378,11 @@ The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
 `../pg-ha-artifacts` directory found no native WAL segments, partial files,
-proofs or archive status entries in either filename grammar. Other cluster
-directories and backups still need a separate inventory.
+proofs or archive status entries in either filename grammar. A read-only scan
+of the wider project directory found no 16-hex or 24-hex native WAL files and
+no primary WAL control files. It found 47 physical backup manifests, which
+still need to be classified before the cutover. Data outside the project
+directory was outside that scan.
 Retiring the legacy grammar requires recreating or
 retiring remaining development data, backups, and retained ancestral WAL.
 
@@ -838,6 +841,11 @@ next fixture's device and inode and reproduced the missing-catalog error.
 Each real-startup fixture now owns its fence table for the lifetime of its
 temporary host. The same probe started successfully with this binding. The
 combined rerun passed Rove and all 1,172 legacy checks.
+
+The live physical bootstrap and static standby scripts share native startup
+and control helpers. The standby run also completed bootstrap with SBCL unset
+in the environment. It verified recovery read-only behavior, reload, crash
+restart, unchanged backup bytes, and refusal of five damaged image variants.
 
 ### A18 runner diagnostics
 
