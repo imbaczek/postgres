@@ -460,8 +460,12 @@ The gate skeleton and folder now share the analyzed `IN` layout, including
 scalar operands, array operands and typed comparison pairs. The regression
 witnesses callback order and source ownership. Array access now also shares
 operand mapping, preserving the folder's upper-bounds, lower-bounds, then
-base order and keeping omitted bounds intact. The separate semantic-key
-encoder remains to audit.
+base order and keeping omitted bounds intact. Semantic keys encode literal
+values, window frame metadata and sort directions in addition to executable
+operands. The encoder retains its structural traversal so these fields
+continue to contribute to equality. Window key refresh uses the scoped
+mapper and refreshes the caller-side subplan comparison in place. It
+preserves the independently prepared query and opaque payloads.
 
 ## Open development tasks
 

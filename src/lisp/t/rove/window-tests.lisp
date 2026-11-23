@@ -23,6 +23,23 @@
                (setf rank next-rank dense next-dense))
           always (and (= rank start) (= dense groups)))))
 
+(rove:deftest window-key-refresh-respects-comparison-and-query-scope
+    (let* ((*select-named-windows* nil)
+           (window (list :kind :row-number :type :int8))
+           (*select-window-functions* (vector window))
+           (reference (list :window-ref 0 :type :int8 :window-key nil))
+           (opaque (list :window-ref 99 :type :int8 :window-key nil))
+           (child (list :targets (list (list :expr opaque))))
+           (descriptor (make-sql-subplan :test reference :prepared child))
+           (expression (list :func "f" (list (list :subplan descriptor) (list :const opaque))
+                             :saved opaque)))
+      (resolve-query-window-specifications nil (list (list :expr expression)))
+      (rove:ok (equal (sql-expression-key-value (getf (cddr reference) :window-key))
+                      (subquery-semantic-key window)))
+      (rove:ok (eq (sql-subplan-test descriptor) reference))
+      (rove:ok (eq (getf (first (getf child :targets)) :expr) opaque))
+      (rove:ok (null (getf (cddr opaque) :window-key)))))
+
 (rove:deftest window-references-lower-only-in-local-operands
     (let* ((reference '(:window-ref 2 :type :int8))
            (literal (list :const reference :type :text))

@@ -203,8 +203,13 @@
                            :value (subquery-semantic-key
                                    (aref *select-window-functions* (second expression)))))
                     expression)
-                   ((subquery-expression-p expression) expression)
-                   (t (mapcar #'refresh expression)))))
+                   ((eq (first expression) :outer-ref) expression)
+                   ((subquery-expression-p expression)
+                    (let ((descriptor (second expression)))
+                      (setf (sql-subplan-test descriptor)
+                            (refresh (sql-subplan-test descriptor))))
+                    expression)
+                   (t (map-local-expression-operands #'refresh expression)))))
     (dolist (target targets)
       (setf (getf target :expr) (refresh (getf target :expr))))))
 
