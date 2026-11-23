@@ -30,6 +30,8 @@ production."
     (wal-require-no-temp-cleanup-under-lock))
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-id namespace metadata)
       (wal-read-control-fields)
+    (when (and (eq namespace :legacy) (startup-primary-wal-archive-enabled-p))
+      (error "primary WAL archiving requires timeline-qualified WAL names; migrate the legacy namespace with archive_mode=off"))
     (when metadata
       (wal-require-supported-timelines insertion checkpoint-id)
       (wal-atomic-write-bytes

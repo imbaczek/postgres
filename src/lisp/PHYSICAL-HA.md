@@ -13,7 +13,7 @@ when each recorded check ran.
 | --- | --- |
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
 | Primary WAL control and checkpoint payload | `PGWAL6` and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
-| Primary WAL filenames | Fresh clusters use 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Startup and backup still honor the namespace recorded in `PGWAL6`, including 16-digit legacy TLI-1 names. The receive spool has its own naming contract. Existing primaries can use the [namespace migration operation](#timeline-qualified-native-wal-namespace). |
+| Primary WAL filenames | Fresh clusters use 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. A primary with archiving enabled requires timeline-qualified names. Start a legacy primary with `archive_mode=off` to use the [namespace migration operation](#timeline-qualified-native-wal-namespace). Backup still honors the namespace recorded in `PGWAL6`. The receive spool has its own naming contract. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
 | Physical receive control | `PGPHYS03`, with the current base, history-selection, and retained-root forms. |

@@ -88,6 +88,16 @@ fi
 cp -a "$TMP/source" "$TMP/baseline"
 inspect_source --namespace legacy --save "$TMP/before.json"
 
+# The primary must migrate before producing new archives.
+archive_start_status=0
+timeout -k 2 20 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" \
+    -c archive_mode=on >"$TMP/legacy-archive-startup.log" 2>&1 || archive_start_status=$?
+test "$archive_start_status" -eq 1
+grep -Fq 'primary WAL archiving requires timeline-qualified WAL names' "$TMP/legacy-archive-startup.log"
+cmp "$TMP/baseline/global/pg_wal_control" "$TMP/source/global/pg_wal_control"
+diff -r "$TMP/baseline/pg_wal" "$TMP/source/pg_wal"
+inspect_source --namespace legacy --expect "$TMP/before.json"
+
 for phase in after-link after-links-sync after-control-rename after-control-before-memory after-memory after-cleanup-link; do
     restore_baseline
     start_source

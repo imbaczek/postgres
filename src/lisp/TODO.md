@@ -420,6 +420,12 @@ from the archiver queue, and qualified restore only at the exact fork.
 The complete-segment legacy fallback stays available for now.
 The live Patroni archive-descendant observer replayed the child-only row
 from the archive and retained it across restart.
+Primary startup now requires qualified WAL when archiving is enabled.
+Legacy primaries can still migrate with archiving disabled. Both archive
+modes refused legacy startup with unchanged control bytes and WAL inventory.
+The full namespace migration suite passed, including crash retries,
+continued follow, and qualified bootstrap. Five strict control and archive
+heads passed.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
