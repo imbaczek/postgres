@@ -625,7 +625,8 @@ The supported ambiguous bit and bytea overloads have no text candidate."
   "Coerce a resolved input, retaining the concrete type for polymorphic arrays."
   (cond
     ((eq type :anyarray)
-     (when (in-unknown-constant-p argument)
+     ;; Scalar decorations are rejected after lookup and before polymorphic resolution.
+     (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
        (ereport "42804" "could not determine polymorphic type because input has type unknown"))
      (if (eq (expr-type argument) :int2vector)
          (list :cast argument :type :int2-array :typmod -1)

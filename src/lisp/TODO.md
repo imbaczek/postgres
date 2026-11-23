@@ -520,8 +520,10 @@ slices of external values.
 The two `array_to_string` overloads use registry polymorphic array
 matching and stable volatility. The two-argument call is strict and
 the three-argument call accepts a NULL replacement. The recursive CTE
-differential passed 139 comparisons, including array dimensions,
-`int2vector`, NULL replacements, and unresolved array input.
+differential passed 142 comparisons, including array dimensions,
+`int2vector`, NULL replacements, and unresolved array input. After
+signature lookup, scalar `DISTINCT` and `ORDER BY` errors take precedence
+over polymorphic type resolution, matching C.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
