@@ -37,8 +37,7 @@ sql() {
     PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"
 }
 start() {
-    rm -f "$CASE/control.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" --control-socket "$CASE/control.sock" >>"$CASE/server.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$CASE/data" "$TMP/c.sock" "$CASE/server.log"
     SERVER=$!
     test_wait_owned_sql_server "$SERVER" "$PORT" "$PSQL"
     test "$(sql 'SELECT pg_is_in_recovery()')" = f
@@ -64,7 +63,7 @@ cycle() {
     test "$(sql 'SELECT count(*) FROM promoted_items')" = 1
     sql 'INSERT INTO promoted_items VALUES (102)'
     printf '(load "%s/t/promotion-fill-wal.lisp")\n(promotion-test-fill-wal)\n(quit)\n' "$BASE" |
-        "$SBCL" --script "$BASE/t/control-client.lisp" unix "$CASE/control.sock" >"$CASE/fill.log"
+        "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/c.sock" >"$CASE/fill.log"
     if grep -q ';; error:' "$CASE/fill.log"; then cat "$CASE/fill.log" >&2; exit 1; fi
     sql CHECKPOINT
     test ! -e "$CASE/data/pg_wal/000000020000000000000000.wal"
@@ -74,7 +73,7 @@ cycle() {
     inspect check "$CASE/data" "$CASE/expected.json" later
     stop
 }
-points='normal after-pending-retained-registration after-child-history-sync after-child-eor-write after-child-eor-flush after-child-batch-write after-child-checkpoint-write after-child-checkpoint-flush after-child-data-sync after-child-control-rename after-child-control-directory-fsync after-child-primary-initialization after-primary-retained-registration after-retire-required after-retire-manifest after-retire-follow after-retire-pointer after-retire-pending after-pending-retained-retirement after-child-primary-ready'
+points='normal after-pending-retained-registration after-child-history-sync after-child-eor-write after-child-eor-flush after-child-batch-write after-child-checkpoint-write after-child-checkpoint-flush after-child-data-sync after-child-control-rename after-child-control-directory-fsync after-child-primary-initialization after-primary-retained-registration after-retire-required after-retire-manifest after-retire-follow-transfer after-retire-pointer after-retire-pending after-pending-retained-retirement after-child-primary-ready'
 for point in $points; do
     CASE=$TMP/$point
     mkdir -m 700 "$CASE"
@@ -100,6 +99,7 @@ for point in $points; do
     fi
     case "$point" in
         after-child-checkpoint-write|after-child-control-rename) cp -a "$CASE/data" "$CASE/crash-data" ;;
+        after-retire-follow-transfer) inspect check-follow-transfer "$CASE/data" "$CASE/expected.json" ;;
     esac
     case "$point" in
         after-child-control-*|after-child-primary-*|after-retire-*|after-primary-retained-registration|after-pending-retained-retirement)
@@ -145,7 +145,11 @@ for kind in foreign-staging oversized-staging orphan-history bad-child-checkpoin
     esac
     cp -a "$source_case/crash-data" "$CASE/data"
     cp "$source_case/expected.json" "$CASE/expected.json"
-    inspect damage "$CASE/data" "$CASE/expected.json" "$kind"
+    if [ "$kind" = oversized-staging ]; then
+        inspect damage "$CASE/data" "$CASE/expected.json" "$kind" "$TMP/after-child-control-rename/crash-data"
+    else
+        inspect damage "$CASE/data" "$CASE/expected.json" "$kind"
+    fi
     python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --snapshot-storage "$CASE/data" "$CASE/before.json"
     set +e
     timeout -k 2 15 "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1

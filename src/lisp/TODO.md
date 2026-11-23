@@ -376,6 +376,11 @@ The live restartpoint seed also defaults to qualified WAL. The dual-namespace
 promotion commit scenario explicitly requests a legacy seed for its first
 case. Live restartpoint tests passed with the new default and explicit legacy
 selection. The default seed also passed the online promotion crash suite.
+The automatic promotion commit suite passed with both seed namespaces. Its
+owned fixture installs startup resource capacity and verifies durable follow
+cleanup transfer before restarting the crashed process. The oversized
+checkpoint fixture appends one byte to the exact staged record and checks
+startup refusal without file mutation.
 Promotion fixtures pass the requested namespace to base setup, including
 explicit legacy cases, so the base is written under the selected name from
 the start.

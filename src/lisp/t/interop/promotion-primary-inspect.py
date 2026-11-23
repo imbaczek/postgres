@@ -75,6 +75,16 @@ def save_expected(target, output):
                 "parent_history": parent_history, "parent_digest": parent_digest,
                 "pending_control": state.hex(),
                 "retained_reference": ARCHIVE["retained_reference"](state)}
+    manifest_image = (root / "physical-backup.manifest").read_bytes()
+    manifest = ARCHIVE["plist"](ARCHIVE["literal"](manifest_image.split(b"\n", 1)[1].decode("ascii")))
+    manifest_digest = ARCHIVE["fnv"](manifest_image)
+    assert manifest_digest == struct.unpack_from("<Q", state, 24)[0]
+    expected["bootstrap_follow"] = {
+        ":PIN": manifest[":SOURCE-PIN"],
+        ":REQUEST": [":VERSION", 1, ":SYSTEM-ID", expected["system_id"],
+                     ":SOURCE-TIMELINE", manifest[":TIMELINE"], ":BASE", manifest[":END"],
+                     ":MANIFEST-DIGEST", manifest_digest],
+    }
     if resources is not None:
         expected["resource_fact"] = resources
     pathlib.Path(output).write_text(json.dumps(expected, sort_keys=True))
@@ -146,9 +156,25 @@ def check_primary(target, expected_path, initial):
     else:
         assert initial == "later"
     for name in ("recovery.required", "physical-backup.manifest", "physical-recovery.control",
-                 "physical-restartpoint.control", "physical-follow.control"):
+                 "physical-restartpoint.control"):
         assert not (root / name).exists(), f"retired metadata remains: {name}"
+    check_follow_transfer(root, expected_path)
     print(f"promotion-primary-inspect: {initial} child={child} checkpoint={checkpoint} PASS")
+
+
+def check_follow_transfer(target, expected_path):
+    root = pathlib.Path(target)
+    expected = json.loads(pathlib.Path(expected_path).read_text())
+    header, body = (root / "physical-follow.control").read_bytes().split(b"\n", 1)
+    magic, checksum = header.split()
+    assert magic == b"PGPHYSICALFOLLOW1" and body.endswith(b"\n")
+    assert crc32c(body[:-1]) == int(checksum, 16)
+    config = ARCHIVE["literal"](body.decode("ascii"))
+    assert config[:5] == [1, None, None, None, None] and len(config) == 6
+    state = ARCHIVE["plist"](config[5])
+    assert ARCHIVE["plist"](state.pop(":UNOWNED-BOOTSTRAP")) == expected["bootstrap_follow"]
+    assert state == {":VERSION": 1, ":ENABLED": None, ":PREPARING": None, ":CLEANUP": None,
+                     ":KNOWN-TIMELINE": expected["parent"]}
 
 
 def drop_retired(target):
@@ -181,7 +207,7 @@ def checkpoint_bytes(expected):
     return start, record
 
 
-def damage(target, expected_path, kind):
+def damage(target, expected_path, kind, committed=None):
     root = pathlib.Path(target)
     expected = json.loads(pathlib.Path(expected_path).read_text())
     start, record = checkpoint_bytes(expected)
@@ -203,7 +229,18 @@ def damage(target, expected_path, kind):
         struct.pack_into("<I", record, 28, crc32c(record))
         path.write_bytes(path.read_bytes()[:offset] + record)
     elif kind == "oversized-staging":
-        path.write_bytes(path.read_bytes()[:offset] + record + b"x")
+        # Preserve the staged checkpoint's real policy extensions. Only its
+        # final extent should differ from the expected complete frame.
+        committed_root = pathlib.Path(committed)
+        _, _, _, _, _, snapshot = control(committed_root)
+        actual_start = struct.unpack_from("<Q", snapshot, 8)[0]
+        assert actual_start == start
+        actual = read_record(committed_root, expected["child"], start, len(snapshot) + 32, 4)
+        assert actual[32:] == snapshot
+        data = path_for(committed_root, expected["child"], start).read_bytes()
+        assert len(data) == offset + len(actual)
+        assert data.startswith(path.read_bytes())
+        path.write_bytes(data + b"x")
     elif kind == "bad-child-checkpoint":
         data = bytearray(path.read_bytes())
         data[offset + 119] ^= 1
@@ -230,5 +267,6 @@ def damage(target, expected_path, kind):
 
 
 if __name__ == "__main__":
-    {"expected": save_expected, "check": check_primary, "drop-retired": drop_retired,
+    {"expected": save_expected, "check": check_primary, "check-follow-transfer": check_follow_transfer,
+     "drop-retired": drop_retired,
      "damage": damage}[sys.argv[1]](*sys.argv[2:])

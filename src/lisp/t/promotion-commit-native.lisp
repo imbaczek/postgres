@@ -7,8 +7,17 @@
 (in-package #:pg)
 
 (defun promotion-commit-native ()
-  (setf *pgdata* (uiop:ensure-directory-pathname (uiop:getenv "PG_PROMOTION_DATA")))
-  (postmaster-own-data-directory "127.0.0.1" (parse-integer (uiop:getenv "PG_PROMOTION_PORT")))
+  (multiple-value-bind (host port pgdata control-port control-socket
+                        swank-port swank-bind-address temp-limit sort-limit
+                        slot-limit settings native overrides)
+      (parse-args (list "-D" (uiop:getenv "PG_PROMOTION_DATA")
+                        "-p" (uiop:getenv "PG_PROMOTION_PORT")))
+    (declare (ignore control-port control-socket swank-port swank-bind-address
+                     temp-limit sort-limit slot-limit))
+    (setf *pgdata* (directory-pathname pgdata))
+    (startup-install-initial-settings settings native overrides)
+    (startup-install-resource-capacity settings)
+    (postmaster-own-data-directory host port))
   (unwind-protect
        (let ((*physical-promotion-test-hook*
                (lambda (point)
