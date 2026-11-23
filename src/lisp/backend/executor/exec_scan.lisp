@@ -1669,8 +1669,9 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
   "Pad an unmatched join row and its optional origin vector on the missing side."
   (let* ((values (if null-first-p (concatenate 'vector null-row row)
                      (concatenate 'vector row null-row)))
-         (padded-origins (when capture-p (make-array (length values) :initial-element nil))))
-    (when (and padded-origins origins)
+         (padded-origins (when (and capture-p origins)
+                           (make-array (length values) :initial-element nil))))
+    (when padded-origins
       (replace padded-origins origins :start1 (if null-first-p (length null-row) 0)))
     (values values padded-origins)))
 
@@ -1709,7 +1710,7 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (with-query-temp-files ()
                            (with-query-row-spool (right-spool spool-memory)
                              (labels ((run-join (matched-right)
-                                        (let ((right-loaded nil) (outer-seen nil) (stopped nil))
+                                        (let ((right-loaded nil) (outer-seen nil) (stopped nil) (matched-left nil))
                                           (labels
                                               ((emit (environment origins presence)
                                                  (let ((*query-row-origins* origins) (*query-row-presence* presence))
@@ -1723,16 +1724,16 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                                (stored-origins (stored)
                                                  (when capture-p (datum-origins-from-spill (second stored))))
                                                (process-right (left left-origins left-presence right right-origins
-                                                               right-presence right-index matched-left)
+                                                               right-presence right-index)
                                                  (check-for-interrupts)
                                                  (multiple-value-bind (joined origins presence)
                                                      (qualify-select-join-pair join qual left right left-origins right-origins
                                                                                left-presence right-presence t)
                                                    (when joined
-                                                     (setf (car matched-left) t)
+                                                     (setf matched-left t)
                                                      (when matched-right (query-match-map-mark matched-right right-index))
                                                      (emit joined origins presence))))
-                                               (load-right-for-left (left left-origins left-presence matched-left)
+                                               (load-right-for-left (left left-origins left-presence)
                                                  (setf right-loaded t)
                                                  (funcall right-stream
                                                           (lambda (right)
@@ -1743,14 +1744,13 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                                                 (unless (= index (query-match-map-append matched-right))
                                                                   (error "Join spool and match map lost row alignment")))
                                                               (process-right left left-origins left-presence right right-origins
-                                                                             right-presence index matched-left))))
+                                                                             right-presence index))))
                                                  (unless stopped (query-row-spool-seal right-spool)))
                                                (visit-left (left)
                                                  (unless stopped
                                                    (check-for-interrupts)
-                                                   (setf outer-seen t)
-                                                   (let ((matched-left (list nil))
-                                                         (left-origins *query-row-origins*)
+                                                   (setf outer-seen t matched-left nil)
+                                                   (let ((left-origins *query-row-origins*)
                                                          (left-presence *query-row-presence*))
                                                      (if right-loaded
                                                          (map-query-row-spool
@@ -1758,9 +1758,9 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                                           (lambda (stored index)
                                                             (process-right left left-origins left-presence
                                                                            (first stored) (stored-origins stored)
-                                                                           (third stored) index matched-left)))
-                                                         (load-right-for-left left left-origins left-presence matched-left))
-                                                     (when (and (not stopped) (not (car matched-left))
+                                                                           (third stored) index)))
+                                                         (load-right-for-left left left-origins left-presence))
+                                                     (when (and (not stopped) (not matched-left)
                                                                 (member join-type '(:left :full)))
                                                        (multiple-value-bind (row origins)
                                                            (null-extend-select-join-row left left-origins null-right nil left-origins)

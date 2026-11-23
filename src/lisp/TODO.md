@@ -402,6 +402,11 @@ Push and pull nested-loop joins now use the same work-memory split
 between the replay spool and right-row match map. A zero-spill-quota
 regression checks that both drivers can keep an inner join in memory
 at a budget where a full join needs to spill.
+Both drivers leave origins absent when null-extending a row without
+origin metadata. The presence regression checks that distinction with
+origin capture enabled, in memory and on disk. The push driver keeps one
+match flag per join execution. An SBCL REPL probe over 100,000 left rows
+and an empty right input measured about 1.6 MB less allocation.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

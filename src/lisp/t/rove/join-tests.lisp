@@ -20,6 +20,7 @@
 (rove:deftest joins-preserve-source-presence-in-memory-and-on-disk
     (dolist (memory '(1 100000))
       (let ((*query-work-memory-bytes* memory)
+            (*datum-origin-capture* t)
             (*query-temp-directory* (uiop:temporary-directory)))
         (dolist (type '(:inner :left :right :full))
           (dolist (match-p '(nil t))
@@ -49,6 +50,7 @@
                                         #'left-stream #'right-stream join
                                         (lambda (row)
                                           (rove:ok (every (lambda (value) (eq value +null+)) row))
+                                          (rove:ok (null *query-row-origins*))
                                           (push (copy-seq *query-row-presence*) callback-presence)
                                           nil))
                                        (let ((iterator (make-nested-loop-iterator join (input 11) (input 12))))
@@ -56,6 +58,7 @@
                                               (map-sql-iterator iterator
                                                                 (lambda (row)
                                                                   (declare (ignore row))
+                                                                  (rove:ok (null *query-row-origins*))
                                                                   (push (copy-seq *query-row-presence*) iterator-presence)))
                                            (close-sql-iterator iterator))))
                                      (rove:ok (equalp (nreverse callback-presence) expected))
