@@ -352,14 +352,16 @@
   (if (getf prepared :ctes) (list :with-ctes (getf prepared :ctes) tree) tree))
 
 (defun cte-reference-filter-p (form relation)
-  (cond ((atom form) t)
-        ((member (first form) '(:subplan :outer-ref :window-ref :whole-row)) nil)
-        ((eq (first form) :col)
-         (< (getf relation :offset) (second form)
-            (1+ (+ (getf relation :offset) (getf relation :width)))))
-        ((and (eq (first form) :func) (cte-expression-volatile-p form)) nil)
-        (t (and (cte-reference-filter-p (car form) relation)
-                (cte-reference-filter-p (cdr form) relation)))))
+  (let* ((offset (getf relation :offset))
+         (end (+ offset (getf relation :width))))
+    (not (some-local-plan-expression
+          (lambda (node walk)
+            (declare (ignore walk))
+            (case (first node)
+              ((:subplan :outer-ref :window-ref :whole-row) t)
+              (:col (not (< offset (second node) (1+ end))))
+              (otherwise (cte-volatile-call-p node))))
+          form))))
 
 (defun substitute-cte-output-columns (form relation)
   (cond ((atom form) form)
@@ -367,8 +369,8 @@
          (copy-tree (getf (nth (- (second form) (getf relation :offset) 1)
                                (getf (sql-cte-prepared (getf relation :cte)) :targets))
                           :expr)))
-        (t (cons (substitute-cte-output-columns (car form) relation)
-                 (substitute-cte-output-columns (cdr form) relation)))))
+        (t (map-local-expression-operands
+            (lambda (operand) (substitute-cte-output-columns operand relation)) form))))
 
 (defun cte-reference-producer-tree (tree qual)
   (cond ((null qual) tree)

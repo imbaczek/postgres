@@ -1,6 +1,24 @@
 ;;;; cte-tests.lisp -- shared demand-driven query producers and WITH scope.
 (in-package #:pg)
 
+(rove:deftest cte-filter-pushdown-rewrites-only-local-column-operands
+    (let* ((column '(:col 3 :type :int4))
+           (foreign '(:col 99 :type :int4))
+           (literal (list :const foreign :type :text))
+           (source '(:const 17 :type :int4))
+           (definition (make-sql-cte :prepared (list :targets (list (list :expr source)))))
+           (relation (list :offset 2 :width 1 :cte definition))
+           (filter (list :func "lower" (list column literal) :type :text :saved foreign)))
+      (rove:ok (cte-reference-filter-p filter relation))
+      (rove:ok (not (cte-reference-filter-p foreign relation)))
+      (rove:ok (not (cte-reference-filter-p '(:func "nextval" nil) relation)))
+      (rove:ok (not (cte-reference-filter-p (list :outer-ref 1 column) relation)))
+      (let ((rewritten (substitute-cte-output-columns filter relation)))
+        (rove:ok (equal (first (third rewritten)) source))
+        (rove:ok (not (eq (first (third rewritten)) source)))
+        (rove:ok (eq (second (second (third rewritten))) foreign))
+        (rove:ok (eq (getf (cdddr rewritten) :saved) foreign)))))
+
 (rove:deftest cte-volatility-follows-executable-operands-and-subqueries
     (let* ((volatile '(:func "nextval" nil :type :int8))
            (literal (list :const volatile :type :text))

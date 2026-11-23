@@ -412,6 +412,10 @@ partition and target while preserving matching literal and call metadata.
 The read-only visitor and the rewriting mapper now share one operand layout
 table. The visitor can inspect subplan tests and outer-reference operands.
 The mapper preserves both boundary nodes for callers that own the rewrite.
+CTE filter pushdown uses these same rules for both eligibility and column
+substitution. The regression checks out-of-scope and volatile operands,
+owned copies of substituted expressions, and unchanged literal and call
+metadata. The 114-case CTE differential passed.
 
 ## Open development tasks
 
