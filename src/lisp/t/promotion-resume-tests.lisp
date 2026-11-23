@@ -141,8 +141,9 @@
                                (when (and (eq ,point :clog-open) (= phase 1))
                                  (setf clog-armed t))))
                            (symbol-function 'pg::physical-restartpoint-prepare-storage)
-                           (lambda (store)
-                             (prog1 (funcall (original 'pg::physical-restartpoint-prepare-storage) store)
+                           (lambda (&rest arguments)
+                             (multiple-value-prog1
+                                 (apply (original 'pg::physical-restartpoint-prepare-storage) arguments)
                                (when (eq ,point :clog-open) (setf clog-armed t))))
                            (symbol-function 'pg::physical-store-open)
                            (lambda (&rest arguments)

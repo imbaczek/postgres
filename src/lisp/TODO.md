@@ -1231,6 +1231,14 @@ The current retention and automatic restartpoint process tests passed at
 restart. It also confirmed that an unproven pending promotion left 28
 storage files unchanged. Both live logs are in the current acceptance archive.
 
+The frozen `d3ba433c79e` physical selection completed 702 heads in
+369.18 seconds with two cold-recovery fixture failures. Its restartpoint
+fault hook accepted only a store argument, while the production call
+passes `:allow-clog-reset`. The fixture now forwards the full argument
+list and both return values. All four cold-recovery fault heads passed
+with a fresh strict compile, including streaming and static late exits,
+interrupted receive handoff, and CLOG registration before interruption.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
