@@ -129,15 +129,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
              (when (and tuple (htup-visible-p tuple snapshot))
                (let ((row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
                      (origins (and capture-p (htup-origins tuple))))
-                 (return
-                   (values (if (getf relation :join-order-base)
-                               (make-select-relation-environment relations relation row)
-                               row)
-                           t
-                           (if (getf relation :join-order-base)
-                               (make-select-relation-origins relations relation origins)
-                               origins)
-                           nil presence))))))))
+                 (multiple-value-bind (projected-row projected-origins)
+                     (project-select-scan-row relations relation row origins)
+                   (return (values projected-row t projected-origins nil presence)))))))))
      (lambda () (close-sql-iterator tids)))))
 
 (defun make-select-scan-iterator (node relations)
@@ -170,11 +164,8 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
          (check-for-interrupts)
          (when rows
            (let ((row (pop rows)))
-             (return
-               (values (if (getf relation :join-order-base)
-                           (make-select-relation-environment relations relation row)
-                           row)
-                       t nil nil presence))))
+             (return (values (project-select-scan-row relations relation row nil)
+                             t nil nil presence))))
          (when page-reader
            (multiple-value-bind (tuple present) (sql-iterator-next page-reader)
              (when present
@@ -189,15 +180,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                                                 (list (pg-class-toast table) value snapshot values)))))
                       (row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
                       (origins (and capture-p (htup-origins tuple))))
-                 (return
-                   (values (if (getf relation :join-order-base)
-                               (make-select-relation-environment relations relation row)
-                               row)
-                           t
-                           (if (getf relation :join-order-base)
-                               (make-select-relation-origins relations relation origins)
-                               origins)
-                           toast-context presence))))
+                 (multiple-value-bind (projected-row projected-origins)
+                     (project-select-scan-row relations relation row origins)
+                   (return (values projected-row t projected-origins toast-context presence)))))
              (close-sql-iterator page-reader)
              (setf page-reader nil)))
          (when (or source (>= block nblocks)) (return (values nil nil)))

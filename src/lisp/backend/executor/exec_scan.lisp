@@ -1622,23 +1622,19 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
         (scan-select-path table (pg-class-relfilenode table) path snapshot
                           callback environment))))
 
-(defun make-select-relation-environment (relations relation row)
-  "Place ROW in its source-order slots after a greedy join-order scan."
-  (let* ((width (or (getf relation :environment-width)
-                    (reduce #'+ relations :key (lambda (spec) (getf spec :width))
-                                          :initial-value 0)))
-         (environment (make-array width :initial-element +null+)))
-    (replace environment row :start1 (getf relation :offset))
-    environment))
-
-(defun make-select-relation-origins (relations relation origins)
-  "Place ORIGINS in the same source-order slots as a reordered scan row."
-  (when origins
-    (let* ((width (or (getf relation :environment-width)
-                      (reduce #'+ relations :key (lambda (spec) (getf spec :width)) :initial-value 0)))
-           (result (make-array width :initial-element nil)))
-      (replace result origins :start1 (getf relation :offset))
-      result)))
+(defun project-select-scan-row (relations relation row origins)
+  "Return ROW and ORIGINS in source order, borrowing both when no placement is needed."
+  (if (getf relation :join-order-base)
+      (let* ((width (or (getf relation :environment-width)
+                        (reduce #'+ relations :key (lambda (spec) (getf spec :width))
+                                              :initial-value 0)))
+             (offset (getf relation :offset))
+             (environment (make-array width :initial-element +null+))
+             (placed-origins (when origins (make-array width :initial-element nil))))
+        (replace environment row :start1 offset)
+        (when placed-origins (replace placed-origins origins :start1 offset))
+        (values environment placed-origins))
+      (values row origins)))
 
 (defun make-select-result-row (environment where targets)
   "Apply WHERE before projecting ENVIRONMENT, retaining it for ORDER BY."

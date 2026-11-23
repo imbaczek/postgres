@@ -645,6 +645,12 @@ list reversal for each source row. The LIMIT expansion owns lazy child opening
 and caching. REPL allocation probes still measured approximately 112 bytes
 per eager wrapper and 144 per lazy wrapper. The focused strict tests, the
 key-slot and parent-frame regressions, and live LIMIT checks passed.
+Callback scans and portal heap, index, and virtual scans now share source-order
+row and datum-origin placement. A REPL probe over 100,000 rows matched the
+previous allocation in all three cases: zero for borrowed vectors, one array
+per reordered row, and a second array when origins were present. All 82 strict
+scan, origin, presence, and join selections passed, along with the live C DML
+differential, resumed portal checks, and native TOAST DML.
 
 For A4, the drop and resource proofs share private stage construction and
 record validation with promotion where they use the same ordering. Follow

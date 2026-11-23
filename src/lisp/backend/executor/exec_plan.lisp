@@ -1877,25 +1877,19 @@ ROW's source environment.  Only final target origins leave this projection."
 (defun execute-physical-scan-node (node registered-relations outer-environment emit)
   (let* ((relation (physical-scan-relation node registered-relations))
          (path (physical-scan-path node relation))
+         (source (getf relation :row-source))
          (presence (vector (ensure-select-source-identity relation))))
     (scan-select-relation
      relation path *current-snapshot*
      (lambda (row)
        (check-for-interrupts)
-       (let* ((*query-row-presence* presence)
-              (environment (if (getf relation :row-source)
-                               row
-                               (htup-values row)))
-              (*query-row-origins*
-                (and *datum-origin-capture* (not (getf relation :row-source))
-                     (if (getf relation :join-order-base)
-                         (make-select-relation-origins registered-relations relation (htup-origins row))
-                         (htup-origins row)))))
-         (funcall emit
-                  (if (getf relation :join-order-base)
-                      (make-select-relation-environment
-                       registered-relations relation environment)
-                      environment))))
+       (multiple-value-bind (environment origins)
+           (project-select-scan-row registered-relations relation
+                                    (if source row (htup-values row))
+                                    (and *datum-origin-capture* (not source) (htup-origins row)))
+         (let ((*query-row-presence* presence)
+               (*query-row-origins* origins))
+           (funcall emit environment))))
      outer-environment)))
 
 (defun make-physical-subquery-scan-frame (node relations outer-environment)
