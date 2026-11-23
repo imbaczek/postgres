@@ -23,7 +23,7 @@ trap 'exit 130' HUP INT TERM
 if [ -n "${PROMOTION_SEED:-}" ]; then
     SEED=$PROMOTION_SEED
 else
-    PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/seed.log" 2>&1
+    SOURCE_WAL_NAMESPACE=legacy PORT=$PORT "$BASE/t/physical-restartpoint-auto.sh" >"$TMP/seed.log" 2>&1
     SEED=$(sed -n 's/^physical-restartpoint-auto: artifacts=//p' "$TMP/seed.log")
 fi
 if [ -n "${PROMOTION_PENDING_SEED:-}" ]; then

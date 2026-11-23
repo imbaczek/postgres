@@ -64,7 +64,7 @@ compare() {
 mkdir -m 700 "$TMP/copy"
 start_source
 sql "$PORT" 'CREATE TABLE data (id integer); INSERT INTO data VALUES (1)'
-namespace=${SOURCE_WAL_NAMESPACE:-legacy}
+namespace=${SOURCE_WAL_NAMESPACE:-timeline}
 case "$namespace" in
     timeline) : ;;
     legacy)
