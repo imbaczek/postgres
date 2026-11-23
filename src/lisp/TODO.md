@@ -704,6 +704,10 @@ and storage for all 54 supported type OIDs.
 Heap tuple sizing and writing share the varlena header rule. The
 regression verifies exact tuple offsets, header bytes, and round trips
 for packable 126- and 127-byte payloads and a 126-byte PLAIN payload.
+Tuple layout, writing, deformation, and TOAST estimation and planning
+share the same physical varlena type classification. TOAST estimation
+still computes typmod-dependent widths for varchar and numeric. TOAST
+candidate ranking uses the same header widths as the heap codec.
 
 ### A17 follow-up evidence
 

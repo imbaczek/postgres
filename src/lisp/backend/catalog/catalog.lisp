@@ -1649,23 +1649,17 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
     (loop for column across columns
           for type = (pg-column-type column)
           for typmod = (pg-column-typmod column)
-          do (setf data-length (align-up data-length
-                                         (if (or (heap-varlena-array-element-type type)
-                                                 (member type '(:varchar :numeric :text :bytea :json :jsonb)))
-                                             4 (column-align column))))
+          for varlena-p = (heap-varlena-type-p type)
+          do (setf data-length (align-up data-length (if varlena-p 4 (column-align column))))
+             (when varlena-p (setf has-toastable t))
              (let ((size
                      (case type
                        (:varchar
-                        (setf has-toastable t)
                         (and (>= typmod 4) (+ 4 (* 4 (- typmod 4)))))
                        (:numeric
-                        (setf has-toastable t)
                         (and (>= typmod 4)
                              (+ 8 (* 2 (floor (+ (ldb (byte 16 16) (- typmod 4)) 6) 4)))))
-                       ((:text :bytea :json :jsonb :bytea-array :json-array :jsonb-array)
-                        (setf has-toastable t)
-                        nil)
-                       (otherwise (column-fixed-size column)))))
+                       (otherwise (unless varlena-p (column-fixed-size column))))))
                (if size (incf data-length size) (setf unknown t))))
     (let* ((per-page 4)
            (space (floor (- +blcksz+ (maxalign (+ +size-of-page-header+
@@ -1840,10 +1834,9 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
                  (setf cached encoded)
                  size))
              (size-at (i)
-               (let* ((value (aref physical i))
-                      (size (length (aref cached i))))
-                 (+ size (if (and (not (heap-compressed-varlena-p value))
-                                  (<= size 126)) 1 4))))
+               (let ((value (aref physical i))
+                     (data (aref cached i)))
+                 (+ (length data) (heap-varlena-header-size value data (aref columns i)))))
              (candidate (main-p compress-p)
                (let ((best nil) (best-size (maxalign (+ 4 +external-varlena-fixed-size+))))
                  (loop for i below (length columns)
@@ -1851,8 +1844,7 @@ VALUES remains unchanged; EXTERNAL-P says whether the relation has a TOAST table
                        for column = (aref columns i)
                        for type = (pg-column-type column)
                        for storage = (pg-column-effective-storage column)
-                       when (and (or (heap-varlena-array-element-type type)
-                                     (member type '(:varchar :text :json :jsonb :bytea :numeric)))
+                       when (and (heap-varlena-type-p type)
                                  (if main-p (char= storage #\m) (find storage "xe"))
                                  (not (eq value +null+))
                                  (not (heap-external-varlena-p value))

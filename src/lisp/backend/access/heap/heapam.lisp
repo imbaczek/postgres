@@ -138,6 +138,11 @@
           (or (gethash relfilenode *heap-fsms*)
               (setf (gethash relfilenode *heap-fsms*) fsm))))))
 
+(defun heap-varlena-type-p (type)
+  "Recognize the variable-width types implemented by the physical heap codec."
+  (case type
+    ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array) t)))
+
 (defun heap-varlena-array-element-type (type)
   "Return the element type for the supported physical varlena arrays."
   (when (member type '(:bytea-array :json-array :jsonb-array))
@@ -218,8 +223,7 @@ must remain stable while the layout is used."
                ((eq v +null+) (setf has-null t))
                (t
                 (let* ((type (pg-column-type col))
-                       (element (heap-varlena-array-element-type type))
-                       (varlena-p (or element (member type '(:varchar :text :json :jsonb :bytea :numeric)))))
+                       (varlena-p (heap-varlena-type-p type)))
                   (when varlena-p
                     (setf (aref varlena-data i)
                           (if (heap-external-varlena-p v)
@@ -231,7 +235,7 @@ must remain stable while the layout is used."
                                     (:jsonb (sql-jsonb-to-octets v))
                                     (:numeric (sql-numeric-to-varlena-payload v))
                                     ((:bytea-array :json-array :jsonb-array)
-                                     (sql-varlena-array-encode v element))
+                                     (sql-varlena-array-encode v (heap-varlena-array-element-type type)))
                                     (otherwise (string->bytes v)))))))
                   (let* ((data (aref varlena-data i))
                          (header-size (and varlena-p (heap-varlena-header-size v data col))))
@@ -243,8 +247,7 @@ must remain stable while the layout is used."
     (when has-null (setf infomask (logior infomask +heap-hasnull+)))
     (when (some #'heap-external-varlena-p values)
       (setf infomask (logior infomask +heap-hasexternal+)))
-    (when (some (lambda (c) (or (heap-varlena-array-element-type (pg-column-type c))
-                                (member (pg-column-type c) '(:varchar :text :json :jsonb :bytea :numeric)))) columns)
+    (when (some (lambda (column) (heap-varlena-type-p (pg-column-type column))) columns)
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (values cursor offsets varlena-data infomask)))
 
@@ -306,17 +309,18 @@ This codec does not create or fetch TOAST data."
                     (page-set-u32 bytes off (logand v #xFFFFFFFF)))
                    ((:int8 :time :timestamp :timestamptz)
                     (page-set-u64 bytes off (logand v #xFFFFFFFFFFFFFFFF)))
-                   ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array)
-                    (let ((data (aref varlena-data i)))
-                      (ecase (heap-varlena-header-size v data col)
-                        (0 (replace bytes data :start1 off))
-                        (1
-                         (setf (aref bytes off) (logior (ash (1+ (length data)) 1) 1))
-                         (replace bytes data :start1 (1+ off)))
-                        (4
-                         (page-set-u32 bytes off (logior (ash (+ 4 (length data)) 2)
-                                                         (if (heap-compressed-varlena-p v) 2 0)))
-                         (replace bytes data :start1 (+ off 4)))))))))
+                   (otherwise
+                    (when (heap-varlena-type-p (pg-column-type col))
+                      (let ((data (aref varlena-data i)))
+                        (ecase (heap-varlena-header-size v data col)
+                          (0 (replace bytes data :start1 off))
+                          (1
+                           (setf (aref bytes off) (logior (ash (1+ (length data)) 1) 1))
+                           (replace bytes data :start1 (1+ off)))
+                          (4
+                           (page-set-u32 bytes off (logior (ash (+ 4 (length data)) 2)
+                                                           (if (heap-compressed-varlena-p v) 2 0)))
+                           (replace bytes data :start1 (+ off 4))))))))))
       bytes)))
 
 (defun heap-encode-external-varlena (pointer)
@@ -500,12 +504,11 @@ external decompression are deferred."
                                    (aref bytes (+ +size-of-heap-tuple-header+
                                                   (floor i 8)))))))
                (unless is-null
-                 (let ((al (column-align col)))
-                   (unless (and (or (heap-varlena-array-element-type (pg-column-type col))
-                                    (member (pg-column-type col) '(:varchar :text :json :jsonb :bytea :numeric)))
-                                (not (zerop (aref bytes cursor))))
-                     (setf cursor (align-up cursor al)))
-                   (case (pg-column-type col)
+                 (let* ((type (pg-column-type col))
+                        (varlena-p (heap-varlena-type-p type)))
+                   (unless (and varlena-p (not (zerop (aref bytes cursor))))
+                     (setf cursor (align-up cursor (column-align col))))
+                   (case type
                      (:timetz
                       (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
                         (when (logbitp 63 micros) (decf micros #x10000000000000000))
@@ -546,31 +549,32 @@ external decompression are deferred."
                           (decf v #x10000000000000000))
                         (setf (aref values i) v))
                       (incf cursor 8))
-                     ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array)
-                      (multiple-value-bind (physical-end raw-size)
-                          (heap-varlena-physical-end-and-raw-size bytes cursor)
-                        (cond ((and demand (/= i demand)) (setf cursor physical-end))
-                              ((and max-varlena-size (> raw-size max-varlena-size))
-                               (setf (aref values i) wide-value cursor physical-end))
-                              (t (if (= (aref bytes cursor) 1)
-                                     (multiple-value-bind (pointer end)
-                                         (heap-decode-external-varlena bytes cursor)
-                                       (setf (aref values i) pointer cursor end))
-                                     (multiple-value-bind (payload end)
-                                         (heap-inline-varlena-bytes bytes cursor)
-                                       (when (= (logand (aref bytes cursor) 3) 2)
-                                         (unless physical-compressed
-                                           (setf physical-compressed (make-array natts :initial-element nil)))
-                                         (setf (aref physical-compressed i)
-                                               (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
-                                       (setf (aref values i) (case (pg-column-type col)
-                                                               (:bytea payload)
-                                                               (:jsonb (sql-jsonb-from-octets payload))
-                                                               (:numeric (sql-numeric-from-varlena-payload payload))
-                                                               ((:bytea-array :json-array :jsonb-array)
-                                                                (sql-varlena-array-decode payload (heap-varlena-array-element-type (pg-column-type col))))
-                                                               (otherwise (bytes->string payload)))
-                                             cursor end))))))))))))
+                     (otherwise
+                      (when varlena-p
+                        (multiple-value-bind (physical-end raw-size)
+                            (heap-varlena-physical-end-and-raw-size bytes cursor)
+                          (cond ((and demand (/= i demand)) (setf cursor physical-end))
+                                ((and max-varlena-size (> raw-size max-varlena-size))
+                                 (setf (aref values i) wide-value cursor physical-end))
+                                (t (if (= (aref bytes cursor) 1)
+                                       (multiple-value-bind (pointer end)
+                                           (heap-decode-external-varlena bytes cursor)
+                                         (setf (aref values i) pointer cursor end))
+                                       (multiple-value-bind (payload end)
+                                           (heap-inline-varlena-bytes bytes cursor)
+                                         (when (= (logand (aref bytes cursor) 3) 2)
+                                           (unless physical-compressed
+                                             (setf physical-compressed (make-array natts :initial-element nil)))
+                                           (setf (aref physical-compressed i)
+                                                 (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
+                                         (setf (aref values i) (case type
+                                                                 (:bytea payload)
+                                                                 (:jsonb (sql-jsonb-from-octets payload))
+                                                                 (:numeric (sql-numeric-from-varlena-payload payload))
+                                                                 ((:bytea-array :json-array :jsonb-array)
+                                                                  (sql-varlena-array-decode payload (heap-varlena-array-element-type type)))
+                                                                 (otherwise (bytes->string payload)))
+                                               cursor end)))))))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns &optional toast-visibility-p)
