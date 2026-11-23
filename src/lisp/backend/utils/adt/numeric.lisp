@@ -623,7 +623,7 @@ extra integer digit allowed for rounding; special values pass through."
   "Apply a basic numeric function to VALUE, using SCALE for round and trunc.
 Special values pass through except for abs of negative infinity and sign of
 infinity.  Numeric sign preserves NaN, unlike the floating-point version."
-  (cond ((member name '("abs" "numeric_abs") :test #'string=)
+  (cond ((string= name "abs")
          (if (eq value :numeric-negative-infinity) :numeric-positive-infinity
              (if (or (sql-numeric-special-p value)
                      (not (minusp (sql-numeric-coefficient value))))

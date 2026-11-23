@@ -575,6 +575,11 @@ shared absolute-value, remainder, or bitwise implementation. The
 1,427 C comparisons covered qualified lookup, narrowing rejection,
 and shift width. Stored smallint remainder and bigint shift defaults
 were also checked after restart.
+The fixed numeric math aliases `numeric_abs`, `numeric_sqrt`,
+`numeric_exp`, `numeric_ln`, and `numeric_log` use registry signatures
+and shared numeric evaluation. The 1,431 C comparisons covered special
+values, NULLs, and lookup and decoration precedence. The restart check
+exercised stored absolute-value and logarithm defaults.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

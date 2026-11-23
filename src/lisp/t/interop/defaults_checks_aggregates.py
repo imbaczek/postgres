@@ -500,6 +500,10 @@ CASES = (
     "SELECT ln('1.000000000000000000000000000000000000001'::numeric),ln('0.999999999999999999999999999999999999999'::numeric)",
     "SELECT ln('1e-1000'::numeric),ln('1e1000'::numeric)",
     "SELECT log(100::numeric),log10(1000::numeric),log(2::numeric,8::numeric),numeric_log(3,27)",
+    "SELECT pg_catalog.numeric_abs('-Infinity'), pg_catalog.numeric_sqrt(NULL), pg_catalog.numeric_exp(0::smallint), pg_catalog.numeric_ln('NaN')",
+    "SELECT pg_catalog.numeric_log(10)",
+    "SELECT pg_catalog.numeric_ln(DISTINCT 'bad')",
+    "CREATE TABLE dc_numeric_math_alias_default (a numeric DEFAULT numeric_abs(-1.2300), b numeric DEFAULT numeric_log(10,100))",
     "SELECT log(1::numeric,2::numeric)",
     "SELECT log(0::numeric,(-1)::numeric)",
     "SELECT log('Infinity'::numeric,'Infinity'::numeric),log('Infinity'::numeric,2::numeric),log(0.5::numeric,'Infinity'::numeric)",
@@ -1361,6 +1365,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_numeric_math_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_integer_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_float_alias_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_trig_registry_default DEFAULT VALUES RETURNING v,w",

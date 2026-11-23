@@ -568,6 +568,12 @@ exist\" messages."
                    (make-numeric-builtin "dtrunc" '(:float8) :float8
                                          (lambda (value) (sql-float-basic-function "trunc" value)))
                    (make-numeric-builtin "dpow" '(:float8 :float8) :float8 'sql-float-power)
+                   (make-numeric-builtin "numeric_abs" '(:numeric) :numeric
+                                         (lambda (value) (sql-numeric-basic-function "abs" value)))
+                   (make-numeric-builtin "numeric_sqrt" '(:numeric) :numeric 'sql-numeric-sqrt)
+                   (make-numeric-builtin "numeric_exp" '(:numeric) :numeric 'sql-numeric-exp)
+                   (make-numeric-builtin "numeric_ln" '(:numeric) :numeric 'sql-numeric-ln)
+                   (make-numeric-builtin "numeric_log" '(:numeric :numeric) :numeric 'sql-numeric-log)
                    (make-numeric-builtin "numeric_power" '(:numeric :numeric) :numeric 'sql-numeric-power)
                    (make-numeric-builtin "pi" nil :float8 (lambda () pi))
                    (make-float-trig-builtin "cbrt")
@@ -1084,9 +1090,9 @@ names and unknown types.  setseed has no catalog argument names."
 (defun numeric-function-p (name)
   "Recognize the supported mathematical catalog functions without argument names."
   (or (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p)
-      (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                     "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                     "log" "log10" "numeric_log" "power" "pow"
+      (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                     "sqrt" "exp" "ln"
+                     "log" "log10" "power" "pow"
                      "width_bucket") :test #'string=)))
 
 (defun numeric-function-argument-count-p (name count)
@@ -1096,7 +1102,7 @@ names and unknown types.  setseed has no catalog argument names."
                (gethash name *scalar-builtin-descriptors*)))
         ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
-        ((member name '("numeric_log" "power" "pow") :test #'string=)
+        ((member name '("power" "pow") :test #'string=)
          (= count 2))
         (t (= count 1))))
 
@@ -1272,8 +1278,8 @@ then argument types. Only ambiguity and type failures carry the cast hint."
 (defun analyze-basic-numeric-function (name args)
   "Resolve the supported basic numeric overload and coerce its arguments.
 Two-argument round and trunc use numeric and an int4 scale.  Unary abs
-preserves a known input type.  The numeric_ aliases choose numeric; other
-unary calls choose numeric for numeric inputs and float8 otherwise.  An
+preserves a known input type. Other unary calls choose numeric for
+numeric inputs and float8 otherwise. An
 unknown unary trunc argument is ambiguous because its catalog overloads
 include different type categories."
   ;; trunc also has macaddr/macaddr8 overloads. An unknown unary argument
@@ -1291,7 +1297,7 @@ include different type categories."
                    (member (expr-type (second args)) '(:int2 :int4))))
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (let* ((argument (first args))
-         (type (cond ((or (= (length args) 2) (member name '("numeric_abs" "numeric_sqrt" "numeric_exp" "numeric_ln") :test #'string=)) :numeric)
+         (type (cond ((= (length args) 2) :numeric)
                      ((and (string= name "abs")
                            (not (in-unknown-constant-p argument)))
                       (expr-type argument))
@@ -1327,7 +1333,7 @@ include different type categories."
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
   (cond
-    ((and (= (length args) 1) (not (string= name "numeric_log")))
+    ((= (length args) 1)
      (analyze-basic-numeric-function name args))
     ((and (= (length args) 2) (not (string= name "log10"))
           (every (lambda (arg)
@@ -1522,11 +1528,11 @@ so a nested argument error keeps its own diagnostics."
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
         ((string= name "width_bucket") (analyze-width-bucket args))
-        ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                        "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln")
+        ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                        "sqrt" "exp" "ln")
                  :test #'string=)
          (analyze-basic-numeric-function name args))
-        ((member name '("log" "log10" "numeric_log") :test #'string=)
+        ((member name '("log" "log10") :test #'string=)
          (analyze-log-function name args))
         ((member name '("power" "pow") :test #'string=)
          (analyze-power-function name args)))
@@ -3851,9 +3857,9 @@ still requires deferred sort projection."
 
 (defun legacy-immutable-function-p (name)
   "Recognize immutable scalar functions whose signatures still have separate analyzers."
-  (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                 "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                 "log" "log10" "numeric_log" "power" "pow"
+  (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                 "sqrt" "exp" "ln"
+                 "log" "log10" "power" "pow"
                  "width_bucket")
           :test #'string=))
 
@@ -4661,7 +4667,7 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
     ((string= name "width_bucket") (sql-width-bucket args))
-    ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+    ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
              :test #'string=)
      (if (member +null+ args) +null+
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
@@ -4963,15 +4969,15 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls."
   (cond
-    ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+    ((and (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                   :test #'string=)
           (member +null+ arguments))
      +null+)
-    ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+    ((and (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                   :test #'string=)
           (member type '(:float4 :float8)))
      (sql-float-basic-function name (first arguments)))
-    ((member name '("sqrt" "numeric_sqrt") :test #'string=)
+    ((string= name "sqrt")
      (let ((value (first arguments)))
        (cond ((eq value +null+) +null+)
              ((eq type :numeric) (sql-numeric-sqrt value))
@@ -4980,19 +4986,19 @@ Arguments have already been evaluated in order, including for strict calls."
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
            (t (sql-float-power (first arguments) (second arguments)))))
-    ((member name '("log" "log10" "numeric_log") :test #'string=)
+    ((member name '("log" "log10") :test #'string=)
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric)
             (if (rest arguments)
                 (sql-numeric-log (first arguments) (second arguments))
                 (sql-numeric-log 10 (first arguments))))
            (t (sql-float-log10 (first arguments)))))
-    ((member name '("ln" "numeric_ln") :test #'string=)
+    ((string= name "ln")
      (let ((value (first arguments)))
        (cond ((eq value +null+) +null+)
              ((eq type :numeric) (sql-numeric-ln value))
              (t (sql-float-ln value)))))
-    ((member name '("exp" "numeric_exp") :test #'string=)
+    ((string= name "exp")
      (let ((value (first arguments)))
        (cond ((eq value +null+) +null+)
              ((eq type :numeric) (sql-numeric-exp value))
