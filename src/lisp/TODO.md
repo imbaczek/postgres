@@ -509,8 +509,7 @@ still has work outstanding.
   Per-fixture tracing identified the replication-slot catalog view test.
   It now resets its own backend transaction on exit. The instrumented
   Rove-plus-legacy run found no surviving readers and passed all 1,172
-  legacy checks. The interrupted run and its wait-for-no-active-xids
-  backtrace are archived with the DDL evidence.
+  legacy checks.
 
 - [ ] Qualify native CRC32C on physical ARM hardware.
   Native WAL and storage checksums now use Castagnoli CRC32C, without an IEEE
@@ -2081,18 +2080,19 @@ still has work outstanding.
   native follow, and managed-worker lifecycle and shutdown have completed this
   pass and its review. Keep the same order for the remaining HA work.
 
-- [ ] Restore legacy unit-test runner fixture state after the suite. A warm worker
+- [x] Restore legacy unit-test runner fixture state after the suite. A warm worker
   retained `*active-xids* = (3)` after 1,598 passing checks, causing later physical
   promotion and shutdown checks to fail. Use the intended fresh legacy entrypoint
   for acceptance and inspect or isolate fixture state before later warm suites;
   do not restart an owned live SQL server to hide leaks. A later warm worker also
   had orphan fixture XIDs and cached streams pointing at deleted legacy PGDATA;
-  the fresh intended legacy runner passed 1,159 checks. The leaking test and
-  suite-isolation fix are not yet known.
-  A fresh per-fixture audit after the slot-view cleanup passed all 1,172
-  legacy checks with no new real XIDs at any case boundary and no active
-  XIDs at suite exit. Warm-worker cached stream ownership still needs
-  verification.
+  the fresh intended legacy runner passed 1,159 checks.
+  The harness now closes its own CLOG, WAL and relation streams before
+  deleting its temporary data directory. Both VACUUM workers use that
+  suite's CLOG and relation cache. The WAL retention fixture allocates
+  a fresh active-XID list because release mutates it. Two runs in the
+  same Lisp image each passed 1,172 checks and left no cached relation
+  streams, CLOG or WAL stream, real XIDs, or virtual readers.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or

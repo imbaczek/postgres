@@ -240,6 +240,11 @@
     (ensure-directories-exist dir)
     (let ((*pgdata* dir)
           (*backend* (make-backend))
+          (*clog-stream* nil)
+          (*clog-stream-extents* (make-hash-table :test #'eq :weakness :key))
+          (*relation-streams* (make-hash-table :test #'equal))
+          (*wal-output-stream* nil)
+          (*wal-output-segment* nil)
           (*startup-installed-configuration*
             (let ((native (make-hash-table :test #'equal))
                   (*physical-follow-desired* nil) (*physical-recovery-state* nil))
@@ -248,13 +253,18 @@
                 (startup-prepare-installation
                  (startup-default-settings dir) native (make-hash-table :test #'equal)
                  nil)))))
-      (clog-init :initialize t)
-      (run-query-and-concurrency-unit-tests)
-      (run-backend-protocol-and-wal-unit-tests)
-      (run-storage-and-planner-unit-tests)
-      (run-vacuum-and-transaction-unit-tests))
-    (ignore-errors
-     (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
+      (unwind-protect
+           (progn
+             (clog-init :initialize t)
+             (run-query-and-concurrency-unit-tests)
+             (run-backend-protocol-and-wal-unit-tests)
+             (run-storage-and-planner-unit-tests)
+             (run-vacuum-and-transaction-unit-tests))
+        (smgr-close-all)
+        (when *wal-output-stream* (ignore-errors (close *wal-output-stream*)))
+        (when *clog-stream* (ignore-errors (close *clog-stream*)))
+        (ignore-errors
+         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
   (format t "~&unit-tests: ~a checks, ~a failures~%"
           *test-checks* *test-failures*)
   (when (plusp *test-failures*)

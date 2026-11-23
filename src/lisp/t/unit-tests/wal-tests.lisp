@@ -678,7 +678,7 @@
 (defun test-wal-checkpoint-retains-active-xid-segments ()
   (let* ((test-pgdata (merge-pathnames "wal-active-xid-retention-test/" *pgdata*))
          (*pgdata* test-pgdata)
-         (*active-xids* '(6401 6402))
+         (*active-xids* (list 6401 6402))
          (*next-xid* 6403)
          (*active-snapshots* 0)
          (*active-snapshot-set* (make-hash-table :test #'eq))
