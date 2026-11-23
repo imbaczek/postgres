@@ -424,7 +424,11 @@ exist\" messages."
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
-             (list (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
+             (list (make-scalar-builtin :name "pg_backend_pid" :result-type :int4
+                                        :volatility :stable :strict-p t :evaluator 'sql-backend-pid)
+                   (make-scalar-builtin :name "txid_current" :result-type :int8
+                                        :volatility :stable :strict-p t :evaluator 'sql-txid-current)
+                   (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-jsonb-kind)
@@ -1683,11 +1687,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
      (when (eq (expr-type (first args)) :char)
        (setf args (list (list :cast (first args) :type :text :typmod -1))))
      (list :func name args :type :int4 :typmod -1))
-    ((member name '("pg_backend_pid" "txid_current") :test #'string=)
-     (when args
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type (if (string= name "txid_current") :int8 :int4) :typmod -1))
     ((string= name "pg_cancel_backend")
      (unless (and (= (length args) 1)
                   (admin-arg-coercible-p (first args) :int4))
@@ -3940,7 +3939,7 @@ checks still apply."
                      "current_catalog" "current_user" "session_user" "user" "pg_postmaster_start_time"
                      "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                      "jsonb_build_array" "jsonb_build_object"
-                     "substr" "substring" "length" "char_length" "character_length" "octet_length" "pg_backend_pid" "txid_current"
+                     "substr" "substring" "length" "char_length" "character_length" "octet_length"
                      "chr" "array_to_string" "string_to_array" "greatest" "least"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
@@ -4682,6 +4681,9 @@ aliases share the corresponding numeric operator implementation."
                                    (t "%"))))
                (sql-numeric-arithmetic operator left right))))))
 
+(defun sql-backend-pid ()
+  (if *backend* (backend-pid *backend*) 0))
+
 (defun sql-txid-current ()
   "Return the backend's top-level transaction ID, assigning it at execution.
 Reject recovery before assignment. The deprecated SQL int8 result interprets
@@ -4775,10 +4777,6 @@ the full 64-bit ID as a signed value."
      (current-user-name))
     ((string= name "current_catalog")
      (backend-database *backend*))
-    ((string= name "pg_backend_pid")
-     (if *backend* (backend-pid *backend*) 0))
-    ((string= name "txid_current")
-     (sql-txid-current))
     ((string= name "pg_cancel_backend")
      (admin-cancel-backend (admin-pid-arg (first args))))
     ((string= name "pg_terminate_backend")
