@@ -391,9 +391,9 @@ ProjectSet detection and lifting also share local operand traversal. The
 regression checks opaque payloads, local result slots, and subplan and outer
 reference boundaries. The ProjectSet attempt test passed on C and native
 servers in Simple Query and extended protocol, including a suspended portal.
-The existing `ANY`/`ALL` sublink test boundary still needs a parser check.
-An SRF on the left of `ANY (SELECT ...)` reaches the Lisp evaluator and
-raises XX000. C rejects that row comparison during analysis with 42804.
+`ANY` and `ALL` sublinks now reject a set-returning comparison during
+analysis with C's 42804 diagnostic. The 111-case C differential verifies
+both rejections and a valid SRF target in the separate subquery scope.
 
 ## Open development tasks
 

@@ -54,9 +54,14 @@ SETUP = (
     "CREATE INDEX subq_inner_owner ON subq_inner(owner)",
     "CREATE INDEX subq_outer_id ON subq_outer(id)",
     "CREATE SEQUENCE subq_seq",
+    "CREATE TABLE subq_published (id int)",
+    "CREATE PUBLICATION subq_pub FOR TABLE subq_published",
 )
 
 CASES = (
+    "SELECT (pg_get_publication_tables('subq_pub')).relid = ANY (SELECT 1::oid)",
+    "SELECT (pg_get_publication_tables('subq_pub')).relid <> ALL (SELECT 1::oid)",
+    "SELECT true = ANY (SELECT (pg_get_publication_tables('subq_pub')).relid IS NOT NULL)",
     "SELECT (SELECT 7)",
     "SELECT (SELECT 7 AS child_name)::text",
     "SELECT (SELECT label FROM subq_inner WHERE owner=2) AS child",
