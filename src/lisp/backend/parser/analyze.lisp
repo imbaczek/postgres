@@ -1158,13 +1158,13 @@ names and unknown types.  setseed has no catalog argument names."
          name analyzed :schema schema :signature signature :named-p t :overlapping-p overlapping))
       (values (if names (coerce slots 'list) analyzed) signature))))
 
-(defun scalar-builtin-call-policy-p (name policies)
+(defun scalar-builtin-call-policy-p (candidates policies)
   (some (lambda (builtin) (member (scalar-builtin-implicit-arguments-p builtin) policies))
-        (gethash name *scalar-builtin-descriptors*)))
+        candidates))
 
-(defun numeric-function-p (name)
+(defun numeric-function-p (name &optional (candidates (gethash name *scalar-builtin-descriptors*)))
   "Recognize registered math calls that use the numeric diagnostic path."
-  (scalar-builtin-call-policy-p name '(:numeric :random)))
+  (scalar-builtin-call-policy-p candidates '(:numeric :random)))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
@@ -1214,8 +1214,8 @@ then argument types. Only ambiguity and type failures carry the cast hint."
      name analyzed :schema schema :named-p t
      :signature (random-call-signature analyzed (nreverse argument-names)))))
 
-(defun scalar-builtin-named-parameters (name)
-  (let ((builtin (first (gethash name *scalar-builtin-descriptors*))))
+(defun scalar-builtin-named-parameters (candidates)
+  (let ((builtin (first candidates)))
     (when builtin
       (let ((evaluator (scalar-builtin-evaluator builtin)))
         (when (and (consp evaluator) (eq (car evaluator) :named))
@@ -1304,16 +1304,17 @@ then argument types. Only ambiguity and type failures carry the cast hint."
   (wal-drop-replication-slot name)
   nil)
 
-(defun analyze-call-argument-list (name arguments table &optional variadic schema)
+(defun analyze-call-argument-list (name arguments table &optional variadic schema
+                                                          (candidates (gethash name *scalar-builtin-descriptors*)))
   "Analyze call arguments, binding supported named arguments."
-  (let ((parameters (scalar-builtin-named-parameters name)))
+  (let ((parameters (scalar-builtin-named-parameters candidates)))
     (cond (parameters
            (analyze-named-builtin-arguments name arguments table variadic parameters))
-          ((scalar-builtin-call-policy-p name '(:catalog-nullary))
+          ((scalar-builtin-call-policy-p candidates '(:catalog-nullary))
            (analyze-catalog-call-inputs arguments table))
-          ((scalar-builtin-call-policy-p name '(:random))
+          ((scalar-builtin-call-policy-p candidates '(:random))
            (analyze-random-arguments arguments table name schema))
-          ((and (numeric-function-p name)
+          ((and (numeric-function-p name candidates)
                 (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
            (analyze-numeric-call-arguments name arguments table schema))
           (t (mapcar (lambda (argument)
@@ -1321,15 +1322,15 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                          (ereport "0A000" "named arguments are not supported for function ~a" name))
                        (analyze-expr argument table)) arguments)))))
 
-(defun analyze-numeric-overload (name args first-type)
+(defun analyze-numeric-overload (name candidates args first-type)
   "Use the preferred input type to select candidates and let the registry check the full signature."
   (analyze-scalar-builtin
    name
    (remove-if-not (lambda (builtin) (eq first-type (first (scalar-builtin-argument-types builtin))))
-                  (gethash name *scalar-builtin-descriptors*))
+                  candidates)
    args *defer-function-constant-coercion-p*))
 
-(defun analyze-basic-numeric-function (name args)
+(defun analyze-basic-numeric-function (name args &optional (candidates (gethash name *scalar-builtin-descriptors*)))
   "Choose the preferred numeric domain before checking the catalog signature."
   (let* ((argument (first args))
          (unknown-p (in-unknown-constant-p argument))
@@ -1337,7 +1338,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
     ;; C also considers macaddr and macaddr8 when the unary argument is unknown.
     (when (and (string= name "trunc") (null (rest args)) unknown-p)
       (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
-    (analyze-numeric-overload name args
+    (analyze-numeric-overload name candidates args
                               (cond ((= (length args) 2) :numeric)
                                     ((and (not unknown-p)
                                           (or (string= name "abs") (eq type :numeric)))
@@ -1368,9 +1369,9 @@ then argument types. Only ambiguity and type failures carry the cast hint."
            (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args))
       :numeric :float8))
 
-(defun analyze-power-function (name args)
+(defun analyze-power-function (name args &optional (candidates (gethash name *scalar-builtin-descriptors*)))
   "Resolve power operands using the preferred domain and the registry signature."
-  (analyze-numeric-overload name args (preferred-numeric-input-type args)))
+  (analyze-numeric-overload name candidates args (preferred-numeric-input-type args)))
 
 (defun analyze-width-bucket (args candidates)
   "Resolve compatible thresholds or select the catalog's preferred range signature."
@@ -1415,7 +1416,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                          (coerce-common-expression array array-type)))
                :type result-type :typmod -1))))
     ((= (length args) 4)
-     (analyze-numeric-overload "width_bucket" args
+     (analyze-numeric-overload "width_bucket" candidates args
                                (preferred-numeric-input-type (subseq args 0 3))))
     (t (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))))
 
@@ -1510,21 +1511,21 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
                             (- (sql-numeric-rational bound2)
                                (sql-numeric-rational bound1))))))))))
 
-(defun analyze-numeric-function (name args schema &optional signature)
+(defun analyze-numeric-function (name candidates args schema &optional signature)
   "Resolve a numeric catalog call, retaining its original diagnostic signature.
 Argument transformation and named-notation validation happen before this call,
 so a nested argument error keeps its own diagnostics."
   (handler-case
       (cond
         ((string= name "width_bucket")
-         (analyze-width-bucket args (gethash name *scalar-builtin-descriptors*)))
+         (analyze-width-bucket args candidates))
         ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                         "sqrt" "exp" "ln" "log" "log10")
                  :test #'string=)
-         (analyze-basic-numeric-function name args))
+         (analyze-basic-numeric-function name args candidates))
         ((member name '("power" "pow") :test #'string=)
-         (analyze-power-function name args))
-        (t (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
+         (analyze-power-function name args candidates))
+        (t (analyze-scalar-builtin name candidates args
                                    *defer-function-constant-coercion-p*)))
     (pg-error (condition)
       (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
@@ -1639,7 +1640,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (random-signature nil)
          (args (multiple-value-bind (arguments signature)
                    (analyze-call-argument-list name (third expr) table (getf (cdddr expr) :variadic)
-                                               (getf (cdddr expr) :schema))
+                                               (getf (cdddr expr) :schema) builtins)
                  (setf random-signature signature)
                  arguments)))
     (when (member name '("row_number" "rank" "dense_rank") :test #'string=)
@@ -1647,13 +1648,13 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (ereport "42809" "window function ~a requires an OVER clause" name))
     (cond
       (prepare-call (funcall prepare-call name builtins args (getf (cdddr expr) :variadic)))
-      ((numeric-function-p name)
+      ((numeric-function-p name builtins)
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
        ;; then coerces arguments. Defer constant input conversion until that check.
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
-         (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
+         (analyze-numeric-function name builtins args (getf (cdddr expr) :schema) random-signature)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
       ((and builtins (not (eq (scalar-builtin-implicit-arguments-p (first builtins)) :syntax-only)))

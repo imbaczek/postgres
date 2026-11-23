@@ -493,6 +493,11 @@ and an empty right input measured about 1.6 MB less allocation.
 
 ### A3 follow-up evidence
 
+Scalar call analysis now passes the resolved builtin candidates through named
+argument binding, numeric-family classification and overload selection. The
+arithmetic operator entry points still resolve candidates by name, and qualified
+diagnostics keep the original argument signature.
+
 `pg_backend_pid()` and `txid_current()` now take their signatures,
 result types, stability, and evaluators from the scalar builtin registry.
 The definitions match the nullary entries in C's `pg_proc.dat`.
