@@ -432,6 +432,9 @@ Prepared subplan discovery and outer-depth analysis share a read-only
 expression-root visitor. Discovery preserves existing expression storage
 and leaves derived queries to their own planner pass. The regression checks
 root and sort-list identity and excludes descriptors under outer references.
+CTE volatility inspection now uses the same read-only query roots and stops
+at the first volatile executable operand. The regression checks storage
+identity, the outer-reference boundary, and recognition across set arms.
 
 ## Open development tasks
 

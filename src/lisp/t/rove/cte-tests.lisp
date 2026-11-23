@@ -19,6 +19,21 @@
         (rove:ok (eq (second (second (third rewritten))) foreign))
         (rove:ok (eq (getf (cdddr rewritten) :saved) foreign)))))
 
+(rove:deftest cte-volatility-inspection-preserves-prepared-expression-storage
+    (let* ((volatile '(:func "nextval" nil :type :int8))
+           (outer (list :outer-ref 1 volatile))
+           (predicate (list :bool t))
+           (order (list (cons predicate :asc)))
+           (prepared (list :where predicate :targets (list (list :expr outer)) :order order)))
+      (rove:ok (not (cte-query-volatile-p prepared)))
+      (rove:ok (eq predicate (getf prepared :where)))
+      (rove:ok (eq order (getf prepared :order)))
+      (rove:ok (cte-expression-volatile-p outer))
+      (rove:ok (cte-query-volatile-p
+                (list :set-operation :union
+                      :left prepared
+                      :right (list :targets (list (list :expr volatile))))))))
+
 (rove:deftest cte-volatility-follows-executable-operands-and-subqueries
     (let* ((volatile '(:func "nextval" nil :type :int8))
            (literal (list :const volatile :type :text))
