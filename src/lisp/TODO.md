@@ -524,6 +524,12 @@ differential passed 142 comparisons, including array dimensions,
 `int2vector`, NULL replacements, and unresolved array input. After
 signature lookup, scalar `DISTINCT` and `ORDER BY` errors take precedence
 over polymorphic type resolution, matching C.
+`array_length` shares registry resolution and retains its stored and
+executed expression shape. A warmed SBCL probe allocated zero bytes
+for 100,000 evaluations of a typed length expression. The 1,402 C
+comparisons covered dimensions, diagnostics, and a fresh-process
+default using an empty `int2vector`. Array rendering also reads
+`int2vector` directly without copying it to an array.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

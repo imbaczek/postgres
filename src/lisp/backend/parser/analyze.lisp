@@ -320,18 +320,6 @@ exist\" messages."
     (ereport "42883" "function ~a(~a) does not exist" name (typed-arg-name argument)))
   (coerce-numeric-expression-to-oid (coerce-in-constant argument :oid)))
 
-(defun analyze-array-length-function (name arguments)
-  (unless (and (= 2 (length arguments))
-               (or (eq (expr-type (first arguments)) :int2vector)
-                   (sql-array-element-type (expr-type (first arguments)))))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (let ((dimension (coerce-in-constant (second arguments) :int4)))
-    (unless (member (expr-type dimension) '(:int2 :int4))
-      (ereport "42883" "array_length dimension must be integer"))
-    (when (eq (expr-type dimension) :int2)
-      (setf dimension (list :cast dimension :type :int4 :typmod -1)))
-    (list :array-length (first arguments) dimension :type :int4 :typmod -1)))
-
 (defun sql-get-expr (node relation)
   (declare (ignore node relation))
   (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported"))
@@ -521,6 +509,9 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "array_length" :argument-types '(:anyarray :int4)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-array-length :implicit-arguments-p t)
                    (make-scalar-builtin :name "array_to_string" :argument-types '(:anyarray :text)
                                         :result-type :text :volatility :stable :strict-p t
                                         :evaluator 'sql-array-to-string :implicit-arguments-p t)
@@ -628,9 +619,7 @@ The supported ambiguous bit and bytea overloads have no text candidate."
      ;; Scalar decorations are rejected after lookup and before polymorphic resolution.
      (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
        (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-     (if (eq (expr-type argument) :int2vector)
-         (list :cast argument :type :int2-array :typmod -1)
-         argument))
+     argument)
     ((and (eq type :oid) (member (expr-type argument) '(:int2 :int4 :int8)))
      (coerce-numeric-expression-to-oid argument))
     (t (coerce-common-expression argument type))))
@@ -644,17 +633,21 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              ((t) decorated-p)
              ((nil) *defer-function-constant-coercion-p*)
              (:always t))))
-    (list* :func name
-           (case (scalar-builtin-implicit-arguments-p builtin)
-             (:admin arguments)
-             (:sequence (coerce-sequence-builtin-arguments arguments
-                                                           (scalar-builtin-argument-types builtin)))
-             (otherwise
-              (mapcar #'coerce-scalar-builtin-argument arguments
-                      (scalar-builtin-argument-types builtin))))
-           :type (scalar-builtin-result-type builtin) :typmod -1
-           (when (eq (scalar-builtin-result-type builtin) :record)
-             (list :fields (scalar-record-builtin-fields name))))))
+    (let ((inputs
+            (case (scalar-builtin-implicit-arguments-p builtin)
+              (:admin arguments)
+              (:sequence (coerce-sequence-builtin-arguments arguments
+                                                            (scalar-builtin-argument-types builtin)))
+              (otherwise
+               (mapcar #'coerce-scalar-builtin-argument arguments
+                       (scalar-builtin-argument-types builtin)))))
+          (result-type (scalar-builtin-result-type builtin)))
+      ;; Preserve the allocation-free evaluator and the stored expression shape.
+      (if (eq (scalar-builtin-evaluator builtin) 'sql-array-length)
+          (list :array-length (first inputs) (second inputs) :type result-type :typmod -1)
+          (list* :func name inputs :type result-type :typmod -1
+                 (when (eq result-type :record)
+                   (list :fields (scalar-record-builtin-fields name))))))))
 
 (defun analyze-to-jsonb-function (name arguments)
   "Resolve to_jsonb's polymorphic argument within supported scalar and array types."
@@ -736,16 +729,19 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
 (defun sql-array-to-string (input delimiter &optional replacement)
   "Join unquoted array elements, omitting NULL unless a replacement is supplied."
   (sql-strict-let ((array input) (separator delimiter))
-    (let ((printed nil))
+    (let* ((ordinary-array-p (sql-array-p array))
+           (elements (if ordinary-array-p (sql-array-elements array) array))
+           (element-type (if ordinary-array-p (sql-array-element-type-id array) :int2))
+           (printed nil))
       (with-output-to-string (stream)
-        (loop for value across (sql-array-elements array)
+        (loop for value across elements
               for index from 0
               do (when (zerop (mod index 4096)) (check-for-interrupts))
                  (unless (and (eq value +null+)
                               (or (null replacement) (eq replacement +null+)))
                    (when printed (write-string separator stream))
                    (write-string (if (eq value +null+) replacement
-                                     (value->text value (sql-array-element-type-id array)))
+                                     (value->text value element-type))
                                  stream)
                    (setf printed t)))))))
 
@@ -1789,7 +1785,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                                    (getf (cdddr expr) :call-order))))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
-      ((string= name "array_length") (analyze-array-length-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       (t (analyze-utility-function-call name args)))))
 
@@ -4928,13 +4923,20 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
                         :dimensions (and (plusp (length values)) (list (length values)))
                         :lower-bounds (and (plusp (length values)) (list 1))))))
 
+(defun sql-array-length (array dimension)
+  "Return the requested dimension length, preserving int2vector's single dimension."
+  (if (sql-array-p array)
+      (let ((dimensions (sql-array-dimensions array)))
+        (if (<= 1 dimension (length dimensions))
+            (nth (1- dimension) dimensions)
+            +null+))
+      (if (= dimension 1) (length array) +null+)))
+
 (defun eval-array-length (expression environment)
+  "Evaluate the array-length node retained in stored expressions."
   (sql-strict-let ((array (eval-expr (second expression) environment))
                    (dimension (eval-expr (third expression) environment)))
-    (if (sql-array-p array)
-        (if (<= 1 dimension (length (sql-array-dimensions array)))
-            (nth (1- dimension) (sql-array-dimensions array)) +null+)
-        (if (= dimension 1) (length array) +null+))))
+    (sql-array-length array dimension)))
 
 (defun sql-random-numeric (minimum maximum)
   (when (sql-numeric-special-p minimum)

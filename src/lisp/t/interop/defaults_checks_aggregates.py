@@ -7,6 +7,12 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.array_length(ARRAY[[1,2],[3,4]], '2'), array_length(ARRAY[1], 1::smallint), array_length(ARRAY[1], 0), array_length(ARRAY[1], 2)",
+    "SELECT array_length(''::int2vector, 1), array_length('1 2'::int2vector, 1), array_length(ARRAY[]::int[], 1), array_length(ARRAY[1], NULL)",
+    "SELECT array_length(ARRAY[1], 1::bigint)",
+    "SELECT array_length(NULL, 1)",
+    "SELECT array_length(DISTINCT NULL, 1)",
+    "CREATE TABLE dc_array_length_restart (v int DEFAULT array_length(''::int2vector, 1))",
     "SELECT pg_catalog.substr('aéΣ', 2::smallint), substr('aéΣ', '2', '1'), substr(NULL,1)",
     "SELECT pg_catalog.substring('aéΣ'::varchar, 2, 1), substring('aéΣ', 2, NULL)",
     "SELECT substring('aéΣ', 2, -1)",
@@ -1330,6 +1336,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_array_length_restart DEFAULT VALUES RETURNING v",
                       "INSERT INTO dc_bit_index DEFAULT VALUES RETURNING first_bit, octets",
                     "INSERT INTO dc_decimal DEFAULT VALUES RETURNING a",
                     "INSERT INTO dc_decimal VALUES(0)",
