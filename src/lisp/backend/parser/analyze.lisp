@@ -521,6 +521,12 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "array_to_string" :argument-types '(:anyarray :text)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-array-to-string :implicit-arguments-p t)
+                   (make-scalar-builtin :name "array_to_string" :argument-types '(:anyarray :text :text)
+                                        :result-type :text :volatility :stable
+                                        :evaluator 'sql-array-to-string :implicit-arguments-p t)
                    (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text)
                                         :result-type :text-array :volatility :immutable
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
@@ -586,6 +592,9 @@ exist\" messages."
                             ((and (eq policy :sequence) (zerop position))
                              (eq (expr-type argument) :text))
                             ((in-unknown-constant-p argument) t)
+                            ((eq type :anyarray)
+                             (or (eq (expr-type argument) :int2vector)
+                                 (sql-array-element-type (expr-type argument))))
                             (policy (sql-implicit-coercion-p (expr-type argument) type))
                             (t (eq (expr-type argument) type)))))))
 
@@ -613,10 +622,17 @@ The supported ambiguous bit and bytea overloads have no text candidate."
           (t best))))
 
 (defun coerce-scalar-builtin-argument (argument type)
-  "Keep eager OID constant conversion for catalog signatures."
-  (if (and (eq type :oid) (member (expr-type argument) '(:int2 :int4 :int8)))
-      (coerce-numeric-expression-to-oid argument)
-      (coerce-common-expression argument type)))
+  "Coerce a resolved input, retaining the concrete type for polymorphic arrays."
+  (cond
+    ((eq type :anyarray)
+     (when (in-unknown-constant-p argument)
+       (ereport "42804" "could not determine polymorphic type because input has type unknown"))
+     (if (eq (expr-type argument) :int2vector)
+         (list :cast argument :type :int2-array :typmod -1)
+         argument))
+    ((and (eq type :oid) (member (expr-type argument) '(:int2 :int4 :int8)))
+     (coerce-numeric-expression-to-oid argument))
+    (t (coerce-common-expression argument type))))
 
 (defun analyze-scalar-builtin (name candidates arguments decorated-p)
   "Resolve a scalar signature and apply its constant coercion policy.
@@ -677,27 +693,6 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
                 (when pretty (list (coerce-common-expression pretty :bool))))
           :type :json :typmod -1)))
 
-(defun analyze-array-to-string (name arguments)
-  "Resolve the polymorphic array input and coerce the text arguments."
-  (let ((array (first arguments)))
-    (when (and (member (length arguments) '(2 3)) (in-unknown-constant-p array))
-      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-    (unless (and (member (length arguments) '(2 3))
-                 (or (eq (expr-type array) :int2vector)
-                     (sql-array-element-type (expr-type array)))
-                 (every (lambda (argument)
-                          (or (in-unknown-constant-p argument)
-                              (sql-implicit-coercion-p (expr-type argument) :text)))
-                        (rest arguments)))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (list :func name
-          (cons (if (eq (expr-type array) :int2vector)
-                    (list :cast array :type :int2-array :typmod -1)
-                    array)
-                (mapcar (lambda (argument) (coerce-common-expression argument :text))
-                        (rest arguments)))
-          :type :text :typmod -1)))
-
 (defun sql-string-to-array (text separator &optional null-string)
   "Split text at delimiters, replacing fields equal to the optional NULL string.
 A NULL delimiter splits at character boundaries; empty input yields an empty array."
@@ -737,11 +732,10 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
          (ereport "54000" "requested character not valid for encoding: ~d" code))
         (t (string (code-char code)))))
 
-(defun eval-array-to-string (arguments)
+(defun sql-array-to-string (input delimiter &optional replacement)
   "Join unquoted array elements, omitting NULL unless a replacement is supplied."
-  (sql-strict-let ((array (first arguments)) (separator (second arguments)))
-    (let ((replacement (third arguments))
-          (printed nil))
+  (sql-strict-let ((array input) (separator delimiter))
+    (let ((printed nil))
       (with-output-to-string (stream)
         (loop for value across (sql-array-elements array)
               for index from 0
@@ -1792,11 +1786,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-scalar-builtin name builtins args
                                (or (getf (cdddr expr) :call-distinct)
                                    (getf (cdddr expr) :call-order))))
-      ((string= name "array_to_string")
-       (let ((*defer-function-constant-coercion-p*
-               (or (getf (cdddr expr) :call-distinct)
-                   (getf (cdddr expr) :call-order))))
-         (analyze-array-to-string name args)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
       ((string= name "array_length") (analyze-array-length-function name args))
@@ -3944,7 +3933,7 @@ still requires deferred sort projection."
                  (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
                                 "json_build_array" "json_build_object"
                                 "jsonb_build_array" "jsonb_build_object"
-                                "array_to_string" "greatest" "least")
+                                "greatest" "least")
                          :test #'string=))))))
 
 (defun analyzed-expression-volatile-p (form)
@@ -4762,7 +4751,6 @@ the full 64-bit ID as a signed value."
              :test #'string=)
      (if (member +null+ args) +null+
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
-    ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))

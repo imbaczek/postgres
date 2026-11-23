@@ -43,6 +43,8 @@ CASES = [
     "SELECT greatest(1,true)",
     "SELECT pg_catalog.greatest(1,2)",
     "SELECT array_to_string(NULL,',' )",
+    "SELECT pg_catalog.array_to_string(NULL, 42)",
+    "SELECT pg_catalog.array_to_string(ARRAY[1, NULL, 3], ':'::varchar, 'x'::varchar)",
     "SELECT greatest(DISTINCT 1,2)",
     "SELECT greatest(VARIADIC ARRAY[1,2])",
     "SELECT greatest(a=>1)",
