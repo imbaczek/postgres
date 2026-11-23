@@ -145,6 +145,10 @@ that inventory and no-op proof paths preserve the original bytes.
 For B8, the bootstrap pin reader requires PGPHYSPIN2 and rejects a
 checksummed PGPHYSPIN1 pin without rewriting it. PGPHYSPIN2 keeps both
 manifest-bound and unbound encodings. Follow pins use their own codec.
+The live source fixture derives a checksummed PGPHYSPIN1 file from a
+current pin's identity and WAL coordinates. Startup rejects that exact
+file without rewriting it. Restoring PGPHYSPIN2 makes the pin available
+again and preserves all 1,800 source rows.
 
 For B9, reopening the receive store requires PGPHYS03 with a recorded floor
 and digest seed. A checksummed PGPHYS02 image is rejected without rewriting

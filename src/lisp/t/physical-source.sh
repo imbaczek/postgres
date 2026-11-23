@@ -62,6 +62,44 @@ grep -q 'PIN-RESTORED-AND-RELEASED$' "$TMP/restart.log"
 test "$(sql -c 'SELECT count(*) FROM physical_pin_fixture;')" = 1800
 sql -c 'SELECT id, payload FROM physical_pin_fixture ORDER BY id;' >"$TMP/rows.released"
 diff -u "$TMP/rows.expected" "$TMP/rows.released"
+control '(progn (pg::physical-source-pin-create "retirement_probe") (format t "RETIREMENT-PIN-CREATED~%"))' \
+    >"$TMP/retirement-create.log"
+grep -q 'RETIREMENT-PIN-CREATED$' "$TMP/retirement-create.log"
+kill -INT "$SRV"
+wait "$SRV"
+SRV=
+pin="$TMP/data/pg_physical_pins/retirement_probe.pin"
+cp -p "$pin" "$TMP/current-pin"
+PYTHONPATH="$BASE/t/interop${PYTHONPATH:+:$PYTHONPATH}" python3 - "$TMP" <<'PY'
+import sys
+from pathlib import Path
+
+from crc32c_reference import crc32c
+
+root = Path(sys.argv[1])
+line = (root / "current-pin").read_bytes()
+assert line.endswith(b"\n")
+prefix, checksum = line[:-1].rsplit(b" ", 1)
+fields = prefix.split()
+assert len(fields) == 9 and fields[:2] == [b"PGPHYSPIN2", b"retirement_probe"]
+assert fields[3] == b"1" and fields[6] == b"-1" and fields[8] == b"reserved"
+assert int(checksum, 16) == crc32c(prefix)
+legacy = b" ".join([b"PGPHYSPIN1", *fields[1:6]])
+(root / "retired-pin").write_bytes(legacy + f" {crc32c(legacy):08X}\n".encode())
+PY
+cp "$TMP/retired-pin" "$pin"
+result=0
+timeout 30 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" >"$TMP/retired-pin.log" 2>&1 || result=$?
+test "$result" -eq 1
+grep -Fq "corrupt or foreign physical source pin $pin" "$TMP/retired-pin.log"
+cmp "$TMP/retired-pin" "$pin"
+cp -p "$TMP/current-pin" "$pin"
+start
+control '(progn (assert (gethash "retirement_probe" pg::*physical-source-pins*)) (format t "RETIREMENT-PIN-RESTORED~%"))' \
+    >"$TMP/retirement-restored.log"
+grep -q 'RETIREMENT-PIN-RESTORED$' "$TMP/retirement-restored.log"
+sql -c 'SELECT id, payload FROM physical_pin_fixture ORDER BY id;' >"$TMP/rows.restored-pin"
+diff -u "$TMP/rows.expected" "$TMP/rows.restored-pin"
 kill -INT "$SRV"
 wait "$SRV"
 SRV=
