@@ -283,7 +283,6 @@
   "Use pg_proc.dat volatility for supported builtins; unknown helpers stay fenced."
   (and (not (member name
                     '("array_length"
-                      "pg_get_expr" "pg_get_replica_identity_index"
                       "pg_stat_get_wal_receiver" "pg_get_publication_tables" "pg_get_replication_slots")
                     :test #'string=))
        (analyzed-function-volatile-p name)))

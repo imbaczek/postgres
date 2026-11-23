@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE TABLE dc_registry_replica_no_index (id int)",
+    "CREATE TABLE dc_registry_replica (id int PRIMARY KEY)",
+    "SELECT relname, pg_catalog.pg_get_replica_identity_index(oid) IS NULL FROM pg_catalog.pg_class WHERE relname IN ('dc_registry_replica_no_index', 'dc_registry_replica') ORDER BY relname",
+    "SELECT pg_catalog.pg_get_expr(NULL, 0::smallint), pg_get_replica_identity_index(NULL) IS NULL",
+    "SELECT pg_get_expr()",
     "CREATE TABLE dc_array_access_default (element int DEFAULT (ARRAY[10,20,30])[2], prefix text DEFAULT ((ARRAY[10,20,30])[:2])::text, suffix text DEFAULT ((ARRAY[10,20,30])[2:])::text)",
     "INSERT INTO dc_array_access_default DEFAULT VALUES RETURNING element, prefix, suffix",
     "CREATE TABLE dc_array_bound_error (v text DEFAULT ((ARRAY[10,20])[get_bit('\\x00'::bytea, 8):(1 / 0)])::text)",

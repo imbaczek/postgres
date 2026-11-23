@@ -472,6 +472,12 @@ only for the retained row of an ORDER BY with LIMIT.
 The registry resolves both reload commands as volatile nullary calls and
 routes them to the same asynchronous SIGHUP operation. The shutdown
 suite verifies that each SQL call requests and completes a reload.
+The scalar registry supplies stability and strictness for
+`pg_get_replica_identity_index` and the two-argument `pg_get_expr`.
+These signatures retain native OID representation and eager numeric
+OID conversion. The SQL differential checks replica identity for
+tables with and without a primary index, strict NULLs, and missing
+signatures.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

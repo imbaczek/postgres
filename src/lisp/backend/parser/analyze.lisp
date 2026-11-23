@@ -320,32 +320,21 @@ exist\" messages."
     (ereport "42883" "function ~a(~a) does not exist" name (typed-arg-name argument)))
   (coerce-numeric-expression-to-oid (coerce-in-constant argument :oid)))
 
-(defun analyze-metadata-function (name arguments)
-  (cond
-    ((string= name "array_length")
-     (unless (and (= 2 (length arguments))
-                  (or (eq (expr-type (first arguments)) :int2vector)
-                      (sql-array-element-type (expr-type (first arguments)))))
-       (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-     (let ((dimension (coerce-in-constant (second arguments) :int4)))
-       (unless (member (expr-type dimension) '(:int2 :int4))
-         (ereport "42883" "array_length dimension must be integer"))
-       (when (eq (expr-type dimension) :int2)
-         (setf dimension (list :cast dimension :type :int4 :typmod -1)))
-       (list :array-length (first arguments) dimension :type :int4 :typmod -1)))
-    ((string= name "pg_get_replica_identity_index")
-     (unless (= 1 (length arguments))
-       (ereport "42883" "function ~a requires one relation OID" name))
-     (list :func name (list (coerce-catalog-oid-argument (first arguments) name))
-           :type :oid :typmod -1))
-    ((string= name "pg_get_expr")
-     (unless (= 2 (length arguments))
-       (ereport "42883" "function ~a requires pg_node_tree and OID" name))
-     (let ((node (coerce-in-constant (first arguments) :pg-node-tree)))
-       (unless (eq (expr-type node) :pg-node-tree)
-         (ereport "42883" "pg_get_expr requires pg_node_tree"))
-       (list :func name (list node (coerce-catalog-oid-argument (second arguments) name))
-             :type :text :typmod -1)))))
+(defun analyze-array-length-function (name arguments)
+  (unless (and (= 2 (length arguments))
+               (or (eq (expr-type (first arguments)) :int2vector)
+                   (sql-array-element-type (expr-type (first arguments)))))
+    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
+  (let ((dimension (coerce-in-constant (second arguments) :int4)))
+    (unless (member (expr-type dimension) '(:int2 :int4))
+      (ereport "42883" "array_length dimension must be integer"))
+    (when (eq (expr-type dimension) :int2)
+      (setf dimension (list :cast dimension :type :int4 :typmod -1)))
+    (list :array-length (first arguments) dimension :type :int4 :typmod -1)))
+
+(defun sql-get-expr (node relation)
+  (declare (ignore node relation))
+  (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported"))
 
 (defun sql-text-octet-length (text)
   (length (string->bytes text)))
@@ -447,6 +436,14 @@ exist\" messages."
                                         :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
                    (make-scalar-builtin :name "pg_reload_code" :result-type :bool
                                         :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
+                   (make-scalar-builtin :name "pg_get_replica_identity_index" :argument-types '(:oid)
+                                        :result-type :oid :volatility :stable :strict-p t
+                                        :evaluator 'sql-replica-identity-index :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "pg_get_expr" :argument-types '(:pg-node-tree :oid)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-expr :implicit-arguments-p t
+                                        :defer-decorated-coercion-p nil)
                    (make-scalar-builtin :name "version" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
@@ -534,6 +531,12 @@ The bit/bytea alternatives have different non-string categories and stay ambiguo
            (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
           (t best))))
 
+(defun coerce-scalar-builtin-argument (argument type)
+  "Keep eager OID constant conversion for catalog signatures."
+  (if (and (eq type :oid) (member (expr-type argument) '(:int2 :int4 :int8)))
+      (coerce-numeric-expression-to-oid argument)
+      (coerce-common-expression argument type)))
+
 (defun analyze-scalar-builtin (name candidates arguments decorated-p)
   "Resolve a scalar signature and apply its constant coercion policy.
 Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
@@ -543,7 +546,7 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              ((t) decorated-p)
              ((nil) *defer-function-constant-coercion-p*)
              (:always t))))
-    (list :func name (mapcar #'coerce-common-expression arguments
+    (list :func name (mapcar #'coerce-scalar-builtin-argument arguments
                              (scalar-builtin-argument-types builtin))
           :type (scalar-builtin-result-type builtin) :typmod -1)))
 
@@ -1793,8 +1796,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (analyze-render-function name args)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
-      ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
-       (analyze-metadata-function name args))
+      ((string= name "array_length") (analyze-array-length-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       ((member name '("nextval" "currval" "setval") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
@@ -4738,11 +4740,6 @@ the full 64-bit ID as a signed value."
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((string= name "string_to_array") (eval-string-to-array args))
-    ((string= name "pg_get_expr")
-     (sql-strict-let ((node (first args)) (relation (second args)))
-       (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported")))
-    ((string= name "pg_get_replica_identity_index")
-     (sql-strict-let ((oid (first args))) (sql-replica-identity-index oid)))
     ((string= name "nextval")
      (unless (and (= (length args) 1) (stringp (first args)))
        (ereport "42883" "nextval expects one sequence name string"))

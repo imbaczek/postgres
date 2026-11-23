@@ -46,7 +46,6 @@ Only constant names can be tracked for persisted expressions and replication."
         (every #'scalar-builtin-strict-p builtins)
         (or (having-immutable-function-p name)
             (member name '("nextval" "currval" "setval" "pg_promote"
-                           "pg_get_expr" "pg_get_replica_identity_index"
                            "pg_cancel_backend" "pg_terminate_backend")
                     :test #'string=)))))
 
