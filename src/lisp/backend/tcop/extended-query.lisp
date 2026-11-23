@@ -205,50 +205,59 @@
         (ereport "58030" "portal cleanup remains incomplete"))))
   (values))
 
+(defun make-extended-portal-execution-owner (portal &key suppress-datum-origins)
+  "Build the bindings retained by the portal's resumable executor."
+  (make-query-execution-owner
+   :bindings
+   (list* (cons '*query-parameter-types* (extended-statement-types (extended-portal-statement portal)))
+          (cons '*query-parameter-values* (extended-portal-values portal))
+          (cons '*select-result-formats* (extended-portal-result-formats portal))
+          (cons '*select-expected-result-columns* (extended-portal-result-columns portal))
+          (cons '*select-suppress-description* t)
+          (when suppress-datum-origins (list (cons '*datum-origin-capture* nil))))))
+
+(defmacro with-extended-portal-initialization ((portal execution registry) &body body)
+  "Register the execution before acquisition so cleanup can retire a partial Bind."
+  (let ((actual-portal (gensym "PORTAL-"))
+        (complete (gensym "COMPLETE-")))
+    `(let ((,actual-portal ,portal)
+           (,complete nil))
+       (unwind-protect
+            (progn
+              (sb-thread:with-mutex (*extended-portal-executions-lock*)
+                (setf (gethash ,actual-portal ,registry) ,execution))
+              ,@body
+              (setf ,complete t)
+              ,actual-portal)
+         (unless ,complete (extended-close-portal ,actual-portal))))))
+
 (defun extended-initialize-select-portal (portal)
-  ;; Publish the execution owner before acquiring its snapshot or iterator, so
-  ;; failure can retire all partially initialized state through portal cleanup.
   (let* ((statement (extended-portal-statement portal))
-         (owner (make-query-execution-owner
-                 :bindings
-                 (list (cons '*query-parameter-types* (extended-statement-types statement))
-                       (cons '*query-parameter-values* (extended-portal-values portal))
-                       (cons '*select-result-formats* (extended-portal-result-formats portal))
-                       (cons '*select-expected-result-columns* (extended-portal-result-columns portal))
-                       (cons '*select-suppress-description* t)
-                       (cons '*datum-origin-capture* nil))))
-         (execution (make-extended-select-execution :owner owner))
-         (complete nil))
-    (unwind-protect
-         (progn
-           (sb-thread:with-mutex (*extended-portal-executions-lock*)
-             (setf (gethash portal *extended-select-executions*) execution))
-           (recovery-check-statement (extended-statement-ast statement))
-           (query-execution-owner-acquire-snapshot
-            owner (lambda (registration) (statement-start registration nil)))
-           (call-with-query-execution-owner
-            owner
-            (lambda ()
-              (multiple-value-bind (plan targets columns)
-                  (prepare-select-result (extended-statement-ast statement))
-                (check-result-column-shape columns *select-expected-result-columns*)
-                (setf (extended-select-execution-plan execution) plan
-                      (extended-select-execution-targets execution) targets)
-                (flet ((initialize (relations)
-                         (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
-                               relations)
-                         ;; Record scans now, including lazy children, while the portal
-                         ;; owns the initialized executor.
-                         (retain-query-plan-executor-tables plan relations)
-                         (call-with-select-index-lease-domain
-                          (query-plan-index-relfilenodes plan relations)
-                          (lambda ()
-                            (setf (extended-select-execution-iterator execution)
-                                  (make-resumable-query-plan-iterator plan relations))))))
-                  (call-with-admitted-select-plan plan #'initialize)))))
-           (setf complete t)
-           portal)
-      (unless complete (extended-close-portal portal)))))
+         (owner (make-extended-portal-execution-owner portal :suppress-datum-origins t))
+         (execution (make-extended-select-execution :owner owner)))
+    (with-extended-portal-initialization (portal execution *extended-select-executions*)
+      (recovery-check-statement (extended-statement-ast statement))
+      (query-execution-owner-acquire-snapshot
+       owner (lambda (registration) (statement-start registration nil)))
+      (call-with-query-execution-owner
+       owner
+       (lambda ()
+         (multiple-value-bind (plan targets columns)
+             (prepare-select-result (extended-statement-ast statement))
+           (check-result-column-shape columns *select-expected-result-columns*)
+           (setf (extended-select-execution-plan execution) plan
+                 (extended-select-execution-targets execution) targets)
+           (flet ((initialize (relations)
+                    (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
+                          relations)
+                    ;; Retain scans, including lazy children, for the portal's executor.
+                    (retain-query-plan-executor-tables plan relations)
+                    (call-with-select-index-lease-domain
+                     (query-plan-index-relfilenodes plan relations)
+                     (lambda ()
+                       (setf (extended-select-execution-iterator execution)
+                             (make-resumable-query-plan-iterator plan relations))))))
+             (call-with-admitted-select-plan plan #'initialize))))))))
 
 (defun extended-send-portal-rows (stream iterator targets limit &optional values-only-p)
   ;; Observe EOF only through a pull allowed by LIMIT, even for a sealed store.
@@ -296,36 +305,21 @@
           nil))))
 
 (defun extended-initialize-dml-portal (portal)
-  ;; Publish the owner before preparing and admitting the target and sources.
-  ;; A failed Bind passes the partial execution to portal cleanup.
   (let* ((statement (extended-portal-statement portal))
-         (owner (make-query-execution-owner
-                 :bindings
-                 (list (cons '*query-parameter-types* (extended-statement-types statement))
-                       (cons '*query-parameter-values* (extended-portal-values portal))
-                       (cons '*select-result-formats* (extended-portal-result-formats portal))
-                       (cons '*select-expected-result-columns* (extended-portal-result-columns portal))
-                       (cons '*select-suppress-description* t))))
-         (execution (make-extended-dml-execution :owner owner))
-         (complete nil))
-    (unwind-protect
-         (progn
-           (sb-thread:with-mutex (*extended-portal-executions-lock*)
-             (setf (gethash portal *extended-dml-executions*) execution))
-           (call-with-query-execution-owner
-            owner
-            (lambda ()
-              (unless (recovery-in-progress-p)
-                (prepare-xid-wraparound-for-statement *backend*))
-              ;; Disallow isolation changes after Bind has admitted the query.
-              (setf (backend-first-snapshot-set *backend*) t)
-              (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
-                (setf (extended-dml-execution-prepared execution) prepared
-                      (extended-dml-execution-targets execution) (getf prepared :returning))
-                (register-dml-subquery-relations prepared (get-current-reader-xid)))))
-           (setf complete t)
-           portal)
-      (unless complete (extended-close-portal portal)))))
+         (owner (make-extended-portal-execution-owner portal))
+         (execution (make-extended-dml-execution :owner owner)))
+    (with-extended-portal-initialization (portal execution *extended-dml-executions*)
+      (call-with-query-execution-owner
+       owner
+       (lambda ()
+         (unless (recovery-in-progress-p)
+           (prepare-xid-wraparound-for-statement *backend*))
+         ;; Disallow isolation changes after Bind has admitted the query.
+         (setf (backend-first-snapshot-set *backend*) t)
+         (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
+           (setf (extended-dml-execution-prepared execution) prepared
+                 (extended-dml-execution-targets execution) (getf prepared :returning))
+           (register-dml-subquery-relations prepared (get-current-reader-xid))))))))
 
 (defun extended-materialize-dml-portal (stream portal execution)
   ;; Run mutations once and retain a sealed result for later pulls. The receiver

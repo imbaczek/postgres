@@ -287,6 +287,10 @@ Simple SELECT, portal initialization, and extended-protocol metadata now
 derive their result columns through the same preparation entry point. Parse
 and Bind still retain readers before returning, and statement Describe
 recomputes and checks the prepared statement's result signature.
+SELECT and RETURNING Bind share execution-owner bindings, registry publication,
+and failure cleanup. SELECT keeps its recovery check and snapshot acquisition
+before plan admission. RETURNING retains its transaction and reader setup.
+Eighty-five strict tests and the live portal lifecycle suite passed.
 
 The B-tree point search, resumable equality cursor, and insert routing share
 one internal-page child range. Equality visits the preceding child and every
