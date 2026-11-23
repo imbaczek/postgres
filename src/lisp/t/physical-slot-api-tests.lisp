@@ -1200,10 +1200,10 @@
                              (lambda () (physical-slot-test-analyze-call "SELECT pg_get_replication_slots()")))))))))
 
 (deftest replication-slot-srf-is-stable-and-wal-loss-is-not-a-recovery-conflict
-    (ok (not (pg::cte-function-volatile-p "pg_get_replication_slots")))
+    (ok (not (pg::cte-volatile-call-p '(:set-func "pg_get_replication_slots" nil))))
   (dolist (name '("pg_create_physical_replication_slot" "pg_replication_slot_advance"
                   "pg_drop_replication_slot"))
-    (ok (pg::cte-function-volatile-p name)))
+    (ok (pg::cte-volatile-call-p (list :func name nil))))
   (call-with-physical-slot-api-fixture
    (lambda (root)
      (declare (ignore root))

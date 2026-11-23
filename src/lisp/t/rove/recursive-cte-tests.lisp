@@ -156,7 +156,7 @@
 (rove:deftest mandelbrot-function-volatility
     (dolist (name '("chr" "array_to_string" "string_to_array" "greatest" "least"))
       (rove:ok (not (analyzed-expression-volatile-p (list :func name nil))) name)
-      (rove:ok (not (cte-function-volatile-p name)) name)
+      (rove:ok (not (cte-volatile-call-p (list :func name nil))) name)
       (rove:ok (analyzed-expression-volatile-p
                 (list :func name (list (list :func "random" nil)))) name)))
 

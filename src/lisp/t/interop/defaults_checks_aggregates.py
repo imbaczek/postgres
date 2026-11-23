@@ -7,6 +7,13 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE TABLE dc_registry_pub_table (id int PRIMARY KEY)",
+    "CREATE PUBLICATION dc_registry_pub FOR TABLE dc_registry_pub_table",
+    "SELECT count(*) FROM pg_catalog.pg_get_publication_tables('dc_registry_pub')",
+    "SELECT count(*) FROM pg_get_publication_tables(VARIADIC ARRAY['dc_registry_pub'])",
+    "SELECT count(*) FROM pg_get_publication_tables(ARRAY['dc_registry_pub', 'missing'], (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'dc_registry_pub_table'))",
+    "SELECT count(*) FROM pg_get_publication_tables(VARIADIC NULL::text[])",
+    "SELECT count(*) FROM pg_catalog.pg_get_replication_slots()",
     "SELECT pid = pg_backend_pid() AS own_pid FROM pg_catalog.pg_stat_get_activity(pg_backend_pid())",
     "SELECT pid = pg_backend_pid() AS own_pid FROM pg_stat_get_activity(NULL) WHERE pid = pg_backend_pid()",
     "SELECT count(*) FROM pg_catalog.pg_stat_get_wal_senders()",

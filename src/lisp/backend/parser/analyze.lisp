@@ -540,6 +540,14 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_get_replication_slots" :result-type :record
+                                        :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
+                   (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
+                                        :result-type :record :volatility :stable :strict-p t
+                                        :evaluator '(:iterator . make-publication-table-result-iterator))
+                   (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array :oid)
+                                        :result-type :record :volatility :stable :strict-p t
+                                        :evaluator '(:iterator . make-publication-table-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_wal_senders" :result-type :record
                                         :volatility :stable :evaluator '(:iterator . make-wal-sender-result-iterator))
                    (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type :record
@@ -879,7 +887,8 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
           (result-type (scalar-builtin-result-type builtin)))
       (cond
         ((scalar-builtin-iterator builtin)
-         (analyze-record-set-call name inputs (scalar-record-builtin-fields name)))
+         (check-record-set-call-context)
+         (make-record-set-call name inputs))
         ;; Preserve the allocation-free evaluator and the stored expression shape.
         ((eq (scalar-builtin-evaluator builtin) 'sql-array-length)
          (list :array-length (first inputs) (second inputs) :type result-type :typmod -1))
@@ -1048,15 +1057,18 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
   (cond ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
         ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
         ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
-        ((string= name "pg_stat_get_activity") +activity-result-fields+)))
+        ((string= name "pg_stat_get_activity") +activity-result-fields+)
+        ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
+        ((string= name "pg_get_publication_tables") +publication-table-result-fields+)))
 
-(defun analyze-record-set-call (name arguments fields)
-  "Build a record-valued set call after checking its expression context."
+(defun check-record-set-call-context ()
   (unless *select-set-functions-allowed-p*
     (ereport "0A000" "set-returning functions are not allowed in this context"))
   (when *inside-aggregate-input-p*
-    (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
-  (list :set-func name arguments :type :record :typmod -1 :fields fields))
+    (ereport "0A000" "aggregate function calls cannot contain set-returning functions")))
+
+(defun make-record-set-call (name arguments)
+  (list :set-func name arguments :type :record :typmod -1 :fields (scalar-record-builtin-fields name)))
 
 (defun analyze-promotion-arguments (arguments table &optional variadic)
   "Bind pg_promote arguments in parameter order and supply defaults.
@@ -1714,7 +1726,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (return-from analyze-function-expression
         (analyze-publication-table-call name args (getf (cdddr expr) :variadic))))
     (cond
-      ((string= name "pg_get_replication_slots") (analyze-replication-slot-call name args))
       ((replication-slot-function-signature name) (analyze-replication-slot-function name args))
       ((or (numeric-function-p name)
            (member name '("random" "setseed") :test #'string=))
@@ -3529,9 +3540,7 @@ candidate selection."
     (ereport "42809" "expression is not a supported composite type"))
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
-          ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
           ((scalar-record-builtin-fields name))
-          ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
           ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
                    :test #'string=) +physical-slot-create-result-fields+)
           ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)
@@ -3608,17 +3617,8 @@ checks still apply."
              (member (first node) '(:subplan :outer-ref))))
    form))
 
-(defun analyze-replication-slot-call (name arguments)
-  "Resolve the nullary slot SRF and reject contexts that cannot accept a set."
-  (when arguments
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (analyze-record-set-call name nil +replication-slot-result-fields+))
-
 (defun analyze-publication-table-call (name arguments variadic)
-  (unless *select-set-functions-allowed-p*
-    (ereport "0A000" "set-returning functions are not allowed in this context"))
-  (when (and (boundp '*inside-aggregate-input-p*) *inside-aggregate-input-p*)
-    (ereport "0A000" "aggregate function calls cannot contain set-returning functions"))
+  (check-record-set-call-context)
   (when (some #'analyzed-expression-contains-set-p arguments)
     (ereport "0A000" "nested set-returning functions are not supported"))
   (let* ((filtered
@@ -3646,10 +3646,9 @@ checks still apply."
                              arguments)
                 (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
               (list :array arguments :type :text-array :typmod -1)))))
-    (list :set-func name
-          (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
-              (list array))
-          :type :record :typmod -1 :fields +publication-table-result-fields+)))
+    (make-record-set-call name
+                          (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
+                              (list array)))))
 
 (defun analyze-record-field (raw scope)
   (let* ((record (analyze-expr (second raw) scope))
@@ -4633,11 +4632,14 @@ the full 64-bit ID as a signed value."
     (ereport "42883" "setval expects a sequence name, int8 value, and optional boolean"))
   (sequence-setval (check-sequence-function-relation name t) value is-called))
 
+(defun scalar-builtin-for-call (name arguments first-argument)
+  (let ((candidates (gethash name *scalar-builtin-descriptors*)))
+    (if (rest candidates)
+        (scalar-builtin-for-evaluation candidates (length arguments) first-argument)
+        (first candidates))))
+
 (defun eval-func (name args &optional first-argument call)
-  (let* ((candidates (gethash name *scalar-builtin-descriptors*))
-         (builtin (if (rest candidates)
-                      (scalar-builtin-for-evaluation candidates (length args) first-argument)
-                      (first candidates))))
+  (let ((builtin (scalar-builtin-for-call name args first-argument)))
     (when builtin (return-from eval-func (eval-scalar-builtin builtin args first-argument call))))
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))

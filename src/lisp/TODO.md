@@ -620,6 +620,12 @@ shared by scalar projection analysis and record expansion. The
 1,453 C comparisons covered qualified calls, a NULL activity filter,
 and lookup and decoration precedence. Focused physical heads verify
 sender fields and owned activity snapshots.
+`pg_get_replication_slots` and both `pg_get_publication_tables` call
+shapes share registry iterator selection and stable CTE metadata.
+Publication analysis still normalizes variadic names and the optional
+relation filter before selecting a set plan. The 1,460 C comparisons
+covered both publication shapes, NULL arrays, and empty slot results.
+Focused physical heads verify slot fields, snapshots, and CTE stability.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

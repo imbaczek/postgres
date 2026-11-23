@@ -1636,8 +1636,10 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
 
 (defun make-sql-set-function-iterator (call environment)
   (let* ((arguments (mapcar (lambda (argument) (eval-expr argument environment)) (third call)))
-         (iterator (when (eq (first call) :set-func)
-                     (scalar-builtin-iterator (first (gethash (second call) *scalar-builtin-descriptors*))))))
+         (iterator
+           (when (eq (first call) :set-func)
+             (scalar-builtin-iterator
+              (scalar-builtin-for-call (second call) arguments (first (third call)))))))
     (cond ((eq (first call) :single-record)
            (let ((value (eval-func (second call) arguments)) (pending t))
              (lambda ()
@@ -1646,10 +1648,6 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
           ((string= (second call) "pg_ls_dir")
            (apply #'make-rewind-directory-result-iterator arguments))
           (iterator (apply iterator arguments))
-          ((string= (second call) "pg_get_replication_slots")
-           (make-replication-slot-result-iterator))
-          ((string= (second call) "pg_get_publication_tables")
-           (apply #'make-publication-table-result-iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
 
 (defun project-set-row-origins (origins input-width output-width)

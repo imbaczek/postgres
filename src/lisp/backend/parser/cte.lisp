@@ -279,16 +279,9 @@
           :cte definition :cte-worktable (not (null (member definition *select-recursive-worktables* :test #'eq)))
           :cte-filter nil :cte-reference-plan nil :cte-levelsup (- *select-cte-level* (sql-cte-owner-level definition)))))
 
-(defun cte-function-volatile-p (name)
-  "Use pg_proc.dat volatility for supported builtins; unknown helpers stay fenced."
-  (and (not (member name
-                    '("pg_get_publication_tables" "pg_get_replication_slots")
-                    :test #'string=))
-       (analyzed-function-volatile-p name)))
-
 (defun cte-volatile-call-p (form)
   (and (member (first form) '(:func :set-func :single-record))
-       (cte-function-volatile-p (second form))))
+       (analyzed-function-volatile-p (second form))))
 
 (defun cte-expression-volatile-p (form &key skip-outer-references)
   "Check executable operands and explicitly visit nested subquery scopes."
