@@ -535,6 +535,20 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-numeric-builtin "dsqrt" '(:float8) :float8 'sql-float-sqrt)
+                   (make-numeric-builtin "dexp" '(:float8) :float8 'sql-float-exp)
+                   (make-numeric-builtin "dlog1" '(:float8) :float8 'sql-float-ln)
+                   (make-numeric-builtin "dlog10" '(:float8) :float8 'sql-float-log10)
+                   (make-numeric-builtin "float4abs" '(:float4) :float4
+                                         (lambda (value) (sql-float-basic-function "abs" value)))
+                   (make-numeric-builtin "float8abs" '(:float8) :float8
+                                         (lambda (value) (sql-float-basic-function "abs" value)))
+                   (make-numeric-builtin "dround" '(:float8) :float8
+                                         (lambda (value) (sql-float-basic-function "round" value)))
+                   (make-numeric-builtin "dtrunc" '(:float8) :float8
+                                         (lambda (value) (sql-float-basic-function "trunc" value)))
+                   (make-numeric-builtin "dpow" '(:float8 :float8) :float8 'sql-float-power)
+                   (make-numeric-builtin "numeric_power" '(:numeric :numeric) :numeric 'sql-numeric-power)
                    (make-numeric-builtin "pi" nil :float8 (lambda () pi))
                    (make-float-trig-builtin "cbrt")
                    (make-float-trig-builtin "dcbrt")
@@ -1050,9 +1064,8 @@ names and unknown types.  setseed has no catalog argument names."
   (or (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p)
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                     "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                     "log" "log10" "numeric_log" "power" "pow"
                      "width_bucket") :test #'string=)
-      (float-catalog-alias name)
       (integer-catalog-alias-p name)))
 
 (defun numeric-function-argument-count-p (name count)
@@ -1064,7 +1077,7 @@ names and unknown types.  setseed has no catalog argument names."
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
          (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
-        ((member name '("numeric_log" "power" "pow" "numeric_power" "dpow") :test #'string=)
+        ((member name '("numeric_log" "power" "pow") :test #'string=)
          (= count 2))
         (t (= count 1))))
 
@@ -1309,15 +1322,12 @@ include different type categories."
 (defun resolve-power-operands (name args)
   "Resolve and coerce the two operands of a power function or operator.
 A known numeric operand selects numeric unless a float operand is present;
-otherwise the preferred float8 overload is used.  The catalog aliases dpow
-and numeric_power select their declared types."
+otherwise the preferred float8 overload is used."
   (unless (= (length args) 2)
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (let* ((numeric (and (not (string= name "dpow"))
-                       (or (string= name "numeric_power")
-                           (and (some (lambda (arg) (and (not (in-unknown-constant-p arg))
-                                                         (eq (expr-type arg) :numeric))) args)
-                                (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args)))))
+  (let* ((numeric (and (some (lambda (arg) (and (not (in-unknown-constant-p arg))
+                                                (eq (expr-type arg) :numeric))) args)
+                       (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args)))
          (type (if numeric :numeric :float8)))
     (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
                                      (sql-implicit-coercion-p (expr-type arg) type))) args)
@@ -1483,21 +1493,6 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
         ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
         (t (sql-width-bucket-range args))))
 
-(defun float-catalog-alias (name)
-  "Return the declared argument type and execution name for a float catalog function.
-Each listed function takes one argument and returns the same float type.  The
-execution name selects a shared implementation; analysis keeps the catalog name
-so expression identity remains distinct from the corresponding SQL function."
-  (cdr (assoc name '(("float4abs" :float4 "abs")
-                     ("float8abs" :float8 "abs")
-                     ("dround" :float8 "round")
-                     ("dtrunc" :float8 "trunc")
-                     ("dsqrt" :float8 "sqrt")
-                     ("dexp" :float8 "exp")
-                     ("dlog1" :float8 "ln")
-                     ("dlog10" :float8 "log10"))
-              :test #'string=)))
-
 (defun integer-catalog-alias-p (name)
   "Recognize supported integer catalog function names, retaining call identity.
 The declared operand types are resolved during analysis; execution shares the
@@ -1542,14 +1537,6 @@ so a nested argument error keeps its own diagnostics."
   (handler-case
       (cond
         ((integer-catalog-alias-p name) (analyze-integer-catalog-function name args schema))
-        ((float-catalog-alias name)
-         (let ((type (first (float-catalog-alias name))))
-           (unless (and (= (length args) 1)
-                        (or (in-unknown-constant-p (first args))
-                            (sql-implicit-coercion-p (expr-type (first args)) type)))
-             (report-numeric-function-resolution-error name args :schema schema))
-           (list :func name (list (coerce-common-expression (first args) type))
-                 :type type :typmod -1)))
         ((gethash name *scalar-builtin-descriptors*)
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
@@ -1560,7 +1547,7 @@ so a nested argument error keeps its own diagnostics."
          (analyze-basic-numeric-function name args))
         ((member name '("log" "log10" "numeric_log") :test #'string=)
          (analyze-log-function name args))
-        ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+        ((member name '("power" "pow") :test #'string=)
          (analyze-power-function name args)))
     (pg-error (condition)
       (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
@@ -3884,10 +3871,9 @@ still requires deferred sort projection."
 (defun legacy-immutable-function-p (name)
   "Recognize immutable scalar functions whose signatures still have separate analyzers."
   (or (integer-catalog-alias-p name)
-      (float-catalog-alias name)
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                     "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
+                     "log" "log10" "numeric_log" "power" "pow"
                      "width_bucket")
               :test #'string=)))
 
@@ -4989,10 +4975,7 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
 
 (defun eval-analyzed-function (name arguments type &optional first-argument)
   "Evaluate a resolved call using its coerced argument values and result type.
-Arguments have already been evaluated in order, including for strict calls.
-Map float catalog names and dispatch integer catalog names only here, after
-expression identity has been resolved."
-  (setf name (or (second (float-catalog-alias name)) name))
+Arguments have already been evaluated in order, including for strict calls."
   (cond
     ((integer-catalog-alias-p name)
      (if (member +null+ arguments) +null+
@@ -5017,7 +5000,7 @@ expression identity has been resolved."
        (cond ((eq value +null+) +null+)
              ((eq type :numeric) (sql-numeric-sqrt value))
              (t (sql-float-sqrt value)))))
-    ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
+    ((member name '("power" "pow") :test #'string=)
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
            (t (sql-float-power (first arguments) (second arguments)))))

@@ -520,6 +520,10 @@ CASES = (
     "SELECT DISTINCT x^2 FROM (SELECT 2 AS x UNION ALL SELECT 3) t ORDER BY power(x,2)",
     "SELECT DISTINCT power(x,2) FROM (SELECT 2 AS x UNION ALL SELECT 3) t ORDER BY x^2",
     "SELECT power(2,3),pow(2::numeric,3::numeric),numeric_power(2,3),dpow(2,3)",
+    "SELECT pg_catalog.dpow(2::numeric,'3'), pg_catalog.numeric_power(2::smallint,'3')",
+    "SELECT pg_catalog.numeric_power(2::real,3)",
+    "SELECT pg_catalog.dlog1(DISTINCT 'bad')",
+    "CREATE TABLE dc_float_alias_default (a real DEFAULT float4abs('-0'), b float8 DEFAULT dpow(2,3), c numeric DEFAULT numeric_power(2,3))",
     "SELECT power(0::numeric,0::numeric),power(2.00::numeric,0.0::numeric),power((-2)::numeric,3::numeric),power((-2)::numeric,4::numeric)",
     "SELECT power(2::numeric,(-3)::numeric),power(9::numeric,0.5::numeric),power(0::numeric,0.5::numeric)",
     "SELECT power(0::numeric,(-1)::numeric)",
@@ -1354,6 +1358,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_float_alias_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_trig_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_arithmetic_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_numeric_helper_default DEFAULT VALUES RETURNING v",

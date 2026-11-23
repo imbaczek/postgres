@@ -564,6 +564,11 @@ conversions, cube-root aliases, and `pi` use registry resolution and
 strict immutable dispatch. The 1,420 C comparisons covered signed
 zero, NaN, exact degree values, range and lookup diagnostics, and
 unary roots. Stored angle and cube-root defaults passed after restart.
+The fixed float catalog aliases and `numeric_power` now use their
+declared registry signatures. Stored expressions retain the catalog
+names. The 1,424 C comparisons covered input width, qualified calls,
+and diagnostic precedence. Float and numeric power defaults passed
+after a fresh-process restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
