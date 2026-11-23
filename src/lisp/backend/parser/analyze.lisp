@@ -453,6 +453,11 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type :record
+                                        :volatility :stable :evaluator 'wal-receiver-result)
+                   (make-scalar-builtin :name "pg_control_checkpoint" :result-type :record
+                                        :volatility :volatile :strict-p t
+                                        :evaluator 'native-control-checkpoint-result)
                    (make-scalar-builtin :name "pg_promote" :argument-types '(:bool :int4)
                                         :result-type :bool :volatility :volatile :strict-p t
                                         :evaluator 'pg-promote)
@@ -573,14 +578,17 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              ((t) decorated-p)
              ((nil) *defer-function-constant-coercion-p*)
              (:always t))))
-    (list :func name (case (scalar-builtin-implicit-arguments-p builtin)
-                       (:admin arguments)
-                       (:sequence (coerce-sequence-builtin-arguments arguments
-                                                                     (scalar-builtin-argument-types builtin)))
-                       (otherwise
-                        (mapcar #'coerce-scalar-builtin-argument arguments
-                                (scalar-builtin-argument-types builtin))))
-          :type (scalar-builtin-result-type builtin) :typmod -1)))
+    (list* :func name
+           (case (scalar-builtin-implicit-arguments-p builtin)
+             (:admin arguments)
+             (:sequence (coerce-sequence-builtin-arguments arguments
+                                                           (scalar-builtin-argument-types builtin)))
+             (otherwise
+              (mapcar #'coerce-scalar-builtin-argument arguments
+                      (scalar-builtin-argument-types builtin))))
+           :type (scalar-builtin-result-type builtin) :typmod -1
+           (when (eq (scalar-builtin-result-type builtin) :record)
+             (list :fields (scalar-record-builtin-fields name))))))
 
 (defun analyze-jsonb-set-function (name arguments)
   "Resolve jsonb_set(jsonb, text[], jsonb [, boolean])."
@@ -818,10 +826,9 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
           (toast-map-text-characters toast pointer snapshot nil
                                      :index-reader #'select-toast-index-reader)))))
 
-(defun analyze-nullary-record-function (name arguments fields)
-  (when arguments
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (list :func name nil :type :record :typmod -1 :fields fields))
+(defun scalar-record-builtin-fields (name)
+  (cond ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
+        ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)))
 
 (defun analyze-record-set-call (name arguments fields)
   "Build a record-valued set call after checking its expression context."
@@ -1773,10 +1780,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-jsonb-set-function name args)))
-      ((string= name "pg_stat_get_wal_receiver")
-       (analyze-nullary-record-function name args +wal-receiver-result-fields+))
-      ((string= name "pg_control_checkpoint")
-       (analyze-nullary-record-function name args +control-checkpoint-result-fields+))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
       (builtins
@@ -3596,8 +3599,7 @@ candidate selection."
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
           ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
-          ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
-          ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
+          ((scalar-record-builtin-fields name))
           ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
           ((string= name "pg_stat_get_activity") +activity-result-fields+)
           ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
@@ -4761,8 +4763,6 @@ the full 64-bit ID as a signed value."
              :test #'string=)
      (if (member +null+ args) +null+
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
-    ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
-    ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))

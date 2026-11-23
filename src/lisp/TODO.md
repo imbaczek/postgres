@@ -499,6 +499,9 @@ branches. A NULL sequence name contributes no dependency.
 execution, with the existing named binder supplying defaults and
 preserving coercion and evaluation order. Strictness and sort
 volatility now come from that descriptor.
+The scalar registry also supplies signatures, evaluators, and C catalog
+volatility for `pg_stat_get_wal_receiver` and `pg_control_checkpoint`.
+Scalar and expanded projections share their fixed record field definitions.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
