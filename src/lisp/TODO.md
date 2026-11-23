@@ -154,6 +154,10 @@ For B9, reopening the receive store requires PGPHYS03 with a recorded floor
 and digest seed. A checksummed PGPHYS02 image is rejected without rewriting
 it. PGPHYS03 still supports control with no history selection, with history
 selection, and with a retained-root identity.
+The live physical replay fixture projects an unreclaimed receive store
+into the checksummed 52-byte PGPHYS02 format. A cold standby rejects it
+without rewriting it. Restoring PGPHYS03 permits an owned restart,
+successful replay, and recovery across the restartpoint crash cuts.
 
 For B10, startup requires PGRSTAT3 for ordinary recovery or PGRSTAT4 for
 pending promotion. The signal harness checks rejection of both retired

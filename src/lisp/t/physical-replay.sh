@@ -89,6 +89,43 @@ checked source "(physical-base-backup \"$TMP/copy/\" \"redo_base\")" backup
 start_target
 checked target '(physical-recovery-enable-streaming)' enable
 compare
+# The first receive store has no reclaimed prefix, so its current fields
+# can supply a valid witness in the retired 52-byte receive format.
+kill -INT "$TARGET"
+wait "$TARGET"
+TARGET=
+receive_control="$TMP/copy/pg_physical_receive/receive.control"
+cp -p "$receive_control" "$TMP/receive-current"
+PYTHONPATH="$BASE/t/interop${PYTHONPATH:+:$PYTHONPATH}" python3 - "$TMP" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+from crc32c_reference import crc32c
+
+root = Path(sys.argv[1])
+current = bytearray((root / "receive-current").read_bytes())
+assert len(current) == 68 and current[:8] == b"PGPHYS03"
+checksum = struct.unpack_from("<I", current, 64)[0]
+struct.pack_into("<I", current, 64, 0)
+assert checksum == crc32c(current)
+base, flush, _, floor, seed = struct.unpack_from("<QQQQQ", current, 24)
+assert floor == base <= flush and seed == 0xCBF29CE484222325
+retired = current[:48] + b"\0" * 4
+retired[:8] = b"PGPHYS02"
+struct.pack_into("<I", retired, 48, crc32c(retired))
+(root / "receive-retired").write_bytes(retired)
+PY
+cp "$TMP/receive-retired" "$receive_control"
+status=0
+timeout 30 "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
+    >"$TMP/retired-receive.log" 2>&1 || status=$?
+test "$status" -eq 1
+grep -Fq 'invalid physical receive control length' "$TMP/retired-receive.log"
+cmp "$TMP/receive-retired" "$receive_control"
+cp -p "$TMP/receive-current" "$receive_control"
+start_target
+compare
 # Primary SELECTs use real transaction IDs and may leave empty commit batches.
 # Drain those before isolating the intentionally incomplete INSERT batch below.
 export_wal
