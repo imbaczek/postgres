@@ -1267,9 +1267,15 @@ differential regressions verify the grouped value and comparison result.
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
-  contract. The fixture writes replayable batches across three WAL segments
-  and restores the durable slot under real startup ownership. Its 12 checks
-  pass in isolation, and the combined unit run advances past the fixture.
+  contract. In `6bcf82cf717`,
+  [the durable retention test](t/unit-tests/wal-tests.lisp) writes replayable
+  batches across three WAL segments and restores the slot under startup
+  ownership. It releases the original XID and snapshot before reload. The
+  reconstructed slot alone keeps the old segments until the slot is dropped.
+  All 12 checks passed in isolation. In `b934b3bbb91` the test also acquired a
+  fresh active-XID list for each run.
+  The combined run at `404fa69ea5b` passed all 1,642 Rove heads and 1,172
+  legacy checks, including this fixture.
 
 - [x] Reconcile XID wraparound recovery with strict primary startup. Stage and
   sync the empty CLOG separately, atomically replace `pg_xact`, then sync
