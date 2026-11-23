@@ -907,10 +907,8 @@
              (runtime (pg::make-physical-follow-runtime)))
         (unwind-protect
              (progn
-               (ok (equal "0000000000000001.wal"
-                          (pg::physical-follow-archive-restart-file runtime :legacy)))
                (ok (equal "000000010000000000000001.wal"
-                          (pg::physical-follow-archive-restart-file runtime :timeline)))
+                          (pg::physical-follow-archive-restart-file runtime)))
                (ok (equal "restore x %f %r %"
                           (pg::wal-shell-file-command "restore %f %p %r %%" "x" "%f" "restore_command"
                                                       :restart-file "%r"))))
@@ -1102,12 +1100,17 @@
              (progn
                (pg::wal-ensure-directory-durable (pg::wal-directory))
                (pg::wal-ensure-directory-durable archive)
-               (pg::wal-atomic-write-bytes (merge-pathnames name archive) bytes)
-               (pg::wal-atomic-write-bytes
-                (merge-pathnames (pg::wal-archive-segment-proof-name name) archive)
-                (pg::wal-encode-archive-segment-proof 123 1 0 :timeline end bytes))
-               (setf (getf (gethash "restore_command" settings) :value)
-                     "test -f \"archive/%f\" && cp -- \"archive/%f\" \"%p\"")
+               (let ((command "test -f \"archive/%f\" && cp -- \"archive/%f\" \"%p\""))
+                 (flet ((publish (leaf namespace)
+                          (pg::wal-atomic-write-bytes (merge-pathnames leaf archive) bytes)
+                          (pg::wal-atomic-write-bytes
+                           (merge-pathnames (pg::wal-archive-segment-proof-name leaf) archive)
+                           (pg::wal-encode-archive-segment-proof 123 1 0 namespace end bytes))))
+                   (publish "0000000000000000.wal" :legacy)
+                   (ok (null (pg::physical-follow-restore-next runtime command 0)))
+                   (ok (zerop (pg::physical-store-flushed-lsn store)))
+                   (publish name :timeline))
+                 (setf (getf (gethash "restore_command" settings) :value) command))
                (setf (symbol-function 'pg::physical-follow-session)
                      (lambda (state cursor)
                        (setf seen cursor (pg::physical-follow-runtime-stopped-p state) t)

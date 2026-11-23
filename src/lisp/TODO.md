@@ -417,7 +417,6 @@ Archive discovery, proof matching, and restore now require timeline-qualified
 promotion partials. Six strict heads passed. They include a valid legacy
 partial and proof that cannot advance receipt, exclusion of legacy partials
 from the archiver queue, and qualified restore only at the exact fork.
-The complete-segment legacy fallback stays available for now.
 The live Patroni archive-descendant observer replayed the child-only row
 from the archive and retained it across restart.
 Primary startup now requires qualified WAL when archiving is enabled.
@@ -426,6 +425,10 @@ modes refused legacy startup with unchanged control bytes and WAL inventory.
 The full namespace migration suite passed, including crash retries,
 continued follow, and qualified bootstrap. Five strict control and archive
 heads passed.
+The receiver requests only qualified complete segments and partials.
+Its restart cutoff uses the timeline at the durable receive floor. Six strict
+heads passed, including refusal to advance receipt from a proved legacy
+complete segment and admission of the same bytes under the qualified name.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
@@ -441,7 +444,7 @@ Data outside the project directory was outside the scan.
 The C reference is `XLogFileName` and `IsXLogFileName` in
 `src/include/access/xlog_internal.h`. Native WAL retains its `.wal` suffix.
 The remaining cutover must address startup control and recovery base
-admission, the legacy ancestor search in the archiver, and promotion source
+admission and promotion source
 namespace fields. Migrate positive legacy fixtures to qualified names and
 keep independently generated legacy bytes for rejection checks. Verify that
 startup refuses legacy artifacts before writing controls, renaming files, or

@@ -291,16 +291,16 @@ The shell archiver expands `%f` to the filename, `%p` to the input path, and
 offline rewind uses the same three escapes for its restore command, with
 `%p` naming an output path.
 
-Online standby restore expands `%r` to the WAL filename that contains the
-durable receive floor, using the requested native namespace. The segment and
-its proof use the same cutoff. The live archive-to-stream test checked the
-first legacy proof request and its cutoff and passed in 51.47 s on the ramdisk.
-Three focused tests passed, including a compacted descendant floor.
+Online standby restore requests timeline-qualified WAL files and proofs.
+Its `%r` cutoff names the qualified segment containing the durable receive
+floor, including after a timeline change. Use a fresh qualified archive and
+matching base backup before switching a standby that depends on 16-digit
+archive filenames. Preserve retired artifacts with the matching prior build.
 
 C describes `%r` as the oldest WAL file needed for restart
-(`src/backend/access/transam/xlogarchive.c:141`). Native filename suffixes,
-legacy names, and proof files differ, so archive cleanup tools must understand
-those names. Bound descendant partial restore has live coverage. Archive
+(`src/backend/access/transam/xlogarchive.c:141`). Archive cleanup tools need to
+understand the native filename suffix and proof files. Bound descendant
+partial restore has live coverage. Archive
 backlog and cleanup remain open.
 
 Native WAL can rotate early when the next record will not fit. The closed
@@ -429,8 +429,7 @@ compilation and eight focused heads took 63.22 s.
 Promotion partials now receive a proof after the partial archive receipt. Restore
 accepts a partial only when its proof matches the requested segment and the exact
 selected fork. Promotion partials and their proofs require timeline-qualified
-names for archive publication and restore. Legacy-named complete segments
-retain their restore path. A data receipt allows a proof retry after the child
+names for archive publication and restore. A data receipt allows a proof retry after the child
 WAL has been recycled. A qualified partial without a proof requires a
 regenerated proof before restore.
 The pinned Patroni `archive-promotion-history` run verified that both the partial

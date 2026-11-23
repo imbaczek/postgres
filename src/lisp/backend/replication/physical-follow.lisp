@@ -1710,7 +1710,7 @@ Receipt ends there; replay remains free to reach its own policy fence."
 
 (declaim (ftype function startup-restore-command))
 
-(defun physical-follow-archive-restart-file (runtime namespace)
+(defun physical-follow-archive-restart-file (runtime)
   "Name the oldest segment needed by the durable receive floor.
 Capture the floor and its timeline together before running the restore shell."
   (with-physical-follow-generation-operation
@@ -1721,7 +1721,7 @@ Capture the floor and its timeline together before running the restore shell."
         (physical-store-check-live store)
         (let* ((floor (physical-store-floor-lsn store))
                (timeline (physical-store-prefix-timeline store floor)))
-          (wal-segment-filename (floor floor +wal-segment-size+) timeline namespace))))))
+          (wal-segment-filename (floor floor +wal-segment-size+) timeline :timeline))))))
 
 (defparameter *physical-restore-stage-template* ".pg-restore.XXXXXX")
 
@@ -1825,15 +1825,15 @@ Capture the floor and its timeline together before running the restore shell."
         (when fd (sb-posix:close fd))
         (when parent (sb-posix:close parent))))))
 
-(defun physical-follow-fetch-archive (runtime command system-id timeline segment namespace &optional partial)
+(defun physical-follow-fetch-archive (runtime command system-id timeline segment &optional partial)
   "Fetch one proved extent through a private directory pinned under pg_wal."
   (call-with-physical-follow-restore-stage
    runtime
    (lambda (fd check cancel-check)
-     (wal-restore-proved-segment command fd system-id timeline segment namespace
+     (wal-restore-proved-segment command fd system-id timeline segment :timeline
                                  :working-directory *pgdata* :check check :partial partial
                                  :cancel-check cancel-check
-                                 :restart-file (physical-follow-archive-restart-file runtime namespace)))))
+                                 :restart-file (physical-follow-archive-restart-file runtime)))))
 
 (defun physical-follow-fetch-archive-history (runtime command timeline)
   "Fetch bounded history bytes without publishing them or choosing a branch."
@@ -1863,28 +1863,25 @@ Selection still requires WAL transition evidence and durable publication."
                    (<= cursor (timeline-history-entry-end ancestor)))
           (values history text))))))
 
-(defun physical-follow-fetch-archive-with-limit (runtime command system-id timeline segment namespace limit)
+(defun physical-follow-fetch-archive-with-limit (runtime command system-id timeline segment limit)
   "Fetch a proved closed extent or a partial that ends exactly at the fork."
   (multiple-value-bind (bytes end)
-      (physical-follow-fetch-archive runtime command system-id timeline segment namespace)
+      (physical-follow-fetch-archive runtime command system-id timeline segment)
     (cond ((and bytes (or (null limit) (<= end limit)))
            (values bytes end))
-          ((and (eq namespace :timeline) limit (plusp (mod limit +wal-segment-size+))
+          ((and limit (plusp (mod limit +wal-segment-size+))
                 (= segment (floor limit +wal-segment-size+)))
            (multiple-value-bind (partial proved-end)
-               (physical-follow-fetch-archive runtime command system-id timeline segment namespace t)
+               (physical-follow-fetch-archive runtime command system-id timeline segment t)
              (when (eql limit proved-end)
                (values partial proved-end)))))))
 
 (defun physical-follow-fetch-archive-fork-prefix (runtime command system-id parent fork)
   "Fetch proof-verified parent bytes ending exactly at a rotated child fork."
-  (let ((segment (floor fork +wal-segment-size+)))
-    (flet ((fetch (namespace)
-             (multiple-value-bind (bytes end)
-                 (physical-follow-fetch-archive-with-limit
-                  runtime command system-id parent segment namespace fork)
-               (when (eql fork end) bytes))))
-      (or (fetch :timeline) (when (= parent 1) (fetch :legacy))))))
+  (multiple-value-bind (bytes end)
+      (physical-follow-fetch-archive-with-limit
+       runtime command system-id parent (floor fork +wal-segment-size+) fork)
+    (when (eql fork end) bytes)))
 
 (defun physical-follow-archive-transition (runtime command local-history cursor &optional candidate)
   "Return immediate child history and EOR evidence at the durable parent fork.
@@ -1914,7 +1911,7 @@ The caller still has to compare that overlap and publish the selection."
                    (system-id (getf *physical-recovery-state* :system-id))
                    (child-end (timeline-history-entry-end child-entry)))
               (let ((bytes (physical-follow-fetch-archive-with-limit
-                            runtime command system-id child segment :timeline child-end)))
+                            runtime command system-id child segment child-end)))
                 (when (and bytes (<= (+ offset +wal-end-of-recovery-record-size+) (length bytes)))
                   (let* ((raw (subseq bytes offset (+ offset +wal-end-of-recovery-record-size+)))
                          (record (wal-decode-record raw start)))
@@ -1934,13 +1931,8 @@ The caller still has to compare that overlap and publish the selection."
          (segment (floor cursor +wal-segment-size+))
          (limit (or (physical-follow-runtime-boundary runtime) archive-limit)))
     (labels ((fetch (number)
-               (flet ((from-namespace (namespace)
-                        (physical-follow-fetch-archive-with-limit
-                         runtime command system-id timeline number namespace limit)))
-                 (multiple-value-bind (bytes end) (from-namespace :timeline)
-                   (if (or bytes (/= timeline 1))
-                       (values bytes end)
-                       (from-namespace :legacy)))))
+               (physical-follow-fetch-archive-with-limit
+                runtime command system-id timeline number limit))
              (admit (number bytes end &optional predecessor)
                (when (and bytes (or (null limit) (<= end limit)))
                  (with-physical-follow-generation-operation

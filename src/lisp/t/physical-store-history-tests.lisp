@@ -490,7 +490,7 @@
                  (let ((pg::*physical-receive-store* reopened))
                    (ok (equal "000000020000000000000001.wal"
                               (pg::physical-follow-archive-restart-file
-                               (pg::make-physical-follow-runtime) :timeline)))))
+                               (pg::make-physical-follow-runtime))))))
             (pg::physical-store-close reopened))))))
 
 (deftest receive-history-successive-selections-preserve-all-ancestry
