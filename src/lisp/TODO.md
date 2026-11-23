@@ -846,6 +846,17 @@ injected error printed its message, counted as a failure, and left the next
 selected test running. The runner still reports per-head timing and returns a
 failing status if any selected head fails.
 
+### A15 slot retention extraction
+
+The storage ASDF components load slot retention after WAL core. The module
+owns the independent and slot-constrained retention floors, the native byte
+cap, and the advisory slot status and safe-size calculations. The ten moved
+definitions retain their predicates, lock acquisitions and endpoint inputs.
+Checkpoint recycling still owns segment removal in WAL core.
+All 92 selected tests passed under strict compilation. The combined unit suite
+passed, including 1,172 legacy checks. The live retention test passed replay,
+recycling and restart, including durable slot loss after a source crash.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

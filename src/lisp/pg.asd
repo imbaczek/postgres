@@ -57,6 +57,7 @@
                    (:file "wal-catalog-publication" :depends-on ("wal-page-publication"))
                    (:file "wal-archive" :depends-on ("wal"))
                    (:file "wal-slot-persistence" :depends-on ("wal"))
+                   (:file "wal-slot-retention" :depends-on ("wal"))
                    (:file "wal-pressure")
                    (:file "wal-resource-parameters")
                    (:file "wal-eor")
