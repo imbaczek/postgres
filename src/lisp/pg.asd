@@ -181,7 +181,8 @@
                     :depends-on ("../replication/metadata-literal-envelope"))
                    (:file "../replication/physical-store-history")
                    (:file "../replication/physical-replay-facts"
-                    :depends-on ("../replication/physical-store-history"
+                    :depends-on ("../replication/physical-recovery"
+                                 "../replication/physical-store-history"
                                  "../replication/physical-fpw"
                                  "../replication/physical-logical-status"))
                    (:file "../replication/physical-recovery-policy")

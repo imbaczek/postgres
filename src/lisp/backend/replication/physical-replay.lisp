@@ -264,28 +264,6 @@ Direct control operation; does not promote, follow a network source or coordinat
     (setf (getf *physical-recovery-state* :receive-lsn) flush)
     flush))
 
-(defun physical-source-reservation-valid-p (state)
-  (and (listp state) (= (length state) 8)
-       (equal (loop for (key value) on state by #'cddr collect key)
-              '(:version :through :bound :complete))
-       (eql 1 (getf state :version))
-       (typep (getf state :through) '(unsigned-byte 64))
-       (wal-xid-reservation-valid-bound-p (getf state :bound))
-       (member (getf state :complete) '(nil t))))
-
-(defun physical-recovery-checkpoint-reservation (manifest record next-xid)
-  "Derive the base reservation from the checkpoint and verified manifest."
-  (let ((end (getf manifest :end))
-        (bound (1- (canonical-next-full-xid next-xid)))
-        (snapshot (wal-checkpoint-record-snapshot record)))
-    (unless (and (= (wal-record-start record) (physical-manifest-checkpoint-start manifest))
-                 (= (wal-record-end record) end))
-      (error "base reservation record differs from checkpoint coordinates"))
-    (unless (and (= bound (getf snapshot :xid-reserved-through))
-                 (= (getf manifest :next-xid) (getf snapshot :next-xid)))
-      (error "base XID counters differ from checkpoint"))
-    (list :version 1 :through end :bound bound :complete t)))
-
 (defun physical-recovery-initial-reservation (manifest)
   "Only after immutable base verification; old source formats do not prove coverage."
   (physical-recovery-checkpoint-reservation
@@ -293,64 +271,6 @@ Direct control operation; does not promote, follow a network source or coordinat
    (wal-read-checkpoint-record (physical-manifest-checkpoint-start manifest)
                                (getf manifest :end))
    (load-next-xid)))
-
-(defun physical-source-reservation-next (prior record observed-next)
-  "Track source capacity separately from reader visibility; no promotion authority.
-EOR keeps the proven bound but clears completeness. A child checkpoint must
-restore proof before promotion; observed next XID must stay within that bound."
-  (when (and prior (not (physical-source-reservation-valid-p prior)))
-    (error "invalid source allocation frontier"))
-  (when (and prior (> (getf prior :through) (wal-record-start record)))
-    (error "source allocation history moved backwards"))
-  (let ((bound (if prior (getf prior :bound) 2))
-        (complete (and prior (getf prior :complete)))
-        (type (wal-record-type record)))
-    (cond
-      ((= type +wal-record-end-of-recovery+) (setf complete nil))
-      ((= type +wal-record-xid-reservation+)
-       (let ((new-bound (wal-xid-reservation-record-bound record)))
-         (when (< new-bound bound) (error "source XID reservation regressed"))
-         (setf bound new-bound complete t)))
-      ((= type +wal-record-checkpoint+)
-       (let* ((snapshot (wal-checkpoint-record-snapshot record))
-              (new-bound (1- (canonical-next-full-xid (1+ (getf snapshot :xid-reserved-through))))))
-         (when (< new-bound bound) (error "checkpoint XID reservation regressed"))
-         (setf bound new-bound complete t))))
-    (when (and complete (> observed-next (1+ bound)))
-      (error "observed XID exceeds the source's durable allocation reservation"))
-    (list :version 1 :through (wal-record-end record) :bound bound :complete complete)))
-
-;;; Compute prospective membership for each record in WAL order.  A complete
-;;; reanchor preserves prior exclusions; reset or missing state leaves coverage
-;;; unknown until a later anchor.
-;;; The set is conservative: aborted transactions can remain because native
-;;; ABORT has no WAL record.  Between anchors, only an ordered commit removes
-;;; its XID.
-;;; This result is not published until its batch reaches an applied terminal.
-
-(defun physical-source-xids-next (prior record observed-next)
-  "Track prospective source membership independently of existing reader snapshots.
-EOR clears this proof. A later running-transaction anchor can establish it again.
-Complete prior coverage preserves known exclusions when a new anchor arrives.
-Do not consult replay CLOG: it may be ahead of this record's applied position."
-  (when prior
-    (running-xacts-check-state prior)
-    (when (> (getf prior :through) (wal-record-start record))
-      (error "source transaction history moved backwards")))
-  (let ((type (wal-record-type record)) (end (wal-record-end record)))
-    (cond
-      ((= type +wal-record-running-xacts+)
-       (let ((snapshot (wal-running-xacts-record-info record)))
-         (unless (and (= observed-next (getf snapshot :next-xid))
-                      (or (null prior) (<= (getf prior :next-xid) observed-next)))
-           (error "source running snapshot differs from observed actual next XID"))
-         (running-xacts-reanchor prior snapshot end)))
-      ((member type (list +wal-record-clog-reset+ +wal-record-end-of-recovery+)) nil)
-      ((null prior) nil)
-      (t
-       (running-xacts-advance
-        prior observed-next end
-        :committed-xid (when (= type +wal-record-commit+) (wal-record-xid record)))))))
 
 (defun physical-replay-create-heap-forks (catalog)
   "Redo first appearances of parent and TOAST heap main forks at catalog terminals.
