@@ -495,7 +495,7 @@ source itself.  Closing the result closes the sort and its source."
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (outer-p (member (getf join :type) '(:right :full)))
-         (matches (when outer-p (make-query-match-map)))
+         (matches nil)
          (null-left (make-array (getf join :left-width) :initial-element +null+))
          (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
@@ -508,19 +508,24 @@ source itself.  Closing the result closes the sort and its source."
                    left-origins origins left-presence presence))
            (unless left-present (setf left-done t))
            (when left-present
+             (when (and outer-p (not left-seen))
+               (setf matches (make-query-match-map)))
              (setf left-seen t matched nil right-index 0 reader (make-query-replay-reader store))))
          (when (and left-done (not outer-p)) (return (values nil nil)))
          (when (and left-done (not right-phase))
-           (setf right-phase t right-index 0 reader (make-query-replay-reader store))
-           (when left-seen (query-match-map-finish matches)))
-         (multiple-value-bind (row present right-origins toast right-presence) (sql-iterator-next reader)
+           (setf right-phase t right-index 0)
+           (when left-seen
+             (setf reader (make-query-replay-reader store))
+             (query-match-map-finish matches)))
+         ;; With no left rows, nothing will replay the right input or consult the match map.
+         (multiple-value-bind (row present right-origins toast right-presence)
+             (sql-iterator-next (if left-seen reader right))
            (declare (ignore toast))
-           (when (and matches present)
-             (loop while (<= (query-match-map-count matches) right-index)
-                   do (query-match-map-append matches)))
            (cond
              (right-phase
-              (unless present (return (values nil nil)))
+              (unless present
+                (unless left-seen (close-sql-iterator right))
+                (return (values nil nil)))
               (let ((index right-index))
                 (incf right-index)
                 (unless (and left-seen (query-match-map-matched-p matches index))
@@ -528,6 +533,8 @@ source itself.  Closing the result closes the sort and its source."
                       (null-extend-select-join-row row right-origins null-left t *datum-origin-capture*)
                     (return (values values t origins nil right-presence))))))
              (present
+              (when (and matches (= (query-match-map-count matches) right-index))
+                (query-match-map-append matches))
               (let ((index right-index))
                 (incf right-index)
                 (multiple-value-bind (joined origins presence)

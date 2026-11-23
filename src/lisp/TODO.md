@@ -392,6 +392,13 @@ The audit names below follow the North Star Architecture. Commit IDs identify
 implementation slices. A slice can have passing tests while its audit item
 still has work outstanding.
 
+For A1, empty-left RIGHT and FULL nested-loop joins stream unmatched
+right rows through both execution drivers without writing a replay spool
+or match map. The pull regression uses a one-byte work budget and zero
+spill quota, and checks one-row pulls, origin and presence propagation,
+early close, and repeated EOF. The join streaming and portal lifecycle
+process tests also passed.
+
 | Audit item | Implementation evidence and remaining verification |
 |---|---|
 | A1. Push and pull query duplication | Projection and WindowAgg transitions are shared in `e13c164f35a` and `0529ff96c23`. The window differential exercises one-row portal resumption. Audit remaining SQL rules and verify row ownership and allocations across both drivers. |
