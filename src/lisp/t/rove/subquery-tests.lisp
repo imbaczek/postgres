@@ -141,11 +141,14 @@
     (let* ((column '(:col 0 :type :int4))
            (outer (list :outer-ref 2 column))
            (nested (list :outer-ref 2 column))
-           (subplan (make-sql-subplan :test outer :prepared (list :where nested)))
+           (order (list (cons (list :bool t) :asc)))
+           (prepared (list :where nested :order order))
+           (subplan (make-sql-subplan :test outer :prepared prepared))
            (literal (list :const (list column) :type :record))
            (call (list :func "test" (list outer literal) :saved (list column))))
       (rove:ok (= 2 (aggregate-input-owner-depth call)))
       (rove:ok (= 1 (aggregate-input-owner-depth (list :subplan subplan))))
+      (rove:ok (eq order (getf prepared :order)))
       (rove:ok (zerop (aggregate-input-owner-depth (list :whole-row 0 (list outer)))))))
 
 (rove:deftest subquery-consumer-stop-crosses-limit

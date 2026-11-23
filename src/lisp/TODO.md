@@ -442,6 +442,9 @@ probe still measured about 320 bytes per lookup.
 Lateral-reference legality and recursive aggregate validation now use a
 read-only traversal of prepared query scopes. The lateral regression checks
 nesting depth through an unused CTE and preserves its original sort list.
+Aggregate ownership analysis now uses the same read-only traversal for
+nested queries. Its regression checks the nearest referenced scope and
+preserves the nested query's sort list.
 
 ## Open development tasks
 

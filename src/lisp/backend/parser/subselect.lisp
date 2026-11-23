@@ -88,9 +88,8 @@ may still contain expression lists and are traversed structurally."
        copy))
     (:structural (mapcar function form))))
 
-(defun map-prepared-query-expressions (function prepared &optional (depth 0) query-function)
-  "Visit executable expressions with nesting depth, excluding saved raw ASTs.
-Optional QUERY-FUNCTION visits each prepared query before its expressions."
+(defun map-prepared-query-expressions (function prepared &optional (depth 0))
+  "Rewrite executable expressions with nesting depth, excluding saved raw ASTs."
   (labels
       ((expression (form level)
          (cond
@@ -106,7 +105,6 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
                        (map-local-expression-operands
                         (lambda (part) (expression part level)) form) level))))
        (query (state level)
-         (when query-function (funcall query-function state level))
          (dolist (definition (getf state :ctes))
            (query (sql-cte-prepared definition) (1+ level)))
          (if (getf state :set-operation)
@@ -275,10 +273,8 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
            (:subplan
             (let ((descriptor (second form)))
               (funcall walk (sql-subplan-test descriptor))
-              (map-prepared-query-expressions
-               (lambda (part nesting)
-                 (note-outer part nesting)
-                 part)
+              (visit-prepared-query-expressions
+               #'note-outer
                (sql-subplan-prepared descriptor) 1))
             (values nil t))))
        input))
