@@ -435,6 +435,10 @@ root and sort-list identity and excludes descriptors under outer references.
 CTE volatility inspection now uses the same read-only query roots and stops
 at the first volatile executable operand. The regression checks storage
 identity, the outer-reference boundary, and recognition across set arms.
+Recursive cache lookup now uses the same expression roots, including window
+inputs, partitions and order keys. A regression distinguishes a window
+partition's subplan from an opaque descriptor field. The 200,000-lookup SBCL
+probe still measured about 320 bytes per lookup.
 
 ## Open development tasks
 

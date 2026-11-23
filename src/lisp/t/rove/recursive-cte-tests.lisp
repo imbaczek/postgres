@@ -12,6 +12,9 @@
            (visible (list :subplan (make-sql-subplan :prepared (list :relations (list outer-ref)))))
            (call (list :func "f" (list (list :const hidden) visible) :saved hidden)))
       (rove:ok (eq :outer (prepared-query-worktable-cache (list :where call))))
+      (rove:ok (eq :outer
+                   (prepared-query-worktable-cache
+                    (list :windows (list (list :partition (list visible) :saved hidden))))))
       (rove:ok (eq :nearest
                    (prepared-query-worktable-cache
                     (list :where (list :subplan

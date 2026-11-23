@@ -43,11 +43,7 @@
                  (if (getf state :set-operation)
                      (progn (query (getf state :left)) (query (getf state :right)))
                      (progn
-                       (dolist (key '(:where :having :group-keys :window-keys :windows :order :set-functions))
-                         (expression (getf state key)))
-                       (dolist (target (getf state :targets)) (expression (getf target :expr)))
-                       (dolist (aggregate (getf state :aggregates)) (expression (getf aggregate :input)))
-                       (dolist (join (getf state :joins)) (expression (getf join :qual)))
+                       (visit-prepared-query-local-expressions #'expression state)
                        (dolist (relation (getf state :source-relations (getf state :relations)))
                          (cond
                            ((getf relation :cte-worktable)
@@ -55,7 +51,7 @@
                               (pushnew (getf relation :cte) found :test #'eq)))
                            ((getf relation :cte) (query (sql-cte-prepared (getf relation :cte))))
                            ((getf relation :subquery-prepared) (query (getf relation :subquery-prepared))))))))))
-      (declare (dynamic-extent #'visit-subplan))
+      (declare (dynamic-extent #'visit-subplan #'expression))
       (query prepared))
     (loop for binding in *recursive-cte-generation-caches*
           when (member (car binding) found :test #'eq) return (cdr binding))))
