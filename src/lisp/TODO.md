@@ -77,7 +77,7 @@ The timing ledger retains both logs and the exact selection.
 
 ### Milestone 0 producer inventory
 
-| Audit item | Current writer | Compatibility evidence |
+| Audit item | Current writer or owner | Compatibility and acceptance evidence |
 |---|---|---|
 | B1 | [Native WAL encoder](backend/storage/wal-record.lisp) | `wal-encode-record` stamps version 8. The maintenance replay, lineage byte preservation and receive byte preservation fixtures now use the current writer. |
 | B2 | [Primary WAL control encoder](backend/storage/wal-checkpoint.lisp) | `wal-encode-control-image` writes PGWAL6, including variants for lifecycle metadata, retained references, resources, native checksums, and a local CLOG extent. |
@@ -91,6 +91,11 @@ The timing ledger retains both logs and the exact selection.
 | B10 | [Recovery control codec](backend/replication/physical-recovery.lisp) | The writer uses version 3 for ordinary phases and version 4 for pending promotion. Current extensions, including retained identity, policy intents and source facts, stay within those versions. |
 | B11 | [Physical backup writer](backend/replication/physical-bootstrap.lisp) | New backup manifests use version 3 with explicit checkpoint start, derived from the checkpoint record. |
 | B12 | [Restartpoint generation codec](backend/replication/physical-restartpoint.lisp) | Standby publication and logical-copy source proof emit PGRPGEN2 with metadata version 4. The XID process fixture constructs retired generations independently to test startup rejection. |
+| B13 | [Live-operation admission](backend/tcop/control.lisp) | In `87b987c4be0`, the gate closes and reopens with a quiescence owner token. Cold restart crosses the image layout boundary. Six strict checks covered borrowed admission, unwind, canceled drain, and terminal shutdown. |
+| B14 | [Backend transaction spool](backend/access/transam/xact.lisp) | In `509bc1c6992`, the backend owns a spool for logical row changes. Cold restart crosses the layout boundary. Live capture verified rollback, disconnect, restart, and corrupt spool refusal. |
+| B15 | [Owned CLOG completion](backend/access/transam/clog.lisp) | In `0dbafd57add`, legacy fixture calls moved to owned completion. Strict CLOG tests, live commit receipts, and asynchronous commit verified tag checks, failure cleanup, and restart. |
+| B16 | [Physical SELECT plans](backend/executor/exec_plan.lisp) | In `05af2a42ac8c`, the uncalled collectors and streaming wrappers were removed. The former test-only caller executes a live plan. Live joins retain the scan and result-row helpers. |
+| B17 | [Extended statements and portals](backend/tcop/extended-query.lisp) | In `0ebd131b2eb`, metadata moved to its statement or portal. Cold restart crosses the layout boundary. Live portal lifecycle and C protocol comparisons verified cleanup, suspension, and result-type checks. |
 | B18 | [WAL initialization](backend/storage/wal-core.lisp) | Fresh and existing serving clusters require qualified filenames. A physical base copy preserves the source control and copies qualified WAL entries. |
 
 For B15, `0dbafd57add` removes the ownerless CLOG staging, materialization,
