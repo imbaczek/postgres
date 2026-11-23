@@ -439,6 +439,11 @@ exist\" messages."
          append (list (make-numeric-builtin name '(:float8 :float8) :float8 'sql-float-power)
                       (make-numeric-builtin name '(:numeric :numeric) :numeric 'sql-numeric-power)))))
 
+(defun make-json-conversion-builtin (name argument-types result-type evaluator)
+  "Register a strict conversion whose evaluator also takes the analyzed input type."
+  (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
+                       :volatility :stable :strict-p t :evaluator (cons :typed-first evaluator)))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -705,6 +710,12 @@ exist\" messages."
                    (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text :text)
                                         :result-type :text-array :volatility :immutable
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
+                   (make-json-conversion-builtin "to_json" '(:anyelement) :json 'sql-typed-to-json)
+                   (make-json-conversion-builtin "to_jsonb" '(:anyelement) :jsonb 'sql-typed-to-jsonb)
+                   (make-json-conversion-builtin "row_to_json" '(:record) :json 'sql-typed-to-json)
+                   (make-json-conversion-builtin "row_to_json" '(:record :bool) :json 'sql-typed-to-json)
+                   (make-json-conversion-builtin "array_to_json" '(:anyarray) :json 'sql-typed-to-json)
+                   (make-json-conversion-builtin "array_to_json" '(:anyarray :bool) :json 'sql-typed-to-json)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_set"
@@ -752,10 +763,13 @@ exist\" messages."
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
-(defun eval-scalar-builtin (builtin arguments)
+(defun eval-scalar-builtin (builtin arguments first-argument)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
       +null+
-      (apply (scalar-builtin-evaluator builtin) arguments)))
+      (let ((evaluator (scalar-builtin-evaluator builtin)))
+        (if (consp evaluator)
+            (apply (cdr evaluator) (expr-type first-argument) arguments)
+            (apply evaluator arguments)))))
 
 (defun scalar-builtin-match-p (builtin arguments)
   (let ((types (scalar-builtin-argument-types builtin))
@@ -766,6 +780,7 @@ exist\" messages."
                             ((and (eq policy :sequence) (zerop position))
                              (eq (expr-type argument) :text))
                             ((in-unknown-constant-p argument) t)
+                            ((eq type :anyelement) t)
                             ((eq type :anyarray)
                              (or (eq (expr-type argument) :int2vector)
                                  (sql-array-element-type (expr-type argument))))
@@ -798,6 +813,7 @@ The supported ambiguous bit and bytea overloads have no text candidate."
 (defun coerce-scalar-builtin-argument (argument type)
   "Coerce a resolved input, retaining the concrete type for polymorphic arrays."
   (cond
+    ((eq type :anyelement) (check-json-conversion-input argument))
     ((eq type :anyarray)
      ;; Scalar decorations are rejected after lookup and before polymorphic resolution.
      (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
@@ -832,43 +848,24 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
                  (when (eq result-type :record)
                    (list :fields (scalar-record-builtin-fields name))))))))
 
-(defun analyze-to-jsonb-function (name arguments)
-  "Resolve to_jsonb's polymorphic argument within supported scalar and array types."
-  (unless (= (length arguments) 1)
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (let* ((argument (first arguments))
-         (type (expr-type argument))
+(defun check-json-conversion-input (argument)
+  "Keep the concrete SQL type for polymorphic JSON conversion."
+  (let* ((type (expr-type argument))
          (element-type (or (sql-array-element-type type) type)))
-    (when (and (in-unknown-constant-p argument) (not *defer-function-constant-coercion-p*))
-      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-    (unless (or *defer-function-constant-coercion-p*
-                (member element-type '(:record :text :varchar :name :bool :int2 :int4 :int8
-                                       :numeric :float4 :float8 :json :jsonb :bytea :oid :oid8 :xid :char :bit :date
-                                       :time :timetz :timestamp :timestamptz :interval :pg-lsn :inet :int2vector)))
-      (ereport "0A000" "to_jsonb for type ~a is not supported" type))
-    (list :func name arguments :type (if (string= name "to_json") :json :jsonb) :typmod -1)))
+    (unless *defer-function-constant-coercion-p*
+      (when (in-unknown-constant-p argument)
+        (ereport "42804" "could not determine polymorphic type because input has type unknown"))
+      (unless (member element-type '(:record :text :varchar :name :bool :int2 :int4 :int8
+                                     :numeric :float4 :float8 :json :jsonb :bytea :oid :oid8 :xid :char :bit :date
+                                     :time :timetz :timestamp :timestamptz :interval :pg-lsn :inet :int2vector))
+        (ereport "0A000" "to_jsonb for type ~a is not supported" type))))
+  argument)
 
-(defun analyze-json-container-function (name arguments)
-  "Resolve record and array JSON conversion with optional pretty printing."
-  (let* ((row-p (string= name "row_to_json"))
-         (value (first arguments))
-         (type (when value (expr-type value)))
-         (pretty (second arguments)))
-    (unless (and (<= 1 (length arguments) 2)
-                 (if row-p
-                     (or (eq type :record) (in-unknown-constant-p value))
-                     (or (sql-array-element-type type) (eq type :int2vector)
-                         (in-unknown-constant-p value)))
-                 (or (null pretty) (eq (expr-type pretty) :bool)
-                     (in-unknown-constant-p pretty)))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (when (and (not row-p) (in-unknown-constant-p value))
-      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-    (list :func name
-          (cons (if (in-unknown-constant-p value)
-                    (coerce-common-expression value :record) value)
-                (when pretty (list (coerce-common-expression pretty :bool))))
-          :type :json :typmod -1)))
+(defun sql-typed-to-json (type value &optional pretty)
+  (sql-to-json value type 0 pretty))
+
+(defun sql-typed-to-jsonb (type value)
+  (sql-to-jsonb value type))
 
 (defun sql-string-to-array (text separator &optional null-string)
   "Split text at delimiters, replacing fields equal to the optional NULL string.
@@ -1687,13 +1684,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
-      ((member name '("row_to_json" "array_to_json") :test #'string=)
-       (analyze-json-container-function name args))
-      ((member name '("to_json" "to_jsonb") :test #'string=)
-       (let ((*defer-function-constant-coercion-p*
-               (or (getf (cdddr expr) :call-distinct)
-                   (getf (cdddr expr) :call-order))))
-         (analyze-to-jsonb-function name args)))
       ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
        (when (> (length args) 100)
          (ereport "54023" "cannot pass more than 100 arguments to a function"))
@@ -3838,8 +3828,7 @@ still requires deferred sort projection."
   (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
     (if registered-p
         (not (member volatility '(:immutable :stable)))
-        (not (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
-                            "json_build_array" "json_build_object"
+        (not (member name '("json_build_array" "json_build_object"
                             "jsonb_build_array" "jsonb_build_object"
                             "greatest" "least")
                      :test #'string=)))))
@@ -3872,9 +3861,7 @@ still requires deferred sort projection."
          (ereport "42883" "function ~a(~a) does not exist" (second raw) (typed-arg-name argument)))
        (values argument (if (member type '(:varchar :name)) :text type)))
       (:json-agg
-       (when (in-unknown-constant-p argument)
-         (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-       (analyze-to-jsonb-function "to_json" (list argument))
+       (check-json-conversion-input argument)
        (values argument :json))
       (:array-agg
        (unless (member type '(:text :json))
@@ -4630,7 +4617,7 @@ the full 64-bit ID as a signed value."
          (builtin (if (rest candidates)
                       (scalar-builtin-for-evaluation candidates (length args) first-argument)
                       (first candidates))))
-    (when builtin (return-from eval-func (eval-scalar-builtin builtin args))))
+    (when builtin (return-from eval-func (eval-scalar-builtin builtin args first-argument))))
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
@@ -5105,13 +5092,7 @@ truncate and interpret the result at TYPE's signed width."
                (eval-toast-substring (third expr) (cdr slice) (expr-type expr))))))
      (let* ((name (second expr))
             (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr))))
-       (cond ((string= name "to_jsonb")
-              (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
-             ((member name '("to_json" "row_to_json" "array_to_json") :test #'string=)
-              (if (member +null+ arguments) +null+
-                  (sql-to-json (first arguments) (expr-type (first (third expr)))
-                               0 (second arguments))))
-             ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
+       (cond ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
               (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
              (t (eval-func name arguments (first (third expr)))))))
     (t

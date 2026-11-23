@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.to_json(ARRAY[1,NULL,3]), pg_catalog.to_jsonb('null'::json), row_to_json(r), array_to_json(ARRAY[[1,2],[3,4]], true) FROM (SELECT 1 AS id, 'a'::text AS label) r",
+    "SELECT to_json(NULL::int), to_jsonb(NULL::int), row_to_json(r,NULL), array_to_json(ARRAY[1],NULL) FROM (SELECT 1 AS id) r",
+    "SELECT pg_catalog.array_to_json(DISTINCT NULL)",
+    "SELECT pg_catalog.to_jsonb(NULL)",
+    "CREATE TABLE dc_typed_json_default (a json DEFAULT to_json(ARRAY[1,NULL]), b jsonb DEFAULT to_jsonb('null'::json))",
     "SELECT pg_catalog.round('1.234', 2::smallint), pg_catalog.log('2', 8), power(2, 3::numeric), 2 ^ 3::numeric",
     "SELECT pg_catalog.round('bad', 2::bigint)",
     "SELECT pg_catalog.log10('bad', 10)",
@@ -1372,6 +1377,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_typed_json_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_overloaded_math_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_bucket_registry_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_numeric_math_alias_default DEFAULT VALUES RETURNING a,b",

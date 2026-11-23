@@ -597,6 +597,12 @@ uses the registry to check arity, validate inputs, and perform coercion.
 Power calls, the exponentiation operator, and range buckets share the
 numeric versus float8 preference. The 1,438 C comparisons verified
 mixed operands, scale coercion, and lookup before literal conversion.
+`to_json`, `to_jsonb`, `row_to_json`, and `array_to_json` use stable,
+strict registry signatures. Their evaluators receive the concrete
+analyzed input type. `json_agg` shares the supported-input check.
+The 1,443 C comparisons covered pretty arrays, row conversion,
+SQL NULL and JSON null, and scalar decoration precedence. Typed JSON
+defaults also passed after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
