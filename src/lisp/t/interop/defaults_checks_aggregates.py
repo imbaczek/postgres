@@ -151,8 +151,11 @@ CASES = (
     "SELECT pg_catalog.pg_backend_pid() > 0, pg_catalog.txid_current() = txid_current()",
     "SELECT pg_backend_pid(1)",
     "SELECT txid_current(1)",
-    "SELECT oid, typalign, typstorage FROM pg_catalog.pg_type "
-    "WHERE oid IN (20, 21, 1005, 1016, 6437) ORDER BY oid",
+    "SELECT oid, typname, typlen, typalign, typstorage FROM pg_catalog.pg_type "
+    "WHERE oid IN (16,17,18,19,20,21,22,23,25,26,28,114,194,199,700,701,869,"
+    "1000,1001,1002,1003,1005,1006,1007,1009,1015,1016,1021,1022,1028,1043,"
+    "1082,1083,1114,1115,1182,1183,1184,1185,1186,1187,1231,1266,1270,"
+    "1560,1561,1700,2249,2278,3220,3221,3802,3807,6437) ORDER BY oid",
     "SELECT CAST('é漢字' AS varchar(2)), 'é漢字'::character varying(2)",
     "SELECT 'x'::varchar(0)",
     "SELECT 'x'::varchar(10485761)",

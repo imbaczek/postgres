@@ -694,33 +694,6 @@ Capture policy and keep size once for every row in the snapshot."
                  (database-sequences database)))
       (sort rows #'< :key (lambda (row) (aref row 0))))))
 
-(defun sql-type-storage-code (type)
-  "Return PostgreSQL's default typstorage code for a supported TYPE."
-  (cond ((member type '(:numeric :inet)) #\m)
-        ((or (sql-array-element-type type)
-             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record)))
-         #\x)
-        (t #\p)))
-
-(defun sql-type-catalog-name (type)
-  "Return PostgreSQL's internal typname for a supported Lisp type identifier."
-  (let ((element (sql-array-element-type type)))
-    (if element
-        (concatenate 'string "_" (sql-type-catalog-name element))
-        (substitute #\_ #\- (string-downcase (symbol-name type))))))
-
-(defun sql-type-alignment-code (type)
-  "Return the native typalign code for a supported type."
-  (let ((element (sql-array-element-type type)))
-    (cond
-      ;; PostgreSQL promotes array alignment to at least int alignment.
-      (element (if (char= (sql-type-alignment-code element) #\d) #\d #\i))
-      ((member type '(:bool :char :name)) #\c)
-      ((eq type :int2) #\s)
-      ((member type '(:int8 :oid8 :float8 :time :timetz :timestamp :timestamptz
-                      :interval :pg-lsn :record)) #\d)
-      (t #\i))))
-
 (defun sql-type-rows ()
   "Expose metadata for the type identifiers recognized by SQL expression analysis."
   (loop for (type oid length) in +sql-expression-types+

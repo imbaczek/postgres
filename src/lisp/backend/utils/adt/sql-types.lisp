@@ -41,8 +41,13 @@
 (defun sql-array-type (element-type)
   (cdr (assoc element-type +sql-array-types+)))
 
+(defparameter *sql-element-types-by-array*
+  (let ((elements (make-hash-table :test #'eq)))
+    (dolist (pair +sql-array-types+ elements)
+      (setf (gethash (cdr pair) elements) (car pair)))))
+
 (defun sql-array-element-type (array-type)
-  (car (rassoc array-type +sql-array-types+)))
+  (values (gethash array-type *sql-element-types-by-array*)))
 
 (defun sql-expression-type-description (type)
   (or (assoc type +sql-expression-types+)
@@ -62,6 +67,32 @@
 (defun sql-type-from-oid (oid)
   "Return the supported SQL type identifier for OID, or NIL."
   (values (gethash oid *sql-type-identifiers-by-oid*)))
+
+(defun sql-type-storage-code (type)
+  "Return PostgreSQL's default typstorage code for a supported TYPE."
+  (cond ((member type '(:numeric :inet)) #\m)
+        ((or (sql-array-element-type type)
+             (member type '(:text :varchar :bytea :json :jsonb :bit :pg-node-tree :record)))
+         #\x)
+        (t #\p)))
+
+(defun sql-type-catalog-name (type)
+  "Return PostgreSQL's internal typname for a supported Lisp type identifier."
+  (let ((element (sql-array-element-type type)))
+    (if element
+        (concatenate 'string "_" (sql-type-catalog-name element))
+        (substitute #\_ #\- (string-downcase (symbol-name type))))))
+
+(defun sql-type-alignment-code (type)
+  "Return the catalog typalign code. Arrays use at least integer alignment."
+  (let ((element (sql-array-element-type type)))
+    (cond
+      (element (if (char= (sql-type-alignment-code element) #\d) #\d #\i))
+      ((member type '(:bool :char :name)) #\c)
+      ((eq type :int2) #\s)
+      ((member type '(:int8 :oid8 :float8 :time :timetz :timestamp :timestamptz
+                      :interval :pg-lsn :record)) #\d)
+      (t #\i))))
 
 (defun sql-varchar-typmod (length)
   "Encode a declared varchar character count as a PostgreSQL type modifier."

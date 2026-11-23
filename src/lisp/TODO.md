@@ -693,6 +693,15 @@ immutable. The C differential checks error precedence for an invalid
 The complete live TOAST DML suite passed, including the varchar length
 and direct TOAST projection checks. See the A17 fixture evidence below.
 
+### A8 and A19 type metadata evidence
+
+The independently loadable `pg/sql-types` system supplies catalog type
+names, alignment, and storage codes. A warm load preserves their existing
+server symbol identities. The physical heap array codec uses the shared
+array-to-element index for the same three supported varlena array types.
+The PostgreSQL C differential compares catalog names, width, alignment,
+and storage for all 54 supported type OIDs.
+
 ### A17 follow-up evidence
 
 A focused backend trace located the TOAST rewrite fixture wait in

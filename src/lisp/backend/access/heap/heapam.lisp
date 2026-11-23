@@ -140,7 +140,8 @@
 
 (defun heap-varlena-array-element-type (type)
   "Return the element type for the supported physical varlena arrays."
-  (case type (:bytea-array :bytea) (:json-array :json) (:jsonb-array :jsonb)))
+  (when (member type '(:bytea-array :json-array :jsonb-array))
+    (sql-array-element-type type)))
 
 (defun column-align (col)
   (case (pg-column-type col)
