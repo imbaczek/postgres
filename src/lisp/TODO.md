@@ -655,6 +655,12 @@ the normalized inputs against the same candidates used during analysis.
 This preserves the descriptor's SBCL structure layout for warm reload.
 The 1,477 C comparisons include scalar variadic expansion, explicit array
 passing, filtered publication lookup, and rejection without inputs.
+The registered random and seed signatures select the numeric diagnostic
+path, including schema errors and named-argument analysis. Diagnostic
+arity checks use the supported signatures directly. The 1,480 C
+comparisons include reordered random bounds, a positional seed, and
+rejection of a named seed. Exact diagnostic comparisons also cover
+qualified random lookup and argument-error precedence.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

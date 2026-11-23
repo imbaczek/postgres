@@ -760,19 +760,19 @@ exist\" messages."
                    (make-numeric-builtin "trim_scale" '(:numeric) :numeric 'sql-numeric-trim-scale)
                    (make-numeric-builtin "factorial" '(:int8) :numeric 'sql-factorial)
                    (make-scalar-builtin :name "random" :result-type :float8
-                                        :volatility :volatile :strict-p t :evaluator 'sql-random-float)
+                                        :volatility :volatile :strict-p t :evaluator 'sql-random-float :implicit-arguments-p :random)
                    (make-scalar-builtin :name "random" :argument-types '(:int4 :int4)
                                         :result-type :int4 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-random-integer :implicit-arguments-p t)
+                                        :evaluator 'sql-random-integer :implicit-arguments-p :random)
                    (make-scalar-builtin :name "random" :argument-types '(:int8 :int8)
                                         :result-type :int8 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-random-integer :implicit-arguments-p t)
+                                        :evaluator 'sql-random-integer :implicit-arguments-p :random)
                    (make-scalar-builtin :name "random" :argument-types '(:numeric :numeric)
                                         :result-type :numeric :volatility :volatile :strict-p t
-                                        :evaluator 'sql-random-numeric :implicit-arguments-p t)
+                                        :evaluator 'sql-random-numeric :implicit-arguments-p :random)
                    (make-scalar-builtin :name "setseed" :argument-types '(:float8)
                                         :result-type :void :volatility :volatile :strict-p t
-                                        :evaluator 'sql-setseed :implicit-arguments-p t)
+                                        :evaluator 'sql-setseed :implicit-arguments-p :random)
                    (make-scalar-builtin :name "array_length" :argument-types '(:anyarray :int4)
                                         :result-type :int4 :volatility :immutable :strict-p t
                                         :evaluator 'sql-array-length :implicit-arguments-p t)
@@ -1180,16 +1180,18 @@ names and unknown types.  setseed has no catalog argument names."
          name analyzed :schema schema :signature signature :named-p t :overlapping-p overlapping))
       (values (if names (coerce slots 'list) analyzed) signature))))
 
+(defun scalar-builtin-call-policy-p (name policies)
+  (some (lambda (builtin) (member (scalar-builtin-implicit-arguments-p builtin) policies))
+        (gethash name *scalar-builtin-descriptors*)))
+
 (defun numeric-function-p (name)
   "Recognize registered math calls that use the numeric diagnostic path."
-  (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p))
+  (scalar-builtin-call-policy-p name '(:numeric :random)))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
-  (cond ((gethash name *scalar-builtin-descriptors*)
-         (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
-               (gethash name *scalar-builtin-descriptors*)))
-        (t (= count 1))))
+  (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
+        (gethash name *scalar-builtin-descriptors*)))
 
 (defun report-numeric-function-resolution-error
     (name args &key schema signature ambiguous-p named-p overlapping-p)
@@ -1331,7 +1333,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
            (analyze-named-builtin-arguments name arguments table variadic parameters))
           ((string= name "pg_get_replication_slots")
            (analyze-catalog-call-inputs arguments table))
-          ((member name '("random" "setseed") :test #'string=)
+          ((scalar-builtin-call-policy-p name '(:random))
            (analyze-random-arguments arguments table name schema))
           ((and (numeric-function-p name)
                 (some (lambda (argument) (eq (first argument) :named-arg)) arguments))
@@ -1587,8 +1589,7 @@ so a nested argument error keeps its own diagnostics."
   (let ((schema (getf (cdddr expr) :schema))
         (name (second expr)))
     (when (and schema (not (string= schema "pg_catalog"))
-               (or (numeric-function-p name)
-                   (member name '("random" "setseed") :test #'string=)))
+               (numeric-function-p name))
       (report-qualified-numeric-call-error name schema (third expr) table
                                            (getf (cdddr expr) :call-order)))))
 
@@ -1668,8 +1669,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       (ereport "42809" "window function ~a requires an OVER clause" name))
     (cond
       (prepare-call (funcall prepare-call name builtins args (getf (cdddr expr) :variadic)))
-      ((or (numeric-function-p name)
-           (member name '("random" "setseed") :test #'string=))
+      ((numeric-function-p name)
        ;; ParseFuncOrColumn selects the candidate before rejecting decorations,
        ;; then coerces arguments. Defer constant input conversion until that check.
        (let ((*defer-function-constant-coercion-p*

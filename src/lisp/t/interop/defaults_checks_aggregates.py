@@ -7,6 +7,9 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.random(max=>7, min=>7)",
+    "SELECT pg_catalog.setseed(0)",
+    "SELECT pg_catalog.setseed(min=>0)",
     "SELECT octet_length(pg_catalog.pg_read_binary_file('PG_VERSION',0,1,false)) = 1",
     "SELECT (pg_catalog.pg_stat_file('base',false)).isdir",
     "SELECT pg_read_binary_file(NULL::text) IS NULL",
