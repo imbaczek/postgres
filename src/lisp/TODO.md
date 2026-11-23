@@ -59,6 +59,15 @@ why existing code could not meet the need when a new implementation is required.
 At `b7744cc1b88`, a tilth declaration scan measured 3,680 function and macro
 spans in the 127 production Lisp files changed since `6bcf82cf717`.
 All measured spans fit within 120 lines.
+The six production Lisp files changed between that scan and
+`beab6957b0c` also fit within the limit. The longest measured function in
+those files spans 87 lines.
+
+The WAL archive descriptor polish in `35990490e51` shares interrupt-safe
+acquisition and cleanup across history selection, partial selection, standby
+staging, and promotion staging. Five physical heads passed with a fresh
+strict compile in 71.73 seconds. The runner log and compiler receipt are
+archived under `architecture-current-acceptance`.
 
 The Milestone 3A polish review checked the temporal, SELECT source, and interval
 extractions against their raw results. The unit batches took 36.12, 38.58,
