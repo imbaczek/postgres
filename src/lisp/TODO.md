@@ -475,6 +475,9 @@ The shared visitor and mapper recognize analyzed `IN` nodes explicitly.
 They visit scalar operands and the coerced array and comparison operands
 used by execution, while leaving the surrounding option fields opaque.
 The regression places a column solely in a typed comparison pair.
+Aggregate rebasing now claims each shared descriptor or prepared query once
+per rewrite. The regression shares one descriptor across raw and typed
+`IN` operands and verifies single shifts in both its comparison and child query.
 
 ## Open development tasks
 

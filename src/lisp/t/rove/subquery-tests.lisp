@@ -36,6 +36,20 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest aggregate-rebase-shifts-shared-subplan-once
+    (let* ((column '(:col 1 :type :int4))
+           (child (list :where (list :outer-ref 4 column)))
+           (descriptor (make-sql-subplan :test (list :outer-ref 3 column)
+                                         :prepared child))
+           (subplan (list :subplan descriptor))
+           (form (list :in subplan (list subplan) nil :type :bool
+                       :comparisons (list (list subplan subplan))))
+           (rebased (rebase-aggregate-input form 1)))
+      (rove:ok (= 2 (second (sql-subplan-test descriptor))))
+      (rove:ok (= 3 (second (getf child :where))))
+      (rove:ok (eq descriptor (second (second rebased))))
+      (rove:ok (eq subplan (caar (getf (cddddr rebased) :comparisons))))))
+
 (rove:deftest analyzed-in-visits-typed-operands-and-keeps-metadata-opaque
     (let* ((reference '(:col 7 :type :int4))
            (metadata '(:col 99 :type :int4))

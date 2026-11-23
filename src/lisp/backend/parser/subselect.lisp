@@ -101,7 +101,12 @@ may still contain expression lists and are traversed structurally."
     (:in (map-analyzed-in-operands function form))
     (:structural (mapcar function form))))
 
-(defun map-prepared-query-expressions (function prepared &optional (depth 0))
+(defun claim-query-rewrite (node seen)
+  "Claim an owned mutable query node once for this rewrite."
+  (unless (gethash node seen)
+    (setf (gethash node seen) t)))
+
+(defun map-prepared-query-expressions (function prepared &optional (depth 0) (seen (make-hash-table :test #'eq)))
   "Rewrite executable expressions with nesting depth, excluding saved raw ASTs."
   (labels
       ((expression (form level)
@@ -110,14 +115,17 @@ may still contain expression lists and are traversed structurally."
            ((eq (first form) :outer-ref) (funcall function form level))
            ((subquery-expression-p form)
             (let ((descriptor (second form)))
-              (setf (sql-subplan-test descriptor)
-                    (expression (sql-subplan-test descriptor) level))
-              (query (sql-subplan-prepared descriptor) (1+ level)))
+              (when (claim-query-rewrite descriptor seen)
+                (setf (sql-subplan-test descriptor)
+                      (expression (sql-subplan-test descriptor) level))
+                (query (sql-subplan-prepared descriptor) (1+ level))))
             (funcall function form level))
            (t (funcall function
                        (map-local-expression-operands
                         (lambda (part) (expression part level)) form) level))))
        (query (state level)
+         (unless (and state (claim-query-rewrite state seen))
+           (return-from query nil))
          (dolist (definition (getf state :ctes))
            (query (sql-cte-prepared definition) (1+ level)))
          (if (getf state :set-operation)
@@ -294,27 +302,30 @@ may still contain expression lists and are traversed structurally."
     (or minimum 0)))
 
 (defun rebase-aggregate-input (input owner-depth)
-  (labels ((rebase (form level)
-             (cond
-               ((atom form) form)
-               ((eq (first form) :outer-ref)
-                (let ((depth (- (second form) owner-depth)))
-                  (cond ((and (zerop level) (zerop depth)) (third form))
-                        ((>= (second form) (+ level owner-depth))
-                         (list :outer-ref depth (third form)
-                               :type (expr-type form) :typmod (expr-typmod form)))
-                        (t form))))
-               ((subquery-expression-p form)
-                (let ((descriptor (second form)))
-                  (setf (sql-subplan-test descriptor)
-                        (rebase (sql-subplan-test descriptor) level))
-                  (map-prepared-query-expressions
-                   (lambda (part nesting)
-                     (if (eq (first part) :outer-ref) (rebase part nesting) part))
-                   (sql-subplan-prepared descriptor) (1+ level)))
-                form)
-               (t (map-local-expression-operands (lambda (part) (rebase part level)) form)))))
-    (rebase input 0)))
+  (let ((seen nil))
+    (labels ((rebase (form level)
+               (cond
+                 ((atom form) form)
+                 ((eq (first form) :outer-ref)
+                  (let ((depth (- (second form) owner-depth)))
+                    (cond ((and (zerop level) (zerop depth)) (third form))
+                          ((>= (second form) (+ level owner-depth))
+                           (list :outer-ref depth (third form)
+                                 :type (expr-type form) :typmod (expr-typmod form)))
+                          (t form))))
+                 ((subquery-expression-p form)
+                  (let ((descriptor (second form)))
+                    (unless seen (setf seen (make-hash-table :test #'eq)))
+                    (when (claim-query-rewrite descriptor seen)
+                      (setf (sql-subplan-test descriptor)
+                            (rebase (sql-subplan-test descriptor) level))
+                      (map-prepared-query-expressions
+                       (lambda (part nesting)
+                         (if (eq (first part) :outer-ref) (rebase part nesting) part))
+                       (sql-subplan-prepared descriptor) (1+ level) seen)))
+                  form)
+                 (t (map-local-expression-operands (lambda (part) (rebase part level)) form)))))
+      (rebase input 0))))
 
 (defun subquery-semantic-key (form)
   "Compare analyzed query meaning without scopes, plans or descriptor identity."
