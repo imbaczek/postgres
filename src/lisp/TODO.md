@@ -478,6 +478,10 @@ The regression places a column solely in a typed comparison pair.
 Aggregate rebasing now claims each shared descriptor or prepared query once
 per rewrite. The regression shares one descriptor across raw and typed
 `IN` operands and verifies single shifts in both its comparison and child query.
+Grouped subplan rewrites also copy outer-reference nodes before changing
+their slot. A correlated `IN` using a source column whose grouped slot
+differs from its source slot previously returned 42803. The Rove and C
+differential regressions verify the grouped value and comparison result.
 
 ## Open development tasks
 

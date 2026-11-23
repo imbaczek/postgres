@@ -36,6 +36,11 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest grouped-sublink-in-rewrites-shared-outer-reference
+    (rove:ok (equalp '((3 t))
+                     (subquery-test-rows
+                      "SELECT d.x, (SELECT d.x IN (3,4)) FROM (SELECT 2 AS pad, 3 AS x) d GROUP BY d.x"))))
+
 (rove:deftest aggregate-rebase-shifts-shared-subplan-once
     (let* ((column '(:col 1 :type :int4))
            (child (list :where (list :outer-ref 4 column)))

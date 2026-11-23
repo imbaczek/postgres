@@ -59,6 +59,7 @@ SETUP = (
 )
 
 CASES = (
+    "SELECT d.x, (SELECT d.x IN (3,4)) FROM (SELECT 2 AS pad, 3 AS x) d GROUP BY d.x",
     "SELECT (pg_get_publication_tables('subq_pub')).relid = ANY (SELECT 1::oid)",
     "SELECT (pg_get_publication_tables('subq_pub')).relid <> ALL (SELECT 1::oid)",
     "SELECT true = ANY (SELECT (pg_get_publication_tables('subq_pub')).relid IS NOT NULL)",

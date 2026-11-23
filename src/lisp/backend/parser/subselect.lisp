@@ -255,10 +255,13 @@ may still contain expression lists and are traversed structurally."
           (rewrite-aggregate-columns (sql-subplan-test descriptor) group-keys scope))
     (map-prepared-query-expressions
      (lambda (expression level)
-       (when (and (eq (first expression) :outer-ref) (= (second expression) level))
-         (setf (third expression)
-               (rewrite-aggregate-columns (third expression) group-keys scope)))
-       expression)
+       (if (and (eq (first expression) :outer-ref) (= (second expression) level))
+           ;; Raw and coerced IN operands can share the same outer reference.
+           (let ((copy (copy-list expression)))
+             (setf (third copy)
+                   (rewrite-aggregate-columns (third expression) group-keys scope))
+             copy)
+           expression))
      (sql-subplan-prepared descriptor) 1))
   form)
 
