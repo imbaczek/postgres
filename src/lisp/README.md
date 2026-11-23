@@ -1320,6 +1320,9 @@ entry point invokes the `pg-unit-tests/all` ASDF test operation, which runs
 the Rove suite and then the legacy harness. Use `./t/run-unit-tests.sh --list`
 to list both harnesses' registered cases without running them. Legacy cases
 with platform guards appear in the inventory even when skipped at runtime.
+The combined runner and its inventory use a private ASDF output cache under
+the temporary directory and remove it on exit. This keeps their compilation
+separate from live servers using the default cache.
 The direct runner honors
 `SBCL` and normal init files. If
 `PG_LISP_TEST_RUN_DIR` is absent, it enters the test RAM-disk wrapper, which

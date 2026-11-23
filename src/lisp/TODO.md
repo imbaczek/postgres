@@ -2601,6 +2601,11 @@ differential regressions verify the grouped value and comparison result.
   context reused its FASLs without compilation. Production FASL paths are
   shared. Noncampaign ASDF cache configuration and the cold test style and
   dependency warnings remain open.
+  The combined unit runner and its inventory now compile into per-process
+  caches. An overlapping live portal run passed startup and reload, and
+  the inventory listed 1,633 Rove heads and 166 legacy cases. A REPL
+  fault check confirmed that the private cache is removed and the
+  original ASDF cache binding is restored when execution unwinds.
 
 - [x] Preserve ownership revocation across live reloads. The stream and directory
   proof modules retain their weak revocation tables and mutexes for the lifetime
