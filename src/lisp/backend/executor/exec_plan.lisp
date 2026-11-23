@@ -2022,6 +2022,20 @@ ROW's source environment.  Only final target origins leave this projection."
            (funcall run-child right right-callback))
          join emit))))
 
+(defun stream-physical-group-node (node source emit)
+  "Run DISTINCT or aggregation over a driver-owned row source."
+  (ecase (first node)
+    (:sorted-distinct
+     (stream-sorted-distinct source (second node) emit))
+    (:hash-distinct
+     (stream-hash-aggregate
+      (lambda (callback)
+        (funcall source (lambda (row) (funcall callback (car row)))))
+      (second node) 0
+      (lambda (values) (funcall emit (cons values values)))))
+    ((:hash-aggregate :sorted-aggregate)
+     (stream-select-aggregates source (second node) (third node) emit))))
+
 (defun execute-physical-plan-node (node registered-relations outer-environment
                                    emit run-child run-node)
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
@@ -2099,17 +2113,12 @@ ROW's source environment.  Only final target origins leave this projection."
                           (close-sql-iterator projected)))
                       (stream-project-set environment (second node) emit))))))
     (:project (execute-physical-projection node emit run-child))
-    (:sorted-distinct
-     (stream-sorted-distinct
-      (lambda (callback) (funcall run-child (third node) callback))
-      (second node) emit))
-    (:hash-distinct
-     (stream-hash-aggregate
-      (lambda (callback)
-        (funcall run-child (third node)
-                 (lambda (row) (funcall callback (car row)))))
-      (second node) 0
-      (lambda (values) (funcall emit (cons values values)))))
+    ((:sorted-distinct :hash-distinct :hash-aggregate :sorted-aggregate)
+     (let ((child (if (member (first node) '(:hash-aggregate :sorted-aggregate))
+                      (fourth node) (third node))))
+       (flet ((source (callback) (funcall run-child child callback)))
+         (declare (dynamic-extent #'source))
+         (stream-physical-group-node node #'source emit))))
     ((:sort :top-n) (execute-physical-order node emit run-child))
     (:limit
      (let ((limit (check-select-limit (second node)))
@@ -2122,11 +2131,6 @@ ROW's source environment.  Only final target origins leave this projection."
                     (when (or (eq (funcall emit row) :stop)
                               (>= count limit))
                       :stop))))))
-    ((:hash-aggregate :sorted-aggregate)
-     (stream-select-aggregates
-      (lambda (aggregate-callback)
-        (funcall run-child (fourth node) aggregate-callback))
-      (second node) (third node) emit))
     (otherwise
      (error "Unknown physical query-plan node ~s" node))))
 

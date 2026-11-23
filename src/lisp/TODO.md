@@ -174,6 +174,11 @@ pass-through rows, and origin capture through both entry points.
 The WindowAgg drivers share partition resets, ranking, aggregate transitions,
 and transition origins. The window differential covers one-row portal
 resumption for ROWS prefixes, RANGE peer groups, and whole partitions.
+The callback and iterator drivers also share the streaming DISTINCT and
+aggregate node dispatcher. This keeps the projected-value input for hash
+DISTINCT and the output row shape in one implementation.
+The DML differential exercises ordinary SELECT and resumed DISTINCT
+and aggregate portals, with the driver still owning source cleanup.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING

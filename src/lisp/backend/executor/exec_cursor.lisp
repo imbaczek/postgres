@@ -735,14 +735,7 @@ source itself.  Closing the result closes the sort and its source."
                      ((:sort :top-n)
                       (stream-select-sort #'source (second node) emit
                                           :limit (and (eq (first node) :top-n) (third node))))
-                     ((:hash-aggregate :sorted-aggregate)
-                      (stream-select-aggregates #'source (second node) (third node) emit))
-                     (:sorted-distinct
-                      (stream-sorted-distinct #'source (second node) emit))
-                     (:hash-distinct
-                      (stream-hash-aggregate
-                       (lambda (callback) (source (lambda (row) (funcall callback (car row)))))
-                       (second node) 0 (lambda (values) (funcall emit (cons values values))))))))
+                     (otherwise (stream-physical-group-node node #'source emit)))))
                input)))
        (if deferred
            (make-mapping-sql-iterator
