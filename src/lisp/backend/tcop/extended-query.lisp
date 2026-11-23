@@ -25,11 +25,6 @@
 (defun extended-portal-select-p (portal)
   (eq (getf (extended-statement-ast (extended-portal-statement portal)) :type) :select))
 
-(defun make-extended-query-portal (statement values returns-rows-p columns formats)
-  (make-extended-portal :statement statement :values values
-                        :returns-rows-p returns-rows-p
-                        :result-columns columns :result-formats formats))
-
 (defun call-with-extended-bind-spool (input size function)
   "Read SIZE bytes into a checksummed anonymous spool, scoped to FUNCTION."
   (unless (<= 0 size (- +max-query-message-size+ 4))
@@ -778,7 +773,9 @@
                                                    :text type -1))
                                  (extended-binary-input (if spooled bytes (subseq bytes start end)) type (1+ index)))))))
         (when (extended-bind-spool-p payload) (extended-verify-bind-spool payload))
-        (let ((bound (make-extended-query-portal statement values returns-rows-p columns result-formats)))
+        (let ((bound (make-extended-portal :statement statement :values values
+                                           :returns-rows-p returns-rows-p
+                                           :result-columns columns :result-formats result-formats)))
           (cond ((extended-portal-select-p bound)
                  (extended-initialize-select-portal bound))
                 ((member (getf (extended-statement-ast statement) :type)

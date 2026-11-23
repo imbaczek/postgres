@@ -2478,7 +2478,7 @@
       (set-backend-state *backend* :aborted)
       (setf (gethash "s" (extended-query-state-statements *extended-query-state*)) statement
             (gethash "p" (extended-query-state-portals *extended-query-state*))
-            (make-extended-query-portal statement #() t nil #()))
+            (make-extended-portal :statement statement :values #() :returns-rows-p t :result-formats #()))
       (unwind-protect
            (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
              (dolist (operation '((:describe #\S "s") (:describe #\P "p")))

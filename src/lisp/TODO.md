@@ -238,6 +238,9 @@ change in `0ebd131b2eb`. Portal result metadata and prepared result signatures
 live on their owners. The SELECT and DML execution registries track executable
 portal state for cleanup and suspension. The live portal lifecycle fixture
 passed snapshot retention, reload exclusion and cleanup after suspension.
+Bind now constructs the portal directly. Both aborted Describe regressions
+passed, and the live C comparison matched Bind, Describe and DataRow frames
+and the result-type drift diagnostic for Bind and statement Describe.
 
 The first A1 slice shares physical row projection between the callback and
 iterator drivers. It preserves deferred sort expressions, ProjectSet

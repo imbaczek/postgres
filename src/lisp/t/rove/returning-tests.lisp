@@ -605,7 +605,7 @@
       (set-backend-state *backend* :aborted)
       (setf (gethash "s" (extended-query-state-statements *extended-query-state*)) statement
             (gethash "p" (extended-query-state-portals *extended-query-state*))
-            (make-extended-query-portal statement #() t nil #()))
+            (make-extended-portal :statement statement :values #() :returns-rows-p t :result-formats #()))
       (dolist (operation '((:describe #\S "s") (:describe #\P "p")))
         (rove:ok
          (handler-case
