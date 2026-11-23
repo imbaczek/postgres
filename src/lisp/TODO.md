@@ -419,6 +419,14 @@ SQL result types, and snapshot export retains volatile evaluation.
 The C differential checks qualified calls, SQL identity syntax, and
 wrong arity. The live portal suite checks snapshot export and the native
 runtime string.
+The registry supplies `lower(text)` and both `current_setting` arities.
+Execution selects a descriptor by arity and uses the analyzed first
+argument type for same-arity overloads. The boolean input to
+`current_setting(text, bool)` retains runtime coercion for unknown
+literals. The existing physical test and the C differential exercise
+strict NULL handling, missing settings, and C/POSIX case conversion.
+Both calls use the C catalog's implicit `pg_node_tree` to `text` cast
+and are eligible for sharing identical aggregate and window inputs.
 
 ### A9 follow-up evidence
 

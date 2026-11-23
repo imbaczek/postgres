@@ -347,33 +347,12 @@ exist\" messages."
        (list :func name (list node (coerce-catalog-oid-argument (second arguments) name))
              :type :text :typmod -1)))))
 
-(defun analyze-setting-function (name args)
-  (unless (and (if (string= name "lower") (= (length args) 1)
-                   (<= 1 (length args) 2))
-               (member (expr-type (first args)) '(:text :varchar :name :char))
-               (or (= (length args) 1)
-                   (eq (expr-type (second args)) :bool)
-                   (in-unknown-constant-p (second args))))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (when (and (rest args) (in-unknown-constant-p (second args)))
-    (setf (second args) (list :cast (second args) :type :bool :typmod -1)))
-  (unless (eq (expr-type (first args)) :text)
-    (setf (first args) (list :cast (first args) :type :text :typmod -1)))
-  (list :func name args :type :text :typmod -1))
-
 (defun sql-lower-c (value)
   "Match formatting.c:asc_tolower for the supported C/POSIX collation."
   (map 'string (lambda (character)
                  (let ((code (char-code character)))
                    (if (<= 65 code 90) (code-char (+ code 32)) character)))
        value))
-
-(defun eval-setting-function (name args)
-  (if (member +null+ args :test #'eq)
-      +null+
-      (if (string= name "lower")
-          (sql-lower-c (first args))
-          (sql-setting-value (first args) (second args)))))
 
 (defun sql-wal-lsn-diff (left right)
   "Match pg_lsn_mi without signed-int64 truncation or floating point."
@@ -430,6 +409,16 @@ exist\" messages."
                    (make-scalar-builtin :name "pg_walfile_name" :argument-types '(:pg-lsn)
                                         :result-type :text :volatility :immutable :strict-p t
                                         :evaluator 'sql-wal-filename :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "lower" :argument-types '(:text)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-lower-c :implicit-arguments-p t)
+                   (make-scalar-builtin :name "current_setting" :argument-types '(:text)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-setting-value :implicit-arguments-p t)
+                   (make-scalar-builtin :name "current_setting" :argument-types '(:text :bool)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-setting-value :implicit-arguments-p t
+                                        :defer-decorated-coercion-p :always)
                    (make-scalar-builtin :name "version" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
@@ -522,11 +511,14 @@ after this step any surviving tie is ambiguous."
           (t best))))
 
 (defun analyze-scalar-builtin (name candidates arguments decorated-p)
+  "Resolve a scalar signature and apply its constant coercion policy.
+Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
   (let* ((builtin (resolve-scalar-builtin name candidates arguments))
          (*defer-function-constant-coercion-p*
-           (if (scalar-builtin-defer-decorated-coercion-p builtin)
-               decorated-p
-               *defer-function-constant-coercion-p*)))
+           (ecase (scalar-builtin-defer-decorated-coercion-p builtin)
+             ((t) decorated-p)
+             ((nil) *defer-function-constant-coercion-p*)
+             (:always t))))
     (list :func name (mapcar #'coerce-common-expression arguments
                              (scalar-builtin-argument-types builtin))
           :type (scalar-builtin-result-type builtin) :typmod -1)))
@@ -1799,8 +1791,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (analyze-render-function name args)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
-      ((member name '("lower" "current_setting") :test #'string=)
-       (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
        (analyze-metadata-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
@@ -4703,12 +4693,22 @@ the full 64-bit ID as a signed value."
 (defun sql-current-database ()
   (backend-database *backend*))
 
+(defun scalar-builtin-for-evaluation (candidates arity first-argument)
+  "Resolve by arity, then by the first analyzed input for same-arity overloads."
+  (let ((first-type (expr-type first-argument))
+        (match nil)
+        (ambiguous-p nil))
+    (dolist (candidate candidates (unless ambiguous-p match))
+      (let ((types (scalar-builtin-argument-types candidate)))
+        (when (= arity (length types))
+          (when (eq first-type (first types)) (return candidate))
+          (when match (setf ambiguous-p t))
+          (setf match candidate))))))
+
 (defun eval-func (name args &optional first-argument)
   (let* ((candidates (gethash name *scalar-builtin-descriptors*))
          (builtin (if (rest candidates)
-                      ;; These signatures differ in their coerced first argument.
-                      (find (expr-type first-argument) candidates
-                            :key (lambda (entry) (first (scalar-builtin-argument-types entry))))
+                      (scalar-builtin-for-evaluation candidates (length args) first-argument)
                       (first candidates))))
     (when builtin (return-from eval-func (eval-scalar-builtin builtin args))))
   (cond
@@ -4730,8 +4730,6 @@ the full 64-bit ID as a signed value."
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((string= name "string_to_array") (eval-string-to-array args))
-    ((member name '("lower" "current_setting") :test #'string=)
-     (eval-setting-function name args))
     ((string= name "pg_get_expr")
      (sql-strict-let ((node (first args)) (relation (second args)))
        (ereport "0A000" "non-NULL pg_node_tree deparsing is not supported")))

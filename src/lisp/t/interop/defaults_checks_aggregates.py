@@ -7,6 +7,12 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.lower('PORT ÄΣ'), lower('AbC'::varchar), lower(NULL::text)",
+    "SELECT lower(42)",
+    "SELECT pg_catalog.current_setting('server_encoding'::name), current_setting('server_encoding', 'true')",
+    "SELECT current_setting('missing.setting', true), current_setting('server_encoding', NULL)",
+    "SELECT current_setting('missing.setting')",
+    "SELECT current_setting('server_encoding', 1)",
     "SELECT pg_catalog.version() IS NOT NULL, pg_catalog.current_database() = CURRENT_CATALOG",
     "SELECT pg_catalog.current_schema() IS NOT NULL, CURRENT_USER = SESSION_USER, USER = CURRENT_USER",
     "SELECT version(1)",
