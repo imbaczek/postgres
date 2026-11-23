@@ -570,7 +570,9 @@ Remove the trace and its temporary helper after the demo:
 ## Milestone verification timing
 
 - Keep test data, temporary files, compiler caches, and live logs on disk by
-  default. For a verification run that explicitly needs RAM-backed storage,
+  default. Limit SSD writes by reusing qualified campaign FASLs where possible
+  and using a bounded RAM workspace for short, write-heavy jobs when system
+  memory has headroom. For a RAM-backed verification run,
   provision it from the repository root with `src/lisp/t/test-ramdisk.sh setup 4G`.
   This mounts a bounded Linux tmpfs at
   `/dev/shm/pg-lisp-tests-$(id -u)` with `noswap`, private permissions, and

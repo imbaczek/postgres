@@ -1370,9 +1370,11 @@ and use the path printed by `create` in subsequent commands:
 
 Each command creates a private disk workspace under `TMPDIR` or `/tmp`.
 The filesystem must allow execution, and the workspace must be outside the
-source tree.
+source tree. Verified strict compile reuse reduces repeated cache writes on
+SSD-backed workspaces.
 For an explicitly RAM-backed campaign, prefix each command with
-`./t/test-ramdisk.sh run`. All commands for a campaign use the same workspace
+`./t/test-ramdisk.sh run`. Use the bounded mount for write-heavy jobs when
+system memory has headroom. All commands for a campaign use the same workspace
 type. Every run uses a fresh
 Lisp image. By default it also runs a fresh no-init compiler, with warnings
 fatal, even when it reuses completed parent FASLs. `--cold` skips the parent
