@@ -456,7 +456,10 @@ subplans in one operand walk. The regression places all three shapes in
 literal and call metadata and then checks the same shapes as operands.
 HAVING gate construction and folding still need their own evaluation
 policy for lazy branches, unsupported functions, and ordered array bounds.
-Audit their shared operand shapes and the separate semantic-key encoder.
+The gate skeleton and folder now share the analyzed `IN` layout, including
+scalar operands, array operands and typed comparison pairs. The regression
+witnesses callback order and source ownership. Array bounds and the separate
+semantic-key encoder remain to audit.
 
 ## Open development tasks
 

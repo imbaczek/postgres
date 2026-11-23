@@ -1953,6 +1953,22 @@ JSON has no comparison operators, even though its stored value is text."
           :array-left (first array) :array-items (rest array)
           :comparisons comparisons)))
 
+(defun map-analyzed-in-operands (function expression)
+  "Copy an analyzed IN expression and map its scalar and comparison operands."
+  (let ((copy (copy-list expression))
+        (options (cddddr expression)))
+    (setf (second copy) (funcall function (second expression))
+          (third copy) (mapcar function (third expression))
+          (getf (cddddr copy) :array-left)
+          (when (getf options :array-left)
+            (funcall function (getf options :array-left)))
+          (getf (cddddr copy) :array-items)
+          (mapcar function (getf options :array-items))
+          (getf (cddddr copy) :comparisons)
+          (mapcar (lambda (pair) (mapcar function pair))
+                  (getf options :comparisons)))
+    copy))
+
 (defun sql-cast-allowed-p (source target)
   "Supported explicit casts from pg_cast and CoerceViaIO's string rules."
   (or (eq source target)

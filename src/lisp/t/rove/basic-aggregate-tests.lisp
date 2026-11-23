@@ -1,5 +1,20 @@
 (in-package #:pg)
 
+(rove:deftest analyzed-in-operand-mapping-preserves-order-and-ownership
+    (let* ((original '(:in a (b c) nil :type :bool :array-left d :array-items (e f)
+                       :comparisons ((g h) (i j)) :metadata untouched))
+           (source (copy-tree original))
+           (visited nil)
+           (mapped (map-analyzed-in-operands
+                    (lambda (operand) (push operand visited) (list :mapped operand))
+                    source)))
+      (rove:ok (equal (reverse visited) '(a b c d e f g h i j)))
+      (rove:ok (equal source original))
+      (rove:ok (equal (second mapped) '(:mapped a)))
+      (rove:ok (equal (getf (cddddr mapped) :comparisons)
+                      '(((:mapped g) (:mapped h)) ((:mapped i) (:mapped j)))))
+      (rove:ok (eq (getf (cddddr mapped) :metadata) 'untouched))))
+
 (rove:deftest having-pushdown-inspects-only-executable-operands
     (let* ((aggregate '(:col 1 :type :int4 :aggregate-output t))
            (volatile '(:func "nextval" nil))
