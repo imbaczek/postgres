@@ -1250,6 +1250,10 @@ interrupted receive handoff, and CLOG registration before interruption.
 The same 702-head selection passed on frozen `c946b71c14f` with a fresh
 strict compile and zero failures in 345.19 seconds. The complete run and
 compiler receipt are archived under `architecture-physical-delta`.
+The physical ASDF system has the same 196 test components at the full baseline
+and at this rerun. Comparing the 30 changed components with the rerun log
+identified 43 additional test heads, for 745 distinct test heads in those
+components. The 43-head complement is a separate current-checkout selection.
 
 ### A9 follow-up evidence
 
