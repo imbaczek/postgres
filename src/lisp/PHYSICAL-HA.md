@@ -14,11 +14,12 @@ when each recorded check ran.
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
 | Primary WAL control and checkpoint payload | `PGWAL6` with the `timeline` namespace and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
 | Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Use the [previous build's namespace migration operation](#timeline-qualified-native-wal-namespace) with `archive_mode=off` for a stopped legacy primary. Recreate legacy backups and reseed standbys. The receive spool has its own naming contract. |
+| Archived WAL ancestry | Full segments use timeline-qualified `.wal` names and fork prefixes use timeline-qualified `.wal.partial` names. Restore requires the matching qualified archive proof. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
 | Physical receive control | `PGPHYS03`, with the current base, history-selection, and retained-root forms. |
 | Physical recovery control | `PGRSTAT3` for ordinary recovery and `PGRSTAT4` for pending promotion with a timeline-qualified source. |
-| Physical backup manifest | Version 3 with an explicit checkpoint start. |
+| Physical backup manifest | Version 3 with an explicit checkpoint start and timeline-qualified WAL entries. |
 | Standby restartpoint | `PGRPGEN2` with metadata version 4. |
 | Catalog and relation pages | Catalog images carry a cluster identity and OIDs for stored publications. B-tree pages use the current page flags for the page type. |
 
@@ -26,9 +27,9 @@ For development data from a retired format, initialize a fresh cluster and
 restore the data logically from a server that can read the old cluster. Create
 new physical backups and standbys from the fresh source. Keep a matching
 binary and data copy for rollback. Restart the Lisp server across changes to
-the live reload gate, backend, portal, or prepared-statement layouts. Follow
-the [format cutover inventory](TODO.md#milestone-0-producer-inventory) for
-remaining retirement prerequisites, including legacy-named ancestral WAL.
+the live reload gate, backend, portal, or prepared-statement layouts.
+The [format cutover inventory](TODO.md#milestone-0-producer-inventory)
+records the migration and verification for each supported format.
 
 ## Goal closeout check
 

@@ -513,6 +513,10 @@ Five strict physical heads covered proof rejection, archived partials, the
 restore cursor, and cold recovery. A separate recycling test verified the
 legacy marker bytes. The live standby restored 2,006 rows from archive while
 the primary was down, then resumed streaming on its existing follow slot.
+The B18 milestone review traced the serving readers and writers for startup,
+backup, follow, archive and promotion through their qualified namespace
+checks. The [current format table](PHYSICAL-HA.md#supported-native-formats)
+records the archive proof and filename contract alongside the receive spool.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
@@ -1023,6 +1027,10 @@ production and clean shutdown.
 
 ### A18 runner diagnostics
 
+The combined run with the WAL storage changes in `d453a4335d2` passed the
+Rove suite and all 1,172 legacy checks. Its warm reload test also loaded the
+extracted WAL scan and control components.
+
 The direct Rove runner reports the type and message of caught conditions. An
 injected error printed its message, counted as a failure, and left the next
 selected test running. The runner still reports per-head timing and returns a
@@ -1065,7 +1073,8 @@ passed through repeated server restarts and fault cuts.
 Primary WAL control I/O loads after the checkpoint codec and WAL core. The
 four moved definitions retain their byte validation and publication order.
 Sixty-six strict physical tests passed, covering checkpoint, control data,
-and standby control boundaries.
+and standby control boundaries. The live checkpoint suite passed crash cuts,
+checkpoint identity, standby replay and restartpoint, and retired-format refusal.
 
 ### A9 follow-up evidence
 
