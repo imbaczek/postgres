@@ -701,6 +701,9 @@ server symbol identities. The physical heap array codec uses the shared
 array-to-element index for the same three supported varlena array types.
 The PostgreSQL C differential compares catalog names, width, alignment,
 and storage for all 54 supported type OIDs.
+Heap tuple sizing and writing share the varlena header rule. The
+regression verifies exact tuple offsets, header bytes, and round trips
+for packable 126- and 127-byte payloads and a 126-byte PLAIN payload.
 
 ### A17 follow-up evidence
 

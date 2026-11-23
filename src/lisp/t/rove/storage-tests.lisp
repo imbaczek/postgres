@@ -857,6 +857,21 @@
                                   columns) 0))
                "NULL bytea survives the tuple codec")))
 
+(rove:deftest heap-varlena-header-boundary-matches-layout-and-disk
+    (dolist (fixture '((126 nil 26 1) (127 nil 28 4) (126 #\p 28 4)))
+      (destructuring-bind (payload-size storage offset header-size) fixture
+        (let* ((columns (vector (make-pg-column :name "prefix" :type :int2 :attnum 1)
+                                (make-pg-column :name "payload" :type :bytea :attnum 2 :storage storage)))
+               (payload (make-array payload-size :element-type '(unsigned-byte 8) :initial-element 197))
+               (values (vector 7 payload))
+               (tuple (form-heap-tuple values columns 1 0 0 0 1)))
+          (multiple-value-bind (size offsets) (heap-tuple-layout values columns)
+            (rove:ok (= (aref offsets 1) offset))
+            (rove:ok (= size (length tuple) (+ offset header-size payload-size))))
+          (rove:ok (= (if (= header-size 1) (aref tuple offset) (page-u32 tuple offset))
+                      (if (= header-size 1) 255 (ash (+ payload-size 4) 2))))
+          (rove:ok (equalp values (deform-heap-tuple tuple columns)))))))
+
 (rove:deftest test-tuple-external-varlena
     (dolist (width '(4 8))
       (let* ((columns (vector (make-pg-column :name "a" :type :int2 :typmod -1 :attnum 1)
