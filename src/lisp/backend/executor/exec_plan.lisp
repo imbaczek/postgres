@@ -2041,12 +2041,8 @@ ROW's source environment.  Only final target origins leave this projection."
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
   (when (member (first node) '(:sort :top-n))
     (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
-      (multiple-value-bind (set-node width calls targets) (sort-project-set-info node child)
-        (when (and set-node
-                   (notany (lambda (entry)
-                             (project-set-expression-dependent-p
-                              (car entry) width (length calls) targets))
-                           (second node)))
+      (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
+        (when set-node
           (let ((input (make-sorted-project-set-iterator
                         node child set-node width calls registered-relations
                         :source-streamer

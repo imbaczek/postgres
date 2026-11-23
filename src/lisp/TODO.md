@@ -179,6 +179,10 @@ aggregate node dispatcher. This keeps the projected-value input for hash
 DISTINCT and the output row shape in one implementation.
 The DML differential exercises ordinary SELECT and resumed DISTINCT
 and aggregate portals, with the driver still owning source cleanup.
+Both drivers use the same ProjectSet postponement rule for sort and
+top-N. A sort key that depends on a generated value keeps expansion
+before sorting. The live DML harness checks set-returning target values,
+volatility, LIMIT, and portal resumption against PostgreSQL C.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING

@@ -42,15 +42,21 @@
 
 (defvar *lateral-outer-environment* nil)
 
-(defun sort-project-set-info (node child)
-  ;; Only this shape can sort source rows before expanding the set results.
-  ;; The sorted path retains both source and projected datum origins.
+(defun postponable-sort-project-set (node child)
+  "Return the ProjectSet, input width and calls when sort keys can run first."
   (when (and (member (first node) '(:sort :top-n))
              (eq (first child) :project) (eq (first (third child)) :project-set))
-    (let* ((set-node (third child)) (width (fourth set-node))
-                                    (calls (second set-node)) (targets (second child)))
-      (when (and (integerp width) (not (minusp width)) calls)
-        (values set-node width calls targets)))))
+    (let* ((set-node (third child))
+           (width (fourth set-node))
+           (calls (second set-node))
+           (targets (second child))
+           (call-count (length calls)))
+      (when (and (integerp width) (not (minusp width)) calls
+                 (notany (lambda (entry)
+                           (project-set-expression-dependent-p
+                            (car entry) width call-count targets))
+                         (second node)))
+        (values set-node width calls)))))
 
 (defun make-visible-heap-page-iterator (page block columns snapshot)
   "Visit visible heap tuples from an owned PAGE one at a time.
@@ -714,12 +720,8 @@ source itself.  Closing the result closes the sort and its source."
      (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
        ;; If a key needs an SRF value, keep expansion below sort instead of
        ;; moving it above the sort and changing the key's evaluation point.
-       (multiple-value-bind (set-node width calls targets) (sort-project-set-info node child)
-         (when (and set-node
-                    (notany (lambda (entry)
-                              (project-set-expression-dependent-p
-                               (car entry) width (length calls) targets))
-                            (second node)))
+       (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
+         (when set-node
            (return-from %make-physical-plan-iterator
              (make-sorted-project-set-iterator node child set-node width calls relations)))))
      (let* ((child (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
