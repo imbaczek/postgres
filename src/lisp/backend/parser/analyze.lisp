@@ -432,6 +432,18 @@ exist\" messages."
                    (make-scalar-builtin :name "set_config" :argument-types '(:text :text :bool)
                                         :result-type :text :volatility :volatile
                                         :evaluator 'set-config-value :implicit-arguments-p t)
+                   (make-scalar-builtin :name "nextval" :argument-types '(:text)
+                                        :result-type :int8 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-nextval :implicit-arguments-p :sequence)
+                   (make-scalar-builtin :name "currval" :argument-types '(:text)
+                                        :result-type :int8 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-currval :implicit-arguments-p :sequence)
+                   (make-scalar-builtin :name "setval" :argument-types '(:text :int8)
+                                        :result-type :int8 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-setval :implicit-arguments-p :sequence)
+                   (make-scalar-builtin :name "setval" :argument-types '(:text :int8 :bool)
+                                        :result-type :int8 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-setval :implicit-arguments-p :sequence)
                    (make-scalar-builtin :name "pg_cancel_backend" :argument-types '(:int4)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-cancel-backend :implicit-arguments-p :admin)
@@ -515,13 +527,13 @@ exist\" messages."
   (let ((types (scalar-builtin-argument-types builtin))
         (policy (scalar-builtin-implicit-arguments-p builtin)))
     (and (= (length arguments) (length types))
-         (loop for argument in arguments for type in types
-               always (if (eq policy :admin)
-                          (admin-arg-coercible-p argument type)
-                          (or (in-unknown-constant-p argument)
-                              (if policy
-                                  (sql-implicit-coercion-p (expr-type argument) type)
-                                  (eq (expr-type argument) type))))))))
+         (loop for argument in arguments for type in types for position from 0
+               always (cond ((eq policy :admin) (admin-arg-coercible-p argument type))
+                            ((and (eq policy :sequence) (zerop position))
+                             (eq (expr-type argument) :text))
+                            ((in-unknown-constant-p argument) t)
+                            (policy (sql-implicit-coercion-p (expr-type argument) type))
+                            (t (eq (expr-type argument) type)))))))
 
 (defun resolve-scalar-builtin (name candidates arguments)
   "Use C's exact-match count and prefer text for unknown unary inputs.
@@ -558,10 +570,13 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              ((t) decorated-p)
              ((nil) *defer-function-constant-coercion-p*)
              (:always t))))
-    (list :func name (if (eq (scalar-builtin-implicit-arguments-p builtin) :admin)
-                         arguments
-                         (mapcar #'coerce-scalar-builtin-argument arguments
-                                 (scalar-builtin-argument-types builtin)))
+    (list :func name (case (scalar-builtin-implicit-arguments-p builtin)
+                       (:admin arguments)
+                       (:sequence (coerce-sequence-builtin-arguments arguments
+                                                                     (scalar-builtin-argument-types builtin)))
+                       (otherwise
+                        (mapcar #'coerce-scalar-builtin-argument arguments
+                                (scalar-builtin-argument-types builtin))))
           :type (scalar-builtin-result-type builtin) :typmod -1)))
 
 (defun analyze-jsonb-set-function (name arguments)
@@ -1636,37 +1651,19 @@ so a nested argument error keeps its own diagnostics."
       (report-qualified-numeric-call-error name schema (third expr) table
                                            (getf (cdddr expr) :call-order)))))
 
-(defun analyze-sequence-function (name arguments)
-  "Resolve sequence calls before execution can discard a strict or unused call.
-
-C coerces an unknown name literal through regclassin during analysis.  Resolve
-names here, but accept numeric OIDs and the dash without a catalog lookup.
-Defer this check when call decorations must be rejected first.  Explicit text
-arguments are resolved at runtime; stored sequence references still use names."
-  (let* ((setval-p (string= name "setval"))
-         (types (if setval-p '(:text :int8 :bool) '(:text))))
-    (unless (and (if setval-p (member (length arguments) '(2 3))
-                     (= (length arguments) 1))
-                 (eq (expr-type (first arguments)) :text)
-                 (loop for argument in (rest arguments) for type in (rest types)
-                       always (or (in-unknown-constant-p argument)
-                                  (sql-implicit-coercion-p (expr-type argument) type))))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (let ((argument (first arguments)))
-      (when (and (not *defer-function-constant-coercion-p*)
-                 (in-unknown-constant-p argument) (stringp (second argument)))
-        (let ((literal (second argument)))
-          ;; parseDashOrOid accepts these without consulting pg_class.
-          (cond ((string= literal "-"))
-                ((and (plusp (length literal))
-                      (every (lambda (character) (char<= #\0 character #\9)) literal))
-                 (sql-oid-input literal))
-                (t (check-sequence-function-relation literal))))))
-    (list :func name
-          (cons (first arguments)
-                (loop for argument in (rest arguments) for type in (rest types)
-                      collect (coerce-common-expression argument type)))
-          :type :int8 :typmod -1)))
+(defun coerce-sequence-builtin-arguments (arguments types)
+  "Validate unknown sequence names at analysis time without changing stored names.
+Numeric OIDs and the dash can pass regclass input without a catalog lookup."
+  (let ((argument (first arguments)))
+    (when (and (not *defer-function-constant-coercion-p*)
+               (in-unknown-constant-p argument) (stringp (second argument)))
+      (let ((literal (second argument)))
+        (cond ((string= literal "-"))
+              ((and (plusp (length literal))
+                    (every (lambda (character) (char<= #\0 character #\9)) literal))
+               (sql-oid-input literal))
+              (t (check-sequence-function-relation literal)))))
+    (cons argument (mapcar #'coerce-common-expression (rest arguments) (rest types)))))
 
 (defun check-sequence-function-relation (name &optional require-sequence-p)
   "Resolve a sequence call's relation without relocking an analysis caller.
@@ -1798,11 +1795,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-minmax-function name args))
       ((string= name "array_length") (analyze-array-length-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
-      ((member name '("nextval" "currval" "setval") :test #'string=)
-       (let ((*defer-function-constant-coercion-p*
-               (or (getf (cdddr expr) :call-distinct)
-                   (getf (cdddr expr) :call-order))))
-         (analyze-sequence-function name args)))
       (t (analyze-utility-function-call name args)))))
 
 (defun expression-contains-column-p (form)
@@ -4739,6 +4731,19 @@ the full 64-bit ID as a signed value."
 (defun sql-terminate-backend (pid &optional (timeout 0))
   (admin-terminate-backend (admin-pid-arg pid) (admin-timeout-arg timeout)))
 
+(defun sql-nextval (name)
+  (unless (stringp name) (ereport "42883" "nextval expects one sequence name string"))
+  (sequence-nextval (check-sequence-function-relation name t)))
+
+(defun sql-currval (name)
+  (unless (stringp name) (ereport "42883" "currval expects one sequence name string"))
+  (sequence-currval (check-sequence-function-relation name t)))
+
+(defun sql-setval (name value &optional (is-called t))
+  (unless (and (stringp name) (integerp value) (member is-called '(t nil)))
+    (ereport "42883" "setval expects a sequence name, int8 value, and optional boolean"))
+  (sequence-setval (check-sequence-function-relation name t) value is-called))
+
 (defun eval-func (name args &optional first-argument)
   (let* ((candidates (gethash name *scalar-builtin-descriptors*))
          (builtin (if (rest candidates)
@@ -4750,9 +4755,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
     ((string= name "width_bucket") (sql-width-bucket args))
-    ((and (member name '("nextval" "currval" "setval") :test #'string=)
-          (member +null+ args))
-     +null+)
     ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
              :test #'string=)
      (if (member +null+ args) +null+
@@ -4764,24 +4766,6 @@ the full 64-bit ID as a signed value."
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((string= name "string_to_array") (eval-string-to-array args))
-    ((string= name "nextval")
-     (unless (and (= (length args) 1) (stringp (first args)))
-       (ereport "42883" "nextval expects one sequence name string"))
-     (sequence-nextval (check-sequence-function-relation (first args) t)))
-    ((string= name "currval")
-     (unless (and (= (length args) 1) (stringp (first args)))
-       (ereport "42883" "currval expects one sequence name string"))
-     (sequence-currval (check-sequence-function-relation (first args) t)))
-    ((string= name "setval")
-     (unless (and (member (length args) '(2 3))
-                  (stringp (first args))
-                  (integerp (second args))
-                  (or (= (length args) 2)
-                      (member (third args) '(t nil))))
-       (ereport "42883"
-                "setval expects a sequence name, int8 value, and optional boolean"))
-     (sequence-setval (check-sequence-function-relation (first args) t) (second args)
-                      (if (= (length args) 3) (third args) t)))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
     (t

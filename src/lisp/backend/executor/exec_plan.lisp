@@ -1786,7 +1786,7 @@ Expressions wrapping a set result must remain in a separate projection."
            (if registered-p
                (eq volatility :volatile)
                (member name
-                       '("nextval" "currval" "setval" "random" "setseed"
+                       '("random" "setseed"
                          "pg_promote"
                          "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
                          "pg_replication_slot_advance" "pg_control_checkpoint"

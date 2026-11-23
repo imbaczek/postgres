@@ -48,7 +48,7 @@ Only constant names can be tracked for persisted expressions and replication."
       ((member name '("pg_cancel_backend" "pg_terminate_backend") :test #'string=) t)
       (builtins (every #'scalar-builtin-strict-p builtins))
       (t (or (having-immutable-function-p name)
-             (member name '("nextval" "currval" "setval" "pg_promote") :test #'string=))))))
+             (string= name "pg_promote"))))))
 
 (defun fold-column-default (expression)
   "Copy a demanded default, folding immutable parts before row execution.

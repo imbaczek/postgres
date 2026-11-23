@@ -486,6 +486,11 @@ Backend cancel and terminate signatures use the registry for arity and
 volatility. Their evaluators retain native runtime integer parsing,
 NULL-to-zero behavior, and the optional timeout. Stored default folding
 retains its historical NULL result for these two commands.
+Sequence calls use the registry for their strict, volatile signatures
+and return type. Name validation still models C regclass input at
+analysis time for unknown literals, and stored calls keep native
+sequence names. The registry also supplies default-folding strictness
+and sort-projection volatility.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
