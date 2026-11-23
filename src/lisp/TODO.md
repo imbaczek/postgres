@@ -1062,6 +1062,11 @@ scanner tests passed, covering legal rotation, exact segment boundaries,
 invalid gaps and the durable tail repair boundary. The live WAL crash suite
 passed through repeated server restarts and fault cuts.
 
+Primary WAL control I/O loads after the checkpoint codec and WAL core. The
+four moved definitions retain their byte validation and publication order.
+Sixty-six strict physical tests passed, covering checkpoint, control data,
+and standby control boundaries.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

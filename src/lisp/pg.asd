@@ -63,6 +63,7 @@
                    (:file "wal-resource-parameters")
                    (:file "wal-eor")
                    (:file "wal-checkpoint")
+                   (:file "wal-control" :depends-on ("wal" "wal-checkpoint"))
                    (:file "wal-full-page-writes")
                    (:file "wal-logical-status")
                    (:file "wal-logical-policy")
