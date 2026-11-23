@@ -74,6 +74,14 @@ The caller holds the WAL lock and syncs the status directory."
                  (logior sb-posix:o-rdonly sb-posix:o-directory
                          sb-posix:o-nofollow +postmaster-o-cloexec+)))
 
+(defmacro with-wal-archive-directory ((fd) &body body)
+  "Hold the WAL directory descriptor until BODY exits, including on interrupt."
+  `(sb-sys:without-interrupts
+     (let ((,fd (wal-archive-open-wal-directory)))
+       (unwind-protect
+            (progn ,@body)
+         (sb-posix:close ,fd)))))
+
 (defun wal-archive-open-status-directory (wal-fd)
   (let ((fd (physical-image-openat
              wal-fd "archive_status"
@@ -137,45 +145,37 @@ The caller holds the WAL lock and syncs the status directory."
   "Select committed history and eligible ancestor prefixes from the held WAL directory.
 When SOURCE-NAME is selected, require its facts to match the held archive source."
   (when (> *wal-insert-timeline* 1)
-    (sb-sys:without-interrupts
-      (let ((wal-fd (wal-archive-open-wal-directory)))
-        (unwind-protect
-             (progn
-               (wal-archive-check-wal-directory wal-fd)
-               (timeline-archive-history-items
-                *wal-insert-timeline*
-                (lambda (timeline)
-                  (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd (timeline-history-filename timeline))
-                    (when (and source-name (string= source-name (timeline-history-filename timeline))
-                               (not (equal source-facts facts)))
-                      (error "WAL archive history changed before command: ~a" source-name))
-                    bytes))))
-          (sb-posix:close wal-fd))))))
+    (with-wal-archive-directory (wal-fd)
+      (wal-archive-check-wal-directory wal-fd)
+      (timeline-archive-history-items
+       *wal-insert-timeline*
+       (lambda (timeline)
+         (multiple-value-bind (bytes facts) (wal-archive-read-source-bytes wal-fd (timeline-history-filename timeline))
+           (when (and source-name (string= source-name (timeline-history-filename timeline))
+                      (not (equal source-facts facts)))
+             (error "WAL archive history changed before command: ~a" source-name))
+           bytes))))))
 
 (defun wal-archive-partial-items ()
   "Select existing partial files at durable forks in the committed history.
 Skip absent files and files with unsuitable type or length."
   (when (> *wal-insert-timeline* 1)
-    (sb-sys:without-interrupts
-      (let ((wal-fd (wal-archive-open-wal-directory)))
-        (unwind-protect
-             (progn
-               (wal-archive-check-wal-directory wal-fd)
-               (loop for (parent child fork) in
-                                             (timeline-archive-partial-coordinates
-                                              *wal-insert-timeline*
-                                              (wal-archive-read-source-bytes
-                                               wal-fd (timeline-history-filename *wal-insert-timeline*)))
-                     for (segment offset) = (multiple-value-list (wal-segment-and-offset fork))
-                     for name = (wal-archive-promotion-partial-name parent fork)
-                     for stat = (and name (<= fork *wal-durable-lsn*)
-                                     (query-temp-lstat (merge-pathnames name (wal-directory))))
-                     when (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                               (= offset (sb-posix:stat-size stat)))
-                       collect (list :partial name
-                                     (wal-segment-filename segment child :timeline)
-                                     offset)))
-          (sb-posix:close wal-fd))))))
+    (with-wal-archive-directory (wal-fd)
+      (wal-archive-check-wal-directory wal-fd)
+      (loop for (parent child fork) in
+                                    (timeline-archive-partial-coordinates
+                                     *wal-insert-timeline*
+                                     (wal-archive-read-source-bytes
+                                      wal-fd (timeline-history-filename *wal-insert-timeline*)))
+            for (segment offset) = (multiple-value-list (wal-segment-and-offset fork))
+            for name = (wal-archive-promotion-partial-name parent fork)
+            for stat = (and name (<= fork *wal-durable-lsn*)
+                            (query-temp-lstat (merge-pathnames name (wal-directory))))
+            when (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                      (= offset (sb-posix:stat-size stat)))
+              collect (list :partial name
+                            (wal-segment-filename segment child :timeline)
+                            offset)))))
 
 (defun wal-archive-partial-matches-p (wal-fd item &optional source-facts)
   "Check that the partial matches the child segment prefix and any held source facts.
@@ -226,22 +226,18 @@ Return NIL when either file cannot be safely checked."
 
 (defun call-with-standby-wal-archive-directory (function)
   "Open the durable staging area and pass its descriptor and binding check."
-  (sb-sys:without-interrupts
-    (let ((wal-fd (wal-archive-open-wal-directory)))
-      (unwind-protect
-           (progn
-             (wal-archive-check-wal-directory wal-fd)
-             (sb-sys:with-local-interrupts
-               (call-with-wal-archive-private-child
-                wal-fd "standby_archive"
-                (lambda (stage-fd)
-                  (call-with-wal-archive-private-child stage-fd "archive_status" #'identity)
-                  (flet ((check-directory (fd)
-                           (wal-archive-check-wal-directory wal-fd)
-                           (wal-archive-check-private-child wal-fd "standby_archive" fd)))
-                    (check-directory stage-fd)
-                    (funcall function stage-fd #'check-directory))))))
-        (sb-posix:close wal-fd)))))
+  (with-wal-archive-directory (wal-fd)
+    (wal-archive-check-wal-directory wal-fd)
+    (sb-sys:with-local-interrupts
+      (call-with-wal-archive-private-child
+       wal-fd "standby_archive"
+       (lambda (stage-fd)
+         (call-with-wal-archive-private-child stage-fd "archive_status" #'identity)
+         (flet ((check-directory (fd)
+                  (wal-archive-check-wal-directory wal-fd)
+                  (wal-archive-check-private-child wal-fd "standby_archive" fd)))
+           (check-directory stage-fd)
+           (funcall function stage-fd #'check-directory)))))))
 
 (defun wal-archive-run-shell (template name wal-fd directory)
   "Run the archive command and wait for it to exit.

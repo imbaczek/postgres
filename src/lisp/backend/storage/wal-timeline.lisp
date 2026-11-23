@@ -133,20 +133,16 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
       (unless (and (typep prefix '(vector (unsigned-byte 8)))
                    (= (length prefix) (mod fork +wal-segment-size+)))
         (error "invalid promotion archive prefix"))
-      (sb-sys:without-interrupts
-        (let ((wal-fd (wal-archive-open-wal-directory)))
-          (unwind-protect
-               (progn
-                 (wal-archive-stage-source wal-fd name prefix #'wal-archive-check-wal-directory)
-                 (when (>= (length prefix) +wal-header-size+)
-                   (wal-archive-stage-source
-                    wal-fd (wal-archive-segment-proof-name name)
-                    (wal-encode-archive-segment-proof
-                     (catalog-system-identifier) source-timeline
-                     (floor fork +wal-segment-size+) :timeline fork prefix)
-                    #'wal-archive-check-wal-directory))
-                 name)
-            (sb-posix:close wal-fd)))))))
+      (with-wal-archive-directory (wal-fd)
+        (wal-archive-stage-source wal-fd name prefix #'wal-archive-check-wal-directory)
+        (when (>= (length prefix) +wal-header-size+)
+          (wal-archive-stage-source
+           wal-fd (wal-archive-segment-proof-name name)
+           (wal-encode-archive-segment-proof
+            (catalog-system-identifier) source-timeline
+            (floor fork +wal-segment-size+) :timeline fork prefix)
+           #'wal-archive-check-wal-directory))
+        name))))
 
 ;; Prefix staging can install several destination paths during rollover, so an
 ;; observer's ledger must distinguish paths.  The scratch stream is closed before
