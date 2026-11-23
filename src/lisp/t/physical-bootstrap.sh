@@ -95,6 +95,52 @@ done
 "$SBCL" --script "$BASE/t/physical-bootstrap-rows.lisp" "$TMP/copy/" "$TMP/rows.copy" >"$TMP/rows.log" 2>&1
 diff -u "$TMP/rows.expected" "$TMP/rows.copy"
 test "$(sql 'SELECT count(*) FROM bootstrap_data;')" = 3
+manifest="$TMP/copy/physical-backup.manifest"
+cp -p "$manifest" "$TMP/manifest-current"
+PYTHONPATH="$BASE/t/interop${PYTHONPATH:+:$PYTHONPATH}" python3 - "$TMP" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+from crc32c_reference import crc32c
+
+root = Path(sys.argv[1])
+header, payload = (root / "manifest-current").read_bytes().split(b"\n", 1)
+assert payload.endswith(b"\n")
+assert header == f"PGPHYSICALBACKUP1 {crc32c(payload[:-1]):08X}".encode()
+without_start, count = re.subn(rb"\s+:checkpoint-start\s+\d+", b"", payload,
+                               count=1, flags=re.I)
+assert count == 1
+for fixture, version, body in (("v1", 1, without_start), ("v2", 2, payload),
+                               ("v3-missing-start", 3, without_start)):
+    if version < 3:
+        body, count = re.subn(rb"\s+:auth-policy-required\s+1(?=\)\n$)", b"", body,
+                              count=1, flags=re.I)
+        assert count == 1
+    body, count = re.subn(rb"(:version\s+)3\b", rb"\g<1>" + str(version).encode(), body,
+                          count=1, flags=re.I)
+    assert count == 1
+    header = f"PGPHYSICALBACKUP1 {crc32c(body[:-1]):08X}\n".encode()
+    (root / f"manifest-{fixture}").write_bytes(header + body)
+PY
+backup_payload_checksums() {
+    (cd "$TMP/copy" &&
+        find . -type f ! -path './physical-backup.manifest' -exec sha256sum {} + | sort)
+}
+backup_payload_checksums >"$TMP/manifest-payload.before"
+for fixture in v1 v2 v3-missing-start; do
+    rejected="$TMP/manifest-$fixture"
+    cp "$rejected" "$manifest"
+    status=0
+    timeout 60 "$BASE/pg-lisp.sh" -p "$((PORT + 1))" -D "$TMP/copy" \
+        >"$rejected.log" 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -q 'unsupported or malformed physical recovery manifest' "$rejected.log"
+    cmp "$rejected" "$manifest"
+    backup_payload_checksums >"$TMP/manifest-payload.after"
+    diff -u "$TMP/manifest-payload.before" "$TMP/manifest-payload.after"
+done
+cp -p "$TMP/manifest-current" "$manifest"
 "$BASE/pg-lisp.sh" -p "$((PORT + 1))" -D "$TMP/copy" >"$TMP/target.log" 2>&1 &
 TARGET=$!
 test_wait_owned_sql_server "$TARGET" "$((PORT + 1))" "$PSQL"

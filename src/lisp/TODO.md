@@ -150,6 +150,11 @@ with the restored current control.
 For B11, the backup and recovery readers require a version 3 manifest with
 an explicit checkpoint start. The schema rejects versions 1 and 2, missing
 checkpoint starts, and inconsistent checkpoint boundaries.
+The live bootstrap test generates checksummed v1 and v2 manifests with
+their historical field sets and a v3 manifest without its checkpoint
+start. Startup rejects all three at manifest validation. The test compares
+the supplied manifest and all other backup files byte for byte after
+each rejection, restores v3, and verifies startup in recovery.
 
 For B12, `64002cfb17e` requires PGRPGEN2 and metadata version 4. The
 `t/xid-reservation.sh` fixture exercises startup rejection of retired
