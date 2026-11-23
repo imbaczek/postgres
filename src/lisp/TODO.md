@@ -633,6 +633,12 @@ The existing lifecycle operations still own publication and durability.
 The 1,466 C comparisons covered named creation, slot lookup and drop,
 NULL handling, and missing required arguments. Focused physical heads
 exercise parameter inference, logical creation, and durable advance.
+Registered replication and recovery record results declare their field
+bindings in the same descriptors as their call signatures. Scalar
+analysis, FROM analysis, and field expansion use those bindings.
+The 1,471 C comparisons included qualified field projection from
+publication and slot records. Focused physical tests check the
+supported field lists and snapshot ownership.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

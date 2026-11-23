@@ -549,34 +549,34 @@ exist\" messages."
                    (make-named-volatile-builtin
                     "pg_create_physical_replication_slot"
                     '(("slot_name" :name :required) ("immediately_reserve" :bool nil) ("temporary" :bool nil))
-                    :record 'sql-create-physical-slot)
+                    '(:record . +physical-slot-create-result-fields+) 'sql-create-physical-slot)
                    (make-named-volatile-builtin
                     "pg_create_logical_replication_slot"
                     '(("slot_name" :name :required) ("plugin" :name :required)
                       ("temporary" :bool nil) ("twophase" :bool nil) ("failover" :bool nil))
-                    :record 'sql-create-logical-slot)
+                    '(:record . +physical-slot-create-result-fields+) 'sql-create-logical-slot)
                    (make-named-volatile-builtin
                     "pg_replication_slot_advance"
                     '(("slot_name" :name :required) ("upto_lsn" :pg-lsn :required))
-                    :record 'sql-advance-replication-slot)
+                    '(:record . +physical-slot-advance-result-fields+) 'sql-advance-replication-slot)
                    (make-named-volatile-builtin
                     "pg_drop_replication_slot" '((nil :name :required)) :void 'sql-drop-replication-slot)
-                   (make-scalar-builtin :name "pg_get_replication_slots" :result-type :record
+                   (make-scalar-builtin :name "pg_get_replication_slots" :result-type '(:record . +replication-slot-result-fields+)
                                         :volatility :stable :evaluator '(:iterator . make-replication-slot-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array)
-                                        :result-type :record :volatility :stable :strict-p t
+                                        :result-type '(:record . +publication-table-result-fields+) :volatility :stable :strict-p t
                                         :evaluator '(:iterator . make-publication-table-result-iterator))
                    (make-scalar-builtin :name "pg_get_publication_tables" :argument-types '(:text-array :oid)
-                                        :result-type :record :volatility :stable :strict-p t
+                                        :result-type '(:record . +publication-table-result-fields+) :volatility :stable :strict-p t
                                         :evaluator '(:iterator . make-publication-table-result-iterator))
-                   (make-scalar-builtin :name "pg_stat_get_wal_senders" :result-type :record
+                   (make-scalar-builtin :name "pg_stat_get_wal_senders" :result-type '(:record . +wal-sender-result-fields+)
                                         :volatility :stable :evaluator '(:iterator . make-wal-sender-result-iterator))
-                   (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type :record
+                   (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type '(:record . +activity-result-fields+)
                                         :volatility :stable :implicit-arguments-p t
                                         :evaluator '(:iterator . make-activity-result-iterator))
-                   (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type :record
+                   (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type '(:record . +wal-receiver-result-fields+)
                                         :volatility :stable :evaluator 'wal-receiver-result)
-                   (make-scalar-builtin :name "pg_control_checkpoint" :result-type :record
+                   (make-scalar-builtin :name "pg_control_checkpoint" :result-type '(:record . +control-checkpoint-result-fields+)
                                         :volatility :volatile :strict-p t
                                         :evaluator 'native-control-checkpoint-result)
                    (make-named-volatile-builtin
@@ -905,17 +905,17 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
               (otherwise
                (mapcar #'coerce-scalar-builtin-argument arguments
                        (scalar-builtin-argument-types builtin)))))
-          (result-type (scalar-builtin-result-type builtin)))
+          (result (scalar-builtin-result-type builtin)))
       (cond
         ((scalar-builtin-iterator builtin)
          (check-record-set-call-context)
-         (make-record-set-call name inputs))
+         (make-record-set-call builtin inputs))
         ;; Preserve the allocation-free evaluator and the stored expression shape.
         ((eq (scalar-builtin-evaluator builtin) 'sql-array-length)
-         (list :array-length (first inputs) (second inputs) :type result-type :typmod -1))
-        (t (list* :func name inputs :type result-type :typmod -1
-                  (when (eq result-type :record)
-                    (list :fields (scalar-record-builtin-fields name)))))))))
+         (list :array-length (first inputs) (second inputs) :type result :typmod -1))
+        ((consp result)
+         (list :func name inputs :type :record :typmod -1 :fields (scalar-builtin-record-fields builtin)))
+        (t (list :func name inputs :type result :typmod -1))))))
 
 (defun check-json-conversion-input (argument)
   "Keep the concrete SQL type for polymorphic JSON conversion."
@@ -1074,16 +1074,12 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
           (toast-map-text-characters toast pointer snapshot nil
                                      :index-reader #'select-toast-index-reader)))))
 
-(defun scalar-record-builtin-fields (name)
-  (cond ((string= name "pg_stat_get_wal_receiver") +wal-receiver-result-fields+)
-        ((string= name "pg_control_checkpoint") +control-checkpoint-result-fields+)
-        ((string= name "pg_stat_get_wal_senders") +wal-sender-result-fields+)
-        ((string= name "pg_stat_get_activity") +activity-result-fields+)
-        ((string= name "pg_get_replication_slots") +replication-slot-result-fields+)
-        ((string= name "pg_get_publication_tables") +publication-table-result-fields+)
-        ((member name '("pg_create_physical_replication_slot" "pg_create_logical_replication_slot")
-                 :test #'string=) +physical-slot-create-result-fields+)
-        ((string= name "pg_replication_slot_advance") +physical-slot-advance-result-fields+)))
+(defun scalar-builtin-record-fields (builtin)
+  "Resolve a record field binding at use time so reloads see the current fields."
+  (when builtin
+    (let ((result (scalar-builtin-result-type builtin)))
+      (when (and (consp result) (eq (car result) :record))
+        (symbol-value (cdr result))))))
 
 (defun check-record-set-call-context ()
   (unless *select-set-functions-allowed-p*
@@ -1091,8 +1087,9 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
   (when *inside-aggregate-input-p*
     (ereport "0A000" "aggregate function calls cannot contain set-returning functions")))
 
-(defun make-record-set-call (name arguments)
-  (list :set-func name arguments :type :record :typmod -1 :fields (scalar-record-builtin-fields name)))
+(defun make-record-set-call (builtin arguments)
+  (list :set-func (scalar-builtin-name builtin) arguments :type :record :typmod -1
+                                                          :fields (scalar-builtin-record-fields builtin)))
 
 (defun random-call-signature (arguments &optional names)
   "Describe the caller's argument types before overload coercion.
@@ -3501,7 +3498,7 @@ candidate selection."
     (ereport "42809" "expression is not a supported composite type"))
   (let ((name (builtin-function-name (second raw) (getf (cdddr raw) :schema))))
     (cond ((string= name "pg_stat_file") +rewind-stat-file-result-fields+)
-          ((scalar-record-builtin-fields name))
+          ((scalar-builtin-record-fields (first (gethash name *scalar-builtin-descriptors*))))
           (t (ereport "42809" "expression is not a supported composite type")))))
 
 (defun qualified-star-targets (qualifier scope)
@@ -3604,9 +3601,9 @@ checks still apply."
                              arguments)
                 (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
               (list :array arguments :type :text-array :typmod -1)))))
-    (make-record-set-call name
-                          (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
-                              (list array)))))
+    (let ((inputs (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
+                      (list array))))
+      (make-record-set-call (scalar-builtin-for-call name inputs (first inputs)) inputs))))
 
 (defun analyze-record-field (raw scope)
   (let* ((record (analyze-expr (second raw) scope))
