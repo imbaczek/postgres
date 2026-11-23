@@ -380,11 +380,20 @@ tree and the documented
 `../pg-ha-artifacts` directory found no native WAL segments, partial files,
 proofs or archive status entries in either filename grammar. A read-only scan
 of the wider project directory found no 16-hex or 24-hex native WAL files and
-no primary WAL control files. It found 47 physical backup manifests, which
-still need to be classified before the cutover. Data outside the project
-directory was outside that scan.
-Retiring the legacy grammar requires recreating or
-retiring remaining development data, backups, and retained ancestral WAL.
+no primary WAL control files. All 47 physical backup manifests had valid
+envelope CRC32C, version 3 payloads, and 16-hex WAL entries. They were all
+under `retired-logs`, with no listed WAL files or accompanying
+`global/pg_wal_control`. Preserve those manifests as historical evidence.
+Data outside the project directory was outside the scan.
+
+The C reference is `XLogFileName` and `IsXLogFileName` in
+`src/include/access/xlog_internal.h`. Native WAL retains its `.wal` suffix.
+The remaining cutover must address startup control and recovery base
+admission, the legacy ancestor search in the archiver, and promotion source
+namespace fields. Migrate positive legacy fixtures to qualified names and
+keep independently generated legacy bytes for rejection checks. Verify that
+startup refuses legacy artifacts before writing controls, renaming files, or
+changing the selected timeline.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
