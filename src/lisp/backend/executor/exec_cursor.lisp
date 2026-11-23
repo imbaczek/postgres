@@ -451,8 +451,9 @@ source itself.  Closing the result closes the sort and its source."
 
 (defun make-lateral-join-iterator (join left right-factory)
   ;; Each left row owns a fresh right iterator and parameter epoch.
-  (let ((right nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil) (matched nil)
-                    (null-right (make-array (getf join :right-width) :initial-element +null+)))
+  (let ((qual (getf join :qual))
+        (right nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil) (matched nil)
+        (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
      (lambda ()
        (loop
@@ -466,14 +467,12 @@ source itself.  Closing the result closes the sort and its source."
          (multiple-value-bind (row present right-origins toast right-presence) (sql-iterator-next right)
            (declare (ignore toast))
            (if present
-               (let* ((joined (combine-select-join-environment current-left row join))
-                      (origins (and *datum-origin-capture*
-                                    (combine-select-join-origins current-left left-origins row right-origins join)))
-                      (*query-row-origins* origins)
-                      (*query-row-presence* (combine-query-row-presence left-presence right-presence)))
-                 (when (true-p (eval-expr (getf join :qual) joined))
+               (multiple-value-bind (joined origins presence)
+                   (qualify-select-join-pair join qual current-left row left-origins right-origins
+                                             left-presence right-presence *datum-origin-capture*)
+                 (when joined
                    (setf matched t)
-                   (return (values joined t origins nil *query-row-presence*))))
+                   (return (values joined t origins nil presence))))
                (progn
                  (close-sql-iterator right)
                  (setf right nil left-present nil)
@@ -493,7 +492,8 @@ source itself.  Closing the result closes the sort and its source."
 ;; RIGHT for each left row; right/full joins make one final pass for unmatched
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
 (defun make-nested-loop-iterator (join left right)
-  (let* ((store (make-query-replay-store right))
+  (let* ((qual (getf join :qual))
+         (store (make-query-replay-store right))
          (reader nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil)
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
@@ -534,17 +534,15 @@ source itself.  Closing the result closes the sort and its source."
                                                     (or right-origins (make-array (length row) :initial-element nil))))
                                   nil right-presence)))))
              (present
-              (let* ((index right-index)
-                     (joined (combine-select-join-environment current-left row join))
-                     (origins (and *datum-origin-capture*
-                                   (combine-select-join-origins current-left left-origins row right-origins join)))
-                     (*query-row-origins* origins)
-                     (*query-row-presence* (combine-query-row-presence left-presence right-presence)))
+              (let ((index right-index))
                 (incf right-index)
-                (when (true-p (eval-expr (getf join :qual) joined))
-                  (setf matched t)
-                  (when matches (query-match-map-mark matches index))
-                  (return (values joined t origins nil *query-row-presence*)))))
+                (multiple-value-bind (joined origins presence)
+                    (qualify-select-join-pair join qual current-left row left-origins right-origins
+                                              left-presence right-presence *datum-origin-capture*)
+                  (when joined
+                    (setf matched t)
+                    (when matches (query-match-map-mark matches index))
+                    (return (values joined t origins nil presence))))))
              (t
               (close-sql-iterator reader)
               (setf reader nil left-present nil)

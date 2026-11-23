@@ -1699,6 +1699,17 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
      (or right-origins (make-array (length right) :initial-element nil))
      join)))
 
+(defun qualify-select-join-pair (join qual left right left-origins right-origins
+                                 left-presence right-presence capture-p)
+  "Return a matching joined row with its origins and source presence."
+  (let* ((joined (combine-select-join-environment left right join))
+         (origins (and capture-p (combine-select-join-origins left left-origins right right-origins join)))
+         (presence (combine-query-row-presence left-presence right-presence))
+         (*query-row-origins* origins)
+         (*query-row-presence* presence))
+    (when (true-p (eval-expr qual joined))
+      (values joined origins presence))))
+
 (defun stream-select-join-environments (left-stream right-stream join callback)
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
@@ -1730,16 +1741,13 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                                (process-right (left left-origins left-presence right right-origins
                                                                right-presence right-index matched-left)
                                                  (check-for-interrupts)
-                                                 (let* ((joined (combine-select-join-environment left right join))
-                                                        (origins (combine-select-join-origins
-                                                                  left left-origins right right-origins join))
-                                                        (*query-row-origins* origins)
-                                                        (*query-row-presence*
-                                                          (combine-query-row-presence left-presence right-presence)))
-                                                   (when (true-p (eval-expr qual joined))
+                                                 (multiple-value-bind (joined origins presence)
+                                                     (qualify-select-join-pair join qual left right left-origins right-origins
+                                                                               left-presence right-presence t)
+                                                   (when joined
                                                      (setf (car matched-left) t)
                                                      (when matched-right (query-match-map-mark matched-right right-index))
-                                                     (emit joined origins *query-row-presence*))))
+                                                     (emit joined origins presence))))
                                                (load-right-for-left (left left-origins left-presence matched-left)
                                                  (setf right-loaded t)
                                                  (funcall right-stream
@@ -1825,13 +1833,12 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                      (left-presence *query-row-presence*))
                    (funcall parameterized-right-stream left
                             (lambda (right)
-                              (let ((presence (combine-query-row-presence left-presence *query-row-presence*))
-                                    (joined (combine-select-join-environment left right join))
-                                    (origins (combine-select-join-origins left left-origins right *query-row-origins* join)))
-                                (let ((*query-row-origins* origins) (*query-row-presence* presence))
-                                  (when (true-p (eval-expr qual joined))
-                                    (setf matched t)
-                                    (emit joined origins presence))))))
+                              (multiple-value-bind (joined origins presence)
+                                  (qualify-select-join-pair join qual left right left-origins *query-row-origins*
+                                                            left-presence *query-row-presence* t)
+                                (when joined
+                                  (setf matched t)
+                                  (emit joined origins presence)))))
                    (when (and (not stopped) (not matched) (eq join-type :left))
                      (emit (concatenate 'vector left null-right)
                            (and left-origins

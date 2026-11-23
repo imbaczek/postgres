@@ -186,6 +186,9 @@ volatility, LIMIT, and portal resumption against PostgreSQL C.
 Sort and top-N now use the same buffered node dispatch and child layout
 in both drivers. Deferred projection still runs as each driver delivers
 a sorted row, including after portal suspension.
+Both join drivers share pair qualification, including the combined row,
+datum origins and source presence visible to the ON expression. Replay,
+match tracking and null extension remain in the driver state machines.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING
