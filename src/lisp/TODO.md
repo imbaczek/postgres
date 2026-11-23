@@ -398,6 +398,13 @@ CTE volatility uses the local visitor for executable call operands and
 explicitly enters nested subqueries. The Rove regression distinguishes
 volatile nested arguments and subqueries from identical literal or call
 metadata. The C differentials passed 114 ordinary and 137 recursive CTE cases.
+Window reference lowering now rewrites only executable local operands,
+while CTE window key selection uses the shared ProjectSet predicate.
+The Rove regression checks slot numbers, literal and call metadata, and
+query boundaries. The C differentials passed 168 window and 114 CTE cases.
+The local `ANY`/`ALL` comparison still needs window lowering. The C
+server returns true for `row_number() OVER () = ANY (SELECT 1::bigint)`;
+Lisp currently reaches the evaluator with an unresolved window reference.
 
 ## Open development tasks
 

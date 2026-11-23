@@ -23,6 +23,25 @@
                (setf rank next-rank dense next-dense))
           always (and (= rank start) (= dense groups)))))
 
+(rove:deftest window-references-lower-only-in-local-operands
+    (let* ((reference '(:window-ref 2 :type :int8))
+           (literal (list :const reference :type :text))
+           (outer (list :outer-ref 1 reference :type :int8))
+           (subplan (list :subplan (make-sql-subplan :test reference) :type :int8))
+           (call (list :func "f" (list reference literal outer subplan) :type :int8 :saved reference))
+           (result (lower-window-references call 4)))
+      (destructuring-bind (column unchanged-literal unchanged-outer unchanged-subplan) (third result)
+        (rove:ok (equal column '(:col 7 :type :int8 :window-output t)))
+        (rove:ok (eq reference (second unchanged-literal)))
+        (rove:ok (eq outer unchanged-outer))
+        (rove:ok (eq subplan unchanged-subplan))
+        (rove:ok (eq reference (getf (cdddr result) :saved)))))
+  (let ((record '(:single-record "f" nil :type :record)))
+    (rove:ok (not (analyzed-expression-contains-set-p record)))
+    (rove:ok (analyzed-expression-contains-set-p record :include-single-record t))
+    (rove:ok (not (analyzed-expression-contains-set-p
+                   (list :const record :type :text) :include-single-record t)))))
+
 (rove:deftest window-ranking-contracts
     (let ((data (cl-spec:result-data
                  (cl-spec:check-function 'window-rank-step :trials 300 :seed 42))))

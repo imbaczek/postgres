@@ -220,8 +220,9 @@
         ((eq (first expression) :window-ref)
          (append (list :col (+ width 1 (second expression)))
                  (cddr expression) (list :window-output t)))
-        ((subquery-expression-p expression) expression)
-        (t (mapcar (lambda (part) (lower-window-references part width)) expression))))
+        ((member (first expression) '(:subplan :outer-ref)) expression)
+        (t (map-local-expression-operands
+            (lambda (part) (lower-window-references part width)) expression))))
 
 (defun finalize-query-windows (targets order group-keys scope aggregate-p width)
   ;; Rewrite grouped inputs first, then assign shared pre-window key slots and
@@ -231,15 +232,11 @@
     ;; junk keys. Whole selected keys share a slot; arbitrary subexpressions do not.
     (when (and *cte-definition-analysis-p* *window-key-targets*
                (zerop (length *select-window-functions*)))
-      (labels ((set-expression-p (form)
-                 (and (consp form)
-                      (or (member (first form) '(:set-func :single-record))
-                          (some #'set-expression-p form)))))
-        (dolist (target targets)
-          (let ((expression (getf target :expr)))
-            (unless (set-expression-p expression)
-              (unless (find expression keys :test #'analyzed-expression-identical-p)
-                (setf keys (append keys (list expression)))))))))
+      (dolist (target targets)
+        (let ((expression (getf target :expr)))
+          (unless (or (analyzed-expression-contains-set-p expression :include-single-record t)
+                      (find expression keys :test #'analyzed-expression-identical-p))
+            (setf keys (append keys (list expression)))))))
     (dolist (descriptor (coerce *select-window-functions* 'list))
       (when aggregate-p
         (map-window-expressions

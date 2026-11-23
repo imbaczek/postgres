@@ -3653,12 +3653,13 @@ checks still apply."
                                :alias name)))
           (t (list target)))))
 
-(defun analyzed-expression-contains-set-p (form)
-  "Check for a set-producing operand in this ProjectSet scope."
+(defun analyzed-expression-contains-set-p (form &key include-single-record)
+  "Check for a local SRF, optionally including scalar records lifted by ProjectSet."
   (some-local-plan-expression
    (lambda (node walk)
      (declare (ignore walk))
-     (values (eq (first node) :set-func)
+     (values (or (eq (first node) :set-func)
+                 (and include-single-record (eq (first node) :single-record)))
              (member (first node) '(:subplan :outer-ref))))
    form))
 
