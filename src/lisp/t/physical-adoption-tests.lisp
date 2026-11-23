@@ -7,7 +7,7 @@
            (snapshot (sample-checkpoint-snapshot :oldest-active-xid 42))
            (metadata (pg::make-wal-control-metadata
                       (pg::catalog-system-identifier) pg::+db-shutdowned+ 100))
-           (control (pg::wal-encode-control-image 152 152 snapshot :metadata metadata)))
+           (control (pg::wal-encode-control-image 152 152 snapshot :namespace :timeline :metadata metadata)))
       (sb-posix:chmod (namestring root) #o700)
       (setf (gethash "postgres" (pg::catalog-databases pg::*catalog*))
             (pg::make-database :name "postgres" :oid 5))
@@ -18,10 +18,13 @@
       (pg::wal-atomic-write-bytes (merge-pathnames "PG_VERSION" root)
                                   (pg::string->bytes (format nil "16~%")))
       (pg::wal-atomic-write-bytes (pg::control-path) (pg::string->bytes (format nil "1003~%")))
+      (let ((pg::*clog-stream* nil))
+        (pg::clog-init :initialize t)
+        (close pg::*clog-stream*))
       (pg::wal-atomic-write-bytes (pg::wal-control-path) control)
       (pg::wal-ensure-directory-durable (pg::wal-directory))
       (pg::wal-atomic-write-bytes
-       (pg::wal-segment-path 0 1 :legacy)
+       (pg::wal-segment-path 0 1 :timeline)
        (concatenate '(vector (unsigned-byte 8))
                     (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                     (pg::wal-encode-record pg::+wal-record-checkpoint+ 0 32
@@ -34,7 +37,7 @@
        (declare (ignore snapshot metadata))
        (let ((before (mapcar #'lineage-test-bytes
                              (list (pg::catalog-path) (pg::control-path) (pg::wal-control-path)
-                                   (pg::wal-segment-path 0 1 :legacy)))))
+                                   (pg::wal-segment-path 0 1 :timeline)))))
          (pg::call-with-physical-adoption-owner
           root
           (lambda (owner)
@@ -43,10 +46,10 @@
               (ok (= 32 (getf state :checkpoint-start)))
               (ok (= 42 (getf state :next-xid)))
               (ok (= 1003 (getf state :allocation-next-xid)))
-              (ok (eq :legacy (getf state :namespace))))))
+              (ok (eq :timeline (getf state :namespace))))))
          (ok (equalp before (mapcar #'lineage-test-bytes
                                     (list (pg::catalog-path) (pg::control-path) (pg::wal-control-path)
-                                          (pg::wal-segment-path 0 1 :legacy)))))))))
+                                          (pg::wal-segment-path 0 1 :timeline)))))))))
 
 (deftest adoption-primary-proof-requires-the-durable-source-origin
     (call-with-adoption-clean-primary-fixture
@@ -121,7 +124,7 @@
                 (setf (getf checkpoint :oldest-active-xid) (getf checkpoint :next-xid)))
                (:active (setf (getf checkpoint :oldest-active-xid) 17)))
              (pg::wal-atomic-write-bytes
-              path (pg::wal-encode-control-image 152 end checkpoint :metadata copy))
+              path (pg::wal-encode-control-image 152 end checkpoint :namespace :timeline :metadata copy))
              (let ((before (lineage-test-bytes path)))
                (ok (intake-fails-p
                     (lambda ()

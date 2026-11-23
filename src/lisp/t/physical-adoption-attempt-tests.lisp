@@ -8,7 +8,7 @@
                        (sample-checkpoint-snapshot :next-xid next :oldest-active-xid next)))
          (metadata (pg::make-wal-control-metadata system pg::+db-shutdowned+ 100))
          (wal (if state (first (getf state :capture))
-                  (pg::wal-encode-control-image 152 152 snapshot :metadata metadata)))
+                  (pg::wal-encode-control-image 152 152 snapshot :namespace :legacy :metadata metadata)))
          (capture (or (getf state :capture) (list wal nil nil nil nil nil nil)))
          (cluster (if state (getf state :cluster-identity) "attempt-codec"))
          (history (format nil "1~c0/000000D8~cattempt history~%" #\Tab #\Tab))
@@ -30,7 +30,7 @@
                   :inode (if owner (pg::physical-adoption-owner-inode owner) 2)
                   :lock-device (if owner (pg::physical-adoption-owner-lock-device owner) 1)
                   :lock-inode (if owner (pg::physical-adoption-owner-lock-inode owner) 3)
-                  :system-id system :cluster-identity cluster :timeline 1 :namespace :legacy
+                  :system-id system :cluster-identity cluster :timeline 1 :namespace (if state (getf state :namespace) :legacy)
                   :end 152 :checkpoint-start 32 :next-xid (getf snapshot :next-xid)
                   :allocation-next-xid 1003 :wal-control (pg::physical-libpq-octets-datum wal)
                   :capture (mapcar (lambda (bytes)

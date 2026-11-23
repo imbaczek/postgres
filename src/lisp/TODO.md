@@ -368,6 +368,9 @@ Restartpoint and promotion fixtures use qualified base files by default.
 Promotion fixtures pass the requested namespace to base setup, including
 explicit legacy cases, so the base is written under the selected name from
 the start.
+Clean-primary adoption fixtures write qualified base WAL and carry the verified
+namespace through the durable attempt record and staged backup. Shared setup
+creates the CLOG file required for an owned restart of the source.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

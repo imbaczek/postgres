@@ -934,7 +934,7 @@
   (dolist (kind '(:same-timeline :later-writer))
     (dolist (name '("PG_VERSION" "authentication.initialized" "global/pg_catalog.dat"
                     "global/pg_control" "global/pg_wal_control" "pg_hba.conf" "pg_ident.conf"
-                    "pg_wal/0000000000000000.wal" "pg_xact" "physical-backup.manifest"
+                    "pg_wal/000000010000000000000000.wal" "pg_xact" "physical-backup.manifest"
                     "physical-recovery.control" "recovery.required"))
       (ok
        (eq :checked

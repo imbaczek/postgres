@@ -26,8 +26,6 @@
   (call-with-adoption-clean-primary-fixture
    (lambda (root snapshot metadata)
      (declare (ignore snapshot metadata))
-     (pg::wal-atomic-write-bytes (merge-pathnames "pg_xact" root)
-                                 (make-array 0 :element-type '(unsigned-byte 8)))
      (dolist (entry (list (cons "authentication.initialized" pg::*authentication-marker-text*)
                           (cons "pg_hba.conf" (format nil "host all all 127.0.0.1/32 trust~%"))
                           (cons "pg_ident.conf" "")))
@@ -51,7 +49,7 @@
 (defun adoption-stage-source-bytes (root)
   (mapcar (lambda (name) (cons name (lineage-test-bytes (merge-pathnames name root))))
           '("PG_VERSION" "pg_xact" "global/pg_control" "global/pg_catalog.dat"
-            "global/pg_wal_control" "pg_wal/0000000000000000.wal"
+            "global/pg_wal_control" "pg_wal/000000010000000000000000.wal"
             "authentication.initialized" "pg_hba.conf" "pg_ident.conf")))
 
 (deftest adoption-stage-verifies-clean-e-with-actual-xid-without-changing-source
@@ -122,7 +120,7 @@
                      (declare (ignore value))
                      (when (eq point :before-verify)
                        (let* ((directory (if (eq side :source) root target))
-                              (path (merge-pathnames "pg_wal/0000000000000000.wal" directory))
+                              (path (merge-pathnames "pg_wal/000000010000000000000000.wal" directory))
                               (bytes (lineage-test-bytes path)))
                          (setf (aref bytes 32) (logxor 1 (aref bytes 32)))
                          (pg::wal-atomic-write-bytes path bytes))))))

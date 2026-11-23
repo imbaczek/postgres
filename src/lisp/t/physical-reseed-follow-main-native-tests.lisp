@@ -301,7 +301,7 @@
                          process socket driver
                          `(progn
                             (assert (= (sb-posix:getpid) ,(sb-ext:process-pid process)))
-                            (assert (eq :legacy (getf pg::*physical-recovery-state* :wal-namespace)))
+                            (assert (eq :timeline (getf pg::*physical-recovery-state* :wal-namespace)))
                             (assert (= 2 (getf pg::*physical-recovery-state* :phase)))
                             (pg::physical-store-check-live pg::*physical-receive-store*)
                             :native-storage-verified))

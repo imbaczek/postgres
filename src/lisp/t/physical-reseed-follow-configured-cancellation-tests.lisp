@@ -1325,7 +1325,7 @@
 
 (defun check-configured-cancellation-file-changes (phase kind)
   (let ((permanent '((:global "pg_catalog.dat") (:global "pg_control")
-                     (:global "pg_wal_control") (:wal "0000000000000000.wal")
+                     (:global "pg_wal_control") (:wal "000000010000000000000000.wal")
                      (:root "physical-reseed.install"))))
     (dolist (selection (cons :restorable permanent))
       (call-with-reseed-inert-settlement-fixture
