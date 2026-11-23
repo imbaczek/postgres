@@ -70,11 +70,8 @@
                        (sql-subplan-depths descriptor))
                    t)))
         (:func
-         (let ((name (second node)))
-           (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
-             (if registered-p
-                 (not (member volatility '(:immutable :stable)))
-                 (not (legacy-immutable-function-p name))))))))
+         (not (member (scalar-builtin-family-volatility (second node))
+                      '(:immutable :stable))))))
     expression)))
 
 (defun prepare-joined-dml-qualifications (prepared)

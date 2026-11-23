@@ -586,6 +586,12 @@ numeric or float8 signature. Threshold calls retain the shared
 scalar and array element type resolution. The 1,433 C comparisons
 covered the float precision boundary and decorated polymorphic
 diagnostics. Both stored call shapes passed after restart.
+The supported overloaded math functions now use the registry for
+strict execution and planner volatility. This removes the separate
+math evaluator and immutable-name list. SQL call analysis retains
+PostgreSQL-specific overload preferences and diagnostics. The 1,435 C
+comparisons included integer, float and numeric absolute values, both
+rounding arities, and stored overloaded defaults after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

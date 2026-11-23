@@ -880,10 +880,7 @@ Mark direct scalar function sources through their aliases."
 
 (defun having-immutable-function-p (name)
   "Determine whether every signature can be folded in a constant gate."
-  (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
-    (if registered-p
-        (eq volatility :immutable)
-        (legacy-immutable-function-p name))))
+  (eq (scalar-builtin-family-volatility name) :immutable))
 
 (defun having-literal-expression-p (expression)
   ;; Gate folding accepts only literal inputs and immutable operators/functions.

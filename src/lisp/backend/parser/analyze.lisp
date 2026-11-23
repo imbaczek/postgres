@@ -404,6 +404,41 @@ exist\" messages."
               (make-integer-bitwise-builtin (concatenate 'string prefix "shl") type "<<" :int4)
               (make-integer-bitwise-builtin (concatenate 'string prefix "shr") type ">>" :int4))))
 
+(defun overloaded-math-builtins ()
+  "Describe fixed math kernels selected by the numeric coercion rules."
+  (append
+   (loop for name in '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
+         append
+         (let ((function name))
+           (list (make-numeric-builtin name '(:float8) :float8
+                                       (lambda (value) (sql-float-basic-function function value)))
+                 (make-numeric-builtin name '(:numeric) :numeric
+                                       (lambda (value) (sql-numeric-basic-function function value))))))
+   (loop for type in '(:int2 :int4 :int8)
+         collect (let ((width type))
+                   (make-numeric-builtin "abs" (list type) type
+                                         (lambda (value) (sql-integer-abs value width)))))
+   (list (make-numeric-builtin "abs" '(:float4) :float4
+                               (lambda (value) (sql-float-basic-function "abs" value)))
+         (make-numeric-builtin "round" '(:numeric :int4) :numeric
+                               (lambda (value scale) (sql-numeric-round-or-trunc value scale t)))
+         (make-numeric-builtin "trunc" '(:numeric :int4) :numeric
+                               (lambda (value scale) (sql-numeric-round-or-trunc value scale nil)))
+         (make-numeric-builtin "sqrt" '(:float8) :float8 'sql-float-sqrt)
+         (make-numeric-builtin "sqrt" '(:numeric) :numeric 'sql-numeric-sqrt)
+         (make-numeric-builtin "ln" '(:float8) :float8 'sql-float-ln)
+         (make-numeric-builtin "ln" '(:numeric) :numeric 'sql-numeric-ln)
+         (make-numeric-builtin "exp" '(:float8) :float8 'sql-float-exp)
+         (make-numeric-builtin "exp" '(:numeric) :numeric 'sql-numeric-exp)
+         (make-numeric-builtin "log" '(:numeric :numeric) :numeric 'sql-numeric-log))
+   (loop for name in '("log" "log10")
+         append (list (make-numeric-builtin name '(:float8) :float8 'sql-float-log10)
+                      (make-numeric-builtin name '(:numeric) :numeric
+                                            (lambda (value) (sql-numeric-log 10 value)))))
+   (loop for name in '("pow" "power")
+         append (list (make-numeric-builtin name '(:float8 :float8) :float8 'sql-float-power)
+                      (make-numeric-builtin name '(:numeric :numeric) :numeric 'sql-numeric-power)))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -713,7 +748,7 @@ exist\" messages."
                                         :volatility :immutable :strict-p t :evaluator 'sql-bit-set-bit
                                         :implicit-arguments-p t :defer-decorated-coercion-p nil)))
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
-    (dolist (builtin (integer-catalog-builtins))
+    (dolist (builtin (append (integer-catalog-builtins) (overloaded-math-builtins)))
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
@@ -1105,9 +1140,6 @@ names and unknown types.  setseed has no catalog argument names."
   (cond ((gethash name *scalar-builtin-descriptors*)
          (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
                (gethash name *scalar-builtin-descriptors*)))
-        ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
-        ((member name '("power" "pow") :test #'string=)
-         (= count 2))
         (t (= count 1))))
 
 (defun report-numeric-function-resolution-error
@@ -1521,9 +1553,6 @@ so a nested argument error keeps its own diagnostics."
       (cond
         ((string= name "width_bucket")
          (analyze-width-bucket args (gethash name *scalar-builtin-descriptors*)))
-        ((gethash name *scalar-builtin-descriptors*)
-         (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
-                                 *defer-function-constant-coercion-p*))
         ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                         "sqrt" "exp" "ln")
                  :test #'string=)
@@ -1531,7 +1560,9 @@ so a nested argument error keeps its own diagnostics."
         ((member name '("log" "log10") :test #'string=)
          (analyze-log-function name args))
         ((member name '("power" "pow") :test #'string=)
-         (analyze-power-function name args)))
+         (analyze-power-function name args))
+        (t (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
+                                   *defer-function-constant-coercion-p*)))
     (pg-error (condition)
       (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
           (report-numeric-function-resolution-error
@@ -3851,24 +3882,16 @@ still requires deferred sort projection."
         (:stable (when volatility (setf volatility :stable)))
         (:immutable)))))
 
-(defun legacy-immutable-function-p (name)
-  "Recognize immutable scalar functions whose signatures still have separate analyzers."
-  (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                 "sqrt" "exp" "ln"
-                 "log" "log10" "power" "pow")
-          :test #'string=))
-
 (defun analyzed-function-volatile-p (name)
   "Treat unclassified calls as volatile for aggregate and CTE planning."
   (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
     (if registered-p
         (not (member volatility '(:immutable :stable)))
-        (not (or (legacy-immutable-function-p name)
-                 (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
-                                "json_build_array" "json_build_object"
-                                "jsonb_build_array" "jsonb_build_object"
-                                "greatest" "least")
-                         :test #'string=))))))
+        (not (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
+                            "json_build_array" "json_build_object"
+                            "jsonb_build_array" "jsonb_build_object"
+                            "greatest" "least")
+                     :test #'string=)))))
 
 (defun analyzed-expression-volatile-p (form)
   "Only known stable or immutable builtins may share an aggregate transition."
@@ -4661,10 +4684,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
-    ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-             :test #'string=)
-     (if (member +null+ args) +null+
-         (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
@@ -4959,48 +4978,6 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
       (ereport "22003" "bigint out of range"))
     (sql-cast-value value type type -1)))
 
-(defun eval-analyzed-function (name arguments type &optional first-argument)
-  "Evaluate a resolved call using its coerced argument values and result type.
-Arguments have already been evaluated in order, including for strict calls."
-  (cond
-    ((and (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-                  :test #'string=)
-          (member +null+ arguments))
-     +null+)
-    ((and (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
-                  :test #'string=)
-          (member type '(:float4 :float8)))
-     (sql-float-basic-function name (first arguments)))
-    ((string= name "sqrt")
-     (let ((value (first arguments)))
-       (cond ((eq value +null+) +null+)
-             ((eq type :numeric) (sql-numeric-sqrt value))
-             (t (sql-float-sqrt value)))))
-    ((member name '("power" "pow") :test #'string=)
-     (cond ((member +null+ arguments) +null+)
-           ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
-           (t (sql-float-power (first arguments) (second arguments)))))
-    ((member name '("log" "log10") :test #'string=)
-     (cond ((member +null+ arguments) +null+)
-           ((eq type :numeric)
-            (if (rest arguments)
-                (sql-numeric-log (first arguments) (second arguments))
-                (sql-numeric-log 10 (first arguments))))
-           (t (sql-float-log10 (first arguments)))))
-    ((string= name "ln")
-     (let ((value (first arguments)))
-       (cond ((eq value +null+) +null+)
-             ((eq type :numeric) (sql-numeric-ln value))
-             (t (sql-float-ln value)))))
-    ((string= name "exp")
-     (let ((value (first arguments)))
-       (cond ((eq value +null+) +null+)
-             ((eq type :numeric) (sql-numeric-exp value))
-             (t (sql-float-exp value)))))
-    ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
-     (sql-integer-abs (first arguments) type))
-    (t (eval-func name arguments first-argument))))
-
 (defun sql-integer-bitwise (op l r type)
   "Evaluate bitwise operators on already coerced, non-NULL integer operands.
 C's signed shifts can be undefined or implementation-defined. Match the x86
@@ -5137,10 +5114,10 @@ truncate and interpret the result at TYPE's signed width."
        (cond
          ((string= (second expr) "~") (lognot value))
          ((member (second expr) '("@" "|/" "||/") :test #'string=)
-          (eval-analyzed-function (cond ((string= (second expr) "@") "abs")
-                                        ((string= (second expr) "|/") "sqrt")
-                                        (t "cbrt"))
-                                  (list value) (expr-type expr)))
+          (eval-func (cond ((string= (second expr) "@") "abs")
+                           ((string= (second expr) "|/") "sqrt")
+                           (t "cbrt"))
+                     (list value) (third expr)))
          ((string= (second expr) "-")
           (let ((result (cond ((sql-interval-p value) (sql-interval-add (make-sql-interval 0 0 0) value t))
                               ((sql-numeric-p value) (sql-numeric-negate value))
@@ -5176,8 +5153,7 @@ truncate and interpret the result at TYPE's signed width."
                (eval-toast-length expr (cdr slice))
                (eval-toast-substring (third expr) (cdr slice) (expr-type expr))))))
      (let* ((name (second expr))
-            (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr)))
-            (type (expr-type expr)))
+            (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr))))
        (cond ((string= name "to_jsonb")
               (sql-to-jsonb (first arguments) (expr-type (first (third expr)))))
              ((member name '("to_json" "row_to_json" "array_to_json") :test #'string=)
@@ -5186,7 +5162,7 @@ truncate and interpret the result at TYPE's signed width."
                                0 (second arguments))))
              ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
               (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
-             (t (eval-analyzed-function name arguments type (first (third expr)))))))
+             (t (eval-func name arguments (first (third expr)))))))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 

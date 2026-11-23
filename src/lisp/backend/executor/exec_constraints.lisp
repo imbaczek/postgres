@@ -27,8 +27,7 @@
       ((member name '("pg_cancel_backend" "pg_terminate_backend") :test #'string=) t)
       (builtins
        (let ((builtin (scalar-builtin-for-evaluation builtins (length arguments) (first arguments))))
-         (and builtin (scalar-builtin-strict-p builtin))))
-      (t (having-immutable-function-p name)))))
+         (and builtin (scalar-builtin-strict-p builtin)))))))
 
 (defun fold-column-default (expression)
   "Copy a demanded default, folding immutable parts before row execution.

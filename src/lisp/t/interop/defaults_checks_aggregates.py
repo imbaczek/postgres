@@ -7,6 +7,8 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.abs(-2::smallint), pg_catalog.abs('-0'::real), pg_catalog.abs(-2.000::numeric), @ '-2.5', round(2.5), round(2.5, 0)",
+    "CREATE TABLE dc_overloaded_math_default (a real DEFAULT abs('-0'::real), b numeric DEFAULT round(2.555,2), c numeric DEFAULT log(2,8))",
     "CREATE SEQUENCE dc_array_to_string_strict_seq",
     "CREATE TABLE dc_array_to_string_strict (v text DEFAULT array_to_string(NULL::int[], nextval('dc_array_to_string_strict_seq')::text))",
     "INSERT INTO dc_array_to_string_strict DEFAULT VALUES RETURNING v",
@@ -1367,6 +1369,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_overloaded_math_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_bucket_registry_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_numeric_math_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_integer_alias_default DEFAULT VALUES RETURNING a,b",
