@@ -630,7 +630,8 @@ Remove the trace and its temporary helper after the demo:
   update can leave an existing parent on the older runtime while new children
   use the newer one. Compare performance under the same pinned runtime.
 - The verification ceiling is eight concurrent Lisp images, including nested
-  test servers and compiler images. Use private RAM-backed caches and data roots.
+  test servers and compiler images. Use private caches and data roots and follow
+  the disk and bounded RAM workspace policy above.
   Count transient `control-client.lisp` processes too. A two-server native helper
   can use a third Lisp image for a control request. Reserve that capacity before
   overlapping batches, and check the actual descendant processes. A server count
