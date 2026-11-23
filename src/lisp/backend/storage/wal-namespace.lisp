@@ -1,4 +1,4 @@
-;;;; Primary-only durable filename migration; never changes timeline or role.
+;;;; File checks for timeline-qualified WAL artifacts.
 (in-package #:pg)
 
 (defun wal-namespace-file-stat (path &optional missing-ok)
@@ -8,5 +8,5 @@
                   (if (and missing-ok (= (sb-posix:syscall-errno condition) sb-posix:enoent))
                       nil (error condition))))))
     (when (and stat (/= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifreg))
-      (wal-invalid-input "WAL namespace alias is not a regular file: ~a" path))
+      (wal-invalid-input "WAL artifact is not a regular file: ~a" path))
     stat))
