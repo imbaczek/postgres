@@ -3026,6 +3026,12 @@ differential regressions verify the grouped value and comparison result.
   the inventory listed 1,633 Rove heads and 166 legacy cases. A REPL
   fault check confirmed that the private cache is removed and the
   original ASDF cache binding is restored when execution unwinds.
+  The current combined unit compile isolated five source-level style warnings
+  to two test declarations. The staging observer's file binding and the
+  continuation contract's loop index are ignorable in the source body and
+  used by the macro expansions. Recompiling both files removed those warnings.
+  Both strict test heads passed, including the 200-trial property. Dependency
+  warnings still appear from the test toolchain.
 
 - [x] Preserve ownership revocation across live reloads. The stream and directory
   proof modules retain their weak revocation tables and mutexes for the lifetime

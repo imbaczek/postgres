@@ -153,7 +153,7 @@
          (with-open-file (stream parent :direction :output :element-type '(unsigned-byte 8))
            (write-sequence #(1 2 3) stream))
          (with-open-file (stream orphan :direction :output :element-type '(unsigned-byte 8))
-           (declare (ignore stream)))
+           (declare (ignorable stream)))
          (flet ((observe (event operation name fd &optional destination)
                   (declare (ignore name destination))
                   (when fd (rove:ok (sb-posix:s-isreg (third (physical-image-file-facts fd)))))

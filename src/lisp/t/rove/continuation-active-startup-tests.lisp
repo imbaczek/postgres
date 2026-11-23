@@ -962,7 +962,7 @@
       (unit-continuation-boundary-records observe)
       (let ((position sealed))
         (dotimes (i count)
-          (declare (ignore i))
+          (declare (ignorable i))
           (let* ((raw (wal-encode-record +wal-record-batch-start+ 0 position
                                          (make-array 0 :element-type '(unsigned-byte 8))))
                  (record (wal-decode-record raw position)))
