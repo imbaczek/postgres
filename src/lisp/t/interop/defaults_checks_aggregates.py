@@ -438,6 +438,9 @@ CASES = (
     "SELECT sind(30),sind(180),sind(270),cosd(60),cosd(180),tand(45),tand(90),cotd(45),cotd(0)",
     "SELECT asind(-0.5),acosd(-0.5),atand(1),atan2d(1,-1),atan2d(-1,-1)",
     "SELECT atan2('-0'::float8,'-0'::float8),atan2d('-0'::float8,'-0'::float8)",
+    "SELECT pg_catalog.atan2(NULL::float8,1), pg_catalog.atan2d(1,'NaN'), ||/ '8', |/ '9'",
+    "SELECT pg_catalog.atan2(DISTINCT 'bad',1)",
+    "CREATE TABLE dc_trig_registry_default (v float8 DEFAULT atan2d(1,-1), w float8 DEFAULT ||/ 27)",
     "SELECT asind('-0'::float8),sind('-0'::float8),cotd('-0'::float8),radians('1e-320'::float8)",
     "SELECT asin(0.5),acos(0.5),atan(1),atan2(1,-1),degrees(1),radians(1)",
     "SELECT atanh(-1),atanh(1),acosh(1),asinh('-Infinity'::float8),cbrt('-Infinity'::float8)",
@@ -1351,6 +1354,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_trig_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_arithmetic_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_numeric_helper_default DEFAULT VALUES RETURNING v",
                     "INSERT INTO dc_array_length_restart DEFAULT VALUES RETURNING v",

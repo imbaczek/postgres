@@ -559,6 +559,11 @@ overloads share registry dispatch and the existing arithmetic kernels.
 The 1,417 C comparisons covered mixed integer widths, unknown arguments,
 ambiguity, special values, and overflow. A fresh process read stored
 defaults for smallint remainder and numeric truncating division.
+The fixed float8 trigonometric and hyperbolic functions, angle
+conversions, cube-root aliases, and `pi` use registry resolution and
+strict immutable dispatch. The 1,420 C comparisons covered signed
+zero, NaN, exact degree values, range and lookup diagnostics, and
+unary roots. Stored angle and cube-root defaults passed after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

@@ -380,6 +380,10 @@ exist\" messages."
                             (lambda (left right) (sql-numeric-gcd-lcm left right lcm-p))
                             (lambda (left right) (sql-integer-gcd-lcm left right type lcm-p)))))
 
+(defun make-float-trig-builtin (name &optional (arity 1))
+  (make-numeric-builtin name (make-list arity :initial-element :float8) :float8
+                        (lambda (x &optional y) (sql-float-trig name x y))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -531,6 +535,33 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-numeric-builtin "pi" nil :float8 (lambda () pi))
+                   (make-float-trig-builtin "cbrt")
+                   (make-float-trig-builtin "dcbrt")
+                   (make-float-trig-builtin "degrees")
+                   (make-float-trig-builtin "radians")
+                   (make-float-trig-builtin "sin")
+                   (make-float-trig-builtin "cos")
+                   (make-float-trig-builtin "tan")
+                   (make-float-trig-builtin "cot")
+                   (make-float-trig-builtin "asin")
+                   (make-float-trig-builtin "acos")
+                   (make-float-trig-builtin "atan")
+                   (make-float-trig-builtin "atan2" 2)
+                   (make-float-trig-builtin "sind")
+                   (make-float-trig-builtin "cosd")
+                   (make-float-trig-builtin "tand")
+                   (make-float-trig-builtin "cotd")
+                   (make-float-trig-builtin "asind")
+                   (make-float-trig-builtin "acosd")
+                   (make-float-trig-builtin "atand")
+                   (make-float-trig-builtin "atan2d" 2)
+                   (make-float-trig-builtin "sinh")
+                   (make-float-trig-builtin "cosh")
+                   (make-float-trig-builtin "tanh")
+                   (make-float-trig-builtin "asinh")
+                   (make-float-trig-builtin "acosh")
+                   (make-float-trig-builtin "atanh")
                    (make-numeric-comparison-builtin "numeric_eq" #'zerop)
                    (make-numeric-comparison-builtin "numeric_ne" #'(lambda (order) (not (zerop order))))
                    (make-numeric-comparison-builtin "numeric_gt" #'plusp)
@@ -1021,7 +1052,6 @@ names and unknown types.  setseed has no catalog argument names."
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
                      "width_bucket") :test #'string=)
-      (trig-function-p name)
       (float-catalog-alias name)
       (integer-catalog-alias-p name)))
 
@@ -1030,13 +1060,11 @@ names and unknown types.  setseed has no catalog argument names."
   (cond ((gethash name *scalar-builtin-descriptors*)
          (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
                (gethash name *scalar-builtin-descriptors*)))
-        ((string= name "pi") (zerop count))
         ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
          (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
-        ((member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
-                        "atan2" "atan2d") :test #'string=)
+        ((member name '("numeric_log" "power" "pow" "numeric_power" "dpow") :test #'string=)
          (= count 2))
         (t (= count 1))))
 
@@ -1208,25 +1236,6 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                      (when (eq (first argument) :named-arg)
                        (ereport "0A000" "named arguments are not supported for function ~a" name))
                      (analyze-expr argument table)) arguments))))
-
-(defun analyze-trig-function (name args)
-  "Resolve the float8-only mathematical functions."
-  (unless (and (= (length args) (cond ((string= name "pi") 0)
-                                      ((member name '("atan2" "atan2d") :test #'string=) 2)
-                                      (t 1)))
-               (every (lambda (arg)
-                        (or (in-unknown-constant-p arg)
-                            (sql-implicit-coercion-p (expr-type arg) :float8)))
-                      args))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :float8)) args)
-        :type :float8 :typmod -1))
-
-(defun trig-function-p (name)
-  (member name '("pi" "cbrt" "dcbrt" "degrees" "radians" "sin" "cos" "tan" "cot"
-                 "asin" "acos" "atan" "atan2" "sind" "cosd" "tand" "cotd"
-                 "asind" "acosd" "atand" "atan2d" "sinh" "cosh" "tanh"
-                 "asinh" "acosh" "atanh") :test #'string=))
 
 (defun analyze-basic-numeric-function (name args)
   "Resolve the supported basic numeric overload and coerce its arguments.
@@ -1544,7 +1553,6 @@ so a nested argument error keeps its own diagnostics."
         ((gethash name *scalar-builtin-descriptors*)
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
-        ((trig-function-p name) (analyze-trig-function name args))
         ((string= name "width_bucket") (analyze-width-bucket args))
         ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                         "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln")
@@ -3433,14 +3441,11 @@ candidate selection."
                      (member (expr-type e) '(:int2 :int4 :int8 :numeric :float4 :float8)))
            (report-operator-resolution-error (second expr) (list e)))
          ;; Share function coercion while retaining operator identity for grouping.
-         (let ((resolved (cond ((string= (second expr) "||/")
-                                (analyze-trig-function "cbrt" (list e)))
-                               ((string= (second expr) "|/")
-                                (analyze-trig-function "sqrt" (list e)))
-                               (t (analyze-basic-numeric-function "abs" (list e))))))
+         (let ((operand (if (string= (second expr) "@")
+                            (first (third (analyze-basic-numeric-function "abs" (list e))))
+                            (coerce-common-expression e :float8))))
            (return-from analyze-expr
-             (list :unary (second expr) (first (third resolved))
-                   :type (expr-type resolved) :typmod -1))))
+             (list :unary (second expr) operand :type (expr-type operand) :typmod -1))))
        (when (string= (second expr) "~")
          (when (in-unknown-constant-p e)
            (report-operator-resolution-error "~" (list e) t))
@@ -3880,7 +3885,6 @@ still requires deferred sort projection."
   "Recognize immutable scalar functions whose signatures still have separate analyzers."
   (or (integer-catalog-alias-p name)
       (float-catalog-alias name)
-      (trig-function-p name)
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -5013,10 +5017,6 @@ expression identity has been resolved."
        (cond ((eq value +null+) +null+)
              ((eq type :numeric) (sql-numeric-sqrt value))
              (t (sql-float-sqrt value)))))
-    ((trig-function-p name)
-     (cond ((string= name "pi") pi)
-           ((member +null+ arguments) +null+)
-           (t (sql-float-trig name arguments))))
     ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
