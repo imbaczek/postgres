@@ -451,9 +451,12 @@ Joined DML source slot shifting uses the mapper for local column operands.
 The regression checks slot offsets, source identity, and unchanged literal
 payloads, call metadata and outer-reference operands.
 
-The broader A9 audit still needs to classify constant folding, HAVING
-gate skeleton construction and semantic-key encoding, whose walks also
-apply pass-specific expression rules.
+HAVING pushdown eligibility now checks aggregate slots, volatility and
+subplans in one operand walk. The regression places all three shapes in
+literal and call metadata and then checks the same shapes as operands.
+HAVING gate construction and folding still need their own evaluation
+policy for lazy branches, unsupported functions, and ordered array bounds.
+Audit their shared operand shapes and the separate semantic-key encoder.
 
 ## Open development tasks
 

@@ -987,14 +987,13 @@ Mark direct scalar function sources through their aliases."
 
 (defun having-pushdown-safe-p (expression)
   ;; planner.c keeps aggregate, volatile and subplan clauses above grouping.
-  (labels ((contains-special (form)
-             (and (consp form)
-                  (or (subquery-expression-p form)
-                      (and (eq (first form) :col) (getf (cddr form) :aggregate-output))
-                      (contains-special (car form))
-                      (contains-special (cdr form))))))
-    (and (not (contains-special expression))
-         (not (cte-expression-volatile-p expression)))))
+  (not (some-local-plan-expression
+        (lambda (form walk)
+          (declare (ignore walk))
+          (or (subquery-expression-p form)
+              (and (eq (first form) :col) (getf (cddr form) :aggregate-output))
+              (cte-volatile-call-p form)))
+        expression)))
 
 (defun prepare-having-qualifications (where having group-keys scope)
   ;; Validate grouped references before moving clauses back to the input row.

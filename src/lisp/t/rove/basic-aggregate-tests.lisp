@@ -1,5 +1,17 @@
 (in-package #:pg)
 
+(rove:deftest having-pushdown-inspects-only-executable-operands
+    (let* ((aggregate '(:col 1 :type :int4 :aggregate-output t))
+           (volatile '(:func "nextval" nil))
+           (subplan (list :subplan (make-sql-subplan)))
+           (literal (list :const (list aggregate volatile subplan) :type :text)))
+      (rove:ok (having-pushdown-safe-p literal))
+      (dolist (operand (list aggregate volatile subplan))
+        (rove:ok (not (having-pushdown-safe-p
+                       (list :func "lower" (list operand)))))
+        (rove:ok (having-pushdown-safe-p
+                  (list :func "lower" (list literal) :saved operand))))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))
