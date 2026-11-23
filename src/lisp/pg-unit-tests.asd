@@ -120,7 +120,8 @@
                (:file "t/rove/syncrep-tests"))
   :perform (asdf:test-op (operation component)
                          (declare (ignore operation component))
-                         (unless (uiop:symbol-call :rove :run :pg-unit-tests)
+                         ;; Report registered heads, as in the combined inventory.
+                         (unless (uiop:symbol-call :rove :run-suite :pg)
                            (error "Unit regressions or generated contracts failed"))))
 
 (asdf:defsystem "pg-unit-tests/all"

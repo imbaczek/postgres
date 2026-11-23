@@ -1035,6 +1035,9 @@ production and clean shutdown.
 The combined run with the WAL storage changes in `d453a4335d2` passed the
 Rove suite and all 1,172 legacy checks. Its warm reload test also loaded the
 extracted WAL scan and control components.
+The combined runner now invokes the Rove package suite used by `--list`.
+The rerun reported 1,642 individual Rove heads and 1,172 legacy checks,
+with both harnesses passing.
 
 The direct Rove runner reports the type and message of caught conditions. An
 injected error printed its message, counted as a failure, and left the next
