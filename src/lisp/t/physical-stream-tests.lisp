@@ -1054,7 +1054,7 @@
                  (pg::wal-atomic-write-bytes (merge-pathnames legacy archive) bytes)
                  (pg::wal-atomic-write-bytes
                   (merge-pathnames (pg::wal-archive-segment-proof-name legacy) archive)
-                  (pg::wal-encode-archive-segment-proof 123 1 0 :legacy fork bytes)))
+                  (retired-archive-segment-proof 123 0 fork bytes)))
                (setf (symbol-function 'pg::physical-follow-runtime-boundary)
                      (lambda (runtime) (declare (ignore runtime)) limit))
                (ok (null (pg::physical-follow-restore-next runtime command 0)))
@@ -1105,7 +1105,9 @@
                           (pg::wal-atomic-write-bytes (merge-pathnames leaf archive) bytes)
                           (pg::wal-atomic-write-bytes
                            (merge-pathnames (pg::wal-archive-segment-proof-name leaf) archive)
-                           (pg::wal-encode-archive-segment-proof 123 1 0 namespace end bytes))))
+                           (if (eq namespace :timeline)
+                               (pg::wal-encode-archive-segment-proof 123 1 0 :timeline end bytes)
+                               (retired-archive-segment-proof 123 0 end bytes)))))
                    (publish "0000000000000000.wal" :legacy)
                    (ok (null (pg::physical-follow-restore-next runtime command 0)))
                    (ok (zerop (pg::physical-store-flushed-lsn store)))

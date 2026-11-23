@@ -594,6 +594,13 @@
         (unwind-protect (ok (= 32 (pg::physical-store-flushed-lsn reopened)))
           (pg::physical-store-close reopened)))))
 
+(defun retired-archive-segment-proof (system-id segment end bytes)
+  "Build CRC-valid old proof bytes independently of the writer's namespace policy."
+  (let ((proof (pg::wal-encode-archive-segment-proof system-id 1 segment :timeline end bytes)))
+    (pg::wal-set-u32 proof 20 0)
+    (pg::wal-set-u32 proof 48 (pg::wal-crc32 proof 0 48))
+    proof))
+
 (deftest wal-archive-segment-proof-binds-identity-and-exact-content
     (let* ((first (sample-physical-record))
            (bytes (concatenate '(vector (unsigned-byte 8)) first (sample-physical-record (length first))))
@@ -605,9 +612,10 @@
       (ok (signals (pg::wal-verify-archive-segment-proof proof 123 2 0 :timeline bytes) 'error))
       (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 1 :timeline bytes) 'error))
       (ok (signals (pg::wal-verify-archive-segment-proof proof 123 1 0 :legacy bytes) 'error))
-      (let ((legacy (pg::wal-encode-archive-segment-proof 123 1 0 :legacy end bytes)))
-        (ok (= end (pg::wal-verify-archive-segment-proof legacy 123 1 0 :legacy bytes)))
-        (ok (signals (pg::wal-encode-archive-segment-proof 123 2 0 :legacy end bytes) 'error)))
+      (let ((legacy (retired-archive-segment-proof 123 0 end bytes)))
+        (ok (signals (pg::wal-verify-archive-segment-proof legacy 123 1 0 :timeline bytes) 'error))
+        (ok (signals (pg::wal-verify-archive-segment-proof legacy 123 1 0 :legacy bytes) 'error))
+        (ok (signals (pg::wal-encode-archive-segment-proof 123 1 0 :legacy end bytes) 'error)))
       (let ((different (concatenate '(vector (unsigned-byte 8)) first
                                     (pg::wal-encode-record pg::+wal-record-maintenance+ 0
                                                            (length first) (empty-octets))))
@@ -619,7 +627,7 @@
   (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     (ok (equalp #(80 87 65 80 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0
                   0 0 0 0 0 0 32 0 0 0 0 0 0 0 165 245 138 77 120 16 130 12 92 123 156 153)
-                (pg::wal-encode-archive-segment-proof 0 1 0 :legacy 32 bytes))))
+                (retired-archive-segment-proof 0 0 32 bytes))))
   (let* ((size pg::+wal-segment-size+)
          (bytes (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
          (end (* 2 size))

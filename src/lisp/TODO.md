@@ -498,6 +498,12 @@ namespace and legacy segment names before installing runtime state. Follow
 reservation rejects legacy sources before allocating a pin, and adoption
 journal admission requires qualified local facts. The focused strict suite
 passed 41 heads across these boundaries.
+Archive proof admission and publication require timeline-qualified identity.
+Legacy archive status markers stay untouched when qualified status is reclaimed.
+Five strict physical heads covered proof rejection, archived partials, the
+restore cursor, and cold recovery. A separate recycling test verified the
+legacy marker bytes. The live standby restored 2,006 rows from archive while
+the primary was down, then resumed streaming on its existing follow slot.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which
