@@ -533,6 +533,12 @@ The shared visitor and mapper enumerate CASE conditions, results, and
 the ELSE operand. HAVING uses those same rules for literal detection and
 gate construction. The regression verifies that a column reference in
 branch metadata does not prevent a literal CASE from folding.
+Demanded column defaults and HAVING share the mapper for folding array
+access operands. It preserves omitted bounds and visits upper bounds,
+lower bounds, and the array base in the existing fold order. The C
+differential checks a stored element default, text-cast slices with
+either bound omitted, and error precedence between the upper and lower
+bounds of a demanded default.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and

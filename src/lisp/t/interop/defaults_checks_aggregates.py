@@ -7,6 +7,10 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE TABLE dc_array_access_default (element int DEFAULT (ARRAY[10,20,30])[2], prefix text DEFAULT ((ARRAY[10,20,30])[:2])::text, suffix text DEFAULT ((ARRAY[10,20,30])[2:])::text)",
+    "INSERT INTO dc_array_access_default DEFAULT VALUES RETURNING element, prefix, suffix",
+    "CREATE TABLE dc_array_bound_error (v text DEFAULT ((ARRAY[10,20])[get_bit('\\x00'::bytea, 8):(1 / 0)])::text)",
+    "INSERT INTO dc_array_bound_error DEFAULT VALUES",
     "SELECT pg_catalog.length('éΣ'), octet_length('éΣ'), char_length('éΣ'::varchar), character_length('éΣ'::name)",
     "SELECT length('éΣ'::varchar), octet_length('éΣ'::name), length(NULL), octet_length(NULL::bytea)",
     "SELECT length('\\x0001ff'::bytea), octet_length('\\x0001ff'::bytea)",

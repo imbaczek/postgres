@@ -1955,7 +1955,8 @@ JSON has no comparison operators, even though its stored value is text."
     copy))
 
 (defun map-analyzed-array-access-operands (function expression)
-  "Copy array access operands in HAVING fold order, preserving omitted bounds."
+  "Copy array access for constant folding, with bounds before the base.
+Visit present uppers before lowers and preserve omitted bounds."
   (let* ((copy (copy-list expression))
          (indices (third expression))
          (mapped
