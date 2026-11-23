@@ -377,6 +377,10 @@ request legacy control images explicitly where they create legacy-named WAL.
 The export-origin fixtures bind the current timeline-qualified namespace for
 the WAL and sender. All 17 strict heads passed, including stale timeline
 rejection and retained progress across publication failure.
+The retained-reference control and adoption-attempt fixtures likewise write
+timeline-qualified controls. Twelve strict heads passed, including startup
+refusal without rewriting the retained reference and adoption journal
+round trips and publication cuts.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
