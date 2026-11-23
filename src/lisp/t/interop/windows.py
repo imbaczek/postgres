@@ -53,6 +53,7 @@ CASES = [
     "SELECT rank() OVER (w ORDER BY v) FROM win_input WINDOW w AS (ORDER BY id)",
     "SELECT rank() OVER ()+1",
     "SELECT row_number() OVER () = ANY (SELECT 1::bigint)",
+    "SELECT DISTINCT row_number() OVER (ORDER BY id) = ANY (SELECT 1::bigint) FROM win_input ORDER BY row_number() OVER (ORDER BY id) = ANY (SELECT 1::bigint)",
     "SELECT id, row_number() OVER (ORDER BY id) <> ALL (SELECT 2::bigint) FROM win_input ORDER BY id",
     "SELECT id, row_number() OVER (ORDER BY id) = ANY (SELECT row_number() OVER () FROM win_input LIMIT 2) FROM win_input ORDER BY id",
     "SELECT count(*) OVER ()::text",

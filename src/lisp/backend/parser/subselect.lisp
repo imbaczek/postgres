@@ -307,6 +307,8 @@ may still contain expression lists and are traversed structurally."
   "Compare analyzed query meaning without scopes, plans or descriptor identity."
   (cond ((sql-jsonb-p form) (list :jsonb (sql-jsonb-output form)))
         ((sql-decimal-p form) (list :numeric (sql-numeric-coefficient form) (sql-numeric-scale form)))
+        ((sql-expression-key-p form)
+         (list :expression-key (sql-expression-key-value form)))
         ((sql-subplan-p form)
          (list :subplan (sql-subplan-kind form)
                (prepared-query-semantic-key (sql-subplan-prepared form))

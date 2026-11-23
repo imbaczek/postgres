@@ -23,6 +23,16 @@
                (setf rank next-rank dense next-dense))
           always (and (= rank start) (= dense groups)))))
 
+(rove:deftest quantified-window-expression-keys-compare-by-value
+    (flet ((comparison (kind)
+             (list :subplan
+                   (make-sql-subplan
+                    :kind :any
+                    :test (list :window-ref 0 :type :int8
+                                :window-key (make-sql-expression-key :value (list :kind kind)))))))
+      (rove:ok (selected-expression-equal-p (comparison :rank) (comparison :rank)))
+      (rove:ok (not (selected-expression-equal-p (comparison :rank) (comparison :row-number))))))
+
 (rove:deftest window-key-refresh-respects-comparison-and-query-scope
     (let* ((*select-named-windows* nil)
            (window (list :kind :row-number :type :int8))

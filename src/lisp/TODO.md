@@ -466,6 +466,11 @@ operands. The encoder retains its structural traversal so these fields
 continue to contribute to equality. Window key refresh uses the scoped
 mapper and refreshes the caller-side subplan comparison in place. It
 preserves the independently prepared query and opaque payloads.
+Semantic-key encoding compares embedded expression-key wrappers by their
+canonical values. The regression distinguishes equal independently built
+window comparisons from different functions. The expanded 172-case window
+differential also compares repeated quantified window expressions in
+`SELECT DISTINCT` and `ORDER BY`.
 
 ## Open development tasks
 
