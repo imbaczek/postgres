@@ -791,8 +791,7 @@
                                                                       #xCBF29CE484222325 bytes)))
                                         bytes)))
                (overlap-bytes (subseq base 0 base-lsn))
-               (overlap-metadata (overlap-test-metadata base-lsn overlap-bytes
-                                                        :namespace (if cursor-records :timeline :legacy)))
+               (overlap-metadata (overlap-test-metadata base-lsn overlap-bytes))
                (directory (pg::physical-recovery-retained-directory)))
           (when split-first
             (let* ((metadata (nth-value 0 (pg::physical-retained-extent-decode (first images))))

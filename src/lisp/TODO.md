@@ -446,6 +446,10 @@ restored. Both strict cold recovery heads and live static standby passed.
 Base and retained overlap capture also require that verified namespace.
 The boundary fixture rejected missing namespace even with a valid legacy
 file present, then captured the same bytes under explicit legacy provenance.
+Base overlap capture and retained overlap metadata now require the qualified
+namespace. An independently enveloped legacy overlap with a valid checksum
+was rejected. Fifty-six strict overlap, inventory, projection, and prefix heads
+and three archived segment and cursor heads passed.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
@@ -476,8 +480,8 @@ Backup manifests and bundle intake require qualified WAL file entries. A
 checksummed version 3 manifest with a legacy entry reached file-entry
 rejection. Eighty-three strict recovery and promotion heads, three cold
 policy heads, and live qualified bootstrap passed.
-Tighten the primary and pending control codecs and retained
-overlap metadata for callers outside server startup. Use the prior build's
+Tighten the primary and pending control codecs for callers outside server
+startup. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.
 
