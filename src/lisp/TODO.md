@@ -116,6 +116,11 @@ For B4, buffer reads no longer move a historical B-tree type byte out of
 the checksum field. The checksum reader rejects that layout without
 rewriting the page. Indexes from that layout must be rebuilt from matching
 data before using the current reader.
+The live index regression manufactures an unstamped metapage in the
+retired layout while the fixture is stopped. The cold server rejects the
+indexed lookup with XX001 for the exact relfilenode and block zero. The
+index file remains byte-identical across the failed read and shutdown.
+Restoring the current file and restarting yields the expected indexed row.
 
 For B5, catalog decode requires a stored publication OID. Startup rejects
 missing OIDs without rewriting the catalog. The publication process test

@@ -298,4 +298,62 @@ echo "$restore_output" | grep -q 'bye' || fail "relation reader restore failed"
 echo "$restore_output" | grep -Eq ';; (read )?error:' \
     && fail "relation reader restore evaluation failed"
 
+# Manufacture the retired metapage with the fixture stopped. This index has
+# a selective lookup and a verified cold copy of the current page layout.
+run -c 'create index index_diff_retirement_idx on index_diff (category)' >/dev/null
+plan=$(run -c 'explain select id from index_diff where category = 8')
+plan_contains_indented_node "$plan" "Index Scan using index_diff_retirement_idx on index_diff" \
+    || fail "retirement fixture did not select the index: $plan"
+control >"$TMP/retirement-path.out" <<EOF
+(let* ((db (gethash "postgres" (catalog-databases *catalog*)))
+       (index (gethash "index_diff_retirement_idx" (database-indexes db))))
+  (with-open-file (out "$TMP/retirement-path" :direction :output)
+    (write-line (namestring (relation-file-path (pg-index-relfilenode index))) out)))
+(quit)
+EOF
+test -f "$TMP/retirement-path" || fail "could not read the persisted index path"
+IFS= read -r index_path <"$TMP/retirement-path"
+case "$index_path" in
+    "$TMP/data/base/"*) ;;
+    *) fail "retirement fixture index escaped the owned data directory" ;;
+esac
+kill -INT "$SRV"
+wait "$SRV" || fail "could not stop the retirement fixture"
+SRV=
+cp -p "$index_path" "$TMP/current-index"
+python3 - "$index_path" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+assert len(data) >= 8192 and data[10:12] == b"\x01\x00"
+assert struct.unpack_from("<Q", data)[0] != 0
+# The retired layout used an unstamped page with the type in pd_checksum.
+struct.pack_into("<QHH", data, 0, 0, 1, 0)
+path.write_bytes(data)
+PY
+cp -p "$index_path" "$TMP/retired-index"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-port "$CONTROL_PORT"
+test_wait_owned_sql_server "$SRV" "$PORT"
+if run -v VERBOSITY=verbose -c 'select id from index_diff where category = 8' \
+    >"$TMP/retired-index.out" 2>&1; then
+    fail "indexed lookup accepted the retired metapage"
+fi
+grep -Fq "XX001: page checksum mismatch in relation ${index_path##*/} block 0" "$TMP/retired-index.out" \
+    || fail "indexed lookup did not report the retired metapage as corrupt"
+kill -INT "$SRV"
+wait "$SRV" || fail "could not stop after the retired metapage read"
+SRV=
+cmp "$TMP/retired-index" "$index_path" || fail "the retired index was rewritten"
+cp -p "$TMP/current-index" "$index_path"
+test_debug_start_server "$LOG" -p "$PORT" -D "$TMP/data" --control-port "$CONTROL_PORT"
+test_wait_owned_sql_server "$SRV" "$PORT"
+plan=$(run -c 'explain select id from index_diff where category = 8')
+plan_contains_indented_node "$plan" "Index Scan using index_diff_retirement_idx on index_diff" \
+    || fail "restored lookup did not select the current index: $plan"
+test "$(run -c 'select id from index_diff where category = 8')" = 1001 \
+    || fail "the restored current index did not return the expected row"
+
 echo "index-scan-regression: PASS"
