@@ -7,6 +7,9 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.substr('aéΣ', 2::smallint), substr('aéΣ', '2', '1'), substr(NULL,1)",
+    "SELECT pg_catalog.substring('aéΣ'::varchar, 2, 1), substring('aéΣ', 2, NULL)",
+    "SELECT substring('aéΣ', 2, -1)",
     "SELECT pg_catalog.jsonb_set('{}', ARRAY['a'::varchar], '1'), jsonb_set('{}', '{a}', '1', false)",
     "SELECT jsonb_insert('[1,2]', '{0}', '3'), jsonb_insert('[1,2]', '{0}', '3', true)",
     "SELECT jsonb_set('{}', '{a}', '1', NULL), jsonb_insert('{}', '{a}', 'null')",

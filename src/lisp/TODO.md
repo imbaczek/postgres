@@ -511,6 +511,12 @@ immutable classification. Their optional flags retain the C defaults
 of true and false respectively. The unit suite and 1,393 C comparisons
 passed, including SQL NULL versus JSON null, decorated-call error order,
 and a strict NULL default that leaves its sequence untouched.
+The positional `substr` and `substring` signatures share overload
+resolution, strictness, and the range evaluator. Exact matches rank
+first, with the C string preference breaking ties on an unknown first
+argument. The 1,396 C comparisons, the generated character partition
+property, and the live TOAST DML suite passed, including text and bytea
+slices of external values.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

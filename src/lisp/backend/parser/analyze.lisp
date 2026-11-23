@@ -497,6 +497,30 @@ exist\" messages."
                    (make-scalar-builtin :name "chr" :argument-types '(:int4) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-chr
                                         :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substr" :argument-types '(:text :int4)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substr" :argument-types '(:text :int4 :int4)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substr" :argument-types '(:bytea :int4)
+                                        :result-type :bytea :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substr" :argument-types '(:bytea :int4 :int4)
+                                        :result-type :bytea :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substring" :argument-types '(:text :int4)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substring" :argument-types '(:text :int4 :int4)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4)
+                                        :result-type :bytea :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
+                                        :result-type :bytea :volatility :immutable :strict-p t
+                                        :evaluator 'sql-substring :implicit-arguments-p t)
                    (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text)
                                         :result-type :text-array :volatility :immutable
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
@@ -566,21 +590,24 @@ exist\" messages."
                             (t (eq (expr-type argument) type)))))))
 
 (defun resolve-scalar-builtin (name candidates arguments)
-  "Use C's exact-match count and prefer text for unknown unary inputs.
-The bit/bytea alternatives have different non-string categories and stay ambiguous."
-  (let ((best nil) (best-count -1) (tied-p nil))
+  "Rank by exact matches, then prefer text in an unknown first argument.
+The supported ambiguous bit and bytea overloads have no text candidate."
+  (let ((best nil)
+        (best-score -1)
+        (tied-p nil)
+        (unknown-first-p (and arguments (in-unknown-constant-p (first arguments)))))
     (dolist (candidate candidates)
       (when (scalar-builtin-match-p candidate arguments)
-        (let ((count (loop for argument in arguments
-                           for type in (scalar-builtin-argument-types candidate)
-                           count (and (not (in-unknown-constant-p argument))
-                                      (eq (expr-type argument) type)))))
-          (cond ((> count best-count) (setf best candidate best-count count tied-p nil))
-                ((= count best-count) (setf tied-p t))))))
+        (let* ((types (scalar-builtin-argument-types candidate))
+               (exact-count (loop for argument in arguments for type in types
+                                  count (and (not (in-unknown-constant-p argument))
+                                             (eq (expr-type argument) type))))
+               (score (+ (* 2 exact-count)
+                         (if (and unknown-first-p (eq (first types) :text)) 1 0))))
+          (cond ((> score best-score) (setf best candidate best-score score tied-p nil))
+                ((= score best-score) (setf tied-p t))))))
     (cond ((not best)
            (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-          ((and tied-p (null (rest arguments)) (in-unknown-constant-p (first arguments))
-                (find '(:text) candidates :key #'scalar-builtin-argument-types :test #'equal)))
           (tied-p
            (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
           (t best))))
@@ -749,24 +776,6 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
                       (minusp (compare-3way value result))))
           (setf result value))))))
 
-(defun analyze-substr-function (name arguments)
-  "Resolve text and bytea substring overloads."
-  (unless (and (member (length arguments) '(2 3))
-               (or (eq (expr-type (first arguments)) :bytea)
-                   (sql-implicit-coercion-p (expr-type (first arguments)) :text))
-               (every (lambda (argument)
-                        (or (in-unknown-constant-p argument)
-                            (member (expr-type argument) '(:int2 :int4))))
-                      (rest arguments)))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (let ((type (if (eq (expr-type (first arguments)) :bytea) :bytea :text)))
-    (list :func name
-          (cons (if (eq type :bytea) (first arguments)
-                    (cast-expression-to-text (first arguments)))
-                (mapcar (lambda (argument) (coerce-common-expression argument :int4))
-                        (rest arguments)))
-          :type type :typmod -1)))
-
 (defun sql-substring-range (start length length-p)
   "Return a zero-based offset and a count, or NIL count for the tail."
   (when (and length-p (minusp length))
@@ -776,15 +785,13 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
             (unless (or (not length-p) (> (+ start length) +int4-max+))
               (max 0 (- (+ start length) adjusted))))))
 
-(defun eval-substr-function (arguments)
+(defun sql-substring (value start &optional (length nil length-p))
   "Match text and bytea substring position and length rules."
-  (when (member +null+ arguments) (return-from eval-substr-function +null+))
-  (destructuring-bind (value start &optional (length nil length-p)) arguments
-    (multiple-value-bind (offset count) (sql-substring-range start length length-p)
-      (let* ((size (length value))
-             (begin (min size offset))
-             (end (if count (min size (+ begin count)) size)))
-        (subseq value begin end)))))
+  (multiple-value-bind (offset count) (sql-substring-range start length length-p)
+    (let* ((size (length value))
+           (begin (min size offset))
+           (end (if count (min size (+ begin count)) size)))
+      (subseq value begin end))))
 
 (defvar *toast-slice-current* nil)
 
@@ -1785,11 +1792,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-scalar-builtin name builtins args
                                (or (getf (cdddr expr) :call-distinct)
                                    (getf (cdddr expr) :call-order))))
-      ((member name '("substr" "substring") :test #'string=)
-       (let ((*defer-function-constant-coercion-p*
-               (or (getf (cdddr expr) :call-distinct)
-                   (getf (cdddr expr) :call-order))))
-         (analyze-substr-function name args)))
       ((string= name "array_to_string")
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
@@ -3927,8 +3929,7 @@ still requires deferred sort projection."
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)
-      (member name '("substr" "substring"
-                     "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+      (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
                      "scale" "min_scale" "trim_scale" "width_bucket")
@@ -4761,7 +4762,6 @@ the full 64-bit ID as a signed value."
              :test #'string=)
      (if (member +null+ args) +null+
          (sql-numeric-basic-function name (first args) (if (rest args) (second args) 0))))
-    ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((logical-helper-function-p name)

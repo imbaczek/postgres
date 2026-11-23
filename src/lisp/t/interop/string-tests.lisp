@@ -63,13 +63,13 @@
 
 (cl-spec:defproperty substr-partitions-characters-without-loss
     ((size (range integer 0 128)) (position (range integer 0 256)))
-  (:about pg::eval-substr-function)
+  (:about pg::sql-substring)
   (:trials (:normal 200))
   (let* ((text (coerce (loop for index below size collect (char "aλ🙂é" (mod index 4))) 'string))
          (cut (min size position)))
     (string= text
-             (concatenate 'string (pg::eval-substr-function (list text 1 cut))
-                          (pg::eval-substr-function (list text (1+ cut)))))))
+             (concatenate 'string (pg::sql-substring text 1 cut)
+                          (pg::sql-substring text (1+ cut))))))
 
 (deftest generated-substr-character-partitions
     (let ((data (cl-spec:result-data
