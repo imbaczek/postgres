@@ -509,6 +509,20 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
+                   (make-scalar-builtin :name "random" :result-type :float8
+                                        :volatility :volatile :strict-p t :evaluator 'sql-random-float)
+                   (make-scalar-builtin :name "random" :argument-types '(:int4 :int4)
+                                        :result-type :int4 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-random-integer :implicit-arguments-p t)
+                   (make-scalar-builtin :name "random" :argument-types '(:int8 :int8)
+                                        :result-type :int8 :volatility :volatile :strict-p t
+                                        :evaluator 'sql-random-integer :implicit-arguments-p t)
+                   (make-scalar-builtin :name "random" :argument-types '(:numeric :numeric)
+                                        :result-type :numeric :volatility :volatile :strict-p t
+                                        :evaluator 'sql-random-numeric :implicit-arguments-p t)
+                   (make-scalar-builtin :name "setseed" :argument-types '(:float8)
+                                        :result-type :void :volatility :volatile :strict-p t
+                                        :evaluator 'sql-setseed :implicit-arguments-p t)
                    (make-scalar-builtin :name "array_length" :argument-types '(:anyarray :int4)
                                         :result-type :int4 :volatility :immutable :strict-p t
                                         :evaluator 'sql-array-length :implicit-arguments-p t)
@@ -959,8 +973,10 @@ names and unknown types.  setseed has no catalog argument names."
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
-  (cond ((member name '("pi" "random") :test #'string=)
-         (if (string= name "random") (member count '(0 2)) (zerop count)))
+  (cond ((gethash name *scalar-builtin-descriptors*)
+         (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
+               (gethash name *scalar-builtin-descriptors*)))
+        ((string= name "pi") (zerop count))
         ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
@@ -1478,29 +1494,6 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
         ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
         (t (sql-width-bucket-range args))))
 
-(defun analyze-random-function (name args &optional (signature (random-call-signature args)))
-  (cond
-    ((and (string= name "random") (null args))
-     (list :func name args :type :float8 :typmod -1))
-    ((and (string= name "setseed") (= (length args) 1)
-          (or (in-unknown-constant-p (first args))
-              (sql-implicit-coercion-p (expr-type (first args)) :float8)))
-     (list :func name (list (coerce-common-expression (first args) :float8)) :type :void :typmod -1))
-    ((and (string= name "random") (= (length args) 2))
-     (when (every (lambda (arg) (or (in-unknown-constant-p arg)
-                                    (eq (expr-type arg) :int2))) args)
-       (ereport "42725" "function random(~a) is not unique" signature))
-     (let* ((types (mapcar #'expr-type args))
-            (type (cond ((member :numeric types) :numeric)
-                        ((member :int8 types) :int8)
-                        (t :int4))))
-       (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
-                                        (sql-implicit-coercion-p (expr-type arg) type))) args)
-         (ereport "42883" "function ~a(~a) does not exist" name signature))
-       (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
-             :type type :typmod -1)))
-    (t (ereport "42883" "function ~a(~a) does not exist" name signature))))
-
 (defun float-catalog-alias (name)
   "Return the declared argument type and execution name for a float catalog function.
 Each listed function takes one argument and returns the same float type.  The
@@ -1569,7 +1562,8 @@ so a nested argument error keeps its own diagnostics."
            (list :func name (list (coerce-common-expression (first args) type))
                  :type type :typmod -1)))
         ((member name '("random" "setseed") :test #'string=)
-         (analyze-random-function name args signature))
+         (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
+                                 *defer-function-constant-coercion-p*))
         ((trig-function-p name) (analyze-trig-function name args))
         ((string= name "width_bucket") (analyze-width-bucket args))
         ((member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
@@ -4974,21 +4968,20 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
                (setf result (+ (* result 10000) (* padding (sql-prng-range 0 (1- (/ 10000 padding))))))))
         when (<= result limit) return (make-sql-decimal (+ low (/ result padding)) scale)))))
 
-(defun eval-random-function (name arguments type)
-  (when (member +null+ arguments) (return-from eval-random-function +null+))
-  (cond
-    ((string= name "setseed")
-     (let ((seed (first arguments)))
-       (unless (and (not (sb-ext:float-nan-p seed)) (<= -1d0 seed) (<= seed 1d0))
-         (ereport "22023" "setseed parameter ~a is out of allowed range [-1,1]"
-                  (sql-float-output seed :float8 -9)))
-       (sql-prng-seed (truncate (* (1- (ash 1 52)) seed)))
-       nil))
-    ((null arguments) (scale-float (float (ash (sql-prng-next) -12) 1d0) -52))
-    ((eq type :numeric) (sql-random-numeric (first arguments) (second arguments)))
-    (t (when (> (first arguments) (second arguments))
-         (ereport "22023" "lower bound must be less than or equal to upper bound"))
-       (sql-prng-range (first arguments) (second arguments)))))
+(defun sql-setseed (seed)
+  (unless (and (not (sb-ext:float-nan-p seed)) (<= -1d0 seed) (<= seed 1d0))
+    (ereport "22023" "setseed parameter ~a is out of allowed range [-1,1]"
+             (sql-float-output seed :float8 -9)))
+  (sql-prng-seed (truncate (* (1- (ash 1 52)) seed)))
+  nil)
+
+(defun sql-random-float ()
+  (scale-float (float (ash (sql-prng-next) -12) 1d0) -52))
+
+(defun sql-random-integer (minimum maximum)
+  (when (> minimum maximum)
+    (ereport "22023" "lower bound must be less than or equal to upper bound"))
+  (sql-prng-range minimum maximum))
 
 (defun sql-byte-bit-operation (value index input-type bit-p set-p new-value)
   "Apply the C bytea or bit indexing and copy-on-write semantics."
@@ -5053,8 +5046,6 @@ expression identity has been resolved."
                  (t (sql-integer-bitwise
                      (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
                      (first arguments) (second arguments) type))))))
-    ((member name '("random" "setseed") :test #'string=)
-     (eval-random-function name arguments type))
     ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                   :test #'string=)
           (member +null+ arguments))

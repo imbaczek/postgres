@@ -30,6 +30,12 @@ def run(port):
         after = a.observe('select random()')
         b.query('select setseed(-0.25)')
         assert b.observe('select random()') == after, 'rollback state'
+        a.query('select setseed(0.5)')
+        values.append(a.observe(
+            'select x, random() '
+            'from (select 3 as x union all select 1 union all select 2) t '
+            'order by x limit 2'))
+        values.append(a.observe('select random()'))
         for expr in ['setseed(2)', "setseed('NaN'::float8)", 'random(2,1)',
                      'random(2.0,1.0)', 'setseed(NULL)', 'random(NULL::int,1)',
                      'random(NULL,NULL)', "random('1','2')",

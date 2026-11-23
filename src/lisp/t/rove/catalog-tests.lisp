@@ -3,14 +3,14 @@
 
 (rove:deftest test-sql-prng-sequence
     (let ((*sql-prng-state* nil))
-      (eval-random-function "setseed" (list 0.5d0) :void)
-      (rove:ok (= (eval-random-function "random" nil :float8) 0.9851677175347999d0))
-      (rove:ok (= (eval-random-function "random" '(-100 100) :int4) -67))
+      (sql-setseed 0.5d0)
+      (rove:ok (= (sql-random-float) 0.9851677175347999d0))
+      (rove:ok (= (sql-random-integer -100 100) -67))
       (let ((before (copy-seq *sql-prng-state*)))
         (rove:ok (= (sql-prng-range 4 4) 4))
         (rove:ok (equalp before *sql-prng-state*)))
-      (eval-random-function "setseed" (list 0.5d0) :void)
-      (rove:ok (= (eval-random-function "random" nil :float8) 0.9851677175347999d0))))
+      (sql-setseed 0.5d0)
+      (rove:ok (= (sql-random-float) 0.9851677175347999d0))))
 
 (rove:deftest test-key-order
     (flet ((k (v ty) (encode-index-key (list v) (list ty))))

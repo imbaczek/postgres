@@ -534,12 +534,16 @@ Default folding reads strictness from the original analyzed signature
 in the scalar registry. The C differential verifies that the strict
 two-argument `array_to_string` default skips a volatile sequence input
 when its array is NULL, while the three-argument overload evaluates it.
-The C
-differential covers a demanded default that folds a strict
+The differential also covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
 that must execute with a NULL value to reset the session setting.
 An overloaded `get_bit` default also returns NULL without advancing
 the sequence referenced by its other argument.
+The registry supplies volatility and strict dispatch for `setseed`,
+nullary `random`, and the supported integer and numeric range overloads.
+The existing named binder preserves caller-order analysis and diagnostic
+signatures. The C differential verified seeded values, session isolation,
+rollback, exact lookup diagnostics, and draws after sorting and limiting.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
