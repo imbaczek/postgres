@@ -178,6 +178,9 @@
                              (*wal-segment-namespace* :legacy) (*wal-prev-timeline* 1)
                              (*wal-checkpoint-snapshot* nil) (*wal-xid-reserved-through* nil)
                              (*catalog* nil)
+                             ;; This fixture owns a fresh host. The filesystem can reuse a deleted test host's inode.
+                             (*logical-slot-continuation-fenced-roots*
+                               (make-hash-table :test #'equal :synchronized t))
                              (*catalog-oldest-relfrozenxid* nil) (*catalog-durable-generation* 0)
                              (*catalog-logical-event-publication-p* nil)
                              (*wal-level* wal-level) (*backend* nil)

@@ -832,6 +832,13 @@ helper resolved against the matching C installation. The physical test runbook
 records that prerequisite, and the resolver reports a missing `pg_config`
 with exit status 127 and the two supported overrides.
 
+The combined unit baseline exposed a sticky continuation fence crossing
+temporary host lifetimes. A REPL probe seeded the outer fence table with the
+next fixture's device and inode and reproduced the missing-catalog error.
+Each real-startup fixture now owns its fence table for the lifetime of its
+temporary host. The same probe started successfully with this binding. The
+combined rerun passed Rove and all 1,172 legacy checks.
+
 ### A18 runner diagnostics
 
 The direct Rove runner reports the type and message of caught conditions. An
