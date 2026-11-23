@@ -364,9 +364,10 @@ streaming, pin retention and archive tests. The stream revalidation test changes
 the namespace in flight to check that stale reads and feedback are rejected.
 The logical recovery base fixtures use timeline-qualified checkpoint files and
 matching WAL controls, including the case with a separate witness segment.
-The restartpoint fixture uses qualified base files by default. Promotion
-fixtures pass the requested namespace to base setup, including the historical
-legacy cases, so the base is written under the selected name from the start.
+Restartpoint and promotion fixtures use qualified base files by default.
+Promotion fixtures pass the requested namespace to base setup, including
+explicit legacy cases, so the base is written under the selected name from
+the start.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

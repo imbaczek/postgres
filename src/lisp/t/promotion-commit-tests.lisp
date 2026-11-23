@@ -97,7 +97,8 @@
                 (append (getf metadata :source-checkpoint) (copy-tree fact)))
           (multiple-value-bind (bytes pending)
               (pg::physical-promotion-make-pending
-               pg::*physical-recovery-state* metadata prefix generation :legacy 2 1793030000 nil)
+               pg::*physical-recovery-state* metadata prefix generation
+               pg::*wal-segment-namespace* 2 1793030000 nil)
             (let* ((control (pg::physical-recovery-decode-control bytes))
                    (restored (pg::physical-promotion-frozen-resource-fact control metadata))
                    (before (pg::physical-promotion-checkpoint-plan pending 20000 1003))

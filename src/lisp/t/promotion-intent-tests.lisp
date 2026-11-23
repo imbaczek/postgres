@@ -8,7 +8,7 @@
 
 (defvar *promotion-test-writer-starts* 0)
 
-(defun call-with-promotion-fixture (function &key (namespace :legacy) (system-id 123) (applied 216))
+(defun call-with-promotion-fixture (function &key (namespace :timeline) (system-id 123) (applied 216))
   (call-with-restartpoint-fixture
    (lambda (root old-store)
      (pg::physical-store-close old-store)
@@ -561,7 +561,7 @@
        (pg::wal-control-path)
        (pg::wal-encode-control-image 152 152 (sample-checkpoint-snapshot :version 2 :next-xid 50
                                                                          :oldest-active-xid 0)
-                                     :namespace :timeline))
+                                     :namespace :legacy))
       (let ((before (lineage-test-bytes (pg::physical-recovery-control-path))))
         (ok (intake-fails-p (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))
         (ok (null pg::*physical-recovery-failed-p*))
