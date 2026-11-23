@@ -1,6 +1,23 @@
 ;;;; cte-tests.lisp -- shared demand-driven query producers and WITH scope.
 (in-package #:pg)
 
+(rove:deftest cte-volatility-follows-executable-operands-and-subqueries
+    (let* ((volatile '(:func "nextval" nil :type :int8))
+           (literal (list :const volatile :type :text))
+           (stable (list :set-func "pg_get_publication_tables" (list literal)
+                         :type :record :saved volatile)))
+      (rove:ok (not (cte-expression-volatile-p literal)))
+      (rove:ok (not (cte-expression-volatile-p stable)))
+      (rove:ok (cte-expression-volatile-p
+                (list :set-func "pg_get_publication_tables" (list volatile))))
+      (rove:ok (cte-expression-volatile-p
+                (list :subplan (make-sql-subplan :test volatile))))
+      (rove:ok (cte-expression-volatile-p
+                (list :subplan
+                      (make-sql-subplan :prepared (list :targets (list (list :expr volatile)))))))
+      (rove:ok (not (cte-query-volatile-p (list :targets (list (list :expr stable))))))
+      (rove:ok (cte-query-volatile-p (list :window-validation-keys (list volatile))))))
+
 (cl-spec:defproperty cte-replay-readers-share-prefix
     ((size (range integer 0 20)) (schedule (range integer 0 1048575)))
   (:about make-query-replay-reader)

@@ -290,25 +290,30 @@
                     :test #'string=))
        (analyzed-function-volatile-p name)))
 
+(defun cte-volatile-call-p (form)
+  (and (member (first form) '(:func :set-func :single-record))
+       (cte-function-volatile-p (second form))))
+
 (defun cte-expression-volatile-p (form)
+  "Check executable operands and explicitly visit nested subquery scopes."
   ;; SQL-SUBPLAN is defined by the following parser module.
   (declare (notinline sql-subplan-prepared sql-subplan-test))
-  (and (consp form)
-       (or (and (subquery-expression-p form)
-                (or (cte-expression-volatile-p (sql-subplan-test (second form)))
-                    (cte-query-volatile-p (sql-subplan-prepared (second form)))))
-           (and (member (first form) '(:func :set-func :single-record))
-                (cte-function-volatile-p (second form)))
-           (cte-expression-volatile-p (car form))
-           (cte-expression-volatile-p (cdr form)))))
+  (some-local-plan-expression
+   (lambda (node walk)
+     (if (subquery-expression-p node)
+         (let ((subplan (second node)))
+           (values (or (funcall walk (sql-subplan-test subplan))
+                       (cte-query-volatile-p (sql-subplan-prepared subplan)))
+                   t))
+         (cte-volatile-call-p node)))
+   form))
 
 (defun cte-query-volatile-p (prepared)
-  (let ((volatile (cte-expression-volatile-p (getf prepared :window-validation-keys))))
+  (let ((volatile nil))
     (map-prepared-query-expressions
      (lambda (form level)
        (declare (ignore level))
-       (when (and (member (first form) '(:func :set-func :single-record))
-                  (cte-function-volatile-p (second form)))
+       (when (cte-volatile-call-p form)
          (setf volatile t))
        form)
      prepared 0

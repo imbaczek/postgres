@@ -394,6 +394,10 @@ servers in Simple Query and extended protocol, including a suspended portal.
 `ANY` and `ALL` sublinks now reject a set-returning comparison during
 analysis with C's 42804 diagnostic. The 111-case C differential verifies
 both rejections and a valid SRF target in the separate subquery scope.
+CTE volatility uses the local visitor for executable call operands and
+explicitly enters nested subqueries. The Rove regression distinguishes
+volatile nested arguments and subqueries from identical literal or call
+metadata. The C differentials passed 114 ordinary and 137 recursive CTE cases.
 
 ## Open development tasks
 

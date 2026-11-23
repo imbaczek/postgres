@@ -59,7 +59,8 @@ may still contain expression lists and are traversed structurally."
                          (:subplan
                           (let ((subplan (second form)))
                             (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
-                         ((:func :whole-row :outer-ref) (walk (third form)))
+                         ((:func :set-func :single-record :whole-row :outer-ref)
+                          (walk (third form)))
                          (otherwise (or (walk (car form)) (walk (cdr form)))))))))))
     (not (null (walk expression)))))
 
@@ -71,7 +72,7 @@ may still contain expression lists and are traversed structurally."
   (case (first form)
     ((:const :bool :scalar-array-const :col :sort-output :window-ref)
      (copy-list form))
-    ((:func :whole-row)
+    ((:func :set-func :single-record :whole-row)
      (let ((copy (copy-list form)))
        (setf (third copy) (funcall function (third form)))
        copy))
