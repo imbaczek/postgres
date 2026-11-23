@@ -1218,6 +1218,14 @@ visibility fork and contributor. The standalone CRC runner passed 58,082
 checks. Eight physical heads passed with fresh strict compilation, and live
 standby replay passed.
 
+At `bff4a6c1d8b`, the combined suite passed 1,642 Rove heads and 1,172 legacy
+checks. The current namespace fixture again rejected legacy controls and
+names before modifying data or a stale PID, then restarted the qualified
+primary. The physical bootstrap fixture verified both qualified controls
+and segment bytes and started the backup in recovery. The timing ledger
+retains these logs under `architecture-current-acceptance` and the page
+codec compiler and replay logs under `architecture-wal-components`.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
