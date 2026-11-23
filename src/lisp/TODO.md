@@ -608,6 +608,12 @@ variadic-any signatures. Their shared evaluator receives the analyzed
 call and its already evaluated arguments. The 1,443 C comparisons
 covered empty construction, argument limits, typed values, NULL
 variadic arrays, and stored VARIADIC metadata after restart.
+`GREATEST` and `LEAST` register execution and immutable metadata
+as syntax-only expressions. Common-type analysis and stored expression
+shape are preserved. The 1,448 C comparisons covered constant HAVING
+and a demanded default that still evaluates `nextval` alongside NULL,
+including after restart. The recursive CTE differential covers quoted
+and qualified lookup failures and common-type diagnostics.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

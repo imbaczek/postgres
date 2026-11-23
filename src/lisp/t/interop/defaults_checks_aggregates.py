@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "CREATE SEQUENCE dc_minmax_default_seq",
+    "CREATE TABLE dc_minmax_default (v bigint DEFAULT greatest(NULL, nextval('dc_minmax_default_seq')), w numeric DEFAULT least(NULL,2.500,3))",
+    "INSERT INTO dc_minmax_default DEFAULT VALUES RETURNING v,w",
+    "SELECT currval('dc_minmax_default_seq')",
+    "SELECT 1 HAVING greatest(NULL,2) = 2",
     "SELECT pg_catalog.to_json(ARRAY[1,NULL,3]), pg_catalog.to_jsonb('null'::json), row_to_json(r), array_to_json(ARRAY[[1,2],[3,4]], true) FROM (SELECT 1 AS id, 'a'::text AS label) r",
     "SELECT to_json(NULL::int), to_jsonb(NULL::int), row_to_json(r,NULL), array_to_json(ARRAY[1],NULL) FROM (SELECT 1 AS id) r",
     "SELECT pg_catalog.array_to_json(DISTINCT NULL)",
@@ -1377,6 +1382,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_minmax_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_typed_json_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_overloaded_math_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_bucket_registry_default DEFAULT VALUES RETURNING a,b",

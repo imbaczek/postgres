@@ -449,6 +449,14 @@ exist\" messages."
   (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
                        :volatility :stable :evaluator '(:call . eval-json-constructor)))
 
+(defun make-minmax-builtin (name better-p)
+  "Register MinMaxExpr evaluation while keeping the syntax outside function lookup."
+  (make-scalar-builtin :name name :argument-types '(:common-type) :result-type :common-type
+                       :volatility :immutable :implicit-arguments-p :syntax-only
+                       :evaluator (cons :call (lambda (call arguments)
+                                                (declare (ignore call))
+                                                (sql-minmax better-p arguments)))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -715,6 +723,8 @@ exist\" messages."
                    (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text :text)
                                         :result-type :text-array :volatility :immutable
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
+                   (make-minmax-builtin "greatest" #'plusp)
+                   (make-minmax-builtin "least" #'minusp)
                    (make-json-constructor-builtin "json_build_array" nil :json)
                    (make-json-constructor-builtin "json_build_array" '(:variadic-any) :json)
                    (make-json-constructor-builtin "json_build_object" nil :json)
@@ -951,15 +961,12 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
       (json-equality-or-order-error type t))
     (list :func name coerced :type type :typmod (common-expression-typmod coerced))))
 
-(defun eval-minmax-function (name arguments)
-  "Evaluate all inputs, ignoring NULL unless every input is NULL."
+(defun sql-minmax (better-p arguments)
+  "Select an extremum, ignoring NULL unless every input is NULL."
   (let ((result +null+))
     (dolist (value arguments result)
       (unless (eq value +null+)
-        (when (or (eq result +null+)
-                  (if (string= name "greatest")
-                      (plusp (compare-3way value result))
-                      (minusp (compare-3way value result))))
+        (when (or (eq result +null+) (funcall better-p (compare-3way value result)))
           (setf result value))))))
 
 (defun sql-substring-range (start length length-p)
@@ -1718,12 +1725,12 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (analyze-json-constructor name builtins args (getf (cdddr expr) :variadic)))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
-      (builtins
+      ((getf (cdddr expr) :minmax-syntax-p)
+       (analyze-minmax-function name args))
+      ((and builtins (not (eq (scalar-builtin-implicit-arguments-p (first builtins)) :syntax-only)))
        (analyze-scalar-builtin name builtins args
                                (or (getf (cdddr expr) :call-distinct)
                                    (getf (cdddr expr) :call-order))))
-      ((getf (cdddr expr) :minmax-syntax-p)
-       (analyze-minmax-function name args))
       ((logical-helper-function-p name) (analyze-logical-helper-function name args))
       (t (analyze-utility-function-call name args)))))
 
@@ -3846,11 +3853,7 @@ still requires deferred sort projection."
 
 (defun analyzed-function-volatile-p (name)
   "Treat unclassified calls as volatile for aggregate and CTE planning."
-  (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
-    (if registered-p
-        (not (member volatility '(:immutable :stable)))
-        (not (member name '("greatest" "least")
-                     :test #'string=)))))
+  (not (member (scalar-builtin-family-volatility name) '(:immutable :stable))))
 
 (defun analyzed-expression-volatile-p (form)
   "Only known stable or immutable builtins may share an aggregate transition."
@@ -4641,7 +4644,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
-    ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
     (t
