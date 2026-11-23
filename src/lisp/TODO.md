@@ -2089,6 +2089,10 @@ still has work outstanding.
   had orphan fixture XIDs and cached streams pointing at deleted legacy PGDATA;
   the fresh intended legacy runner passed 1,159 checks. The leaking test and
   suite-isolation fix are not yet known.
+  A fresh per-fixture audit after the slot-view cleanup passed all 1,172
+  legacy checks with no new real XIDs at any case boundary and no active
+  XIDs at suite exit. Warm-worker cached stream ownership still needs
+  verification.
 
 - [ ] Audit cold-image compilation and ASDF load-order dependencies across `pg`
   and its test systems. A warm REPL must not conceal missing declarations or
