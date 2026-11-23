@@ -868,6 +868,17 @@
           (rove:ok (eql width (column-fixed-size column)))
           (rove:ok (= alignment (column-align column)))))))
 
+(rove:deftest heap-deformation-advances-by-fixed-column-width
+    (let* ((columns (map 'vector (lambda (type) (make-pg-column :type type))
+                         '(:int2 :timetz :oid :interval :int4)))
+           (values (vector -7 (make-sql-timetz 91234 -3600) #xffffffff
+                           (make-sql-interval -2 -7 -100000) -42))
+           (tuple (form-heap-tuple values columns 1 0 0 0 1)))
+      (rove:ok (equalp #(24 32 44 48 64) (nth-value 1 (heap-tuple-layout values columns))))
+      (rove:ok (= 68 (length tuple)))
+      (rove:ok (equalp values (deform-heap-tuple tuple columns)))
+      (rove:ok (equalp values (deform-heap-tuple tuple columns :demand 4)))))
+
 (rove:deftest heap-varlena-header-boundary-matches-layout-and-disk
     (dolist (fixture '((126 nil 26 1) (127 nil 28 4) (126 #\p 28 4)))
       (destructuring-bind (payload-size storage offset header-size) fixture

@@ -480,6 +480,19 @@ reject external and compressed datums and lengths outside BYTES."
         (t (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset)
              (values end (+ 4 (- end start)))))))
 
+(defmacro heap-decode-case (type cursor &body clauses)
+  "Decode fixed-width values and advance by the width declared in the SQL type registry."
+  `(case ,type
+     ,@(loop for (key . forms) in clauses
+             collect
+             (if (eq key 'otherwise)
+                 (cons key forms)
+                 (let* ((types (if (listp key) key (list key)))
+                        (width (sql-expression-type-length (first types))))
+                   (assert (and (plusp width)
+                                (every (lambda (item) (= width (sql-expression-type-length item))) types)))
+                   `(,key ,@forms (incf ,cursor ,width)))))))
+
 (defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value)
   "Return values, XIDs, command ID, infomask, and successor TID.
 Inline compressed attributes are decompressed, and inline :bytea values are
@@ -509,47 +522,39 @@ external decompression are deferred."
                         (varlena-p (heap-varlena-type-p type)))
                    (unless (and varlena-p (not (zerop (aref bytes cursor))))
                      (setf cursor (align-up cursor (column-align col))))
-                   (case type
+                   (heap-decode-case type cursor
                      (:timetz
                       (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
                         (when (logbitp 63 micros) (decf micros #x10000000000000000))
                         (when (logbitp 31 zone) (decf zone #x100000000))
-                        (setf (aref values i) (make-sql-timetz micros zone)))
-                      (incf cursor 12))
+                        (setf (aref values i) (make-sql-timetz micros zone))))
                      (:interval
                       (let ((micros (page-u64 bytes cursor)) (days (page-u32 bytes (+ cursor 8)))
                                                              (months (page-u32 bytes (+ cursor 12))))
                         (when (logbitp 63 micros) (decf micros #x10000000000000000))
                         (when (logbitp 31 days) (decf days #x100000000))
                         (when (logbitp 31 months) (decf months #x100000000))
-                        (setf (aref values i) (make-sql-interval months days micros)))
-                      (incf cursor 16))
+                        (setf (aref values i) (make-sql-interval months days micros))))
                      (:float4
-                      (setf (aref values i) (sql-float-from-bits (page-u32 bytes cursor) :float4))
-                      (incf cursor 4))
+                      (setf (aref values i) (sql-float-from-bits (page-u32 bytes cursor) :float4)))
                      (:float8
-                      (setf (aref values i) (sql-float-from-bits (page-u64 bytes cursor) :float8))
-                      (incf cursor 8))
+                      (setf (aref values i) (sql-float-from-bits (page-u64 bytes cursor) :float8)))
                      (:int2
                       (let ((v (page-u16 bytes cursor)))
                         (when (>= v #x8000) (decf v #x10000))
-                        (setf (aref values i) v))
-                      (incf cursor 2))
+                        (setf (aref values i) v)))
                      (:oid
-                      (setf (aref values i) (page-u32 bytes cursor))
-                      (incf cursor 4))
+                      (setf (aref values i) (page-u32 bytes cursor)))
                      ((:int4 :date)
                       (let ((v (page-u32 bytes cursor)))
                         (when (>= v #x80000000)
                           (decf v #x100000000))
-                        (setf (aref values i) v))
-                      (incf cursor 4))
+                        (setf (aref values i) v)))
                      ((:int8 :time :timestamp :timestamptz)
                       (let ((v (page-u64 bytes cursor)))
                         (when (>= v #x8000000000000000)
                           (decf v #x10000000000000000))
-                        (setf (aref values i) v))
-                      (incf cursor 8))
+                        (setf (aref values i) v)))
                      (otherwise
                       (when varlena-p
                         (multiple-value-bind (physical-end raw-size)

@@ -714,6 +714,10 @@ the physical size and alignment of all twelve fixed-width types and
 checks that unsupported types do not become heap types.
 A warm SBCL probe over 2.1 million size-and-alignment lookup pairs
 produced the same checksum and zero allocated bytes before and after.
+Heap deformation also compiles fixed-width cursor advances from the
+registry and checks that grouped decoders agree on width. A mixed tuple
+regression verifies exact offsets, including an OID directly after
+the 12-byte timetz, and checks full and demand-driven decoding.
 
 ### A17 follow-up evidence
 
