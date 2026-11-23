@@ -793,6 +793,12 @@ The fixture now verifies the exact old value after plain VACUUM with the
 snapshot open, commits the reader, and verifies the exact replacement
 value after the full rewrite. The complete `t/toast-dml.sh` suite passed.
 
+The physical WAL fixtures initialize the no-WAL DDL catalog and create the
+logical checkpoint test relation before writing its pages. WAL allocation
+fixtures release pending publications and dirty references before closing the
+temporary cluster. All 109 selected XID reservation, logical and FPW policy,
+and WAL namespace tests passed in strict mode.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

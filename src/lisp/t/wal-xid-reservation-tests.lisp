@@ -109,6 +109,7 @@
                                (pg::*wal-end-lsn* 0) (pg::*wal-durable-lsn* 0) (pg::*wal-checkpoint-lsn* 0)
                                (pg::*wal-checkpoint-snapshot* nil) (pg::*wal-xid-reserved-through* nil)
                                (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
+                               (pg::*wal-dirty-store* nil) (pg::*wal-temp-cleanup-domain* nil)
                                (pg::*wal-new-segments* nil) (pg::*wal-page-cache* (make-hash-table :test #'equal))
                                (pg::*wal-page-cache-xids* (make-hash-table :test #'equal))
                                (pg::*wal-xid-first-lsn* (make-hash-table :test #'eql))
@@ -128,8 +129,12 @@
              (pg::wal-init)
              (pg::xact-init :initialize t)
              (funcall function))
-        (when pg::*wal-output-stream* (close pg::*wal-output-stream*))
-        (when pg::*clog-stream* (close pg::*clog-stream*))))))
+        (unwind-protect
+             (progn
+               (pg::dispose-page-publication-test-owner pg::*wal-pending-page-publication*)
+               (pg::clear-wal-test-page-cache))
+          (when pg::*wal-output-stream* (close pg::*wal-output-stream*))
+          (when pg::*clog-stream* (close pg::*clog-stream*)))))))
 
 (deftest wal-allocation-fixture-restores-source-policy-incarnation
     (let* ((outer (gensym "OUTER-WAL-"))
@@ -173,8 +178,9 @@
 (deftest final-ddl-without-wal-keeps-only-the-commit-marker
     (call-with-resource-wal-fixture
      (lambda ()
-       (let ((pg::*wal-ready* nil))
-         (pg::catalog-init)
+       (let ((pg::*wal-ready* nil)
+             (pg::*wal-control-metadata* nil))
+         (pg::catalog-init :initialize t)
          (uiop:with-temporary-file (:stream stream :direction :io
                                     :element-type '(unsigned-byte 8))
            (let* ((pg::*relation-streams* (make-hash-table :test #'equal))

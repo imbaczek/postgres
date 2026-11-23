@@ -28,6 +28,7 @@
                   (setf (gethash "on_interval_pin" pg::*wal-replication-slots*) slot)
                   (pg::wal-create-replication-slot-file slot)
                   (pg::wal-refresh-logical-capture-slot-mirror-under-wal-lock))
+                (pg::smgr-create 777)
                 (let ((page (pg::page-init (pg::make-page))))
                   (dotimes (block (+ 8 (/ pg::+wal-segment-size+ pg::+blcksz+)))
                     (pg::wal-buffer-write 777 block page)))
