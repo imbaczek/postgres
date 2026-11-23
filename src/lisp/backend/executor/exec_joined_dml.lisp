@@ -57,24 +57,24 @@
         (lambda () (close-sql-iterator input)))))))
 
 (defun dml-one-time-qualification-p (expression)
-  ;; Like is_pseudo_constant_clause, a gate must be row-independent and free of
-  ;; volatile calls. Uncorrelated scalar/EXISTS/array subplans can be InitPlans.
-  (cond
-    ((atom expression) t)
-    ((member (first expression) '(:col :outer-ref :subquery-output :whole-row)) nil)
-    ((eq (first expression) :subplan)
-     (let ((descriptor (second expression)))
-       (and (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
-            (null (sql-subplan-depths descriptor)))))
-    ((eq (first expression) :func)
-     (and (or (having-immutable-function-p (second expression))
-              (member (second expression)
-                      '("version" "pg_lisp_runtime" "current_database" "current_schema"
-                        "current_catalog" "current_user" "session_user" "user"
-                        "current_setting" "pg_backend_pid" "pg_postmaster_start_time")
-                      :test #'equal))
-          (every #'dml-one-time-qualification-p (third expression))))
-    (t (every #'dml-one-time-qualification-p expression))))
+  "Recognize row-independent gates using C's is_pseudo_constant_clause rule."
+  (not
+   (some-local-plan-expression
+    (lambda (node walk)
+      (declare (ignore walk))
+      (case (first node)
+        ((:col :outer-ref :subquery-output :whole-row) t)
+        (:subplan
+         (let ((descriptor (second node)))
+           (values (or (not (member (sql-subplan-kind descriptor) '(:scalar :exists :array)))
+                       (sql-subplan-depths descriptor))
+                   t)))
+        (:func
+         (let ((name (second node)))
+           (if (gethash name *scalar-builtin-descriptors*)
+               (analyzed-function-volatile-p name)
+               (not (having-immutable-function-p name)))))))
+    expression)))
 
 (defun prepare-joined-dml-qualifications (prepared)
   ;; Run after subplan planning, when correlation depths distinguish one-time

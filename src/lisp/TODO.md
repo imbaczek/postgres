@@ -468,6 +468,14 @@ value after the full rewrite. The complete `t/toast-dml.sh` suite passed.
 
 ### A9 follow-up evidence
 
+Joined UPDATE and DELETE classify one-time qualifications with the local
+expression visitor and scalar builtin volatility. Whole-row and outer
+references remain row-dependent. An uncorrelated scalar, EXISTS, or array
+subplan stays eligible without walking the child query. The Rove check
+covers opaque call metadata, correlated subplans, and volatile calls.
+The C differential checks that a false stable `txid_current()` gate
+skips a source that would otherwise advance a sequence.
+
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
 function metadata alongside real grouped and aggregate operands. Both C

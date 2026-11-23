@@ -455,6 +455,27 @@
         (rove:ok (not (dml-one-time-qualification-p a)))
         (rove:ok (not (cte-reference-filter-p a '(:offset 0 :width 0)))))))
 
+(rove:deftest joined-dml-gates-use-local-operands-and-builtin-volatility
+    (rove:ok (dml-one-time-qualification-p
+              '(:binop "=" (:func "txid_current" nil :type :int8)
+                (:const 0 :type :int8) :type :bool)))
+  (rove:ok (dml-one-time-qualification-p
+            '(:func "length" ((:const "abc" :type :text)) :type :int4
+              :metadata (:col 0 :type :text))))
+  (rove:ok (dml-one-time-qualification-p
+            '(:is-null (:const (:col 0 :type :text) :type :record) nil :type :bool)))
+  (rove:ok (not (dml-one-time-qualification-p
+                 '(:func "length" ((:col 0 :type :text)) :type :int4))))
+  (rove:ok (not (dml-one-time-qualification-p
+                 '(:is-null (:func "set_config" ((:const "application_name" :type :text)
+                                                 (:const "new name" :type :text) (:bool nil))
+                             :type :text)
+                   nil :type :bool))))
+  (rove:ok (dml-one-time-qualification-p
+            (list :subplan (make-sql-subplan :kind :scalar :prepared '(:col 0)))))
+  (rove:ok (not (dml-one-time-qualification-p
+                 (list :subplan (make-sql-subplan :kind :scalar :depths '(1)))))))
+
 (rove:deftest top-n-retains-source-presence
     (let* ((collector (make-select-top-n-collector 1 '(((:col 1 :type :int4)))))
            (*query-row-presence* (vector 71)))

@@ -31,6 +31,8 @@ CASES = (
     "SELECT currval('jd_seq')",
     "DELETE FROM jd_target t USING (SELECT nextval('jd_seq') AS n) s WHERE current_database()='absent_db' RETURNING t.id",
     "SELECT currval('jd_seq')",
+    "DELETE FROM jd_target t USING (SELECT nextval('jd_seq') AS n) s WHERE txid_current() = 0 RETURNING t.id",
+    "SELECT currval('jd_seq')",
     "UPDATE jd_target t SET v=s.n FROM (SELECT nextval('jd_seq') AS n) s RETURNING t.id,t.v",
     "SELECT currval('jd_seq')",
     "UPDATE jd_target t SET v=delta FROM jd_source s FULL JOIN jd_source u USING(k) WHERE t.id=k RETURNING t.id,k",
