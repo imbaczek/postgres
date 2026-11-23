@@ -643,10 +643,7 @@ source itself.  Closing the result closes the sort and its source."
 (defun make-physical-join-iterator (node relations)
   ;; A parameterized index scan needs a new key and iterator for each left
   ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
-  (if (or (getf (second node) :lateral-dependent)
-          (and (eq (first (fourth node)) :index-scan)
-               (select-scan-path-parameter-expr
-                (physical-scan-path (fourth node) (physical-scan-relation (fourth node) relations)))))
+  (if (physical-join-rescans-inner-p (second node) (fourth node))
       (make-lateral-join-iterator
        (second node) (make-physical-plan-iterator (third node) relations)
        (lambda (environment origins presence)

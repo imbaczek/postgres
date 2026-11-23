@@ -773,6 +773,9 @@ as well. A physical ordered limit can use the bounded top-N node."
       (error "Physical scan relation does not match its registered table"))
     relation))
 
+(defun physical-index-scan-parameter (node)
+  (seventh node))
+
 (defun physical-scan-path (node relation)
   "Resolve a registered scan handle and verify it matches the physical node."
   (let ((table (getf relation :table)))
@@ -794,7 +797,7 @@ as well. A physical ordered limit can use the bounded top-N node."
                               :index index
                               :qual (fifth node)
                               :key (sixth node)
-                              :parameter-expr (seventh node)
+                              :parameter-expr (physical-index-scan-parameter node)
                               :selectivity
                               (select-scan-path-selectivity path))))))
 
@@ -1999,18 +2002,17 @@ ROW's source environment.  Only final target origins leave this projection."
                (funcall emit projected)))
            (funcall emit row))))))
 
-(defun execute-physical-join (node registered-relations emit run-child run-node)
+(defun physical-join-rescans-inner-p (join right)
+  "Recognize LATERAL and parameterized IndexScan inputs from the physical plan."
+  (or (getf join :lateral-dependent)
+      (and (eq (first right) :index-scan)
+           (physical-index-scan-parameter right))))
+
+(defun execute-physical-join (node emit run-child run-node)
   (let* ((join (second node))
          (left (third node))
-         (right (fourth node))
-         (right-relation
-           (and (member (first right) '(:seq-scan :index-scan) :test #'eq)
-                (physical-scan-relation right registered-relations)))
-         (right-path
-           (and right-relation
-                (physical-scan-path right right-relation))))
-    (if (or (getf join :lateral-dependent)
-            (and right-path (select-scan-path-parameter-expr right-path)))
+         (right (fourth node)))
+    (if (physical-join-rescans-inner-p join right)
         (stream-select-indexed-join-environments
          (lambda (left-callback)
            (funcall run-child left left-callback))
@@ -2081,7 +2083,7 @@ ROW's source environment.  Only final target origins leave this projection."
                 (lambda (environment)
                   (when (true-p (eval-expr qual environment))
                     (funcall emit environment))))))
-    (:nested-loop-join (execute-physical-join node registered-relations emit run-child run-node))
+    (:nested-loop-join (execute-physical-join node emit run-child run-node))
     (:window-input
      (funcall run-child (third node)
               (lambda (environment)

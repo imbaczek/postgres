@@ -189,6 +189,9 @@ a sorted row, including after portal suspension.
 Both join drivers share pair qualification, including the combined row,
 datum origins and source presence visible to the ON expression. Replay,
 match tracking and null extension remain in the driver state machines.
+Both drivers identify LATERAL and parameterized index inner inputs from
+the physical plan. Deciding whether to rescan no longer constructs a scan
+path. Index handle validation still runs during admission and scan setup.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING
