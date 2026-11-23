@@ -146,6 +146,11 @@ For B7, logical slot decode rejects PGSLOT1–3. PGSLOT4/5 remain supported
 because current writers emit them, alongside the provenance and child owner
 formats. Continuation fixtures use noncanonical PGSLOT4 values to verify
 that inventory and no-op proof paths preserve the original bytes.
+The live logical capture fixture derives checksummed PGSLOT1–5 images
+from a SQL-created PGSLOT6 slot's durable coordinates. Cold startup rejects
+PGSLOT1–3 without changing their bytes, restores PGSLOT4 and PGSLOT5
+without rewriting them, and then restores the original PGSLOT6 slot and
+the recovered heap row.
 
 For B8, the bootstrap pin reader requires PGPHYSPIN2 and rejects a
 checksummed PGPHYSPIN1 pin without rewriting it. PGPHYSPIN2 keeps both

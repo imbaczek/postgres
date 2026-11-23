@@ -109,4 +109,75 @@ start_server
 [ "$(sql 'SELECT count(*) FROM spool_rows WHERE id >= 10')" = 0 ]
 sql "INSERT INTO spool_rows VALUES (12, 'recovered')" >/dev/null
 [ "$(sql 'SELECT value FROM spool_rows WHERE id=12')" = recovered ]
+test "$(sql "SELECT slot_name FROM pg_create_logical_replication_slot('retirement_probe','pgoutput')")" = retirement_probe
+slot_row_sql="SELECT slot_name, plugin, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'retirement_probe'"
+slot_row=$(sql "$slot_row_sql")
+test -n "$slot_row"
+kill -INT "$SERVER"
+wait "$SERVER"
+SERVER=
+slot_state="$TMP/data/pg_replslot/retirement_probe/state"
+cp -p "$slot_state" "$TMP/current-slot"
+PYTHONPATH="$BASE/t/interop${PYTHONPATH:+:$PYTHONPATH}" python3 - "$TMP" <<'PY'
+import sys
+from pathlib import Path
+
+from crc32c_reference import crc32c
+
+root = Path(sys.argv[1])
+line = (root / "current-slot").read_bytes()
+assert line.endswith(b"\n")
+prefix, checksum = line[:-1].rsplit(b" ", 1)
+assert int(checksum, 16) == crc32c(prefix)
+magic, name, database, restart, consistent, confirmed, plugin, profile, *provenance = prefix.split()
+assert (magic, name, plugin, profile) == (b"PGSLOT6", b"retirement_probe", b"pgoutput", b"text")
+assert provenance
+status = b"reserved"
+
+
+def write_slot(path, fields):
+    prefix = b" ".join(fields)
+    path.write_bytes(prefix + f" {crc32c(prefix):08X}\n".encode())
+
+
+legacy = ((name, restart, consistent),
+          (name, restart, consistent, confirmed, status),
+          (name, database, restart, consistent, confirmed, status))
+for version, fields in enumerate(legacy, 1):
+    write_slot(root / f"retired-slot-{version}", (f"PGSLOT{version}".encode(), *fields))
+write_slot(root / "supported-slot-4",
+           (b"PGSLOT4", name, database, restart, consistent, confirmed, status, plugin))
+write_slot(root / "supported-slot-5",
+           (b"PGSLOT5", name, database, restart, consistent, confirmed, status,
+            b"pg_lisp", b"binary-bytea"))
+PY
+for version in 1 2 3; do
+    retired="$TMP/retired-slot-$version"
+    cp "$retired" "$slot_state"
+    status=0
+    timeout 30 "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/data" -c wal_level=logical \
+        >"$retired.log" 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -Fq 'replication slot file retirement_probe is malformed' "$retired.log"
+    cmp "$retired" "$slot_state"
+done
+for version in 4 5; do
+    supported="$TMP/supported-slot-$version"
+    cp "$supported" "$slot_state"
+    start_server
+    expected="$slot_row"
+    if [ "$version" -eq 5 ]; then
+        expected=$(printf '%s\n' "$slot_row" | sed 's/|pgoutput|/|pg_lisp|/')
+    fi
+    test "$(sql "$slot_row_sql")" = "$expected"
+    cmp "$supported" "$slot_state"
+    kill -INT "$SERVER"
+    wait "$SERVER"
+    SERVER=
+done
+cp -p "$TMP/current-slot" "$slot_state"
+start_server
+test "$(sql "$slot_row_sql")" = "$slot_row"
+cmp "$TMP/current-slot" "$slot_state"
+test "$(sql 'SELECT value FROM spool_rows WHERE id=12')" = recovered
 echo 'logical-capture-spill: PASS'
