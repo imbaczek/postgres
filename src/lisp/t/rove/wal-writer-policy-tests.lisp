@@ -285,7 +285,8 @@
         (rove:ok (= 200 (wal-writer-policy-delay policy)))
         (rove:ok (= 128 (wal-writer-policy-flush-after policy))))
       (dolist (case '(("wal_writer_delay" "200" "ms" "200ms")
-                      ("wal_writer_flush_after" "128" "8kB" "1MB")))
+                      ("wal_writer_flush_after" "128" "8kB" "1MB")
+                      ("wal_receiver_status_interval" "10" "s" "10s")))
         (destructuring-bind (name value unit show) case
           (let ((row (startup-settings-row name (gethash name settings))))
             (rove:ok (equal value (aref row 1)))

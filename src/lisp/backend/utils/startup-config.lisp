@@ -1267,27 +1267,26 @@ Without an installed root, return session rows."
      (list (session-timeout-settings-row) (session-application-name-settings-row)))))
 
 (defun startup-setting-show-value (name)
-  "Read NAME from one installed root; return no match when none is installed."
-  (let ((configuration (startup-capture-configuration)))
-    (when configuration
-      (let ((entry (gethash name (startup-configuration-settings configuration))))
-        (when entry
-          (let ((value (getf entry :value)))
-            (values (case (intern (string-upcase name) :keyword)
-                      (:checkpoint_timeout (startup-format-unit value :seconds))
-                      (:wal_writer_delay (startup-format-unit value :milliseconds))
-                      (:wal_writer_flush_after (startup-format-unit (* value 8192) :bytes))
-                      ((:max_wal_size :wal_keep_size)
-                       (startup-format-unit (* value 1024 1024) :bytes))
-                      (:max_slot_wal_keep_size
-                       (let ((limit (wal-slot-retention-policy-limit
-                                     (startup-configuration-slot-policy configuration))))
-                         (if limit (startup-format-unit limit :bytes) "-1")))
-                      (t (startup-setting-text
-                          name value (startup-setting-value
-                                      (startup-configuration-settings configuration)
-                                      "archive_mode"))))
-                    t)))))))
+  "Read NAME from one installed root and render the descriptor's display units."
+  (let* ((configuration (startup-capture-configuration))
+         (settings (when configuration (startup-configuration-settings configuration)))
+         (entry (when settings (gethash name settings))))
+    (when entry
+      (let* ((value (getf entry :value))
+             (spec (find-startup-setting name))
+             (unit (when spec (startup-setting-descriptor-unit spec))))
+        (values (cond
+                  ;; The native retention limit can be set in exact bytes.
+                  ((string= name "max_slot_wal_keep_size")
+                   (let ((limit (wal-slot-retention-policy-limit
+                                 (startup-configuration-slot-policy configuration))))
+                     (if limit (startup-format-unit limit :bytes) "-1")))
+                  ((member unit '(:seconds :milliseconds))
+                   (startup-format-unit value unit))
+                  ((eq unit :xblocks) (startup-format-unit (* value 8192) :bytes))
+                  ((eq unit :megabytes) (startup-format-unit (* value 1048576) :bytes))
+                  (t (startup-setting-text name value (startup-setting-value settings "archive_mode"))))
+                t)))))
 
 (defun startup-configuration-output (argv)
   "Return the requested -C value in base units using normal configuration precedence.
