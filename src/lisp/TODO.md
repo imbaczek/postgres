@@ -416,6 +416,10 @@ CTE filter pushdown uses these same rules for both eligibility and column
 substitution. The regression checks out-of-scope and volatile operands,
 owned copies of substituted expressions, and unchanged literal and call
 metadata. The 114-case CTE differential passed.
+Physical plan subplan discovery uses the shared visitor for execution-owner
+table registration and plan instrumentation. The regression checks discovery
+order, deduplication, comparison subplans, and opaque call and literal data.
+The 111-case subquery and 114-case CTE differentials passed.
 
 ## Open development tasks
 

@@ -36,6 +36,18 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest physical-plan-discovers-only-executable-subplans
+    (let* ((nested (make-sql-subplan :kind :scalar))
+           (hidden (make-sql-subplan :kind :scalar))
+           (visible (make-sql-subplan :kind :any :test (list :subplan nested)))
+           (expression (list :func "f"
+                             (list (list :const (list :subplan hidden))
+                                   (list :subplan visible)
+                                   (list :subplan nested))
+                             :saved (list :subplan hidden)))
+           (plan (%make-query-plan :physical (list :project (list (list :expr expression)) nil))))
+      (rove:ok (equal (query-plan-expression-subplans plan) (list visible nested)))))
+
 (rove:deftest local-expression-mapper-leaves-scope-transitions-to-callers
     (let* ((column '(:col 2 :type :int4))
            (descriptor (make-sql-subplan :test column))

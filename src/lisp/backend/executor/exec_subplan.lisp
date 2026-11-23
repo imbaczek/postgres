@@ -42,15 +42,18 @@
           (getf prepared :sublinks)))
 
 (defun query-plan-expression-subplans (plan)
+  "Collect descriptors in physical execution expressions in discovery order."
   (let ((descriptors nil))
-    (labels ((visit (form)
-               (cond
-                 ((sql-subplan-p form)
-                  (unless (member form descriptors :test #'eq)
-                    (push form descriptors)
-                    (visit (sql-subplan-test form))))
-                 ((consp form) (visit (car form)) (visit (cdr form))))))
-      (visit (query-plan-physical plan)))
+    (some-local-plan-expression
+     (lambda (form walk)
+       (declare (ignore walk))
+       (when (subquery-expression-p form)
+         (let ((descriptor (second form)))
+           (if (and (sql-subplan-p descriptor)
+                    (not (member descriptor descriptors :test #'eq)))
+               (progn (push descriptor descriptors) nil)
+               (values nil t)))))
+     (query-plan-physical plan))
     (nreverse descriptors)))
 
 (defun reset-query-plan-tree-instrumentation (plan &optional (seen (make-hash-table :test #'eq)))
