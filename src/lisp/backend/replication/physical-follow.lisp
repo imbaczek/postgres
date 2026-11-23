@@ -1869,7 +1869,7 @@ Selection still requires WAL transition evidence and durable publication."
       (physical-follow-fetch-archive runtime command system-id timeline segment namespace)
     (cond ((and bytes (or (null limit) (<= end limit)))
            (values bytes end))
-          ((and limit (plusp (mod limit +wal-segment-size+))
+          ((and (eq namespace :timeline) limit (plusp (mod limit +wal-segment-size+))
                 (= segment (floor limit +wal-segment-size+)))
            (multiple-value-bind (partial proved-end)
                (physical-follow-fetch-archive runtime command system-id timeline segment namespace t)

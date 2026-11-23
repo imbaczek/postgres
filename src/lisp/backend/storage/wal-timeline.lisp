@@ -81,10 +81,10 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
           (when (and temporary (not finished))
             (ignore-errors (sb-posix:unlink (namestring temporary)))))))))
 
-(defun wal-archive-promotion-partial-name (source-timeline fork namespace)
+(defun wal-archive-promotion-partial-name (source-timeline fork)
   (multiple-value-bind (segment offset) (wal-segment-and-offset fork)
     (when (plusp offset)
-      (concatenate 'string (wal-segment-filename segment source-timeline namespace) ".partial"))))
+      (concatenate 'string (wal-segment-filename segment source-timeline :timeline) ".partial"))))
 
 (defun wal-archive-install-source (directory-fd name bytes check-directory)
   "Sync archive source bytes and publish them without replacing a name."
@@ -128,7 +128,7 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
 
 (defun wal-archive-stage-promotion-partial (source-timeline fork prefix)
   "Stage the verified fork prefix under its timeline-qualified archive name."
-  (let ((name (wal-archive-promotion-partial-name source-timeline fork :timeline)))
+  (let ((name (wal-archive-promotion-partial-name source-timeline fork)))
     (when name
       (unless (and (typep prefix '(vector (unsigned-byte 8)))
                    (= (length prefix) (mod fork +wal-segment-size+)))

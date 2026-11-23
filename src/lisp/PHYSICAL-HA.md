@@ -405,7 +405,8 @@ and changed ancestor bytes. Strict compilation and six focused heads took
 
 C gives the old timeline's last incomplete segment a separate `.partial`
 name. Native promotion with archiving enabled now stages the authenticated
-fork prefix as `.wal.partial` before installing the child prefix. An exact
+fork prefix under a timeline-qualified `.wal.partial` name before
+installing the child prefix. An exact
 segment boundary needs no partial. Staging syncs the separate file and publishes
 it without replacing an existing name. A retry compares the held file bytes
 and identity and syncs the owning directory. Cold pending promotion can stage
@@ -427,8 +428,11 @@ compilation and eight focused heads took 63.22 s.
 
 Promotion partials now receive a proof after the partial archive receipt. Restore
 accepts a partial only when its proof matches the requested segment and the exact
-selected fork. A data receipt allows a proof retry after the child WAL has been
-recycled. Older partials without proofs require a regenerated proof before restore.
+selected fork. Promotion partials and their proofs require timeline-qualified
+names for archive publication and restore. Legacy-named complete segments
+retain their restore path. A data receipt allows a proof retry after the child
+WAL has been recycled. A qualified partial without a proof requires a
+regenerated proof before restore.
 The pinned Patroni `archive-promotion-history` run verified that both the partial
 and its proof reached the archive in 27.03 s on the ramdisk. Five focused tests
 passed in 1.92 s, covering exact and mismatched fork selection, missing and

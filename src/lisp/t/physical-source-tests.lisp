@@ -520,7 +520,11 @@
            (write-byte 9 stream))
          (ok (pg::wal-archiver-step))
          (ok (not (probe-file target)))
-         (let ((pg::*wal-durable-lsn* 6))
+         (let ((pg::*wal-durable-lsn* 6)
+               (legacy (merge-pathnames "0000000000000000.wal.partial" (pg::wal-directory))))
+           (pg::wal-atomic-write-bytes legacy prefix)
+           (ok (equal (pg::wal-archive-partial-items)
+                      (list (list :partial name "000000020000000000000000.wal" 5))))
            (with-open-file (stream (merge-pathnames name (pg::wal-directory))
                                    :direction :io :if-exists :overwrite
                                    :element-type '(unsigned-byte 8))

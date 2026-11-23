@@ -393,6 +393,11 @@ legacy partials still use the existing reader and archiver validation.
 The live standby archive scenario passed with Patroni 4.1.5 and the matching
 C client library. It covered cold restart, archive retries, promoted-writer
 handoff, and an exact timeline-qualified fork proof after a second promotion.
+Archive discovery, proof matching, and restore now require timeline-qualified
+promotion partials. Six strict heads passed. They include a valid legacy
+partial and proof that cannot advance receipt, exclusion of legacy partials
+from the archiver queue, and qualified restore only at the exact fork.
+The complete-segment legacy fallback stays available for now.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

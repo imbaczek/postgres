@@ -167,15 +167,14 @@ Skip absent files and files with unsuitable type or length."
                                               (wal-archive-read-source-bytes
                                                wal-fd (timeline-history-filename *wal-insert-timeline*)))
                      for (segment offset) = (multiple-value-list (wal-segment-and-offset fork))
-                     when (and (plusp offset) (<= fork *wal-durable-lsn*))
-                       append (loop for namespace in (if (= parent 1) '(:timeline :legacy) '(:timeline))
-                                    for name = (wal-archive-promotion-partial-name parent fork namespace)
-                                    for stat = (query-temp-lstat (merge-pathnames name (wal-directory)))
-                                    when (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                                              (= offset (sb-posix:stat-size stat)))
-                                      collect (list :partial name
-                                                    (wal-segment-filename segment child :timeline)
-                                                    offset))))
+                     for name = (wal-archive-promotion-partial-name parent fork)
+                     for stat = (and name (<= fork *wal-durable-lsn*)
+                                     (query-temp-lstat (merge-pathnames name (wal-directory))))
+                     when (and stat (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                               (= offset (sb-posix:stat-size stat)))
+                       collect (list :partial name
+                                     (wal-segment-filename segment child :timeline)
+                                     offset)))
           (sb-posix:close wal-fd))))))
 
 (defun wal-archive-partial-matches-p (wal-fd item &optional source-facts)
@@ -529,13 +528,12 @@ under the lock, and publish completion only after success."
                (when (and (equal facts (wal-archive-check-source wal-fd name source-fd))
                           (or (null proof-facts) (equal proof-facts read-facts)))
                  (if (wal-archive-partial-item-p item)
-                     (let* ((stem (subseq name 0 (- (length name) (length ".wal.partial"))))
-                            (namespace (if (= (length stem) 16) :legacy :timeline)))
-                       (multiple-value-bind (timeline segment) (wal-parse-segment-name stem namespace)
+                     (let ((stem (subseq name 0 (- (length name) (length ".wal.partial")))))
+                       (multiple-value-bind (timeline segment) (wal-parse-segment-name stem :timeline)
                          (and timeline
                               ;; The data receipt binds bytes checked against the committed child.
                               (wal-verify-archive-segment-proof
-                               proof (catalog-system-identifier) timeline segment namespace bytes))))
+                               proof (catalog-system-identifier) timeline segment :timeline bytes))))
                      (wal-verify-archive-segment-proof
                       proof (catalog-system-identifier) *wal-insert-timeline* item *wal-segment-namespace* bytes))))))
       (sb-posix:close source-fd))))
