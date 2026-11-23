@@ -2180,6 +2180,9 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
       (t (error "unsupported empty metadata terminal")))))
 
 (defun wal-atomic-write-bytes (path bytes &key mode)
+  "Durably replace PATH with BYTES. Reserve the tmp type for staging."
+  (when (equal (pathname-type path) "tmp")
+    (error "WAL atomic write destination uses reserved temporary file type: ~a" path))
   (with-atomic-output (stream
                        path
                        (make-pathname :type "tmp" :defaults path)

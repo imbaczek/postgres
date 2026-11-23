@@ -2143,10 +2143,11 @@ still has work outstanding.
   reused by later checks. Those cases now use fresh lists; check for other cases
   and exercise repeated operations in the same Lisp image.
 
-- [ ] Audit `wal-atomic-write-bytes` callers for temporary destination aliases.
-  Its temporary pathname uses type `tmp`, so a destination already ending in
-  `.tmp` can alias the temporary and cleanup can remove the destination. This
-  was observed in a new fixture; production callers have not been fully audited.
+- [x] Audit `wal-atomic-write-bytes` callers for temporary destination aliases.
+  All 20 production call sites use fixed metadata names, generated names with
+  fixed suffixes, or the standby backup writer's three selected WAL and control
+  paths. The writer rejects the reserved `.tmp` destination suffix before I/O.
+  The regression covers an existing destination and an absent destination.
 
 - [ ] Reproduce and report Dissect's SBCL frame-local inspection fault. While Rove
   reported a missing installed configuration in a retention fixture, Dissect's

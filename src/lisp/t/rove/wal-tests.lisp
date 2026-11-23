@@ -1773,6 +1773,22 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                  (error () t))
                "an unsupported format is rejected even with a valid control CRC")))
 
+(rove:deftest test-wal-atomic-write-refuses-temporary-destination
+    (call-with-wal-scan-test-files
+     nil 0
+     (lambda ()
+       (let ((path (merge-pathnames "control.tmp" *pgdata*))
+             (original (string->bytes "original"))
+             (replacement (string->bytes "replacement")))
+         (with-open-file (stream path :direction :output :element-type '(unsigned-byte 8))
+           (write-sequence original stream))
+         (rove:ok (rove:signals (wal-atomic-write-bytes path replacement) 'error))
+         (rove:ok (and (probe-file path)
+                       (equalp original (read-bounded-regular-file path 32))))
+         (delete-file path)
+         (rove:ok (rove:signals (wal-atomic-write-bytes path replacement) 'error))
+         (rove:ok (null (probe-file path)))))))
+
 (rove:deftest test-qualified-page-checksum-base-copy
     (call-with-wal-scan-test-files
      nil 0
