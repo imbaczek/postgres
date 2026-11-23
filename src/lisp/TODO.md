@@ -827,6 +827,13 @@ helper resolved against the matching C installation. The physical test runbook
 records that prerequisite, and the resolver reports a missing `pg_config`
 with exit status 127 and the two supported overrides.
 
+### A18 runner diagnostics
+
+The direct Rove runner reports the type and message of caught conditions. An
+injected error printed its message, counted as a failure, and left the next
+selected test running. The runner still reports per-head timing and returns a
+failing status if any selected head fails.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

@@ -1315,6 +1315,8 @@ no-init child while the suite loads, treating warnings as errors. Tests wait
 for successful compilation. Optional unqualified head names select individual
 tests, for example
 `./t/run-system-tests.sh physical --strict promotion-cold-resume-closes-interrupted-store-handoffs`.
+When Rove catches a condition, the direct runner prints its type and message
+with the failing test and continues to the next selected test.
 The full physical suite includes native libpq clients. Without an installed
 helper, point `PG_CONFIG` to a C installation with libpq development files
 from PostgreSQL 17 or later, or set `PG_LIBPQ_HELPER` to a prebuilt executable
