@@ -1238,6 +1238,9 @@ passes `:allow-clog-reset`. The fixture now forwards the full argument
 list and both return values. All four cold-recovery fault heads passed
 with a fresh strict compile, including streaming and static late exits,
 interrupted receive handoff, and CLOG registration before interruption.
+The same 702-head selection passed on frozen `c946b71c14f` with a fresh
+strict compile and zero failures in 345.19 seconds. The complete run and
+compiler receipt are archived under `architecture-physical-delta`.
 
 ### A9 follow-up evidence
 
