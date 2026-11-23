@@ -429,36 +429,6 @@ the outer caller must fence it."
                                     *wal-checkpoint-lsn* *wal-durable-lsn* *next-xid*
                                     :resource-fact (wal-copy-control-resource-fields *wal-checkpoint-snapshot*))))
 
-(defun recovery-check-literal-text (text)
-  "Accept only the literal list/string/number/keyword grammar emitted by our manifest."
-  (let ((quoted nil) (escaped nil) (depth 0))
-    (loop for char across text
-          do (cond
-               (quoted
-                (cond (escaped (setf escaped nil))
-                      ((char= char #\\) (setf escaped t))
-                      ((char= char #\") (setf quoted nil))))
-               ((char= char #\") (setf quoted t))
-               ((char= char #\() (when (> (incf depth) 16) (error "recovery manifest too deep")))
-               ((char= char #\)) (when (minusp (decf depth)) (error "invalid recovery manifest")))
-               ((or (find char " :+-" :test #'char=)
-                    (find char '(#\Tab #\Newline #\Return #\Page))
-                    (and (char>= char #\A) (char<= char #\Z))
-                    (and (char>= char #\0) (char<= char #\9))))
-               (t (error "nonliteral syntax in recovery manifest"))))
-    (when (or quoted escaped (not (zerop depth))) (error "incomplete recovery manifest"))))
-
-(defun recovery-parse-manifest-text (text)
-  "Read only the bounded literal grammar, with reader evaluation disabled."
-  (recovery-check-literal-text text)
-  (with-standard-io-syntax
-    (let ((*read-eval* nil) (*package* (find-package "CL-USER")))
-      (multiple-value-bind (manifest position) (read-from-string text)
-        (unless (every (lambda (char) (find char '(#\Space #\Tab #\Newline #\Return)))
-                       (subseq text position))
-          (error "trailing recovery manifest data"))
-        manifest))))
-
 (defun recovery-decode-manifest (bytes)
   "Parse the bounded original manifest envelope and return its value and digest.
 This checks bytes only and grants no filesystem authority."

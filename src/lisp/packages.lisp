@@ -10,7 +10,10 @@
            #:sql-interval-typmod #:sql-interval-typmod-range #:sql-interval-typmod-components
            #:sql-interval-range-mask #:sql-interval-range-fields
            #:+sql-array-types+ #:sql-array-type #:sql-array-element-type
-           #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name)
+           #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name
+           #:metadata-literal-envelope-image #:metadata-literal-envelope-read #:metadata-literal-envelope-decode
+           #:metadata-sized-literal-header #:metadata-sized-literal-span #:physical-bootstrap-manifest-text #:recovery-parse-manifest-text
+           #:recovery-check-literal-text #:%metadata-literal-tree-p #:%metadata-literal-list-p #:string->bytes #:bytes->string #:wal-crc32)
   (:export #:main))
 
 (defpackage #:pg.sql-types
@@ -34,3 +37,14 @@
            #:sql-interval-range-mask #:sql-interval-range-fields
            #:sql-array-type #:sql-array-element-type
            #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name))
+
+(defpackage #:pg.metadata-literal
+  (:use #:cl)
+  ;; Import the established identities so running callers survive reload.
+  (:import-from #:pg
+                #:metadata-literal-envelope-image #:metadata-literal-envelope-read #:metadata-literal-envelope-decode
+                #:metadata-sized-literal-header #:metadata-sized-literal-span #:physical-bootstrap-manifest-text #:recovery-parse-manifest-text
+                #:recovery-check-literal-text #:%metadata-literal-tree-p #:%metadata-literal-list-p #:string->bytes #:bytes->string #:wal-crc32)
+  (:export
+   #:metadata-literal-envelope-image #:metadata-literal-envelope-read #:metadata-literal-envelope-decode
+   #:metadata-sized-literal-header #:metadata-sized-literal-span #:physical-bootstrap-manifest-text #:recovery-parse-manifest-text))

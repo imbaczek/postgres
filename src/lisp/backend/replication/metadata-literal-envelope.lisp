@@ -1,4 +1,51 @@
-(in-package #:pg)
+(in-package #:pg.metadata-literal)
+
+(defun physical-bootstrap-manifest-text (manifest)
+  "Print stable eligible literal trees directly, producing an owned string.
+Standard I/O syntax with readably NIL avoids SBCL's readable BASE-CHAR #A arrays.
+Ineligible trees use the historical copier fallback; depth or cycle rejection
+only declines the fast path and does not add a new cycle error."
+  (when (%metadata-literal-tree-p manifest 0)
+    (return-from physical-bootstrap-manifest-text
+      (with-standard-io-syntax
+        (let ((*print-readably* nil))
+          (prin1-to-string manifest)))))
+  (labels ((literal (value)
+             (typecase value
+               (string (map 'string #'identity value))
+               (cons (mapcar #'literal value))
+               (t value))))
+    (with-standard-io-syntax (prin1-to-string (literal manifest)))))
+
+(defun recovery-check-literal-text (text)
+  "Accept only the literal list/string/number/keyword grammar emitted by our manifest."
+  (let ((quoted nil) (escaped nil) (depth 0))
+    (loop for char across text
+          do (cond
+               (quoted
+                (cond (escaped (setf escaped nil))
+                      ((char= char #\\) (setf escaped t))
+                      ((char= char #\") (setf quoted nil))))
+               ((char= char #\") (setf quoted t))
+               ((char= char #\() (when (> (incf depth) 16) (error "recovery manifest too deep")))
+               ((char= char #\)) (when (minusp (decf depth)) (error "invalid recovery manifest")))
+               ((or (find char " :+-" :test #'char=)
+                    (find char '(#\Tab #\Newline #\Return #\Page))
+                    (and (char>= char #\A) (char<= char #\Z))
+                    (and (char>= char #\0) (char<= char #\9))))
+               (t (error "nonliteral syntax in recovery manifest"))))
+    (when (or quoted escaped (not (zerop depth))) (error "incomplete recovery manifest"))))
+
+(defun recovery-parse-manifest-text (text)
+  "Read only the bounded literal grammar, with reader evaluation disabled."
+  (recovery-check-literal-text text)
+  (with-standard-io-syntax
+    (let ((*read-eval* nil) (*package* (find-package "CL-USER")))
+      (multiple-value-bind (manifest position) (read-from-string text)
+        (unless (every (lambda (char) (find char '(#\Space #\Tab #\Newline #\Return)))
+                       (subseq text position))
+          (error "trailing recovery manifest data"))
+        manifest))))
 
 (defun metadata-literal-envelope-image (magic value maximum label)
   "Encode a canonical literal in a magic, CRC and terminal-newline envelope."

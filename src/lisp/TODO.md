@@ -22,6 +22,29 @@ prefixes, then receive-control snapshots. The query and WAL tracks can proceed
 in parallel wherever their inputs are stable. Keep format cutovers, replay-order
 changes and package reorganizations in separate PRs.
 
+### Architecture decisions
+
+- The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table
+  and [producer inventory](#milestone-0-producer-inventory) govern development
+  upgrades. Retired formats need matching older code for export or migration.
+  Native WAL and physical replication have their own on-disk and wire formats.
+- Push and pull preserve their row lifetimes while sharing SQL operator
+  semantics. Coercion follows the caller's SQL context, and expression
+  traversal enters nested scopes only at their executable boundaries. See
+  [query evidence](#refactoring-audit-crosswalk) and [scoped traversal](#a9-follow-up-evidence).
+- Execution owners hold readers, snapshots and cursors through cleanup.
+  Suspended portals retain their execution until retirement. Reload uses
+  live-operation exclusion, and layout cutovers require a restart.
+- WAL record framing, batch validation and replay fact derivation precede
+  publication. Primary FIFO settlement and redo each retain their ordering,
+  and selected EOR remains a separate validated transition.
+- Shared metadata codecs preserve canonical bytes and checksums. Journal
+  readers accept a proven complete prefix, while domain owners validate and
+  publish the adoption or reseed steps. See [Milestone 1](#milestone-1-verification).
+- ASDF dependencies and package imports follow the verified interfaces.
+  Fixture owners retain cleanup authority. The [combined test runner](#a18-runner-diagnostics)
+  reports both harnesses, and independent C and wire probes check protocol and SQL behavior.
+
 Consult the corresponding PostgreSQL C implementation during planning and
 implementation. Work REPL-first with SLIME or Sly and use cl-mcp for Lisp edits.
 Use tilth or a code-search MCP for other code. Use cl-spec and Rove where useful
@@ -653,7 +676,7 @@ independently supplied wrong timeline and of a position inside a record.
 | A16. Settings metadata | Read-only descriptors in `63085c92361`. The config-output test verified include files, CLI overrides, base units, C metadata and binary numeric parity, and no storage initialization. The numeric and rollback session tests passed, and the application-name C differential verified startup, SQL, wire status, transaction-local restoration, and live reload. The full_page_writes process test passed startup, session context rejection, unchanged and changed SIGHUP reloads, invalid reload rollback, and cold reconciliation. Its probe in `054535a1613` uses the reload timeout when SIGHUP forces code recompilation. |
 | A17. Repeated fixtures and fault setup | The producer inventory records current fixture formats. WAL namespace and restartpoint process tests share a stopped-source fixture conversion. In `03c8c542470`, receiver exit, physical replay and retention share native launch and checked control calls while keeping their own cleanup and readiness policies. All three process tests passed. The retention fixture pauses replay explicitly and installs restartpoint thresholds and slot retention through configuration, then verifies local recycling, cold restart and durable pin loss. In `c10f5055bef`, online promotion and ordinary crash restarts use the same fixture helpers, and instrumented startups retain their crash hooks. The crash suite compares recovered rows with the current seed and uses one short control socket path. Online promotion and the expanded crash suite passed, including seven crash cuts, startup signal handling and an unterminated receive batch. In `c7ec1f1ebb9`, namespace migration and automatic restartpoint also share launch and control helpers while retaining the namespace control timeout. Both namespace layouts passed restartpoint recovery and rejected an unproven promotion without changing storage. The migration suite passed its crash and retry boundaries, byte preservation, continued follow and qualified bootstrap. Audit the remaining fault scenarios. |
 | A18. Test discovery split | Combined ASDF operation in `455e5e741aa`. The shell run and injected Rove failure evidence above cover execution and reporting. `t/run-unit-tests.sh --list` uses Rove registration and the legacy execution declarations to list 1,596 Rove heads and 166 legacy cases without running them. The legacy listing matches the previous invocation order, including the named VACUUM failpoint variant. Normal execution still passed 1,172 legacy checks. |
-| A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Further package boundaries remain to audit. |
+| A19. Package and ASDF organization | ASDF explicitly orders the WAL record and recovery components. In `d62f2710c66`, it also orders replay fact derivation after the store history and policy codecs, and before proof scanners and redo. Eight strict physical heads and the timeline-qualified restartpoint process test passed. In `729d9e4e567`, `pg/sql-types` loads independently with SQLSTATE support. In `7bbff227c87`, package `PG.SQL-TYPES` exposes the type operations and keeps the reverse OID index private. A clean-image check verified OIDs and varchar assignment errors. A running server reloaded across the package change and verified that a compiled caller and the exported entry point still use the same symbol. Package `PG.METADATA-LITERAL` owns the physical manifest literal codec and its eligibility checks. ASDF orders the codec before bootstrap and recovery. A warm reload preserved symbol identity, eight strict unit heads passed including the allocation probes, and the live physical bootstrap fixture passed. |
 | A20. Documentation drift | The test runbook was updated in `02438307f77`. The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table covers current startup, backup, follow, and restart requirements and distinguishes historical milestones. The producer inventory in `bfb3acb33bf` records current B-tree and catalog reader requirements and links to the extracted slot encoder. Update format support when the remaining cutovers land. |
 
 ### A3 follow-up evidence

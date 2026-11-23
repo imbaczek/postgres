@@ -510,23 +510,6 @@ Each read writes and hashes the same bytes.  A requested prefix must be complete
     (physical-bootstrap-test-point :after-file target)
     (list relative length digest)))
 
-(defun physical-bootstrap-manifest-text (manifest)
-  "Print stable eligible literal trees directly, producing an owned string.
-Standard I/O syntax with readably NIL avoids SBCL's readable BASE-CHAR #A arrays.
-Ineligible trees use the historical copier fallback; depth or cycle rejection
-only declines the fast path and does not add a new cycle error."
-  (when (%metadata-literal-tree-p manifest 0)
-    (return-from physical-bootstrap-manifest-text
-      (with-standard-io-syntax
-        (let ((*print-readably* nil))
-          (prin1-to-string manifest)))))
-  (labels ((literal (value)
-             (typecase value
-               (string (map 'string #'identity value))
-               (cons (mapcar #'literal value))
-               (t value))))
-    (with-standard-io-syntax (prin1-to-string (literal manifest)))))
-
 (defun physical-bootstrap-manifest-image (manifest)
   "Return an owned manifest image with its CRC envelope.
 Encode the canonical text as UTF-8 once and calculate the CRC over those bytes."

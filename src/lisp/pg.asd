@@ -170,9 +170,15 @@
                    (:file "../replication/logical-slot-imported-state")
                    (:file "../replication/physical-fpw")
                    (:file "../replication/physical-logical-status")
+                   (:file "../replication/metadata-literal.hot")
+                   (:file "../replication/metadata-literal-envelope"
+                    :depends-on ("../replication/metadata-literal.hot"))
                    (:file "../replication/physical-bootstrap.hot")
-                   (:file "../replication/physical-bootstrap")
-                   (:file "../replication/physical-recovery")
+                   (:file "../replication/physical-bootstrap"
+                    :depends-on ("../replication/metadata-literal-envelope"
+                                 "../replication/physical-bootstrap.hot"))
+                   (:file "../replication/physical-recovery"
+                    :depends-on ("../replication/metadata-literal-envelope"))
                    (:file "../replication/physical-store-history")
                    (:file "../replication/physical-replay-facts"
                     :depends-on ("../replication/physical-store-history"
@@ -199,7 +205,6 @@
                                  "../replication/physical-replay-history"))
                    (:file "../replication/physical-prefix")
                    (:file "../replication/physical-follow-pin")
-                   (:file "../replication/metadata-literal-envelope")
                    (:file "../replication/physical-backup-lease-codec")
                    (:file "../replication/physical-backup-lease-allocation-codec")
                    (:file "../replication/physical-backup-lease-store")
