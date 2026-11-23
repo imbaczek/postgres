@@ -3,7 +3,6 @@
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
-SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PORT=${PORT:-5876}
 TARGET_PORT=$((PORT + 1))
@@ -20,11 +19,10 @@ sql() {
         -qAt -v ON_ERROR_STOP=1 -c "$2"
 }
 control() {
-    printf '%s\n(quit)\n' "$2" | "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock"
+    test_lisp_control "$TMP/$1.sock" "$2"
 }
 checked() {
-    control "$1" "$2" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log"
 }
 cleanup() {
     status=$?
@@ -42,16 +40,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 start_source() {
-    rm -f "$TMP/source.sock"
-    "$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" \
-        --control-socket "$TMP/source.sock" >>"$TMP/source.log" 2>&1 &
+    test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
     SOURCE=$!
     test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 }
 start_target() {
-    rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" \
-        --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    test_launch_lisp_server "$TARGET_PORT" "$TMP/copy" "$TMP/target.sock" "$TMP/target.log"
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
 }
@@ -96,6 +90,7 @@ compare
 checked source '(reload)' source-reload
 checked target '(reload)' target-reload
 test "$(sql "$TARGET_PORT" 'SELECT COALESCE(NULL,1)')" = 1
+wait_target "SELECT COALESCE(status,'') FROM pg_stat_get_wal_receiver()" streaming
 "$PATRONI_PYTHON" "$BASE/t/interop/patroni-tl-lsn.py" "$TARGET_PORT" standby
 "$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" streaming native "$PORT"
 # SQL pause stops only apply: durable receipt and feedback continue.
@@ -116,6 +111,9 @@ checked target '(physical-recovery-replay)' paused-direct-replay
 grep -q '^:PAUSED$' "$TMP/paused-direct-replay.log"
 checked target '(reload)' paused-reload
 test "$(sql "$TARGET_PORT" 'SELECT pg_get_wal_replay_pause_state()')" = paused
+# Reload can reconnect the receiver while leaving replay paused.
+wait_target "SELECT COALESCE(status,'') FROM pg_stat_get_wal_receiver()" streaming
+test "$(sql "$TARGET_PORT" 'SELECT pg_last_wal_replay_lsn()')" = "$paused_replay"
 "$PATRONI_PYTHON" "$BASE/t/interop/receiver-sql.py" "$TARGET_PORT" paused native "$PORT"
 test "$(sql "$TARGET_PORT" 'SELECT pg_wal_replay_resume()')" = ''
 wait_target "SELECT label FROM data WHERE id=1" received-while-paused
@@ -207,8 +205,8 @@ checked target '(let* ((state *physical-recovery-state*)
                   (assert (physical-store-retained-root *physical-receive-store*))
                   (wal-ensure-directory-durable (wal-replication-slot-directory))
                   (sb-thread:with-mutex (*wal-lock*)
-                    (wal-save-replication-slot slot)
-                    (wal-save-replication-slot temporary)
+                    (wal-create-replication-slot-file slot)
+                    (wal-create-replication-slot-file temporary)
                     (setf (gethash "standby_startup_slot" *wal-replication-slots*) slot
                           (gethash "standby_startup_temp" *wal-replication-slots*) temporary)))' slot-fixtures
 kill -KILL "$TARGET"
@@ -242,9 +240,7 @@ checked source '(physical-source-pin-release "network_base")' release
 kill -INT "$SOURCE"
 wait "$SOURCE"
 SOURCE=
-rm -f "$TMP/source.sock"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/foreign-source" \
-    --control-socket "$TMP/source.sock" >>"$TMP/foreign-source.log" 2>&1 &
+test_launch_lisp_server "$PORT" "$TMP/foreign-source" "$TMP/source.sock" "$TMP/foreign-source.log"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 checked target "(physical-follow-start \"127.0.0.1\" $PORT \"network_base\")" wrong-peer

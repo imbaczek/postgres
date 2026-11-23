@@ -881,6 +881,11 @@ The live physical bootstrap and static standby scripts share native startup
 and control helpers. The standby run also completed bootstrap with SBCL unset
 in the environment. It verified recovery read-only behavior, reload, crash
 restart, unchanged backup bytes, and refusal of five damaged image variants.
+The live physical follow fixture uses the same launch and control helpers.
+Its reload checks wait for receiver reconnection and verify that replay
+remains paused. It creates persisted slot fixtures with the slot creation
+path so startup can restore a persistent slot and remove a temporary slot.
+The full follow script passed with Patroni 4.1.5 and the matching C client.
 
 ### A18 runner diagnostics
 
