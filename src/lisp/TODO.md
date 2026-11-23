@@ -381,6 +381,10 @@ The retained-reference control and adoption-attempt fixtures likewise write
 timeline-qualified controls. Twelve strict heads passed, including startup
 refusal without rewriting the retained reference and adoption journal
 round trips and publication cuts.
+The archive transition fixture now supplies a timeline-qualified ancestor
+partial and matching proof when end-of-recovery rotates into the next
+segment. Three strict archive heads passed, covering transition evidence,
+history discovery, and bounded partial restore.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
