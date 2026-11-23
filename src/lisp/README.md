@@ -1315,6 +1315,15 @@ no-init child while the suite loads, treating warnings as errors. Tests wait
 for successful compilation. Optional unqualified head names select individual
 tests, for example
 `./t/run-system-tests.sh physical --strict promotion-cold-resume-closes-interrupted-store-handoffs`.
+The full physical suite includes native libpq clients. Without an installed
+helper, point `PG_CONFIG` to a C installation with libpq development files
+from PostgreSQL 17 or later, or set `PG_LIBPQ_HELPER` to a prebuilt executable
+from this repository. For example
+
+```sh
+PG_CONFIG=/path/to/c-postgres/bin/pg_config ./t/run-system-tests.sh physical --strict
+```
+
 This runner selects Rove test heads. The combined `./t/run-unit-tests.sh`
 entry point invokes the `pg-unit-tests/all` ASDF test operation, which runs
 the Rove suite and then the legacy harness. Use `./t/run-unit-tests.sh --list`

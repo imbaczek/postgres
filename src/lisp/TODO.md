@@ -799,6 +799,11 @@ fixtures release pending publications and dirty references before closing the
 temporary cluster. All 109 selected XID reservation, logical and FPW policy,
 and WAL namespace tests passed in strict mode.
 
+The native backup lease test passed all four capture cases with the libpq
+helper resolved against the matching C installation. The physical test runbook
+records that prerequisite, and the resolver reports a missing `pg_config`
+with exit status 127 and the two supported overrides.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

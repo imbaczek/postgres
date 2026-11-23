@@ -54,7 +54,10 @@ trap cancel HUP INT TERM
 CC=${CC:-cc}
 PG_CONFIG=${PG_CONFIG:-pg_config}
 CC_PATH=$(command -v "$CC")
-PG_CONFIG_PATH=$(command -v "$PG_CONFIG")
+PG_CONFIG_PATH=$(command -v "$PG_CONFIG") || {
+    printf 'libpq-helper: cannot find %s; set PG_CONFIG or PG_LIBPQ_HELPER\n' "$PG_CONFIG" >&2
+    exit 127
+}
 FINGERPRINT="$BUILD_DIR/fingerprint"
 sha256sum "$BASE/port/libpq-helper.c" "$BASE/t/build-libpq-helper.sh" > "$FINGERPRINT"
 readlink -f -- "$CC_PATH" >> "$FINGERPRINT"
