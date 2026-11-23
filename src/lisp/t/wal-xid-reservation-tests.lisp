@@ -167,7 +167,7 @@
 
 (defun call-with-resource-wal-fixture (function)
   (let ((pg::*wal-control-metadata* nil) (pg::*wal-insert-timeline* 1)
-                                         (pg::*wal-checkpoint-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+                                         (pg::*wal-checkpoint-timeline* 1) (pg::*wal-segment-namespace* :timeline)
                                          (pg::*wal-resource-parameters-test-hook* nil))
     (call-with-wal-allocation-fixture
      (lambda ()

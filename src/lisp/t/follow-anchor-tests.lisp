@@ -1599,7 +1599,7 @@
                                (pg::*physical-follow-aborted-attempts* (make-hash-table :test #'equal))
                                (pg::*wal-snapshot-retention-pins* (make-hash-table :test #'eq))
                                (pg::*wal-insert-timeline* timeline) (pg::*wal-checkpoint-timeline* timeline)
-                               (pg::*wal-segment-namespace* (if (= timeline 1) :legacy :timeline))
+                               (pg::*wal-segment-namespace* :timeline)
                                (pg::*wal-poisoned* nil) (pg::*pm-requested-mode* pg::+no-shutdown+)
                                (pg::*max-slot-wal-keep-bytes* nil)
                                (prefix (concatenate '(vector (unsigned-byte 8))

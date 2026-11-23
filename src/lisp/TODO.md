@@ -381,6 +381,10 @@ The retained-reference control and adoption-attempt fixtures likewise write
 timeline-qualified controls. Twelve strict heads passed, including startup
 refusal without rewriting the retained reference and adoption journal
 round trips and publication cuts.
+The same-timeline follow source and resource WAL fixtures use qualified
+names. Forty-six strict heads passed, including real-WAL anchor proof and
+reopen, rejection of unsupported legacy timelines, and XID reservation and
+resource publication failure boundaries.
 The archive transition fixture now supplies a timeline-qualified ancestor
 partial and matching proof when end-of-recovery rotates into the next
 segment. Three strict archive heads passed, covering transition evidence,
