@@ -554,15 +554,16 @@
           (ok (null pg::*physical-recovery-failed-p*))
           (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path))))))))
 
-(deftest promotion-intent-validates-base-namespace-against-immutable-provenance
+(deftest promotion-intent-rejects-legacy-base-control-before-publication
     (with-promotion-fixture (root store)
       (declare (ignore root store))
-      (pg::wal-atomic-write-bytes
-       (pg::wal-control-path)
-       (pg::wal-encode-control-image 152 152 (sample-checkpoint-snapshot :version 2 :next-xid 50
-                                                                         :oldest-active-xid 0)
-                                     :namespace :legacy))
-      (let ((before (lineage-test-bytes (pg::physical-recovery-control-path))))
+      (let* ((snapshot (sample-checkpoint-snapshot :version 2 :next-xid 50 :oldest-active-xid 0))
+             (prefix (format nil "PGWAL6 152 152 1 1 legacy ~a"
+                             (pg::wal-checkpoint-snapshot-hex snapshot)))
+             (bytes (pg::string->bytes
+                     (format nil "~a ~8,'0X~%" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
+             (before (lineage-test-bytes (pg::physical-recovery-control-path))))
+        (pg::wal-atomic-write-bytes (pg::wal-control-path) bytes)
         (ok (intake-fails-p (lambda () (call-with-promotion-exclusion #'pg::physical-promotion-publish-intent))))
         (ok (null pg::*physical-recovery-failed-p*))
         (ok (equalp before (lineage-test-bytes (pg::physical-recovery-control-path)))))))

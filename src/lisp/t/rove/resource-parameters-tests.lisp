@@ -150,7 +150,7 @@
 (rove:deftest resource-control-decodes-only-the-complete-tagged-extension
     (let ((hex (wal-resource-parameters-hex (make-resource-parameters 100 8 10 0 128))))
       (flet ((decode (tail)
-               (let ((prefix (format nil "PGWAL6 0 96 1 1 legacy - 42 4 0 ~a" tail)))
+               (let ((prefix (format nil "PGWAL6 0 96 1 1 timeline - 42 4 0 ~a" tail)))
                  (wal-decode-control-line
                   (format nil "~a ~8,'0X" prefix (wal-crc32 (string->bytes prefix)))))))
         (rove:ok (equal '(100 8 10 0 128)

@@ -174,7 +174,7 @@
                                  (files (list
                                          (list "recovery.required" (pg::string->bytes (format nil "PGPHYSICAL-RECOVERY-REQUIRED-1~%")))
                                          (list "physical-recovery.control" (pending-test-control))
-                                         (list "global/pg_wal_control" (pg::wal-encode-control-image 32 96 nil :namespace :legacy))
+                                         (list "global/pg_wal_control" (pg::wal-encode-control-image 32 96 nil))
                                          (list "global/pg_control" #(3 4 5))
                                          (list "pg_wal/0000000000000000.wal" #(7 8 9))
                                          (list "global/catalog" #(12 13))

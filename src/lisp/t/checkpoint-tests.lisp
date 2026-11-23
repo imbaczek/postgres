@@ -151,7 +151,7 @@
                                  (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
                                  (control (pg::wal-control-path))
                                  (wal (merge-pathnames "pg_wal/0000000000000000.wal" root))
-                                 (bytes (pg::wal-encode-control-image 0 64 nil :timeline 2 :checkpoint-timeline 1 :namespace :legacy))
+                                 (bytes (pg::wal-encode-control-image 0 64 nil :timeline 2 :checkpoint-timeline 1))
                                  (tail (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
         (pg::wal-atomic-write-bytes control bytes)
         (pg::wal-atomic-write-bytes wal tail)
@@ -227,7 +227,7 @@
       (ok (intake-fails-p (lambda () (pg::wal-decode-checkpoint-snapshot bytes))))
       (let* ((hex (with-output-to-string (out)
                     (loop for byte across bytes do (format out "~2,'0X" byte))))
-             (prefix (format nil "PGWAL6 152 300 1 1 legacy ~a" hex))
+             (prefix (format nil "PGWAL6 152 300 1 1 timeline ~a" hex))
              (line (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))
         (ok (intake-fails-p (lambda () (pg::wal-decode-control-line line)))))))
 

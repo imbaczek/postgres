@@ -456,7 +456,7 @@ all fields before the CRC itself."
                (typep timeline '(integer 1 4294967295))
                (typep checkpoint-timeline '(integer 1 4294967295))
                (<= checkpoint-timeline timeline)
-               (member namespace '(:legacy :timeline))
+               (eq namespace :timeline)
                (or (null metadata)
                    (and (wal-control-metadata-valid-p metadata)
                         (wal-control-resource-position-valid-p metadata durable timeline)))
@@ -465,8 +465,8 @@ all fields before the CRC itself."
                         (= checkpoint (getf snapshot :end))
                         (= checkpoint-timeline (getf snapshot :timeline)))))
     (error "invalid WAL control checkpoint copy"))
-  (let* ((prefix (format nil "PGWAL6 ~d ~d ~d ~d ~a ~a" checkpoint durable timeline
-                         checkpoint-timeline (ecase namespace (:legacy "legacy") (:timeline "timeline"))
+  (let* ((prefix (format nil "PGWAL6 ~d ~d ~d ~d timeline ~a" checkpoint durable timeline
+                         checkpoint-timeline
                          (if snapshot (wal-checkpoint-snapshot-hex snapshot) "-")))
          (prefix (if metadata
                      (format nil "~a ~d ~d ~d" prefix (getf metadata :system-id)
@@ -528,6 +528,8 @@ The control CRC does not verify relation pages. Resource facts may be absent."
                  (<= checkpoint-timeline timeline) namespace
                  crc (= crc (wal-crc32 (string->bytes (format nil "~{~a~^ ~}" (butlast fields))))))
       (error "corrupt WAL control image"))
+    (when (eq namespace :legacy)
+      (error "startup requires timeline-qualified WAL; migrate the data with the previous build"))
     (let* ((payload (seventh fields))
            (snapshot (unless (equal payload "-")
                        (wal-checkpoint-snapshot-from-hex payload))))

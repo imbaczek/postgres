@@ -1132,7 +1132,7 @@ this listener evaluates arbitrary Lisp."
                   ;; expressions outside live admission. The backup owns its gate.
                   (funcall (first form) (second form) (third form)))
                  ((and (consp form)
-                       (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-recovery-prepare-shutdown physical-recovery-promote physical-follow-stop wal-migrate-timeline-namespace))
+                       (member (first form) '(physical-recovery-enable-streaming physical-recovery-replay physical-recovery-restartpoint physical-recovery-prepare-shutdown physical-recovery-promote physical-follow-stop))
                        (null (rest form)))
                   (funcall (first form)))
                  ((and (consp form) (eq (first form) 'physical-recovery-select-history)

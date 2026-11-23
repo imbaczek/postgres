@@ -84,7 +84,7 @@
       (ok (intake-fails-p
            (lambda () (pg::physical-source-reservation-next after start 3003))))))
 
-(defun call-with-wal-allocation-fixture (function &key legacy-namespace)
+(defun call-with-wal-allocation-fixture (function)
   (with-physical-store-directory (root)
     (let* ((pg::*pgdata* root) (pg::*backend* nil) (pg::*catalog* nil)
                                (pg::*catalog-oldest-relfrozenxid* nil) (pg::*physical-recovery-state* nil)
@@ -122,10 +122,6 @@
                                (pg::*xid-reservation-test-hook* nil))
       (unwind-protect
            (progn
-             (when legacy-namespace
-               (ensure-directories-exist (pg::wal-control-path))
-               (pg::wal-atomic-write-bytes (pg::wal-control-path)
-                                           (pg::wal-encode-control-image 0 0 nil :namespace :legacy)))
              (pg::wal-init)
              (pg::xact-init :initialize t)
              (funcall function))

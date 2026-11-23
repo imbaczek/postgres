@@ -12,7 +12,7 @@ when each recorded check ran.
 | Artifact | Current baseline |
 | --- | --- |
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
-| Primary WAL control and checkpoint payload | `PGWAL6` and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
+| Primary WAL control and checkpoint payload | `PGWAL6` with the `timeline` namespace and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
 | Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Use the [previous build's namespace migration operation](#timeline-qualified-native-wal-namespace) with `archive_mode=off` for a stopped legacy primary. Recreate legacy backups and reseed standbys. The receive spool has its own naming contract. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |

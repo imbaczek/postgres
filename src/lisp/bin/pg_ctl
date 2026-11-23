@@ -230,15 +230,8 @@ def validate_resource_fields(fields):
         raise ValueError("invalid native resource parameter facts")
 
 
-def primary_committed(root):
-    """Check durable child control and completion of pending-trigger removal.
-
-    This is a control-file wait, like C pg_ctl's production-state wait. It does
-    not probe a SQL listener or establish synchronous replication durability.
-    Lifecycle metadata may include a retained reference, resource metadata,
-    or both. All forms require a valid checksum; committed-child state also
-    requires lifecycle metadata. Promote also verifies the PGDATA owner.
-    """
+def read_primary_control(root):
+    """Read CRC-checked control fields with a timeline-qualified namespace."""
     fields = read_regular(root / "global/pg_wal_control", 1025).split()
     if not fields or fields[0] != b"PGWAL6":
         raise ValueError("invalid native WAL control")
@@ -256,13 +249,21 @@ def primary_committed(root):
         if fields[-2] != b"C1":
             raise ValueError("unsupported native page checksum format")
         fields.pop(-2)
+    if fields[5] != b"timeline":
+        raise ValueError("native WAL control requires timeline-qualified WAL")
     if len(fields) in (19, 23):
         if (fields[-3] != b"L" or re.fullmatch(rb"[0-9]+", fields[-2]) is None
                 or int(fields[-2]) >= 2**64):
             raise ValueError("invalid native logical slot evidence reference")
         del fields[-3:-1]
     validate_resource_fields(fields)
-    return (int(fields[3]) > 1 and fields[3] == fields[4] and fields[5] == b"timeline"
+    return fields
+
+
+def primary_committed(root):
+    """Check durable child control and completion of pending-trigger removal."""
+    fields = read_primary_control(root)
+    return (int(fields[3]) > 1 and fields[3] == fields[4]
             and len(fields) in (11, 15, 17, 21) and fields[8] == b"6"
             and not (root / "physical-recovery.control").exists())
 
@@ -281,6 +282,7 @@ def promote(root, wait, timeout, quiet):
             raise ValueError("server is not in standby mode") from None
         if phase not in (2, 3):
             raise ValueError("native promotion requires a streaming standby")
+        read_primary_control(root)
         path = root / "promote"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
         try:

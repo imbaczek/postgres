@@ -152,23 +152,24 @@ The shared slot fixture mocks the logger and leaves control metadata unset."
          (call-with-logical-slot-wal-cursor
           "cursor_source" start end 1 :prefix-end
           (lambda (cursor)
-            (let* ((fields (multiple-value-list (wal-read-control-fields)))
-                   (bytes (wal-encode-control-image
-                           (first fields) (if (eq failure :horizon) (1- end) (second fields))
-                           (third fields)
-                           :timeline (if (eq failure :timeline) 2 (fourth fields))
-                           :checkpoint-timeline (fifth fields)
-                           :namespace (if (eq failure :namespace)
-                                          :legacy (sixth fields))
-                           :metadata (seventh fields))))
-              (if (eq failure :missing)
-                  (delete-file (wal-control-path))
-                  (progn
-                    (when (eq failure :corrupt)
-                      (setf (aref bytes 0) (logxor 1 (aref bytes 0))))
-                    (wal-atomic-write-bytes (wal-control-path) bytes)))
-              (rove:ok (rove:signals (logical-wal-cursor-next cursor) 'error))
-              (rove:ok (= start (logical-wal-cursor-position cursor))))))
+            (case failure
+              (:missing (delete-file (wal-control-path)))
+              (:namespace
+               (wal-atomic-write-bytes (wal-control-path)
+                                       (string->bytes (format nil "PGWAL6 0 0 1 1 legacy - 748566CF~%"))))
+              (otherwise
+               (destructuring-bind (checkpoint durable snapshot timeline checkpoint-timeline namespace metadata)
+                   (multiple-value-list (wal-read-control-fields))
+                 (declare (ignore namespace))
+                 (let ((bytes (wal-encode-control-image
+                               checkpoint (if (eq failure :horizon) (1- end) durable) snapshot
+                               :timeline (if (eq failure :timeline) 2 timeline)
+                               :checkpoint-timeline checkpoint-timeline :metadata metadata)))
+                   (when (eq failure :corrupt)
+                     (setf (aref bytes 0) (logxor 1 (aref bytes 0))))
+                   (wal-atomic-write-bytes (wal-control-path) bytes)))))
+            (rove:ok (rove:signals (logical-wal-cursor-next cursor) 'error))
+            (rove:ok (= start (logical-wal-cursor-position cursor)))))
          (rove:ok (zerop (hash-table-count *wal-snapshot-retention-pins*)))))))
 
 (defun call-with-cursor-provider-file (bytes function)

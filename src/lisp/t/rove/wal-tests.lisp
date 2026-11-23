@@ -1540,10 +1540,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                             (wal-append-record +wal-record-commit+ 55 #())))
                         (lambda ()
                           (sb-thread:with-mutex (*wal-lock*)
-                            (wal-replace-storage-incarnation-under-lock)))
-                        (lambda ()
-                          (sb-thread:with-mutex (*wal-lock*)
-                            (wal-migrate-namespace-under-lock)))))
+                            (wal-replace-storage-incarnation-under-lock)))))
            (rove:ok (handler-case (progn (funcall operation) nil)
                       (wal-input-validation-error () t)))
            (rove:ok (eq owner *wal-pending-page-publication*))
@@ -1757,7 +1754,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
 (rove:deftest test-qualified-page-checksum-control-format
     (let* ((legacy (make-wal-control-metadata 811 +db-shutdowned+ 22))
            (qualified (append legacy (list :page-checksum-version 1)))
-           (prefix "PGWAL6 0 0 1 1 legacy - 811 1 22 C9")
+           (prefix "PGWAL6 0 0 1 1 timeline - 811 1 22 C9")
            (unsupported (format nil "~a ~8,'0X~%" prefix (wal-crc32 (string->bytes prefix)))))
       (flet ((round-trip (metadata)
                (nth-value 6 (wal-decode-control-line
@@ -1772,6 +1769,14 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
       (rove:ok (handler-case (progn (wal-decode-control-line unsupported) nil)
                  (error () t))
                "an unsupported format is rejected even with a valid control CRC")))
+
+(rove:deftest test-primary-control-requires-qualified-wal-namespace
+    (rove:ok (rove:signals (wal-encode-control-image 0 0 nil :namespace :legacy) 'error))
+  (rove:ok (rove:signals (wal-decode-control-line "PGWAL6 0 0 1 1 legacy - 748566CF") 'error))
+  (rove:ok (eq :timeline
+               (nth-value 5
+                          (wal-decode-control-line
+                           (bytes->string (wal-encode-control-image 0 0 nil)))))))
 
 (rove:deftest test-wal-atomic-write-refuses-temporary-destination
     (call-with-wal-scan-test-files

@@ -1,9 +1,11 @@
 """Exercise pg_ctl's production-state wait across native control shapes."""
 from pathlib import Path
+import os
 import runpy
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from crc32c_reference import crc32c
 
 module = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parents[2] / 'bin/pg_ctl')))
@@ -31,7 +33,7 @@ class PromotionControl(unittest.TestCase):
                 (self.root / 'physical-recovery.control').touch()
                 self.assertFalse(module.primary_committed(self.root))
                 (self.root / 'physical-recovery.control').unlink()
-                for index, value in ((8, '5'), (3, '1'), (4, '1'), (5, 'legacy')):
+                for index, value in ((8, '5'), (3, '1'), (4, '1')):
                     fields = base.copy()
                     fields[index] = value
                     self.write_control(fields + reference)
@@ -47,9 +49,25 @@ class PromotionControl(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.primary_committed(self.root)
 
-    def test_legacy_control_without_lifecycle_is_not_committed(self):
+    def test_control_without_lifecycle_is_not_committed(self):
         self.write_control(['PGWAL6', '32', '64', '2', '2', 'timeline', '-'])
         self.assertFalse(module.primary_committed(self.root))
+
+    def test_crc_valid_legacy_namespace_is_rejected(self):
+        self.write_control(['PGWAL6', '32', '64', '2', '2', 'legacy', '-', '42', '6', '1'])
+        with self.assertRaisesRegex(ValueError, 'requires timeline-qualified WAL'):
+            module.primary_committed(self.root)
+
+    def test_legacy_namespace_refuses_no_wait_promotion_before_request(self):
+        self.write_control(['PGWAL6', '32', '64', '1', '1', 'legacy', '-'])
+        owner = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        with patch.dict(module.promote.__globals__, {
+            'open_postmaster': lambda root: (owner, b''),
+            'recovery_phase': lambda root: 2,
+        }):
+            with self.assertRaisesRegex(ValueError, 'requires timeline-qualified WAL'):
+                module.promote(self.root, wait=False, timeout=0, quiet=True)
+        self.assertFalse((self.root / 'promote').exists())
 
     def test_bad_shape_or_checksum_is_rejected(self):
         self.write_control(['PGWAL6', '32', '64', '2', '2', 'timeline', '-', '42', '6', '1', 'extra'])

@@ -2210,14 +2210,18 @@ Reject extra lines before decoding its CRC and checkpoint metadata."
         (unless (= sb-posix:enoent (sb-posix:syscall-errno condition))
           (error condition))))))
 
+(defun wal-require-qualified-segment-names ()
+  "Refuse legacy WAL names, including dangling directory entries."
+  (when (some (lambda (name)
+                (and (= 20 (length name))
+                     (wal-parse-segment-name (subseq name 0 16) :legacy)))
+              (wal-segment-entry-names))
+    (error "startup requires timeline-qualified WAL; migrate the data with the previous build")))
+
 (defun wal-check-serving-namespace-before-pid ()
   "Refuse legacy primary WAL under the startup flock before publishing PID state."
-  (when (or (some (lambda (name)
-                    (and (= 20 (length name))
-                         (wal-parse-segment-name (subseq name 0 16) :legacy)))
-                  (wal-segment-entry-names))
-            (eq :legacy (nth-value 5 (wal-read-control-fields))))
-    (error "startup requires timeline-qualified WAL; migrate the data with the previous build")))
+  (wal-require-qualified-segment-names)
+  (wal-read-control-fields))
 
 (defun wal-save-control-fields (checkpoint-lsn durable-lsn)
   "Save WAL positions and retain any known primary identity and lifecycle state.
@@ -2271,8 +2275,6 @@ Refresh its modification time. Update memory only after atomic publication."
       (fsync-stream stream)))
   (values))
 
-(declaim (ftype function wal-reconcile-namespace-at-startup))
-
 (defun wal-init ()
   "Initialize WAL under startup or equivalent quiescence.
 Reject surviving page and CLOG debt and a nonempty cleanup domain before
@@ -2292,6 +2294,7 @@ the checkpoint or scanned WAL contains a policy witness."
   (multiple-value-bind (checkpoint-lsn durable-lsn snapshot insertion checkpoint-timeline namespace metadata)
       (wal-read-control-fields)
     (when checkpoint-lsn (wal-require-supported-timelines insertion checkpoint-timeline))
+    (wal-require-qualified-segment-names)
     (wal-replace-storage-incarnation)
     (setf *wal-control-metadata* metadata
           *wal-segment-namespace* (or namespace :timeline)
@@ -2308,7 +2311,6 @@ the checkpoint or scanned WAL contains a policy witness."
     (progn
       (when (and (null checkpoint-lsn) (wal-segment-entry-names))
         (error "WAL control file is missing while WAL segments exist"))
-      (when checkpoint-lsn (wal-reconcile-namespace-at-startup))
       (when *wal-dirty-store*
         (wal-clear-page-cache)
         (wal-dirty-close-empty-store)

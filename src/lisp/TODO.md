@@ -484,8 +484,11 @@ Pending promotion control requires a timeline-qualified source in the server
 codec and the standalone `pg_ctl` reader. The control layout stays at
 `PGRSTAT4`. A CRC-valid legacy namespace is rejected in both readers.
 All 117 focused strict physical heads and all 1,639 unit heads passed.
-Tighten the primary control codec for callers outside server
-startup. Use the prior build's
+The primary control codec and `pg_ctl` also require the `timeline` namespace.
+WAL initialization refuses legacy segment names before replacing the storage
+incarnation. The serving build removes the migration command and startup alias
+reconciliation. The live cutover check confirmed legacy refusal, unchanged
+storage and stale PID, and successful qualified restart. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.
 

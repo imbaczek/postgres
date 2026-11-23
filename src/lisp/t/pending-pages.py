@@ -399,8 +399,8 @@ def run_synchronous_barrier_case(operation):
             server.control('(vacuum-all-relations-for-xid-wraparound *next-xid* '
                            ':fsync-function #\'smgr-fsync)')
         stage_maintenance_predecessor(server, oid)
-        hook = {'recycling': 'wal-prepare-slot-recycling-under-lock',
-                'namespace': 'wal-namespace-migration-plan'}.get(operation, 'wal-append-batch-start')
+        hook = ('wal-prepare-slot-recycling-under-lock' if operation == 'recycling'
+                else 'wal-append-batch-start')
         server.control(
             '(defvar *queue-barrier-seen* nil) '
             f'(defvar *queue-barrier-batch* (symbol-function \'{hook})) '
@@ -439,24 +439,6 @@ def run_synchronous_barrier_case(operation):
                 '(resource-parameters-prepared current) (resource-parameters-locks current))))')
         elif operation == 'recycling':
             server.control('(wal-remove-checkpointed-segments *wal-checkpoint-lsn* :wait nil)')
-        elif operation == 'namespace':
-            server.control(
-                '(defvar *queue-migration-error* nil) (defvar *queue-migration-done* nil) '
-                '(defvar *queue-migration-worker* (sb-thread:make-thread (lambda () '
-                '(handler-case (progn '
-                '(let ((deadline (+ (get-internal-real-time) (* 20 internal-time-units-per-second)))) '
-                f'(loop until (probe-file #p"{server.root / "migrate"}") '
-                'do (when (>= (get-internal-real-time) deadline) (error "migration release timeout")) '
-                '(sleep 0.01))) (wal-migrate-timeline-namespace)) '
-                '(error (condition) (setf *queue-migration-error* (princ-to-string condition)))) '
-                '(setf *queue-migration-done* t)) :name "owned queued namespace migration"))')
-            (server.root / 'migrate').touch()
-            deadline = time.monotonic() + 20
-            while ':DONE T' not in server.control(
-                    '(assert (null *queue-migration-error*)) (list :done *queue-migration-done*)'):
-                assert server.process.poll() is None
-                assert time.monotonic() < deadline, 'namespace migration did not finish'
-                time.sleep(0.02)
         elif operation in ('startup-guard', 'state-guard'):
             action = '(wal-mark-primary-startup)' if operation == 'startup-guard' else \
                 '(wal-set-primary-state +db-shutdowned+)'
@@ -506,5 +488,5 @@ if __name__ == '__main__':
     run_queued_predecessor_case(maintenance=True)
     run_queued_predecessor_case(reset=True)
     for operation in ('catalog', 'checkpoint', 'clog-reset', 'xid-reservation', 'resources',
-                      'recycling', 'namespace', 'startup-guard', 'state-guard'):
+                      'recycling', 'startup-guard', 'state-guard'):
         run_synchronous_barrier_case(operation)

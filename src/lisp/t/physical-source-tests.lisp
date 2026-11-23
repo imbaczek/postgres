@@ -234,42 +234,6 @@
           (ok (signals (restore "nonprivate-output/" "chmod 755 \"$(dirname \"%p\")\"") 'error))
           (ok (signals (restore "failed-shell/" "exit 127") 'error))))))
 
-(deftest archive-proof-follows-wal-namespace-migration
-    (call-with-physical-source-fixture
-     (lambda ()
-       (let* ((old (pg::wal-segment-path 0 1 :legacy))
-              (new (pg::wal-segment-path 0 1 :timeline))
-              (old-proof (pg::wal-namespace-proof-path old))
-              (new-proof (pg::wal-namespace-proof-path new))
-              (bytes (sample-physical-record))
-              (end (length bytes))
-              (id (pg::catalog-system-identifier)))
-         (dolist (segment '(1 2 3))
-           (delete-file (pg::wal-segment-path segment 1 :legacy)))
-         (pg::wal-atomic-write-bytes old bytes)
-         (pg::wal-atomic-write-bytes new-proof bytes)
-         (sb-thread:with-mutex (pg::*wal-lock*)
-           (ok (signals (pg::wal-namespace-stage-qualified-proof old new) 'error)))
-         (delete-file new-proof)
-         (pg::wal-record-primary-archive-rotation 0 end)
-         (sb-posix:link (namestring old) (namestring new))
-         (sb-thread:with-mutex (pg::*wal-lock*)
-           (pg::wal-namespace-stage-qualified-proof old new))
-         (ok (= end (pg::wal-verify-archive-segment-proof
-                     (pg::read-bounded-regular-file new-proof pg::+wal-archive-segment-proof-size+)
-                     id 1 0 :timeline bytes)))
-         (pg::wal-reconcile-namespace-at-startup)
-         (ok (and (probe-file old) (probe-file old-proof)))
-         (ok (not (or (probe-file new) (probe-file new-proof))))
-         (sb-posix:link (namestring old) (namestring new))
-         (sb-thread:with-mutex (pg::*wal-lock*)
-           (pg::wal-namespace-stage-qualified-proof old new))
-         (let ((pg::*wal-segment-namespace* :timeline))
-           (pg::wal-reconcile-namespace-at-startup))
-         (ok (and (probe-file new) (probe-file new-proof)))
-         (ok (not (or (probe-file old) (probe-file old-proof))))))
-     :namespace :legacy))
-
 (deftest primary-archive-ready-follows-control-and-fences-recycling
     (call-with-physical-source-fixture
      (lambda ()

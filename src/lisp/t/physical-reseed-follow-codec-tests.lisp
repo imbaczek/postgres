@@ -297,7 +297,7 @@
               (getf base :wal-control)
               (pg::physical-libpq-octets-datum
                (pg::wal-encode-control-image
-                152 152 nil :timeline 1 :checkpoint-timeline 1 :namespace :legacy
+                152 152 nil :timeline 1 :checkpoint-timeline 1
                 :metadata (pg::make-wal-control-metadata (getf request :system-id) pg::+db-in-production+ 0))))
         (dolist (value (list (getf generation :coordinates) (getf generation :anchor)))
           (when value
