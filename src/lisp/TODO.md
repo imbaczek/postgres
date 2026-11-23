@@ -398,6 +398,8 @@ promotion partials. Six strict heads passed. They include a valid legacy
 partial and proof that cannot advance receipt, exclusion of legacy partials
 from the archiver queue, and qualified restore only at the exact fork.
 The complete-segment legacy fallback stays available for now.
+The live Patroni archive-descendant observer replayed the child-only row
+from the archive and retained it across restart.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented
