@@ -580,6 +580,12 @@ The fixed numeric math aliases `numeric_abs`, `numeric_sqrt`,
 and shared numeric evaluation. The 1,431 C comparisons covered special
 values, NULLs, and lookup and decoration precedence. The restart check
 exercised stored absolute-value and logarithm defaults.
+All three `width_bucket` signatures use registry strictness and
+execution. Range calls reuse registry coercion after selecting the
+numeric or float8 signature. Threshold calls retain the shared
+scalar and array element type resolution. The 1,433 C comparisons
+covered the float precision boundary and decorated polymorphic
+diagnostics. Both stored call shapes passed after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

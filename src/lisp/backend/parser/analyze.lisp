@@ -574,6 +574,12 @@ exist\" messages."
                    (make-numeric-builtin "numeric_exp" '(:numeric) :numeric 'sql-numeric-exp)
                    (make-numeric-builtin "numeric_ln" '(:numeric) :numeric 'sql-numeric-ln)
                    (make-numeric-builtin "numeric_log" '(:numeric :numeric) :numeric 'sql-numeric-log)
+                   (make-numeric-builtin "width_bucket" '(:anycompatible :anycompatiblearray)
+                                         :int4 'sql-width-bucket-array)
+                   (make-numeric-builtin "width_bucket" '(:float8 :float8 :float8 :int4)
+                                         :int4 'sql-width-bucket-range)
+                   (make-numeric-builtin "width_bucket" '(:numeric :numeric :numeric :int4)
+                                         :int4 'sql-width-bucket-range)
                    (make-numeric-builtin "numeric_power" '(:numeric :numeric) :numeric 'sql-numeric-power)
                    (make-numeric-builtin "pi" nil :float8 (lambda () pi))
                    (make-float-trig-builtin "cbrt")
@@ -1092,15 +1098,13 @@ names and unknown types.  setseed has no catalog argument names."
   (or (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p)
       (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "exp" "ln"
-                     "log" "log10" "power" "pow"
-                     "width_bucket") :test #'string=)))
+                     "log" "log10" "power" "pow") :test #'string=)))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
   (cond ((gethash name *scalar-builtin-descriptors*)
          (some (lambda (builtin) (= count (length (scalar-builtin-argument-types builtin))))
                (gethash name *scalar-builtin-descriptors*)))
-        ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((member name '("power" "pow") :test #'string=)
          (= count 2))
@@ -1364,13 +1368,16 @@ otherwise the preferred float8 overload is used."
   (multiple-value-bind (arguments type) (resolve-power-operands name args)
     (list :func name arguments :type type :typmod -1)))
 
-(defun analyze-width-bucket (args)
-  ;; Resolve compatible scalar/array thresholds or numeric/float8 ranges to int4.
+(defun analyze-width-bucket (args candidates)
+  "Resolve compatible thresholds or select the catalog's preferred range signature."
   (cond
     ((= (length args) 2)
-     (let* ((operand (first args)) (array (second args))
-                                   (element (if (eq (expr-type array) :int2vector) :int2
-                                                (sql-array-element-type (expr-type array)))))
+     (let* ((result-type (scalar-builtin-result-type
+                          (find :anycompatible candidates
+                                :key (lambda (builtin) (first (scalar-builtin-argument-types builtin))))))
+            (operand (first args)) (array (second args))
+            (element (if (eq (expr-type array) :int2vector) :int2
+                         (sql-array-element-type (expr-type array)))))
        (unless (or element (in-unknown-constant-p array))
          (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
        (when (and element (not (in-unknown-constant-p operand))
@@ -1389,7 +1396,7 @@ otherwise the preferred float8 overload is used."
          ;; Candidate compatibility is already checked; array type materialization
          ;; follows the aggregate decoration check in ParseFuncOrColumn.
          (when *defer-function-constant-coercion-p*
-           (return-from analyze-width-bucket (list :func "width_bucket" args :type :int4 :typmod -1)))
+           (return-from analyze-width-bucket (list :func "width_bucket" args :type result-type :typmod -1)))
          ;; Like get_array_type in polymorphic resolution, this lookup happens
          ;; before argument coercion or strict NULL evaluation. Ordinary array
          ;; types have no array type of their own; int2vector is exceptional
@@ -1402,22 +1409,17 @@ otherwise the preferred float8 overload is used."
                      (if (eq (expr-type array) :int2vector)
                          (list :cast array :type array-type :typmod -1)
                          (coerce-common-expression array array-type)))
-               :type :int4 :typmod -1))))
+               :type result-type :typmod -1))))
     ((= (length args) 4)
      (let* ((values (subseq args 0 3))
             (type (if (and (some (lambda (a) (and (not (in-unknown-constant-p a))
                                                   (eq (expr-type a) :numeric))) values)
                            (notany (lambda (a) (member (expr-type a) '(:float4 :float8))) values))
                       :numeric :float8)))
-       (unless (and (every (lambda (a) (or (in-unknown-constant-p a)
-                                           (sql-implicit-coercion-p (expr-type a) type))) values)
-                    (or (in-unknown-constant-p (fourth args))
-                        (sql-implicit-coercion-p (expr-type (fourth args)) :int4)))
-         (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))
-       (list :func "width_bucket"
-             (append (mapcar (lambda (a) (coerce-common-expression a type)) values)
-                     (list (coerce-common-expression (fourth args) :int4)))
-             :type :int4 :typmod -1)))
+       (analyze-scalar-builtin "width_bucket"
+                               (list (find type candidates
+                                           :key (lambda (builtin) (first (scalar-builtin-argument-types builtin)))))
+                               args *defer-function-constant-coercion-p*)))
     (t (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))))
 
 (defun sql-width-bucket-timetz-bytes (elements)
@@ -1475,48 +1477,41 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
             do (if (< comparison 0) (setf right mid) (setf left (1+ mid))))
       left)))
 
-(defun sql-width-bucket-range (args)
+(defun sql-width-bucket-range (operand bound1 bound2 count)
   ;; C width_bucket_float8/width_bucket_numeric: equal-width ascending or
   ;; descending buckets, with exterior buckets 0 and COUNT+1.
-  (destructuring-bind (operand bound1 bound2 count) args
-    (when (<= count 0) (ereport "2201G" "count must be greater than zero"))
-    (let* ((float-p (floatp bound1))
-           (nan-p (lambda (v) (if float-p (sb-ext:float-nan-p v) (eq v :numeric-nan))))
-           (infinite-p (lambda (v) (if float-p (sb-ext:float-infinity-p v)
-                                       (member v '(:numeric-positive-infinity :numeric-negative-infinity)))))
-           (compare (if float-p #'sql-float-compare #'sql-numeric-compare)))
-      (when (or (funcall nan-p bound1) (funcall nan-p bound2))
-        (ereport "2201G" "lower and upper bounds cannot be NaN"))
-      (when (or (funcall infinite-p bound1) (funcall infinite-p bound2))
-        (ereport "2201G" "lower and upper bounds must be finite"))
-      (let ((direction (funcall compare bound1 bound2)))
-        (when (zerop direction) (ereport "2201G" "lower bound cannot equal upper bound"))
-        (let ((first-cmp (funcall compare operand bound1))
-              (second-cmp (funcall compare operand bound2)))
-          (cond ((if (minusp direction) (< first-cmp 0) (> first-cmp 0)) 0)
-                ((if (minusp direction) (>= second-cmp 0) (<= second-cmp 0))
-                 (when (= count +int4-max+) (ereport "22003" "integer out of range"))
-                 (1+ count))
-                (float-p
-                 (let* ((a (if (minusp direction) operand bound1))
-                        (b (if (minusp direction) bound1 operand))
-                        (upper (if (minusp direction) bound2 bound1))
-                        (lower (if (minusp direction) bound1 bound2))
-                        (wide (> (- (rational upper) (rational lower)) (rational most-positive-double-float)))
-                        (fraction (if wide
-                                      (/ (- (/ a 2d0) (/ b 2d0)) (- (/ upper 2d0) (/ lower 2d0)))
-                                      (/ (- a b) (- upper lower)))))
-                   (1+ (min (1- count) (truncate (* count fraction))))))
-                (t (1+ (floor (* count (- (sql-numeric-rational operand)
-                                          (sql-numeric-rational bound1)))
-                              (- (sql-numeric-rational bound2)
-                                 (sql-numeric-rational bound1)))))))))))
-
-(defun sql-width-bucket (args)
-  ;; Both overloads are strict; dispatch already-coerced arguments by arity.
-  (cond ((member +null+ args) +null+)
-        ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
-        (t (sql-width-bucket-range args))))
+  (when (<= count 0) (ereport "2201G" "count must be greater than zero"))
+  (let* ((float-p (floatp bound1))
+         (nan-p (lambda (v) (if float-p (sb-ext:float-nan-p v) (eq v :numeric-nan))))
+         (infinite-p (lambda (v) (if float-p (sb-ext:float-infinity-p v)
+                                     (member v '(:numeric-positive-infinity :numeric-negative-infinity)))))
+         (compare (if float-p #'sql-float-compare #'sql-numeric-compare)))
+    (when (or (funcall nan-p bound1) (funcall nan-p bound2))
+      (ereport "2201G" "lower and upper bounds cannot be NaN"))
+    (when (or (funcall infinite-p bound1) (funcall infinite-p bound2))
+      (ereport "2201G" "lower and upper bounds must be finite"))
+    (let ((direction (funcall compare bound1 bound2)))
+      (when (zerop direction) (ereport "2201G" "lower bound cannot equal upper bound"))
+      (let ((first-cmp (funcall compare operand bound1))
+            (second-cmp (funcall compare operand bound2)))
+        (cond ((if (minusp direction) (< first-cmp 0) (> first-cmp 0)) 0)
+              ((if (minusp direction) (>= second-cmp 0) (<= second-cmp 0))
+               (when (= count +int4-max+) (ereport "22003" "integer out of range"))
+               (1+ count))
+              (float-p
+               (let* ((a (if (minusp direction) operand bound1))
+                      (b (if (minusp direction) bound1 operand))
+                      (upper (if (minusp direction) bound2 bound1))
+                      (lower (if (minusp direction) bound1 bound2))
+                      (wide (> (- (rational upper) (rational lower)) (rational most-positive-double-float)))
+                      (fraction (if wide
+                                    (/ (- (/ a 2d0) (/ b 2d0)) (- (/ upper 2d0) (/ lower 2d0)))
+                                    (/ (- a b) (- upper lower)))))
+                 (1+ (min (1- count) (truncate (* count fraction))))))
+              (t (1+ (floor (* count (- (sql-numeric-rational operand)
+                                        (sql-numeric-rational bound1)))
+                            (- (sql-numeric-rational bound2)
+                               (sql-numeric-rational bound1))))))))))
 
 (defun analyze-numeric-function (name args schema &optional signature)
   "Resolve a numeric catalog call, retaining its original diagnostic signature.
@@ -1524,10 +1519,11 @@ Argument transformation and named-notation validation happen before this call,
 so a nested argument error keeps its own diagnostics."
   (handler-case
       (cond
+        ((string= name "width_bucket")
+         (analyze-width-bucket args (gethash name *scalar-builtin-descriptors*)))
         ((gethash name *scalar-builtin-descriptors*)
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
-        ((string= name "width_bucket") (analyze-width-bucket args))
         ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                         "sqrt" "exp" "ln")
                  :test #'string=)
@@ -3859,8 +3855,7 @@ still requires deferred sort projection."
   "Recognize immutable scalar functions whose signatures still have separate analyzers."
   (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                  "sqrt" "exp" "ln"
-                 "log" "log10" "power" "pow"
-                 "width_bucket")
+                 "log" "log10" "power" "pow")
           :test #'string=))
 
 (defun analyzed-function-volatile-p (name)
@@ -4666,7 +4661,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
     ((replication-slot-function-signature name) (eval-replication-slot-function name args))
-    ((string= name "width_bucket") (sql-width-bucket args))
     ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
              :test #'string=)
      (if (member +null+ args) +null+

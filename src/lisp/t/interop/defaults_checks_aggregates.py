@@ -380,6 +380,8 @@ CASES = (
     "SELECT dexp(-1000)",
     "SELECT round(1::integer,2::smallint),numeric_abs(1::bigint),round(NULL::numeric,1),round(1::numeric,NULL::integer)",
     "SELECT width_bucket(-1,0,10,5),width_bucket(0,0,10,5),width_bucket(2,0,10,5),width_bucket(10,0,10,5)",
+    "SELECT pg_catalog.width_bucket('9007199254740993','9007199254740992','9007199254740994',2), pg_catalog.width_bucket(9007199254740993::numeric,9007199254740992,9007199254740994,2)",
+    "CREATE TABLE dc_bucket_registry_default (a int DEFAULT width_bucket(9007199254740993::numeric,9007199254740992,9007199254740994,2), b int DEFAULT width_bucket('b', ARRAY['a','b','c']))",
     "SELECT width_bucket(11,10,0,5),width_bucket(10,10,0,5),width_bucket(8,10,0,5),width_bucket(0,10,0,5)",
     "SELECT width_bucket(0.3::numeric,0::numeric,1::numeric,10),width_bucket('NaN'::numeric,0,1,3),width_bucket(NULL::numeric,0,1,3)",
     "SELECT width_bucket(0::float8,'-1e308'::float8,'1e308'::float8,10),width_bucket('NaN'::float8,0,1,3)",
@@ -1365,6 +1367,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_bucket_registry_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_numeric_math_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_integer_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_float_alias_default DEFAULT VALUES RETURNING a,b,c",
