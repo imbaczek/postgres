@@ -157,6 +157,39 @@ Optional QUERY-FUNCTION visits each prepared query before its expressions."
   (dolist (item (getf prepared :order)) (funcall function (car item)))
   (values))
 
+(defun visit-prepared-query-expressions (function prepared &optional (depth 0) query-function)
+  "Visit executable nodes and query scopes without changing prepared storage."
+  (labels ((expression (form level)
+             (some-local-plan-expression
+              (lambda (node walk)
+                (case (first node)
+                  (:outer-ref
+                   (funcall function node level)
+                   (values nil t))
+                  (:subplan
+                   (let ((descriptor (second node)))
+                     (funcall walk (sql-subplan-test descriptor))
+                     (query (sql-subplan-prepared descriptor) (1+ level)))
+                   (funcall function node level)
+                   (values nil t))
+                  (otherwise (funcall function node level) nil)))
+              form))
+           (query (state level)
+             (when query-function (funcall query-function state level))
+             (dolist (definition (getf state :ctes))
+               (query (sql-cte-prepared definition) (1+ level)))
+             (when (getf state :set-operation)
+               (query (getf state :left) level)
+               (query (getf state :right) level))
+             (visit-prepared-query-local-expressions
+              (lambda (form) (expression form level)) state)
+             (unless (getf state :set-operation)
+               (dolist (relation (getf state :source-relations (getf state :relations)))
+                 (when (getf relation :subquery-prepared)
+                   (query (getf relation :subquery-prepared) (1+ level)))))))
+    (query prepared depth))
+  (values))
+
 (defun prepared-query-outer-depths (prepared)
   ;; Follow referenced producers only: these depths select runtime frame and
   ;; cache ownership, unlike the broader walk used for lateral legality.

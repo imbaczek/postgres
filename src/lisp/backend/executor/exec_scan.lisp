@@ -731,15 +731,12 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
 (defun prepared-query-lateral-reference-p (prepared)
   ;; Include references in unused CTEs: join legality is an analysis property,
   ;; even when the referenced producer will never execute.
-  (let ((found nil))
-    (map-prepared-query-expressions
-     (lambda (form depth)
-       (when (and (consp form) (eq (first form) :outer-ref)
-                  (= (second form) (1+ depth)))
-         (setf found t))
-       form)
-     prepared)
-    found))
+  (visit-prepared-query-expressions
+   (lambda (form depth)
+     (when (and (eq (first form) :outer-ref) (= (second form) (1+ depth)))
+       (return-from prepared-query-lateral-reference-p t)))
+   prepared)
+  nil)
 
 (defun prepare-select-source (source alias offset &optional preceding-scope)
   "Prepare a FROM namespace entry; callers hold the catalog view lock.

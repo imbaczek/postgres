@@ -188,8 +188,8 @@
 
 (defun validate-recursive-term-aggregates (prepared)
   ;; C rejects aggregates at a query level with a direct self-reference RTE.
-  (map-prepared-query-expressions
-   (lambda (form depth) (declare (ignore depth)) form)
+  (visit-prepared-query-expressions
+   (constantly nil)
    prepared 0
    (lambda (state depth)
      (declare (ignore depth))

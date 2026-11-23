@@ -36,6 +36,19 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest lateral-legality-inspects-unused-cte-without-rewriting
+    (let* ((predicate (list :bool t))
+           (outer (list :outer-ref 2 '(:col 1 :type :int4)))
+           (child-order (list (cons outer :asc)))
+           (child (list :order child-order))
+           (definition (make-sql-cte :prepared child))
+           (prepared (list :where predicate :ctes (list definition))))
+      (rove:ok (prepared-query-lateral-reference-p prepared))
+      (rove:ok (eq predicate (getf prepared :where)))
+      (rove:ok (eq child-order (getf child :order)))
+      (setf (second outer) 1)
+      (rove:ok (not (prepared-query-lateral-reference-p prepared)))))
+
 (rove:deftest prepared-subplan-discovery-preserves-expression-storage
     (let* ((hidden (list :subplan (make-sql-subplan :kind :scalar)))
            (outer (list :outer-ref 1 hidden))

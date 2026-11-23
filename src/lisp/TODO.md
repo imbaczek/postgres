@@ -439,6 +439,9 @@ Recursive cache lookup now uses the same expression roots, including window
 inputs, partitions and order keys. A regression distinguishes a window
 partition's subplan from an opaque descriptor field. The 200,000-lookup SBCL
 probe still measured about 320 bytes per lookup.
+Lateral-reference legality and recursive aggregate validation now use a
+read-only traversal of prepared query scopes. The lateral regression checks
+nesting depth through an unused CTE and preserves its original sort list.
 
 ## Open development tasks
 
