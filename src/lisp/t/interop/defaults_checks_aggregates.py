@@ -705,6 +705,9 @@ CASES = (
     "CREATE TABLE dc_decimal(a int DEFAULT '1.5'::numeric CHECK(a<'4.25'::numeric))",
     "CREATE TABLE dc_signed_scale(v numeric(2,-3) DEFAULT 1450::numeric(3,-2))",
     "INSERT INTO dc_signed_scale DEFAULT VALUES RETURNING v",
+    "CREATE TABLE dc_interval_range(v interval hour to minute DEFAULT "
+    "'1 hour 2 minutes 3.123 seconds'::pg_catalog.interval(3072,2))",
+    "INSERT INTO dc_interval_range DEFAULT VALUES RETURNING v",
     "INSERT INTO dc_decimal DEFAULT VALUES RETURNING *",
     "ALTER TABLE dc_decimal ADD CONSTRAINT decimal_later CHECK(a>'0.50'::numeric) NOT VALID",
     "INSERT INTO dc_decimal VALUES(5)",
@@ -1439,6 +1442,7 @@ def check_restart(reference, native):
                       "INSERT INTO dc_bit_index DEFAULT VALUES RETURNING first_bit, octets",
                     "INSERT INTO dc_decimal DEFAULT VALUES RETURNING a",
                     "INSERT INTO dc_signed_scale DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_interval_range DEFAULT VALUES RETURNING v",
                     "INSERT INTO dc_decimal VALUES(0)",
                     "INSERT INTO dc_decimal VALUES(5)",
                     "ALTER TABLE dc_decimal VALIDATE CONSTRAINT decimal_later",

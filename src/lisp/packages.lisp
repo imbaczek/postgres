@@ -7,6 +7,8 @@
            #:sql-expression-type-length #:sql-varchar-assignment-value
            #:sql-varchar-cast-value #:sql-varchar-typmod
            #:sql-numeric-typmod #:sql-numeric-typmod-components
+           #:sql-interval-typmod #:sql-interval-typmod-range #:sql-interval-typmod-components
+           #:sql-interval-range-mask #:sql-interval-range-fields
            #:+sql-array-types+ #:sql-array-type #:sql-array-element-type
            #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name)
   (:export #:main))
@@ -20,11 +22,15 @@
                 #:sql-expression-type-length #:sql-varchar-assignment-value
                 #:sql-varchar-cast-value #:sql-varchar-typmod
                 #:sql-numeric-typmod #:sql-numeric-typmod-components
+                #:sql-interval-typmod #:sql-interval-typmod-range #:sql-interval-typmod-components
+                #:sql-interval-range-mask #:sql-interval-range-fields
                 #:+sql-array-types+ #:sql-array-type #:sql-array-element-type
                 #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name)
   (:export #:type-oid #:sql-type-from-oid #:sql-expression-type-description
            #:sql-expression-type-length #:sql-varchar-assignment-value
            #:sql-varchar-cast-value #:sql-varchar-typmod
            #:sql-numeric-typmod #:sql-numeric-typmod-components
+           #:sql-interval-typmod #:sql-interval-typmod-range #:sql-interval-typmod-components
+           #:sql-interval-range-mask #:sql-interval-range-fields
            #:sql-array-type #:sql-array-element-type
            #:sql-type-storage-code #:sql-type-catalog-name #:sql-type-alignment-code #:sql-type-display-name))

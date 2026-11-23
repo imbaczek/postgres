@@ -138,6 +138,34 @@
     (values (ldb (byte 16 16) packed)
             (- (logxor (logand packed #x7ff) #x400) #x400))))
 
+(defparameter *sql-interval-ranges*
+  '((4 :year) (2 :month) (6 :year :month)
+    (8 :day) (1024 :hour) (2048 :minute) (4096 :second)
+    (1032 :day :hour) (3080 :day :minute) (7176 :day :second)
+    (3072 :hour :minute) (7168 :hour :second) (6144 :minute :second)
+    (#x7fff))
+  "Packed interval masks and their optional starting and ending SQL fields.")
+
+(defun sql-interval-range-mask (start end)
+  "Return the mask for START and optional END, or NIL for an unsupported range."
+  (loop for (mask first last) in *sql-interval-ranges*
+        when (and (eq start first) (eq end last)) return mask))
+
+(defun sql-interval-range-fields (mask)
+  "Return the read-only range descriptor for MASK, or NIL."
+  (assoc mask *sql-interval-ranges*))
+
+(defun sql-interval-typmod (range precision)
+  "Pack validated interval range and precision fields as in timestamp.h."
+  (logior (ash (logand range #x7fff) 16) (logand precision #xffff)))
+
+(defun sql-interval-typmod-range (typmod)
+  (ldb (byte 15 16) typmod))
+
+(defun sql-interval-typmod-components (typmod)
+  "Return the range and precision fields of a specified interval typmod."
+  (values (sql-interval-typmod-range typmod) (ldb (byte 16 0) typmod)))
+
 (defun sql-varchar-typmod (length)
   "Encode a declared varchar character count as a PostgreSQL type modifier."
   (when (< length 1)

@@ -736,6 +736,11 @@ The numeric typmod codec is exported by independently loadable
 `pg/sql-types`. A clean REPL checked precision and signed-scale
 round trips and SQLSTATE 22023 without loading numeric arithmetic.
 The warm server image retained both existing typmod symbol identities.
+The standalone type system also supplies interval range masks and
+packed-field access. Standard interval syntax and qualified casts use
+the same supported ranges. Coercion and catalog replay read the same
+packed fields. The regressions pin the canonical two-argument spelling
+for an hour-to-minute cast and verify its use in a default after restart.
 
 ### A17 follow-up evidence
 

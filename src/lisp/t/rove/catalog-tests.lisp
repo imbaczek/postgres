@@ -217,6 +217,17 @@
       (rove:ok (string= "timestamp(2)" (catalog-expression-type-sql :timestamp 2)))
       (rove:ok (string= "\"t\" timestamp(2) without time zone" (catalog-column-definition-sql timestamp)))))
 
+(rove:deftest catalog-replay-keeps-interval-range-and-precision
+    (let ((hour-minute #x0c000002)
+          (day-second #x1c080002))
+      (rove:ok (= 3072 (sql-interval-range-mask :hour :minute)))
+      (rove:ok (= 7176 (sql-interval-range-mask :day :second)))
+      (rove:ok (null (sql-interval-range-mask :hour :hour)))
+      (rove:ok (equal '(3072 2) (multiple-value-list (sql-interval-typmod-components hour-minute))))
+      (rove:ok (= day-second (sql-interval-typmod 7176 2)))
+      (rove:ok (string= "\"interval\"(3072,2)" (catalog-expression-type-sql :interval hour-minute)))
+      (rove:ok (string= "interval day to second(2)" (catalog-expression-type-sql :interval day-second)))))
+
 (rove:deftest test-toast-relation-eligibility
     (flet ((column (type &optional (typmod -1))
              (make-pg-column :name "x" :type type :typmod typmod :attnum 1)))

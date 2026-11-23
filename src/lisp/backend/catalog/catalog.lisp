@@ -1128,12 +1128,12 @@ from advancing the shared WAL generation between a failed save and rollback."
     ((:timestamp :timestamptz)
      (format nil "timestamp~a~a" (if (minusp typmod) "" (format nil "(~d)" typmod))
              (if (eq type :timestamptz) " with time zone" "")))
-    (:interval (if (and (not (minusp typmod))
-                        (/= (ldb (byte 16 0) typmod) #xffff)
-                        (/= (ldb (byte 15 16) typmod) 32767)
-                        (not (logbitp 12 (ldb (byte 15 16) typmod))))
-                   (format nil "\"interval\"(~d,~d)" (ldb (byte 15 16) typmod) (ldb (byte 16 0) typmod))
-                   (format nil "interval~a" (sql-interval-typmod-sql typmod))))
+    (:interval
+     (multiple-value-bind (range precision) (sql-interval-typmod-components typmod)
+       (if (and (not (minusp typmod)) (/= precision #xffff)
+                (/= range #x7fff) (not (logbitp 12 range)))
+           (format nil "\"interval\"(~d,~d)" range precision)
+           (format nil "interval~a" (sql-interval-typmod-sql typmod)))))
     (:numeric (if (< typmod 4) "numeric"
                   (multiple-value-bind (precision scale) (sql-numeric-typmod-components typmod)
                     (format nil "numeric(~d,~d)" precision scale))))
