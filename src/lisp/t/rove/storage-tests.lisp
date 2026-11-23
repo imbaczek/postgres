@@ -708,6 +708,20 @@
                   (rove:ok (= 6 (aref state 0)))))
            (close-sql-iterator iterator))))))
 
+(rove:deftest test-sorted-project-set-key-slots-follow-original-order
+    (let* ((first-key '(:col 2 :type :int4))
+           (second-key '(:col 3 :type :text))
+           (projected (cons '(:sort-output 1 :type :int4) :desc))
+           (deferred (vector t t))
+           (order (list (cons first-key :asc) projected (cons second-key :desc))))
+      (multiple-value-bind (normalized extra) (sorted-project-set-keys order deferred 2)
+        (rove:ok (equal extra (list first-key second-key)))
+        (rove:ok (equal normalized
+                        (list (cons '(:sort-output 3 :type :int4 :typmod -1) :asc)
+                              projected
+                              (cons '(:sort-output 4 :type :text :typmod -1) :desc))))
+        (rove:ok (equalp deferred #(nil t))))))
+
 (rove:deftest test-toast-chunk-assembly
     (let ((chunks (list (cons 0 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 1 2 3)))
                         (cons 1 #(4 5 6 7))

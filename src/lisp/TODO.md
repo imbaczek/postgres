@@ -613,6 +613,11 @@ pull driver keeps each arm's presence binding through projection and close.
 Seventy-nine strict unit heads and the live C subquery differential passed.
 A REPL probe preserved the projected row's shared value vector, datum
 origins, and source presence at the existing allocation rate.
+Sorted ProjectSet now prepares raw sort keys once in SQL order, avoiding a
+list reversal for each source row. The LIMIT expansion owns lazy child opening
+and caching. REPL allocation probes still measured approximately 112 bytes
+per eager wrapper and 144 per lazy wrapper. The focused strict tests, the
+key-slot and parent-frame regressions, and live LIMIT checks passed.
 
 For A4, the drop and resource proofs share private stage construction and
 record validation with promotion where they use the same ordering. Follow
@@ -1051,7 +1056,8 @@ versions returned the same two segment floors.
 The primary scanner and tail repair now load as a separate WAL storage
 component. The six moved definitions match their previous source. Five strict
 scanner tests passed, covering legal rotation, exact segment boundaries,
-invalid gaps and the durable tail repair boundary.
+invalid gaps and the durable tail repair boundary. The live WAL crash suite
+passed through repeated server restarts and fault cuts.
 
 ### A9 follow-up evidence
 

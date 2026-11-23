@@ -72,9 +72,10 @@
         (rove:ok (equal '(2 1) closes) "early stop closes the current right invocation"))))
 
 (rove:deftest subquery-scan-releases-frame-when-child-opening-fails
-    (let ((close-cache (symbol-function 'close-cte-frame-cache))
-          (closed nil)
-          (*subquery-outer-frames* nil))
+    (let* ((close-cache (symbol-function 'close-cte-frame-cache))
+           (closed nil)
+           (parent-frames (list (make-subquery-parameter-frame #(1))))
+           (*subquery-outer-frames* parent-frames))
       (unwind-protect
            (progn
              (setf (symbol-function 'close-cte-frame-cache)
@@ -90,5 +91,5 @@
                     nil)
                 (pg-error (condition) (string= "0A000" (pg-error-sqlstate condition)))))
              (rove:ok (and (= 1 (length closed)) (hash-table-p (first closed))))
-             (rove:ok (null *subquery-outer-frames*)))
+             (rove:ok (eq parent-frames *subquery-outer-frames*)))
         (setf (symbol-function 'close-cte-frame-cache) close-cache))))
