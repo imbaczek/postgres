@@ -68,6 +68,11 @@ acquisition and cleanup across history selection, partial selection, standby
 staging, and promotion staging. Five physical heads passed with a fresh
 strict compile in 71.73 seconds. The runner log and compiler receipt are
 archived under `architecture-current-acceptance`.
+On `9a1c22a22d3`, the live standby archiver retried a failed command,
+restaged WAL after a cold restart, and archived WAL and fork proofs across
+two promotions. The archive-to-stream run cleaned up an interrupted restore
+stage, replayed 2,006 rows while the source was offline, and resumed
+streaming on `follow_one`. Both logs are in the same archive.
 On `f30383502ba`, `t/run-unit-tests.sh` passed all 1,642 Rove heads and
 1,172 legacy checks. The combined runner log is in the same archive.
 
