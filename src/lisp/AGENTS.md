@@ -569,20 +569,21 @@ Remove the trace and its temporary helper after the demo:
 
 ## Milestone verification timing
 
-- Run test data, temporary files, compiler caches, and live logs on the private
-  RAM workspace to avoid SSD wear. From the repository root, provision it with
-  `src/lisp/t/test-ramdisk.sh setup 4G`. This mounts a bounded Linux tmpfs at
+- Keep test data, temporary files, compiler caches, and live logs on disk by
+  default. For a verification run that explicitly needs RAM-backed storage,
+  provision it from the repository root with `src/lisp/t/test-ramdisk.sh setup 4G`.
+  This mounts a bounded Linux tmpfs at
   `/dev/shm/pg-lisp-tests-$(id -u)` with `noswap`, private permissions, and
   executable files for compiled test helpers. Setup uses noninteractive sudo.
   It fails if the kernel or privileges cannot provide the requested mount.
-- Launch jobs with `src/lisp/t/test-ramdisk.sh run COMMAND ARG...`. Each job gets
+- Launch RAM-backed jobs with `src/lisp/t/test-ramdisk.sh run COMMAND ARG...`. Each job gets
   private `TMPDIR`, `XDG_CACHE_HOME`, `PYTHONPYCACHEPREFIX`,
   `PG_LISP_TEST_RUN_DIR`, and `PG_LISP_TEST_LOG_DIR` directories. Direct raw logs and timing artifacts to the
   log directory. The inherited usage lease prevents teardown during active jobs.
-  Launch live Lisp images through this wrapper too. When moving an existing
+  Launch RAM-backed live Lisp images through this wrapper too. When moving an existing
   image, refresh `uiop:*temporary-directory*` and ASDF output translations after
   changing its environment, and hold a usage lease for its lifetime.
-- Archive required logs once after verification. Run
+- Archive required logs once after RAM-backed verification. Run
   `src/lisp/t/test-ramdisk.sh teardown /absolute/artifact/directory` to copy job
   logs and unmount. Caches and data are discarded. Teardown without an archive
   directory discards logs too. Stop all owned jobs first. Keep source checkouts
@@ -651,13 +652,15 @@ Remove the trace and its temporary helper after the demo:
   Create a new campaign when the checkout revision, dirty source files or checked
   runtime settings change. First qualify the image and each desired target with
   successful serial runs. Independent jobs may then use `--parallel`, each in a
-  separate RAM wrapper invocation; serial campaign and native work must not overlap
+  separate launcher invocation; serial campaign and native work must not overlap
   them. Parallel jobs only read shared manifests and cache, and have private logs,
   caches and single-use job directories. Ensure fixture and port independence and
   count nested images against the eight-image ceiling. A selected physical run is
   not full physical coverage. The main test child retains the run, campaign and
-  RAM leases if its coordinator dies; the strict compiler
-  reacquires campaign and RAM leases. Preserve compact evidence and audit active
+  workspace leases if its coordinator dies; the strict compiler
+  reacquires campaign and workspace leases. Campaigns default to disk under
+  `TMPDIR` or `/tmp`. RAM-backed campaigns require an explicit RAM wrapper for
+  each command. Preserve compact evidence and audit active
   processes before deleting retained campaign files. Full unit runs have used
   3.4–3.8 GiB; eight Lisp images is a ceiling, not a target.
 - On unchanged source, keep the frozen campaign open and reuse its qualified

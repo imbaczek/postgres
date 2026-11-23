@@ -1,8 +1,9 @@
 #!/bin/sh
-# Give each campaign command its own RAM workspace unless already inside one.
+# Give each campaign command its own workspace unless already inside one.
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if [ -z "${PG_LISP_TEST_RUN_DIR:-}" ]; then
-    exec "$BASE/t/test-ramdisk.sh" run python3 "$BASE/t/test-campaign.py" "$@"
+    . "$BASE/t/test-workspace.sh"
+    test_create_workspace run
 fi
 exec python3 "$BASE/t/test-campaign.py" "$@"

@@ -39,13 +39,23 @@ def compile_cache_module():
 COMPILE_CACHE = compile_cache_module()
 
 
+def workspace_is_ram(path):
+    return path.parent == RAM / 'runs'
+
+
 def job_root(path=None):
     value = Path(path or os.environ['PG_LISP_TEST_RUN_DIR'])
-    if value != value.resolve() or value.parent != RAM / 'runs' or not re.fullmatch(r'run\.[A-Za-z0-9]+', value.name):
-        raise ValueError('Expected an owned RAM test run directory')
+    if value != value.resolve() or not re.fullmatch(r'run\.[A-Za-z0-9]+', value.name):
+        raise ValueError('Expected a canonical test run directory')
     info = value.stat()
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError('RAM test run is not private and owned')
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError('Test run is not a private, owned directory')
+    if not workspace_is_ram(value):
+        filesystem = subprocess.check_output(
+            ['findmnt', '-rn', '-T', str(value), '-o', 'FSTYPE'], text=True).strip()
+        if filesystem in ('tmpfs', 'ramfs'):
+            raise ValueError('Use a disk-backed TMPDIR or explicitly launch with test-ramdisk.sh run')
+        return value
     mount = subprocess.check_output(['findmnt', '-rn', '-M', str(RAM), '-o', 'FSTYPE,OPTIONS'], text=True).split()
     if len(mount) != 2 or mount[0] != 'tmpfs' or 'noswap' not in mount[1].split(','):
         raise ValueError('Test campaign requires the unswappable RAM workspace')
@@ -119,13 +129,20 @@ def lock(root, name, exclusive=False, nonblocking=False):
         os.close(fd)
 
 
-@contextlib.contextmanager
-def workspace_lease():
+def workspace_lock_path(job):
+    if not workspace_is_ram(job):
+        return job / 'usage.lock'
     state = RAM.with_name(RAM.name + '-control')
     info = state.lstat()
     if state.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError('Invalid RAM workspace control directory')
-    with lock(state, 'usage.lock') as fd:
+    return state / 'usage.lock'
+
+
+@contextlib.contextmanager
+def workspace_lease():
+    path = workspace_lock_path(job_root())
+    with lock(path.parent, path.name) as fd:
         yield fd
 
 
@@ -147,6 +164,8 @@ def create(source):
     if (root / 'campaign.json').exists():
         raise ValueError('This run already contains a campaign')
     source = source.resolve()
+    if root.is_relative_to(source):
+        raise ValueError('Set TMPDIR to a directory outside the campaign source')
     before, patch = checkout_state(source)
     image = fingerprint(source)
     frozen = root / 'source' / 'src' / 'lisp'
@@ -266,7 +285,7 @@ def job_cache(job):
     return home / 'common-lisp'
 
 
-def campaign_wrapper(root, executable, inherited):
+def campaign_wrapper(root, executable, inherited, workspace_lock):
     # POSIX shells such as dash need single-digit redirection descriptors.
     # Leave inherited lease descriptors untouched when choosing two free ones.
     available = [fd for fd in range(3, 10) if fd not in inherited]
@@ -275,7 +294,7 @@ def campaign_wrapper(root, executable, inherited):
     lease_fd, workspace_fd = available[:2]
     return ('#!/bin/sh\nset -eu\nexec ' + str(lease_fd) + '>>' + shlex.quote(str(root / 'lease.lock')) +
             '\nflock -s ' + str(lease_fd) + '\nexec ' + str(workspace_fd) + '>>' +
-            shlex.quote(str(RAM.with_name(RAM.name + '-control') / 'usage.lock')) +
+            shlex.quote(str(workspace_lock)) +
             '\nflock -s ' + str(workspace_fd) + '\nexec ' + shlex.quote(executable) + ' "$@"\n')
 
 
@@ -285,7 +304,9 @@ def run(campaign, target, heads, cold, workspace, parallel=False, reuse_strict_c
     root = job_root(campaign)
     job = job_root()
     if root == job:
-        raise ValueError('Each campaign job needs its own RAM workspace')
+        raise ValueError('Each campaign job needs its own workspace')
+    if workspace_is_ram(root) != workspace_is_ram(job):
+        raise ValueError('Campaign and job must use the same workspace type')
     claim_job(job)
     # Parallel jobs share read leases; serial jobs exclude them and each other.
     with lock(root, 'run.lock', exclusive=not parallel) as run_lock, \
@@ -316,7 +337,7 @@ def run(campaign, target, heads, cold, workspace, parallel=False, reuse_strict_c
         copy_seconds = time.monotonic() - copied
         wrapper = job / 'campaign-sbcl'
         wrapper.write_text(campaign_wrapper(root, data['environment']['executable'],
-                                            (lease, run_lock, workspace)))
+                                            (lease, run_lock, workspace), workspace_lock_path(job)))
         wrapper.chmod(0o700)
         env = dict(os.environ, SBCL=str(wrapper), PG_LISP_TEST_CAMPAIGN=str(root),
                    PG_LISP_TEST_CAMPAIGN_SBCL=str(wrapper), PG_LISP_FROZEN_SOURCE=str(source),
@@ -371,6 +392,8 @@ def run(campaign, target, heads, cold, workspace, parallel=False, reuse_strict_c
 
 def close(campaign):
     root = job_root(campaign)
+    if workspace_is_ram(root) != workspace_is_ram(job_root()):
+        raise ValueError('Campaign and job must use the same workspace type')
     with lock(root, 'lease.lock', exclusive=True, nonblocking=True):
         data = read_campaign(root)
         data['state'] = 'closed'

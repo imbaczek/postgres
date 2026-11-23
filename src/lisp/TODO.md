@@ -851,6 +851,11 @@ default. The launcher probe verified disk-backed placement, a caller-owned
 workspace, and an explicit `TMPDIR` override. RAM execution uses the explicit
 RAM-disk wrapper.
 
+The campaign launcher uses the same disk workspace setup. The physical slot
+retention head passed on ext4 with a fresh strict compile and again with
+verified reuse, followed by campaign close. The fresh run published 455
+qualified FASLs. Twenty campaign contracts and eleven cache contracts passed.
+
 ### A15 slot retention extraction
 
 The storage ASDF components load slot retention after WAL core. The module

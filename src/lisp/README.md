@@ -1192,7 +1192,7 @@ durable target validation, sequence alignment and post-cutover writes.
 ## Testing
 
 For an opt-in fast-compilation physical campaign, set the same policy when
-creating and running it. With the RAM workspace set up, from `src/lisp` run:
+creating and running it. From `src/lisp` run:
 
 ```sh
 PG_LISP_TEST_COMPILE_POLICY=fast ./t/test-campaign.sh create
@@ -1368,7 +1368,12 @@ and use the path printed by `create` in subsequent commands:
 ./t/test-campaign.sh close /absolute/campaign/path
 ```
 
-Invoke these commands outside an existing RAM wrapper. Every run uses a fresh
+Each command creates a private disk workspace under `TMPDIR` or `/tmp`.
+The filesystem must allow execution, and the workspace must be outside the
+source tree.
+For an explicitly RAM-backed campaign, prefix each command with
+`./t/test-ramdisk.sh run`. All commands for a campaign use the same workspace
+type. Every run uses a fresh
 Lisp image. By default it also runs a fresh no-init compiler, with warnings
 fatal, even when it reuses completed parent FASLs. `--cold` skips the parent
 cache and cannot be combined with `--reuse-strict-compile`.
@@ -1430,8 +1435,7 @@ contracts, run this from `src/lisp` inside the test RAM wrapper:
 
 To overlap independent jobs, first complete successful serial runs that qualify
 the image and each target you plan to use. Then start each `--parallel` run in
-its own `test-campaign.sh` invocation, outside an existing RAM wrapper, so each
-gets a separate job directory:
+its own launcher invocation so each gets a separate job directory:
 
 ```sh
 ./t/test-campaign.sh run /absolute/campaign/path unit
@@ -1454,11 +1458,12 @@ images, including nested servers and compiler children, against the eight-image
 ceiling; also check available RAM. A successful selected physical run qualifies
 its target inventory but does not mean the full physical suite ran.
 
-The main test child inherits the campaign, run and RAM workspace leases. The
+The main test child inherits the campaign, run and workspace leases. The
 strict compiler reacquires campaign and workspace leases. Wait for all children
 before cleanup if the coordinator dies. Close retains files for
-audited cleanup. Archive compact logs and source deltas with the RAM-disk
-teardown, then delete disposable caches and data after checking for active jobs.
+audited cleanup. Archive compact logs and source deltas, then delete disposable
+caches and data after checking for active jobs. Use the RAM-disk teardown command
+for explicitly RAM-backed runs.
 Full unit runs have used roughly 3.4–3.8 GiB; the eight-image limit is a ceiling,
 not a concurrency target.
 

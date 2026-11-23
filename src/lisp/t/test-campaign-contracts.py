@@ -159,7 +159,8 @@ with c.workspace_lease() as workspace, c.lock(root, 'run.lock', exclusive=True) 
         os.dup2(lease, 7)
         os.dup2(run, 9)
         wrapper = root / 'wrapper'
-        wrapper.write_text(c.campaign_wrapper(root, sys.executable, (7, 9, workspace)))
+        wrapper.write_text(c.campaign_wrapper(root, sys.executable, (7, 9, workspace),
+                                              c.workspace_lock_path(c.job_root())))
         wrapper.chmod(0o700)
         command = [str(wrapper), '-c',
                    'import os,sys; assert os.fstat(7).st_ino == int(sys.argv[1]); assert os.fstat(9).st_ino == int(sys.argv[2])',
@@ -217,11 +218,29 @@ with mock.patch.object(c, 'job_root', side_effect=[root, root / 'job']), \
         self.assertEqual('admitted\n', output)
 
     def test_run_mount_redirection_is_rejected(self):
-        root = os.environ['PG_LISP_TEST_RUN_DIR']
-        with mock.patch.object(campaign.subprocess, 'check_output',
-                               side_effect=['tmpfs rw,noswap\n', root + '\n']):
-            with self.assertRaises(ValueError):
-                campaign.job_root()
+        ram = self.root / 'ram'
+        root = ram / 'runs' / 'run.test'
+        root.mkdir(mode=0o700, parents=True)
+        with mock.patch.object(campaign, 'RAM', ram), \
+             mock.patch.object(campaign.subprocess, 'check_output',
+                               side_effect=['tmpfs rw,noswap\n', str(root) + '\n']):
+            with self.assertRaisesRegex(ValueError, 'redirected'):
+                campaign.job_root(root)
+
+    def test_disk_run_rejects_ram_backing(self):
+        root = self.root / 'run.test'
+        root.mkdir(mode=0o700)
+        with mock.patch.object(campaign.subprocess, 'check_output', return_value='tmpfs\n'):
+            with self.assertRaisesRegex(ValueError, 'disk-backed TMPDIR'):
+                campaign.job_root(root)
+
+    def test_create_rejects_workspace_inside_source_before_freezing(self):
+        job = self.root / 'run.test'
+        job.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, PG_LISP_TEST_RUN_DIR=str(job)):
+            with self.assertRaisesRegex(ValueError, 'outside the campaign source'):
+                campaign.create(self.root)
+        self.assertFalse((job / 'source').exists())
 
     def test_next_run_waits_for_surviving_compiler_lease(self):
         (self.root / 'job').mkdir()
