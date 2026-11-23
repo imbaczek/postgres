@@ -82,7 +82,7 @@ def checked_pending_control(root):
     layout, _ = RECOVERY_LAYOUT(control)
     assert layout in (88, 104, 132, 148) and control[:8] == b"PGRSTAT4"
     checked_crc(control, len(control) - 4)
-    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<I", control, 8)[0] & 0x1FFFFFFF == 3
     return control
 
 
@@ -169,7 +169,7 @@ def check_archive_records(data, segment, first, history, logical_start):
     while position < len(data):
         assert position + 32 <= len(data)
         magic, version, kind, size, start, _, _ = struct.unpack_from("<4sHHIQQI", data, position)
-        assert magic == b"PGWL" and version in (7, 8) and size >= 32
+        assert magic == b"PGWL" and version == 8 and size >= 32
         assert start == segment * 16 * 1024 * 1024 + position
         record = data[position:position + size]
         assert len(record) == size
@@ -186,9 +186,7 @@ def check_archive_records(data, segment, first, history, logical_start):
             expected = fork if fork % (16 * 1024 * 1024) + 56 <= 16 * 1024 * 1024 else (fork // (16 * 1024 * 1024) + 1) * 16 * 1024 * 1024
             assert start == expected and level in (0, 1, 2) and padding == 0
         elif kind == 4:
-            assert size in (120, 168) and (version >= 8 or size == 120)
             CHECK_RESOURCES(record[32:])
-            assert record[32:40] == b"PGCKPT02"
             assert struct.unpack_from("<QQQ", record, 40) == (start, start + size, start)
             assert struct.unpack_from("<I", record, 96)[0] == timeline[0]
         if position == first and logical_start < segment * 16 * 1024 * 1024:
@@ -204,8 +202,8 @@ def check_archive_records(data, segment, first, history, logical_start):
 def check_oracle_fixtures():
     boundary = 16 * 1024 * 1024
 
-    def frame(kind, payload=b"", start=boundary):
-        record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, kind, 32 + len(payload), start, 0, 0) + payload)
+    def frame(kind, payload=b"", start=boundary, *, version=8):
+        record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", version, kind, 32 + len(payload), start, 0, 0) + payload)
         struct.pack_into("<I", record, 28, crc32c(record))
         return record
 
@@ -221,6 +219,7 @@ def check_oracle_fixtures():
                 (ordinary, fork, [(1, 0, boundary - 4), (2, boundary - 4, None)]),
                 (ordinary, fork, split),
                 (corrupt, fork, plain),
+                (frame(6, version=7), fork, plain),
                 (frame(6, start=boundary + 1), fork, plain)]
     for record, previous, history in rejected:
         try:
@@ -373,7 +372,7 @@ def snapshot_pending(target, source, snapshot):
     root = pathlib.Path(target)
     lsn, digest = main(target, source)
     control = checked_pending_control(root)
-    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<I", control, 8)[0] & 0x1FFFFFFF == 3
     assert struct.unpack_from("<I", control, 12)[0] == 1
     assert struct.unpack_from("<Q", control, 40)[0] == lsn
     assert struct.unpack_from("<Q", control, 76)[0] == digest
@@ -393,7 +392,7 @@ def check_child_prefix(target, source, expected):
     root = pathlib.Path(target)
     lsn, digest = main(target, source)
     control = checked_pending_control(root)
-    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<I", control, 8)[0] & 0x1FFFFFFF == 3
     assert struct.unpack_from("<Q", control, 40)[0] == lsn
     assert struct.unpack_from("<Q", control, 76)[0] == digest
     child = struct.unpack_from("<I", control, 68)[0]
@@ -417,7 +416,7 @@ def check_promotion_eor(target, source, expected):
     root = pathlib.Path(target)
     fork, digest = main(target, source)
     control = checked_pending_control(root)
-    assert struct.unpack_from("<I", control, 8)[0] & 0x7FFFFFFF == 3
+    assert struct.unpack_from("<I", control, 8)[0] & 0x1FFFFFFF == 3
     parent = struct.unpack_from("<I", control, 12)[0]
     child = struct.unpack_from("<I", control, 68)[0]
     assert struct.unpack_from("<Q", control, 40)[0] == fork
@@ -534,7 +533,7 @@ def damage_resume(target, change):
         assert flush == fork and flush % (16 * 1024 * 1024) + 64 <= 16 * 1024 * 1024
         records = []
         for kind, start in ((6, flush), (9, flush + 32)):
-            record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 7, kind, 32, start, 0, 0))
+            record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, kind, 32, start, 0, 0))
             struct.pack_into("<I", record, 28, crc32c(record))
             records.append(record)
         batch = b"".join(records)

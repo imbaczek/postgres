@@ -99,6 +99,13 @@ Primary scan still recognizes retired transition headers so tail repair
 cannot truncate them as ordinary records.
 The checkpoint process suite rejects a checksummed WAL7 checkpoint before
 exercising native crash, replay and restartpoint behavior on a separate copy.
+The promotion-resume backlog fixture appends a complete WAL8 maintenance
+batch. The live run rejected the unreplayed batch with the expected
+diagnostic and preserved the storage snapshot. Its independent archive
+oracle rejects checksummed WAL7 and accepts the current checkpoint extensions.
+The resource inspector checks offsets across recovery policy trailers and
+slot evidence. Twenty inspector tests and the full promotion-resume process
+suite passed.
 
 For B2, primary WAL control and the independent checkpoint reader require
 PGWAL6. The checksummed PGWAL2–5 fixtures are rejected at decode, and the

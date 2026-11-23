@@ -415,6 +415,36 @@ class ResourceControlTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     RECOVERY_INTENT(data)
 
+    def test_recovery_resource_offsets_survive_logical_sections(self):
+        base = self.fpw_recovery_image(True, 148, True, False)
+        with_fpw_intent = self.promotion_intent_image(base, True)
+        logical_intent = b"PGLOGPI1" + bytes([1, 2]) + bytes(8)
+        for extension in (0, 16):
+            logical_fact = b"PGLOGFC1" + bytes(76 + extension) + struct.pack("<I", extension)
+            evidence = struct.pack("<Q", 42)
+            data = bytearray(with_fpw_intent[:-4] + logical_intent + logical_fact + evidence + bytes(4))
+            phase, = struct.unpack_from("<I", data, 8)
+            struct.pack_into("<I", data, 8, phase | (1 << 30) | (1 << 29))
+            struct.pack_into("<I", data, len(data) - 4, crc32c(data))
+            self.assertEqual(RECOVERY_LAYOUT(base), RECOVERY_LAYOUT(data))
+            self.assertEqual(RECOVERY_FPW(base), RECOVERY_FPW(data))
+            self.assertIs(RECOVERY_INTENT(data), True)
+
+            struct.pack_into("<I", data, len(data) - 16, 8)
+            struct.pack_into("<I", data, len(data) - 4, 0)
+            struct.pack_into("<I", data, len(data) - 4, crc32c(data))
+            with self.assertRaises(AssertionError):
+                RECOVERY_LAYOUT(data)
+
+    def test_recovery_slot_evidence_requires_a_retained_reference(self):
+        base = self.fpw_recovery_image(True, 104, True, False)
+        data = bytearray(base[:-4] + struct.pack("<Q", 42) + bytes(4))
+        phase, = struct.unpack_from("<I", data, 8)
+        struct.pack_into("<I", data, 8, phase | (1 << 29))
+        struct.pack_into("<I", data, len(data) - 4, crc32c(data))
+        with self.assertRaises(AssertionError):
+            RECOVERY_LAYOUT(data)
+
     def test_promotion_fpw_intent_is_pending_only_and_crc_covered(self):
         ordinary = self.promotion_intent_image(self.fpw_recovery_image(False, 72, False, None), True)
         wrong_phase = self.promotion_intent_image(self.fpw_recovery_image(True, 88, False, None), False)

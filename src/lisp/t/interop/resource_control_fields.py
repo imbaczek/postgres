@@ -89,6 +89,36 @@ def source_fpw_fact(data, applied, applied_timeline):
     return fact
 
 
+def recovery_policy_core(data):
+    """Locate the resource and FPW fields before the optional policy sections."""
+    assert 60 <= len(data) <= 415
+    raw_phase = int.from_bytes(data[8:12], "little")
+    end = len(data) - 4
+    if raw_phase & (1 << 29):
+        assert data[:8] == b"PGRSTAT4"
+        end -= 8
+    if raw_phase & (1 << 30):
+        extension = int.from_bytes(data[end - 4:end], "little")
+        assert extension in (0, 16)
+        start = end - 88 - extension
+        assert start >= 56 and data[start:start + 8] == b"PGLOGFC1"
+        end = start
+    residue = end % 4
+    if residue:
+        assert data[:8] == b"PGRSTAT4" and raw_phase & 0x1FFFFFFF == 3
+    if residue & 2:
+        intent = data[end - 18:end]
+        assert intent[:8] == b"PGLOGPI1" and intent[8] in (0, 1)
+        assert intent[9] in (1, 2) and (intent[9] == 1 or intent[8])
+        assert not any(intent[10:])
+        end -= 18
+    if residue & 1:
+        intent = data[end - 17:end]
+        assert intent[:8] == b"PGFPWPI1" and intent[8] in (0, 1) and not any(intent[9:])
+        return end - 17, bool(intent[8])
+    return end, None
+
+
 def recovery_promotion_full_page_writes(data):
     """Read the pending promotion intent, or return None for the legacy layout.
 
@@ -96,29 +126,19 @@ def recovery_promotion_full_page_writes(data):
     independent of the source FPW fact. This helper checks the intent and CRC
     when present; callers still need to validate the rest of the control image.
     """
-    if len(data) % 4 == 0:
+    end, desired = recovery_policy_core(data)
+    if desired is None:
         return None
-    assert len(data) % 4 == 1 and data[:8] == b"PGRSTAT4"
-    assert len(data) - 17 in (88, 104, 132, 136, 148, 152, 160, 176,
+    assert end + 4 in (88, 104, 132, 136, 148, 152, 160, 176,
                              180, 196, 204, 208, 220, 224, 252, 268)
-    assert int.from_bytes(data[8:12], "little") & 0x7FFFFFFF == 3
-    intent = data[-21:-4]
-    assert intent[:8] == b"PGFPWPI1" and intent[8] in (0, 1) and not any(intent[9:])
     assert crc32c(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
-    return bool(intent[8])
+    return desired
 
 
 def recovery_control_fields(data):
-    """Check the control layout and return its resource and source FPW facts.
-
-    A length of one modulo four marks the 17-byte intent after the optional
-    source FPW fact and before the outer CRC. The intent is checked separately.
-    """
-    assert len(data) % 4 in (0, 1)
-    intent = len(data) % 4 == 1
-    if intent:
-        recovery_promotion_full_page_writes(data)
-    core_size = len(data) - (17 if intent else 0)
+    """Check the control layout and return its resource and source FPW facts."""
+    end, _ = recovery_policy_core(data)
+    core_size = end + 4
     ordinary, pending = data[:8] == b"PGRSTAT3", data[:8] == b"PGRSTAT4"
     fpw = ((ordinary and core_size in (144, 160, 192, 208))
            or (pending and core_size in (160, 176, 204, 208, 220, 224, 252, 268)))
@@ -127,6 +147,8 @@ def recovery_control_fields(data):
              or (pending and resource_end + 4 in (136, 152, 180, 196)))
     size = resource_end + 4 - (48 if known else 0)
     assert (ordinary and size in (72, 88)) or (pending and size in (88, 104, 132, 148))
+    if int.from_bytes(data[8:12], "little") & (1 << 29):
+        assert pending and size in (132, 148)
     assert crc32c(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
     selected = size in ((104, 148) if pending else (88,))
     offset = (84 if pending else 68) if selected else 12
