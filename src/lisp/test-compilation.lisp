@@ -15,12 +15,20 @@
   (dolist (root (list cache source))
     (unless (and (uiop:absolute-pathname-p root) (uiop:directory-pathname-p root))
       (error "Expected an absolute cache or source directory: ~s" root)))
-  (let ((tag (ecase profile
-               (:default "common-lisp/tests-default-v1/")
-               (:fast "common-lisp/tests-fast-v1/"))))
+  (let* ((tag (ecase profile
+                (:default "common-lisp/tests-default-v2/")
+                (:fast "common-lisp/tests-fast-v2/")))
+         (base (merge-pathnames tag cache))
+         (source-components (rest (pathname-directory source)))
+         ;; The component count separates the checkout root from the test path,
+         ;; even when one checkout lives inside another checkout's test tree.
+         (target (make-pathname
+                  :directory (append (pathname-directory base)
+                                     (list (format nil "~d" (length source-components)))
+                                     source-components)
+                  :defaults base)))
     (list :output-translations
-          (list (namestring (merge-pathnames "t/" source))
-                (namestring (merge-pathnames tag cache)))
+          (list (namestring (merge-pathnames "t/" source)) (namestring target))
           (list "/" (namestring (merge-pathnames "common-lisp/" cache)))
           :ignore-inherited-configuration)))
 

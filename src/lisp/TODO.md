@@ -2123,6 +2123,11 @@ still has work outstanding.
     defaults an unset `TMPDIR` to its explicit run workspace. The 17
     heads that had failed while accidentally using `/tmp` passed with
     that fallback.
+  Campaign test FASL paths now include the checkout's absolute directory
+  components and their count under the compilation policy namespace. The
+  ASDF translation regression covers two checkout roots with test paths that
+  would otherwise collide after stripping their respective `t/` prefixes.
+  Quicklisp-sensitive dependency cache reuse remains open.
 
 - [ ] Test ownership revocation across live ASDF reloads with the same streams
   and owner tokens. The stream and directory proof modules keep their weak

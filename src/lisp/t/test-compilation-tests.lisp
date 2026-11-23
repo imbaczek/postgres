@@ -16,7 +16,7 @@
     (and (eq profile (if (= mode 2) :fast :default))
          (equal (first config) :output-translations)
          (equal (first (second config)) (namestring (merge-pathnames "t/" source)))
-         (search (if (= mode 2) "tests-fast-v1/" "tests-default-v1/") (second (second config)))
+         (search (if (= mode 2) "tests-fast-v2/" "tests-default-v2/") (second (second config)))
          (equal (third config) (list "/" (namestring (merge-pathnames "common-lisp/" cache))))
          (eq (fourth config) :ignore-inherited-configuration))))
 
@@ -72,12 +72,24 @@
           (asdf:initialize-output-translations
            (pg-test-compilation:cache-translations
             #p"/tmp/policy-cache/" #p"/tmp/policy-source/" profile))
-          (let ((test-path (asdf:apply-output-translations #p"/tmp/policy-source/t/probe.fasl"))
+          (let ((test-path (asdf:apply-output-translations #p"/tmp/policy-source/t/nested/probe.fasl"))
                 (pg-path (asdf:apply-output-translations #p"/tmp/policy-source/probe.fasl")))
             (ok (equal test-path
                        (if (eq profile :fast)
-                           #p"/tmp/policy-cache/common-lisp/tests-fast-v1/probe.fasl"
-                           #p"/tmp/policy-cache/common-lisp/tests-default-v1/probe.fasl")))
+                           #p"/tmp/policy-cache/common-lisp/tests-fast-v2/2/tmp/policy-source/nested/probe.fasl"
+                           #p"/tmp/policy-cache/common-lisp/tests-default-v2/2/tmp/policy-source/nested/probe.fasl")))
+            (pg-test-compilation:call-with-cache
+             profile #p"/tmp/policy-cache/" #p"/tmp/policy-source/nested/"
+             (lambda ()
+               (let ((other-path
+                       (asdf:apply-output-translations #p"/tmp/policy-source/nested/t/probe.fasl")))
+                 (ok (equal other-path
+                            (merge-pathnames
+                             (if (eq profile :fast)
+                                 "tests-fast-v2/3/tmp/policy-source/nested/probe.fasl"
+                                 "tests-default-v2/3/tmp/policy-source/nested/probe.fasl")
+                             #p"/tmp/policy-cache/common-lisp/")))
+                 (ok (not (equal other-path test-path))))))
             (ok (equal pg-path #p"/tmp/policy-cache/common-lisp/tmp/policy-source/probe.fasl"))
             (when production (ok (equal production pg-path)))
             (setf production pg-path))))))
