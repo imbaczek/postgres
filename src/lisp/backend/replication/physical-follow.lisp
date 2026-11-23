@@ -1830,7 +1830,7 @@ Capture the floor and its timeline together before running the restore shell."
   (call-with-physical-follow-restore-stage
    runtime
    (lambda (fd check cancel-check)
-     (wal-restore-proved-segment command fd system-id timeline segment :timeline
+     (wal-restore-proved-segment command fd system-id timeline segment
                                  :working-directory *pgdata* :check check :partial partial
                                  :cancel-check cancel-check
                                  :restart-file (physical-follow-archive-restart-file runtime)))))

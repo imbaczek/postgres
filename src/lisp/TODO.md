@@ -429,6 +429,9 @@ The receiver requests only qualified complete segments and partials.
 Its restart cutoff uses the timeline at the durable receive floor. Six strict
 heads passed, including refusal to advance receipt from a proved legacy
 complete segment and admission of the same bytes under the qualified name.
+The restore helper has no legacy namespace argument. Five strict heads
+passed, covering proof validation, qualified receipt, and migration of
+retained legacy proofs to qualified names.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

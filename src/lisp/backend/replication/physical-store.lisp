@@ -170,14 +170,14 @@ The archive is a trusted source. Checksums detect accidental changes."
                  (error condition)))))
           ((>= status 126) (error "restore_command could not run for ~a" name)))))
 
-(defun wal-restore-proved-segment (template directory-fd system-id timeline segment namespace
+(defun wal-restore-proved-segment (template directory-fd system-id timeline segment
                                    &key working-directory check cancel-check restart-file partial)
   "Fetch a closed segment into an empty private directory owned by the caller.
 Return its bytes and proved end. A missing archive file returns NIL. The caller
 discards the entire staging directory after each attempt."
   (physical-image-check-directory directory-fd)
   (let* ((directory (physical-image-fd-path directory-fd))
-         (segment-name (wal-segment-filename segment timeline namespace))
+         (segment-name (wal-segment-filename segment timeline :timeline))
          (name (if partial (concatenate 'string segment-name ".partial") segment-name))
          (proof-name (wal-archive-segment-proof-name name)))
     (directory-entry-names directory :follow-symlinks t :maximum-entries 0)
@@ -199,7 +199,7 @@ discards the entire staging directory after each attempt."
                                                working-directory check cancel-check restart-file)))
           (when proof
             (values bytes (wal-verify-archive-segment-proof
-                           proof system-id timeline segment namespace bytes))))))))
+                           proof system-id timeline segment :timeline bytes))))))))
 
 (defun physical-store-update-digest-span (digest bytes start end)
   "Extend DIGEST over the half-open span [START, END) without changing BYTES.

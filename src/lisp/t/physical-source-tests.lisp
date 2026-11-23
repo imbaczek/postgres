@@ -210,7 +210,7 @@
                    (sb-posix:mkdir (namestring stage) #o700)
                    (let ((fd (pg::physical-backup-open-directory stage)))
                      (unwind-protect
-                          (pg::wal-restore-proved-segment command fd 17 2 0 :timeline :partial partial)
+                          (pg::wal-restore-proved-segment command fd 17 2 0 :partial partial)
                        (sb-posix:close fd))))))
           (ok (null (restore "missing/")))
           (pg::wal-atomic-write-bytes proof-path
