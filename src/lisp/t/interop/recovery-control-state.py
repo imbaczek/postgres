@@ -22,10 +22,8 @@ def decode(raw):
         assert suffix in (0, 16) and crc_offset >= 68 + 88 + suffix
         logical_start = crc_offset - 88 - suffix
         logical = raw[logical_start:crc_offset]
-        checked = checked[:logical_start] + bytes(4)
-        struct.pack_into('<I', checked, logical_start, crc32c(checked))
         phase &= ~(1 << 30)
-    layout, resources, fpw = RECOVERY_FIELDS(checked if logical is not None else raw)
+    layout, resources, fpw = RECOVERY_FIELDS(raw)
     if phase & (1 << 31):
         assert xid == 0, 'hidden exhausted XID value'
         xid = 1 << 64

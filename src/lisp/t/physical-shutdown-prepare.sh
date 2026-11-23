@@ -3,7 +3,6 @@
 set -eu
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$BASE/t/test-support.sh"
-SBCL=${SBCL:-sbcl}
 PSQL=${PSQL:-psql}
 PORT=${PORT:-5966}
 TARGET_PORT=$((PORT + 1))
@@ -14,11 +13,10 @@ sql() {
         -qAt -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -c "$2"
 }
 control() {
-    printf '%s\n(quit)\n' "$2" | timeout 20 "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock"
+    test_lisp_control "$TMP/$1.sock" "$2" 20
 }
 checked() {
-    control "$1" "$2" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log" 20
 }
 rejected() {
     control target "$1" >"$TMP/$2.log"
@@ -41,8 +39,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 start_target() {
-    rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" --control-socket "$TMP/target.sock" >>"$TMP/target.log" 2>&1 &
+    test_launch_lisp_server "$TARGET_PORT" "$TMP/copy" "$TMP/target.sock" "$TMP/target.log"
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
 }
@@ -61,7 +58,7 @@ follow() {
     checked target "(physical-follow-start \"127.0.0.1\" $PORT \"shutdown_base\")" "$1"
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
+test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" 'CREATE TABLE shutdown_data (id integer PRIMARY KEY); INSERT INTO shutdown_data VALUES (1)'
@@ -75,7 +72,8 @@ checked target "(let ((original (symbol-function 'physical-recovery-prepare-shut
 # Arm before replay advances, so the control client disconnects before the
 # maintenance worker closes admission. Its hook holds the actual publication
 # gate/store/reload locks until the shell releases it.
-checked target "(setf *physical-restartpoint-timeout* 0 *physical-restartpoint-test-hook* (lambda (point) (when (eq point :after-generation) (setf *physical-restartpoint-test-hook* nil) (with-open-file (out \"$TMP/maintenance-generation\" :direction :output) (write-line \"publishing\" out)) (loop repeat 160 until (probe-file \"$TMP/maintenance-release\") do (sleep 0.05)) (unless (probe-file \"$TMP/maintenance-release\") (error \"maintenance publication barrier timed out\")))))" maintenance-hook
+# Age the last restartpoint against the installed timeout before the next row applies.
+checked target "(setf *physical-restartpoint-last-time* (- (get-internal-real-time) (* (1+ (startup-configuration-timeout (startup-require-configuration))) internal-time-units-per-second)) *physical-restartpoint-test-hook* (lambda (point) (when (eq point :after-generation) (setf *physical-restartpoint-test-hook* nil) (with-open-file (out \"$TMP/maintenance-generation\" :direction :output) (write-line \"publishing\" out)) (loop repeat 160 until (probe-file \"$TMP/maintenance-release\") do (sleep 0.05)) (unless (probe-file \"$TMP/maintenance-release\") (error \"maintenance publication barrier timed out\")))))" maintenance-hook
 sql "$PORT" 'INSERT INTO shutdown_data VALUES (2)'
 attempt=0
 while [ ! -f "$TMP/maintenance-generation" ]; do

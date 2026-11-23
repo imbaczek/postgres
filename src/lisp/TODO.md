@@ -951,6 +951,13 @@ preservation for negative-scale widening, narrowing, and scale changes.
 
 ### A17 follow-up evidence
 
+The physical reader, shutdown preparation, and shutdown signal fixtures use the
+shared owned-server launcher and control client. All three live scripts passed.
+Shutdown preparation ages the last restartpoint against the installed timeout
+to exercise the publication barrier before the worker join. The signal fixture's
+control inspector validates the original checksummed image, including the logical
+policy extension used by current writers.
+
 A focused backend trace located the TOAST rewrite fixture wait in
 `ACQUIRE-SCHEMA-WRITE-LOCK`. The repeatable-read session held a schema
 read lock while the fixture waited synchronously for `VACUUM FULL`.

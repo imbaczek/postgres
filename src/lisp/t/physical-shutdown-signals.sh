@@ -14,12 +14,8 @@ sql() {
     PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$1" -U postgres -d postgres \
         -qAt -v ON_ERROR_STOP=1 -c "$2"
 }
-control() {
-    printf '%s\n(quit)\n' "$2" | timeout 20 "$SBCL" --script "$BASE/t/control-client.lisp" unix "$TMP/$1.sock"
-}
 checked() {
-    control "$1" "$2" >"$TMP/$3.log"
-    if grep -q ';; error:' "$TMP/$3.log"; then cat "$TMP/$3.log" >&2; exit 1; fi
+    test_lisp_control_checked "$TMP/$1.sock" "$2" "$TMP/$3.log" 20
 }
 control_state() {
     "$PYTHON" "$BASE/t/interop/recovery-control-state.py" \
@@ -65,9 +61,7 @@ trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 start_target() {
     START=$((START + 1))
-    rm -f "$TMP/target.sock"
-    "$BASE/pg-lisp.sh" -p "$TARGET_PORT" -D "$TMP/copy" --control-socket "$TMP/target.sock" \
-        >"$TMP/target-$START.log" 2>&1 &
+    test_launch_lisp_server "$TARGET_PORT" "$TMP/copy" "$TMP/target.sock" "$TMP/target-$START.log"
     TARGET=$!
     test_wait_owned_sql_server "$TARGET" "$TARGET_PORT" "$PSQL"
     control_state active
@@ -123,7 +117,7 @@ verify_preparation() {
     checked target "(let ((original (symbol-function 'physical-recovery-prepare-shutdown))) (setf (symbol-function 'physical-recovery-prepare-shutdown) (lambda () (setf (symbol-function 'physical-recovery-prepare-shutdown) original) (assert (zerop *live-operation-depth*)) (assert (not *shutdown-finished*)) (prog1 (funcall original) (assert (and (eq *physical-shutdown-state* :prepared) (null *physical-follow-runtime*) (null *physical-restartpoint-worker*) *physical-replay-paused-p* (= *last-replay-lsn* (parse-replication-lsn \"$applied\")) (= (physical-store-floor-lsn *physical-receive-store*) *last-replay-lsn*) (> (physical-store-flushed-lsn *physical-receive-store*) *last-replay-lsn*) (= (getf (physical-restartpoint-read *physical-recovery-state*) :lsn) *last-replay-lsn*))) (with-open-file (out \"$TMP/$1\" :direction :output) (write-line \"prepared\" out))))))" "$1-hook"
 }
 mkdir -m 700 "$TMP/copy"
-"$BASE/pg-lisp.sh" -p "$PORT" -D "$TMP/source" --control-socket "$TMP/source.sock" >"$TMP/source.log" 2>&1 &
+test_launch_lisp_server "$PORT" "$TMP/source" "$TMP/source.sock" "$TMP/source.log"
 SOURCE=$!
 test_wait_owned_sql_server "$SOURCE" "$PORT" "$PSQL"
 sql "$PORT" 'CREATE TABLE signal_data (id integer PRIMARY KEY); INSERT INTO signal_data VALUES (1)'
