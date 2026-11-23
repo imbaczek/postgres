@@ -432,6 +432,15 @@ exist\" messages."
                    (make-scalar-builtin :name "set_config" :argument-types '(:text :text :bool)
                                         :result-type :text :volatility :volatile
                                         :evaluator 'set-config-value :implicit-arguments-p t)
+                   (make-scalar-builtin :name "pg_cancel_backend" :argument-types '(:int4)
+                                        :result-type :bool :volatility :volatile
+                                        :evaluator 'sql-cancel-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4)
+                                        :result-type :bool :volatility :volatile
+                                        :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
+                   (make-scalar-builtin :name "pg_terminate_backend" :argument-types '(:int4 :int8)
+                                        :result-type :bool :volatility :volatile
+                                        :evaluator 'sql-terminate-backend :implicit-arguments-p :admin)
                    (make-scalar-builtin :name "pg_reload_conf" :result-type :bool
                                         :volatility :volatile :strict-p t :evaluator 'admin-request-reload)
                    (make-scalar-builtin :name "pg_reload_code" :result-type :bool
@@ -504,12 +513,15 @@ exist\" messages."
 
 (defun scalar-builtin-match-p (builtin arguments)
   (let ((types (scalar-builtin-argument-types builtin))
-        (matches-p (if (scalar-builtin-implicit-arguments-p builtin)
-                       #'sql-implicit-coercion-p #'eq)))
+        (policy (scalar-builtin-implicit-arguments-p builtin)))
     (and (= (length arguments) (length types))
          (loop for argument in arguments for type in types
-               always (or (in-unknown-constant-p argument)
-                          (funcall matches-p (expr-type argument) type))))))
+               always (if (eq policy :admin)
+                          (admin-arg-coercible-p argument type)
+                          (or (in-unknown-constant-p argument)
+                              (if policy
+                                  (sql-implicit-coercion-p (expr-type argument) type)
+                                  (eq (expr-type argument) type))))))))
 
 (defun resolve-scalar-builtin (name candidates arguments)
   "Use C's exact-match count and prefer text for unknown unary inputs.
@@ -546,8 +558,10 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
              ((t) decorated-p)
              ((nil) *defer-function-constant-coercion-p*)
              (:always t))))
-    (list :func name (mapcar #'coerce-scalar-builtin-argument arguments
-                             (scalar-builtin-argument-types builtin))
+    (list :func name (if (eq (scalar-builtin-implicit-arguments-p builtin) :admin)
+                         arguments
+                         (mapcar #'coerce-scalar-builtin-argument arguments
+                                 (scalar-builtin-argument-types builtin)))
           :type (scalar-builtin-result-type builtin) :typmod -1)))
 
 (defun analyze-jsonb-set-function (name arguments)
@@ -1696,20 +1710,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (ereport "0A000" "set-returning functions are not allowed in this context"))
      (list :set-func name (coerce-rewind-function-arguments name args '(:text :bool :bool))
            :type :text :typmod -1))
-    ((string= name "pg_cancel_backend")
-     (unless (and (= (length args) 1)
-                  (admin-arg-coercible-p (first args) :int4))
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :bool :typmod -1))
-    ((string= name "pg_terminate_backend")
-     (unless (and (<= 1 (length args) 2)
-                  (admin-arg-coercible-p (first args) :int4)
-                  (or (= (length args) 1)
-                      (admin-arg-coercible-p (second args) :int8)))
-       (ereport "42883" "function ~a(~a) does not exist"
-                name (call-signature args)))
-     (list :func name args :type :bool :typmod -1))
     (t
      (ereport "42883" "function ~a(~a) does not exist"
               name (call-signature args)))))
@@ -4564,6 +4564,9 @@ Stop at the first difference, leaving later field types and counts unchecked."
       (ereport "22003" "integer out of range"))
     n))
 
+(defun sql-cancel-backend (pid)
+  (admin-cancel-backend (admin-pid-arg pid)))
+
 (defun admin-timeout-arg (value)
   (let ((n (cond
              ((eq value +null+) 0)
@@ -4733,6 +4736,9 @@ the full 64-bit ID as a signed value."
           (when match (setf ambiguous-p t))
           (setf match candidate))))))
 
+(defun sql-terminate-backend (pid &optional (timeout 0))
+  (admin-terminate-backend (admin-pid-arg pid) (admin-timeout-arg timeout)))
+
 (defun eval-func (name args &optional first-argument)
   (let* ((candidates (gethash name *scalar-builtin-descriptors*))
          (builtin (if (rest candidates)
@@ -4778,13 +4784,6 @@ the full 64-bit ID as a signed value."
                       (if (= (length args) 3) (third args) t)))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
-    ((string= name "pg_cancel_backend")
-     (admin-cancel-backend (admin-pid-arg (first args))))
-    ((string= name "pg_terminate_backend")
-     (admin-terminate-backend (admin-pid-arg (first args))
-                              (if (rest args)
-                                  (admin-timeout-arg (second args))
-                                  0)))
     (t
      (ereport "42883" "function ~a(...) does not exist" name))))
 

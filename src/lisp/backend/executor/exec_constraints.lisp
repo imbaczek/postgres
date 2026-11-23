@@ -42,12 +42,13 @@ Only constant names can be tracked for persisted expressions and replication."
 (defun default-strict-function-p (name)
   "Use declared strictness for registered calls when folding a demanded default."
   (let ((builtins (gethash name *scalar-builtin-descriptors*)))
-    (if builtins
-        (every #'scalar-builtin-strict-p builtins)
-        (or (having-immutable-function-p name)
-            (member name '("nextval" "currval" "setval" "pg_promote"
-                           "pg_cancel_backend" "pg_terminate_backend")
-                    :test #'string=)))))
+    (cond
+      ;; Stored defaults have historically folded NULL for these commands,
+      ;; while ordinary execution converts it to PID or timeout zero.
+      ((member name '("pg_cancel_backend" "pg_terminate_backend") :test #'string=) t)
+      (builtins (every #'scalar-builtin-strict-p builtins))
+      (t (or (having-immutable-function-p name)
+             (member name '("nextval" "currval" "setval" "pg_promote") :test #'string=))))))
 
 (defun fold-column-default (expression)
   "Copy a demanded default, folding immutable parts before row execution.
