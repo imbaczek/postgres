@@ -592,6 +592,11 @@ math evaluator and immutable-name list. SQL call analysis retains
 PostgreSQL-specific overload preferences and diagnostics. The 1,435 C
 comparisons included integer, float and numeric absolute values, both
 rounding arities, and stored overloaded defaults after restart.
+Numeric overload analysis now selects the preferred input domain and
+uses the registry to check arity, validate inputs, and perform coercion.
+Power calls, the exponentiation operator, and range buckets share the
+numeric versus float8 preference. The 1,438 C comparisons verified
+mixed operands, scale coercion, and lookup before literal conversion.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

@@ -7,6 +7,9 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.round('1.234', 2::smallint), pg_catalog.log('2', 8), power(2, 3::numeric), 2 ^ 3::numeric",
+    "SELECT pg_catalog.round('bad', 2::bigint)",
+    "SELECT pg_catalog.log10('bad', 10)",
     "SELECT pg_catalog.abs(-2::smallint), pg_catalog.abs('-0'::real), pg_catalog.abs(-2.000::numeric), @ '-2.5', round(2.5), round(2.5, 0)",
     "CREATE TABLE dc_overloaded_math_default (a real DEFAULT abs('-0'::real), b numeric DEFAULT round(2.555,2), c numeric DEFAULT log(2,8))",
     "CREATE SEQUENCE dc_array_to_string_strict_seq",

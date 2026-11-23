@@ -1129,11 +1129,8 @@ names and unknown types.  setseed has no catalog argument names."
       (values (if names (coerce slots 'list) analyzed) signature))))
 
 (defun numeric-function-p (name)
-  "Recognize the supported mathematical catalog functions without argument names."
-  (or (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p)
-      (member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                     "sqrt" "exp" "ln"
-                     "log" "log10" "power" "pow") :test #'string=)))
+  "Recognize registered math calls that use the numeric diagnostic path."
+  (find :numeric (gethash name *scalar-builtin-descriptors*) :key #'scalar-builtin-implicit-arguments-p))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
@@ -1311,43 +1308,28 @@ then argument types. Only ambiguity and type failures carry the cast hint."
                        (ereport "0A000" "named arguments are not supported for function ~a" name))
                      (analyze-expr argument table)) arguments))))
 
+(defun analyze-numeric-overload (name args first-type)
+  "Use the preferred input type to select candidates and let the registry check the full signature."
+  (analyze-scalar-builtin
+   name
+   (remove-if-not (lambda (builtin) (eq first-type (first (scalar-builtin-argument-types builtin))))
+                  (gethash name *scalar-builtin-descriptors*))
+   args *defer-function-constant-coercion-p*))
+
 (defun analyze-basic-numeric-function (name args)
-  "Resolve the supported basic numeric overload and coerce its arguments.
-Two-argument round and trunc use numeric and an int4 scale.  Unary abs
-preserves a known input type. Other unary calls choose numeric for
-numeric inputs and float8 otherwise. An
-unknown unary trunc argument is ambiguous because its catalog overloads
-include different type categories."
-  ;; trunc also has macaddr/macaddr8 overloads. An unknown unary argument
-  ;; cannot choose a type category even though float8 is preferred numeric.
-  (when (and (string= name "trunc") (= (length args) 1)
-             (in-unknown-constant-p (first args)))
-    (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
-  (unless (and (if (member name '("round" "trunc") :test #'string=)
-                   (member (length args) '(1 2))
-                   (= (length args) 1))
-               (or (in-unknown-constant-p (first args))
-                   (member (expr-type (first args)) '(:int2 :int4 :int8 :numeric :float4 :float8)))
-               (or (= (length args) 1)
-                   (in-unknown-constant-p (second args))
-                   (member (expr-type (second args)) '(:int2 :int4))))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+  "Choose the preferred numeric domain before checking the catalog signature."
   (let* ((argument (first args))
-         (type (cond ((= (length args) 2) :numeric)
-                     ((and (string= name "abs")
-                           (not (in-unknown-constant-p argument)))
-                      (expr-type argument))
-                     ((eq (expr-type argument) :numeric)
-                      (if (in-unknown-constant-p argument) :float8 :numeric))
-                     (t :float8))))
-    (unless (or (in-unknown-constant-p argument)
-                (sql-implicit-coercion-p (expr-type argument) type))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-    (list :func name
-          (cons (coerce-common-expression argument type)
-                (mapcar (lambda (arg) (coerce-common-expression arg :int4))
-                        (rest args)))
-          :type type :typmod -1)))
+         (unknown-p (in-unknown-constant-p argument))
+         (type (expr-type argument)))
+    ;; C also considers macaddr and macaddr8 when the unary argument is unknown.
+    (when (and (string= name "trunc") (null (rest args)) unknown-p)
+      (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
+    (analyze-numeric-overload name args
+                              (cond ((= (length args) 2) :numeric)
+                                    ((and (not unknown-p)
+                                          (or (string= name "abs") (eq type :numeric)))
+                                     type)
+                                    (t :float8)))))
 
 (defun sql-finite-numeric-scale (value)
   (if (sql-numeric-special-p value) +null+ (sql-numeric-scale value)))
@@ -1366,39 +1348,16 @@ include different type categories."
   "Choose the right operand on a tie, preserving its display scale."
   (if (plusp (sql-numeric-compare left right)) left right))
 
-(defun analyze-log-function (name args)
-  "Resolve one-argument or numeric two-argument logarithm overloads."
-  (cond
-    ((= (length args) 1)
-     (analyze-basic-numeric-function name args))
-    ((and (= (length args) 2) (not (string= name "log10"))
-          (every (lambda (arg)
-                   (or (in-unknown-constant-p arg)
-                       (sql-implicit-coercion-p (expr-type arg) :numeric)))
-                 args))
-     (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :numeric)) args)
-           :type :numeric :typmod -1))
-    (t (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))))
-
-(defun resolve-power-operands (name args)
-  "Resolve and coerce the two operands of a power function or operator.
-A known numeric operand selects numeric unless a float operand is present;
-otherwise the preferred float8 overload is used."
-  (unless (= (length args) 2)
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (let* ((numeric (and (some (lambda (arg) (and (not (in-unknown-constant-p arg))
-                                                (eq (expr-type arg) :numeric))) args)
-                       (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args)))
-         (type (if numeric :numeric :float8)))
-    (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
-                                     (sql-implicit-coercion-p (expr-type arg) type))) args)
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-    (values (mapcar (lambda (arg) (coerce-common-expression arg type)) args) type)))
+(defun preferred-numeric-input-type (args)
+  "Prefer float8 unless a known numeric argument can keep all inputs in numeric."
+  (if (and (some (lambda (arg) (and (not (in-unknown-constant-p arg))
+                                    (eq (expr-type arg) :numeric))) args)
+           (notany (lambda (arg) (member (expr-type arg) '(:float4 :float8))) args))
+      :numeric :float8))
 
 (defun analyze-power-function (name args)
-  "Analyze a numeric or float8 power function call."
-  (multiple-value-bind (arguments type) (resolve-power-operands name args)
-    (list :func name arguments :type type :typmod -1)))
+  "Resolve power operands using the preferred domain and the registry signature."
+  (analyze-numeric-overload name args (preferred-numeric-input-type args)))
 
 (defun analyze-width-bucket (args candidates)
   "Resolve compatible thresholds or select the catalog's preferred range signature."
@@ -1443,15 +1402,8 @@ otherwise the preferred float8 overload is used."
                          (coerce-common-expression array array-type)))
                :type result-type :typmod -1))))
     ((= (length args) 4)
-     (let* ((values (subseq args 0 3))
-            (type (if (and (some (lambda (a) (and (not (in-unknown-constant-p a))
-                                                  (eq (expr-type a) :numeric))) values)
-                           (notany (lambda (a) (member (expr-type a) '(:float4 :float8))) values))
-                      :numeric :float8)))
-       (analyze-scalar-builtin "width_bucket"
-                               (list (find type candidates
-                                           :key (lambda (builtin) (first (scalar-builtin-argument-types builtin)))))
-                               args *defer-function-constant-coercion-p*)))
+     (analyze-numeric-overload "width_bucket" args
+                               (preferred-numeric-input-type (subseq args 0 3))))
     (t (ereport "42883" "function width_bucket(~a) does not exist" (call-signature args)))))
 
 (defun sql-width-bucket-timetz-bytes (elements)
@@ -1554,11 +1506,9 @@ so a nested argument error keeps its own diagnostics."
         ((string= name "width_bucket")
          (analyze-width-bucket args (gethash name *scalar-builtin-descriptors*)))
         ((member name '("abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                        "sqrt" "exp" "ln")
+                        "sqrt" "exp" "ln" "log" "log10")
                  :test #'string=)
          (analyze-basic-numeric-function name args))
-        ((member name '("log" "log10") :test #'string=)
-         (analyze-log-function name args))
         ((member name '("power" "pow") :test #'string=)
          (analyze-power-function name args))
         (t (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
@@ -2881,10 +2831,11 @@ candidate selection."
                                    '(:int2 :int4 :int8 :numeric :float4 :float8))))
                      (list left right))
         (report-operator-resolution-error operator (list left right)))
-      (multiple-value-bind (arguments type) (resolve-power-operands "power" (list left right))
+      (let* ((call (analyze-power-function "power" (list left right)))
+             (arguments (third call)))
         (return-from analyze-binop-expression
           (list :binop operator (first arguments) (second arguments)
-                :type type :typmod -1))))
+                :type (expr-type call) :typmod -1))))
     (when (member operator '("&" "|" "#" "<<" ">>") :test #'string=)
       (return-from analyze-binop-expression (analyze-integer-bitwise operator left right)))
     (unless (member operator '("||" "+" "-" "*" "/" "%" "=" "<>" "<" "<=" ">" ">=") :test #'string=)
