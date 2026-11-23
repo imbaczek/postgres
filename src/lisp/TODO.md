@@ -192,6 +192,12 @@ match tracking and null extension remain in the driver state machines.
 Both drivers identify LATERAL and parameterized index inner inputs from
 the physical plan. Deciding whether to rescan no longer constructs a scan
 path. Index handle validation still runs during admission and scan setup.
+Unmatched rows share the null-extension routine. It preserves the
+surviving side's source presence and builds the padded datum origins
+directly, with no temporary padding vectors.
+The live TOAST suite passed origin-sensitive inserts through LEFT,
+RIGHT, FULL, and LATERAL joins. The DML differential passed one-row
+portal resumption through outer joins.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING

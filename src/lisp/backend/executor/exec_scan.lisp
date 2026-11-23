@@ -1699,6 +1699,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
      (or right-origins (make-array (length right) :initial-element nil))
      join)))
 
+(defun null-extend-select-join-row (row origins null-row null-first-p capture-p)
+  "Pad an unmatched join row and its optional origin vector on the missing side."
+  (let* ((values (if null-first-p (concatenate 'vector null-row row)
+                     (concatenate 'vector row null-row)))
+         (padded-origins (when capture-p (make-array (length values) :initial-element nil))))
+    (when (and padded-origins origins)
+      (replace padded-origins origins :start1 (if null-first-p (length null-row) 0)))
+    (values values padded-origins)))
+
 (defun qualify-select-join-pair (join qual left right left-origins right-origins
                                  left-presence right-presence capture-p)
   "Return a matching joined row with its origins and source presence."
@@ -1778,18 +1787,14 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                                          (load-right-for-left left left-origins left-presence matched-left))
                                                      (when (and (not stopped) (not (car matched-left))
                                                                 (member join-type '(:left :full)))
-                                                       (emit (concatenate 'vector left null-right)
-                                                             (and left-origins
-                                                                  (concatenate 'vector left-origins
-                                                                               (make-array right-width :initial-element nil)))
-                                                             left-presence)))
+                                                       (multiple-value-bind (row origins)
+                                                           (null-extend-select-join-row left left-origins null-right nil left-origins)
+                                                         (emit row origins left-presence))))
                                                    (when stopped :stop)))
                                                (emit-unmatched-right (right origins presence)
-                                                 (emit (concatenate 'vector null-left right)
-                                                       (and origins (concatenate 'vector
-                                                                                 (make-array left-width :initial-element nil)
-                                                                                 origins))
-                                                       presence))
+                                                 (multiple-value-bind (row padded-origins)
+                                                     (null-extend-select-join-row right origins null-left t origins)
+                                                   (emit row padded-origins presence)))
                                                (emit-unmatched-rights ()
                                                  (if outer-seen
                                                      (progn
@@ -1840,11 +1845,9 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                                   (setf matched t)
                                   (emit joined origins presence)))))
                    (when (and (not stopped) (not matched) (eq join-type :left))
-                     (emit (concatenate 'vector left null-right)
-                           (and left-origins
-                                (concatenate 'vector left-origins
-                                             (make-array right-width :initial-element nil)))
-                           left-presence)))
+                     (multiple-value-bind (row origins)
+                         (null-extend-select-join-row left left-origins null-right nil left-origins)
+                       (emit row origins left-presence))))
                  (when stopped :stop))))
       (funcall left-stream #'visit-left)
       (if stopped :stop (values)))))

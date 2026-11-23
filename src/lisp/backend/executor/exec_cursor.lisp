@@ -477,12 +477,9 @@ source itself.  Closing the result closes the sort and its source."
                  (close-sql-iterator right)
                  (setf right nil left-present nil)
                  (when (and (not matched) (eq (getf join :type) :left))
-                   (return (values (concatenate 'vector current-left null-right) t
-                                   (and *datum-origin-capture*
-                                        (concatenate 'vector
-                                                     (or left-origins (make-array (length current-left) :initial-element nil))
-                                                     (make-array (length null-right) :initial-element nil)))
-                                   nil left-presence))))))))
+                   (multiple-value-bind (values origins)
+                       (null-extend-select-join-row current-left left-origins null-right nil *datum-origin-capture*)
+                     (return (values values t origins nil left-presence)))))))))
      (lambda ()
        (close-sql-iterator right)
        (close-sql-iterator left)
@@ -527,12 +524,9 @@ source itself.  Closing the result closes the sort and its source."
               (let ((index right-index))
                 (incf right-index)
                 (unless (and left-seen (query-match-map-matched-p matches index))
-                  (return (values (concatenate 'vector null-left row) t
-                                  (and *datum-origin-capture*
-                                       (concatenate 'vector
-                                                    (make-array (length null-left) :initial-element nil)
-                                                    (or right-origins (make-array (length row) :initial-element nil))))
-                                  nil right-presence)))))
+                  (multiple-value-bind (values origins)
+                      (null-extend-select-join-row row right-origins null-left t *datum-origin-capture*)
+                    (return (values values t origins nil right-presence))))))
              (present
               (let ((index right-index))
                 (incf right-index)
@@ -547,12 +541,9 @@ source itself.  Closing the result closes the sort and its source."
               (close-sql-iterator reader)
               (setf reader nil left-present nil)
               (when (and (not matched) (member (getf join :type) '(:left :full)))
-                (return (values (concatenate 'vector current-left null-right) t
-                                (and *datum-origin-capture*
-                                     (concatenate 'vector
-                                                  (or left-origins (make-array (length current-left) :initial-element nil))
-                                                  (make-array (length null-right) :initial-element nil)))
-                                nil left-presence))))))))
+                (multiple-value-bind (values origins)
+                    (null-extend-select-join-row current-left left-origins null-right nil *datum-origin-capture*)
+                  (return (values values t origins nil left-presence)))))))))
      (lambda ()
        (close-sql-iterator reader)
        (close-sql-iterator left)
