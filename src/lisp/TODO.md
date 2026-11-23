@@ -603,6 +603,11 @@ analyzed input type. `json_agg` shares the supported-input check.
 The 1,443 C comparisons covered pretty arrays, row conversion,
 SQL NULL and JSON null, and scalar decoration precedence. Typed JSON
 defaults also passed after restart.
+The four JSON and JSONB builders register both nullary and
+variadic-any signatures. Their shared evaluator receives the analyzed
+call and its already evaluated arguments. The 1,443 C comparisons
+covered empty construction, argument limits, typed values, NULL
+variadic arrays, and stored VARIADIC metadata after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

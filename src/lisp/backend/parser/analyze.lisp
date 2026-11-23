@@ -444,6 +444,11 @@ exist\" messages."
   (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
                        :volatility :stable :strict-p t :evaluator (cons :typed-first evaluator)))
 
+(defun make-json-constructor-builtin (name argument-types result-type)
+  "Register a non-strict constructor that needs its analyzed argument types and VARIADIC marker."
+  (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
+                       :volatility :stable :evaluator '(:call . eval-json-constructor)))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -710,6 +715,14 @@ exist\" messages."
                    (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text :text)
                                         :result-type :text-array :volatility :immutable
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
+                   (make-json-constructor-builtin "json_build_array" nil :json)
+                   (make-json-constructor-builtin "json_build_array" '(:variadic-any) :json)
+                   (make-json-constructor-builtin "json_build_object" nil :json)
+                   (make-json-constructor-builtin "json_build_object" '(:variadic-any) :json)
+                   (make-json-constructor-builtin "jsonb_build_array" nil :jsonb)
+                   (make-json-constructor-builtin "jsonb_build_array" '(:variadic-any) :jsonb)
+                   (make-json-constructor-builtin "jsonb_build_object" nil :jsonb)
+                   (make-json-constructor-builtin "jsonb_build_object" '(:variadic-any) :jsonb)
                    (make-json-conversion-builtin "to_json" '(:anyelement) :json 'sql-typed-to-json)
                    (make-json-conversion-builtin "to_jsonb" '(:anyelement) :jsonb 'sql-typed-to-jsonb)
                    (make-json-conversion-builtin "row_to_json" '(:record) :json 'sql-typed-to-json)
@@ -763,12 +776,14 @@ exist\" messages."
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
-(defun eval-scalar-builtin (builtin arguments first-argument)
+(defun eval-scalar-builtin (builtin arguments first-argument call)
   (if (and (scalar-builtin-strict-p builtin) (member +null+ arguments))
       +null+
       (let ((evaluator (scalar-builtin-evaluator builtin)))
         (if (consp evaluator)
-            (apply (cdr evaluator) (expr-type first-argument) arguments)
+            (ecase (car evaluator)
+              (:typed-first (apply (cdr evaluator) (expr-type first-argument) arguments))
+              (:call (funcall (cdr evaluator) call arguments)))
             (apply evaluator arguments)))))
 
 (defun scalar-builtin-match-p (builtin arguments)
@@ -1648,6 +1663,21 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
      (ereport "42883" "function ~a(~a) does not exist"
               name (call-signature args)))))
 
+(defun analyze-json-constructor (name candidates args variadic)
+  "Resolve a variadic-any JSON constructor while retaining the caller's argument types."
+  (let ((arity (length args)))
+    (when (> arity 100)
+      (ereport "54023" "cannot pass more than 100 arguments to a function"))
+    (when variadic
+      (unless (= arity 1)
+        (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
+      (let ((type (expr-type (first args))))
+        (unless (or (sql-array-element-type type) (eq type :int2vector))
+          (ereport "42804" "VARIADIC argument must be an array"))))
+    (let ((builtin (scalar-builtin-for-evaluation candidates arity (first args))))
+      (list :func name args :type (scalar-builtin-result-type builtin) :typmod -1
+                            :variadic variadic))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
   (check-qualified-numeric-function-call expr table)
@@ -1684,17 +1714,8 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-numeric-function name args (getf (cdddr expr) :schema) random-signature)))
-      ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
-       (when (> (length args) 100)
-         (ereport "54023" "cannot pass more than 100 arguments to a function"))
-       (when (getf (cdddr expr) :variadic)
-         (unless (= (length args) 1)
-           (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-         (unless (or (sql-array-element-type (expr-type (first args)))
-                     (eq (expr-type (first args)) :int2vector))
-           (ereport "42804" "VARIADIC argument must be an array")))
-       (list :func name args :type (if (search "jsonb_" name) :jsonb :json) :typmod -1
-                             :variadic (getf (cdddr expr) :variadic)))
+      ((find '(:variadic-any) builtins :key #'scalar-builtin-argument-types :test #'equal)
+       (analyze-json-constructor name builtins args (getf (cdddr expr) :variadic)))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
       (builtins
@@ -3828,9 +3849,7 @@ still requires deferred sort projection."
   (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
     (if registered-p
         (not (member volatility '(:immutable :stable)))
-        (not (member name '("json_build_array" "json_build_object"
-                            "jsonb_build_array" "jsonb_build_object"
-                            "greatest" "least")
+        (not (member name '("greatest" "least")
                      :test #'string=)))))
 
 (defun analyzed-expression-volatile-p (form)
@@ -4587,7 +4606,7 @@ the full 64-bit ID as a signed value."
         (ambiguous-p nil))
     (dolist (candidate candidates (if ambiguous-p implicit-match match))
       (let ((types (scalar-builtin-argument-types candidate)))
-        (when (= arity (length types))
+        (when (if (equal types '(:variadic-any)) (plusp arity) (= arity (length types)))
           (when (eq first-type (first types)) (return candidate))
           ;; Stored unary text calls can still carry their original varchar or name input.
           (when (and (= arity 1) (member first-type '(:varchar :name))
@@ -4612,12 +4631,12 @@ the full 64-bit ID as a signed value."
     (ereport "42883" "setval expects a sequence name, int8 value, and optional boolean"))
   (sequence-setval (check-sequence-function-relation name t) value is-called))
 
-(defun eval-func (name args &optional first-argument)
+(defun eval-func (name args &optional first-argument call)
   (let* ((candidates (gethash name *scalar-builtin-descriptors*))
          (builtin (if (rest candidates)
                       (scalar-builtin-for-evaluation candidates (length args) first-argument)
                       (first candidates))))
-    (when builtin (return-from eval-func (eval-scalar-builtin builtin args first-argument))))
+    (when builtin (return-from eval-func (eval-scalar-builtin builtin args first-argument call))))
   (cond
     ((string= name "pg_stat_file") (apply #'sql-rewind-stat-file args))
     ((string= name "pg_read_binary_file") (apply #'sql-rewind-read-binary-file args))
@@ -5090,11 +5109,8 @@ truncate and interpret the result at TYPE's signed width."
            (if (member (second expr) '("length" "octet_length" "char_length" "character_length") :test #'string=)
                (eval-toast-length expr (cdr slice))
                (eval-toast-substring (third expr) (cdr slice) (expr-type expr))))))
-     (let* ((name (second expr))
-            (arguments (mapcar (lambda (a) (eval-expr a env)) (third expr))))
-       (cond ((member name '("json_build_array" "json_build_object" "jsonb_build_array" "jsonb_build_object") :test #'string=)
-              (sql-json-build name arguments (mapcar #'expr-type (third expr)) (getf (cdddr expr) :variadic)))
-             (t (eval-func name arguments (first (third expr)))))))
+     (let ((arguments (mapcar (lambda (argument) (eval-expr argument env)) (third expr))))
+       (eval-func (second expr) arguments (first (third expr)) expr)))
     (t
      (ereport "XX000" "cannot evaluate expression ~a" expr))))
 
@@ -5390,6 +5406,10 @@ truncate and interpret the result at TYPE's signed width."
   "Return JSON text using the same renderer as sql-write-json."
   (with-output-to-string (out)
     (sql-write-json value type out depth pretty)))
+
+(defun eval-json-constructor (call values)
+  (sql-json-build (second call) values (mapcar #'expr-type (third call))
+                  (getf (cdddr call) :variadic)))
 
 (defun sql-json-build (name values types &optional variadic)
   "Build JSON text or normalized JSONB, evaluating each argument once."
