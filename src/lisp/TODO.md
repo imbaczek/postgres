@@ -543,6 +543,10 @@ Default folding uses the shared local operand mapper for ordinary
 expressions. It keeps conditional evaluation and strict NULL handling.
 A regression verifies that a constant call argument folds while the
 call and CASE branch retain opaque metadata.
+HAVING literal checks and gate evaluation share the scalar operand
+positions. Gate evaluation uses one mechanism for folding mapped
+operands and evaluating the rebuilt expression only when all of them
+are known. Conditional evaluation and array-bound order stay explicit.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
