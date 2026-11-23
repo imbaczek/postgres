@@ -955,7 +955,7 @@
                     ("SELECT numeric_uplus(1.00)::text" "1.00")))
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case)))
                (first case)))
-  (rove:ok (eq +null+ (eval-numeric-helper-function "numeric_eq" (list +null+ 1))))
+  (rove:ok (eq +null+ (eval-func "numeric_eq" (list +null+ 1))))
   (rove:ok (not (analyzed-expression-volatile-p '(:func "numeric_inc" nil :type :numeric))))
   (let* ((call '(:func "numeric_inc" ((:const 1 :type :numeric :typmod -1))
                  :type :numeric :typmod -1))

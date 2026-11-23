@@ -557,6 +557,9 @@ CASES = (
     "SELECT numeric_smaller(1.0,1.000),numeric_larger(1.0,1.000),numeric_smaller('NaN','Infinity'),numeric_larger('-Infinity',0)",
     "SELECT numeric_eq(NULL,1),numeric_cmp(1,NULL),numeric_inc(NULL),numeric_smaller(NULL,1),numeric_uminus(NULL)",
     "SELECT numeric_eq(1::float8,1),numeric_inc(1::float8)",
+    "SELECT pg_catalog.numeric_cmp('NaN'::numeric, 'Infinity'), pg_catalog.numeric_larger(1.0,1.000)",
+    "SELECT pg_catalog.numeric_eq(DISTINCT 'bad', 1)",
+    "CREATE TABLE dc_numeric_helper_default (v numeric DEFAULT numeric_smaller(1.0,1.000))",
     # PostgreSQL numeric.sql division and carry/borrow regression cases.
     "SELECT 999999999999999999999::numeric/1000000000000000000000,div(999999999999999999999::numeric,1000000000000000000000),mod(999999999999999999999::numeric,1000000000000000000000)",
     "SELECT div(-9999999999999999999999::numeric,1000000000000000000000),mod(-9999999999999999999999::numeric,1000000000000000000000),div(-9999999999999999999999::numeric,1000000000000000000000)*1000000000000000000000+mod(-9999999999999999999999::numeric,1000000000000000000000)",
@@ -1346,6 +1349,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_numeric_helper_default DEFAULT VALUES RETURNING v",
                     "INSERT INTO dc_array_length_restart DEFAULT VALUES RETURNING v",
                       "INSERT INTO dc_bit_index DEFAULT VALUES RETURNING first_bit, octets",
                     "INSERT INTO dc_decimal DEFAULT VALUES RETURNING a",

@@ -549,6 +549,11 @@ coercion and strict immutable evaluation. The numeric diagnostic path
 still reports lookup errors from the caller's types and rejects scalar
 decorations before converting their literals. The 1,412 C comparisons
 covered these diagnostics, scale for special values, and factorial limits.
+The numeric comparison, extrema, and unary catalog helpers share the
+strict immutable registry path. The 1,415 C comparisons covered special
+value ordering, NULLs, and decorated lookup errors. The restart check
+verified that a stored extrema default still preserves the right
+operand's display scale on ties.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

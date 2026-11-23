@@ -358,6 +358,17 @@ exist\" messages."
   (make-scalar-builtin :name name :result-type result-type :volatility :volatile
                        :strict-p t :evaluator (lambda () (physical-replay-pause-command name))))
 
+(defun make-numeric-builtin (name argument-types result-type evaluator)
+  "Register a strict immutable signature using the numeric diagnostic path."
+  (make-scalar-builtin :name name :argument-types argument-types :result-type result-type
+                       :volatility :immutable :strict-p t :evaluator evaluator
+                       :implicit-arguments-p :numeric))
+
+(defun make-numeric-comparison-builtin (name predicate)
+  (make-numeric-builtin name '(:numeric :numeric) :bool
+                        (lambda (left right)
+                          (funcall predicate (sql-numeric-compare left right)))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -509,18 +520,22 @@ exist\" messages."
                    (make-scalar-builtin :name "substring" :argument-types '(:bytea :int4 :int4)
                                         :result-type :bytea :volatility :immutable :strict-p t
                                         :evaluator 'sql-substring :implicit-arguments-p t)
-                   (make-scalar-builtin :name "scale" :argument-types '(:numeric)
-                                        :result-type :int4 :volatility :immutable :strict-p t
-                                        :evaluator 'sql-finite-numeric-scale :implicit-arguments-p :numeric)
-                   (make-scalar-builtin :name "min_scale" :argument-types '(:numeric)
-                                        :result-type :int4 :volatility :immutable :strict-p t
-                                        :evaluator 'sql-finite-numeric-min-scale :implicit-arguments-p :numeric)
-                   (make-scalar-builtin :name "trim_scale" :argument-types '(:numeric)
-                                        :result-type :numeric :volatility :immutable :strict-p t
-                                        :evaluator 'sql-numeric-trim-scale :implicit-arguments-p :numeric)
-                   (make-scalar-builtin :name "factorial" :argument-types '(:int8)
-                                        :result-type :numeric :volatility :immutable :strict-p t
-                                        :evaluator 'sql-factorial :implicit-arguments-p :numeric)
+                   (make-numeric-comparison-builtin "numeric_eq" #'zerop)
+                   (make-numeric-comparison-builtin "numeric_ne" #'(lambda (order) (not (zerop order))))
+                   (make-numeric-comparison-builtin "numeric_gt" #'plusp)
+                   (make-numeric-comparison-builtin "numeric_ge" #'(lambda (order) (not (minusp order))))
+                   (make-numeric-comparison-builtin "numeric_lt" #'minusp)
+                   (make-numeric-comparison-builtin "numeric_le" #'(lambda (order) (not (plusp order))))
+                   (make-numeric-builtin "numeric_cmp" '(:numeric :numeric) :int4 'sql-numeric-compare)
+                   (make-numeric-builtin "numeric_smaller" '(:numeric :numeric) :numeric 'sql-numeric-smaller)
+                   (make-numeric-builtin "numeric_larger" '(:numeric :numeric) :numeric 'sql-numeric-larger)
+                   (make-numeric-builtin "numeric_inc" '(:numeric) :numeric 'sql-numeric-increment)
+                   (make-numeric-builtin "numeric_uminus" '(:numeric) :numeric 'sql-numeric-negate)
+                   (make-numeric-builtin "numeric_uplus" '(:numeric) :numeric 'identity)
+                   (make-numeric-builtin "scale" '(:numeric) :int4 'sql-finite-numeric-scale)
+                   (make-numeric-builtin "min_scale" '(:numeric) :int4 'sql-finite-numeric-min-scale)
+                   (make-numeric-builtin "trim_scale" '(:numeric) :numeric 'sql-numeric-trim-scale)
+                   (make-numeric-builtin "factorial" '(:int8) :numeric 'sql-factorial)
                    (make-scalar-builtin :name "random" :result-type :float8
                                         :volatility :volatile :strict-p t :evaluator 'sql-random-float)
                    (make-scalar-builtin :name "random" :argument-types '(:int4 :int4)
@@ -981,7 +996,6 @@ names and unknown types.  setseed has no catalog argument names."
       (trig-function-p name)
       (float-catalog-alias name)
       (integer-catalog-alias-p name)
-      (numeric-helper-function-p name)
       (numeric-arithmetic-function-p name)))
 
 (defun numeric-function-argument-count-p (name count)
@@ -994,9 +1008,6 @@ names and unknown types.  setseed has no catalog argument names."
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
          (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
-        ((numeric-helper-function-p name)
-         (= count (if (member name '("numeric_inc" "numeric_uminus" "numeric_uplus")
-                              :test #'string=) 1 2)))
         ((or (numeric-arithmetic-function-p name)
              (member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
                             "atan2" "atan2d") :test #'string=))
@@ -1235,45 +1246,16 @@ include different type categories."
 (defun sql-finite-numeric-min-scale (value)
   (if (sql-numeric-special-p value) +null+ (sql-numeric-min-scale value)))
 
-(defun numeric-helper-function-p (name)
-  (member name '("numeric_eq" "numeric_ne" "numeric_gt" "numeric_ge"
-                 "numeric_lt" "numeric_le" "numeric_cmp" "numeric_inc"
-                 "numeric_smaller" "numeric_larger" "numeric_uminus" "numeric_uplus")
-          :test #'string=))
+(defun sql-numeric-increment (value)
+  (sql-numeric-arithmetic "+" value 1))
 
-(defun analyze-numeric-helper-function (name args)
-  (let ((arity (if (member name '("numeric_inc" "numeric_uminus" "numeric_uplus")
-                           :test #'string=) 1 2)))
-    (unless (and (= (length args) arity)
-                 (every (lambda (arg)
-                          (or (in-unknown-constant-p arg)
-                              (sql-implicit-coercion-p (expr-type arg) :numeric))) args))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-    (list :func name (mapcar (lambda (arg) (coerce-common-expression arg :numeric)) args)
-          :type (cond ((member name '("numeric_eq" "numeric_ne" "numeric_gt" "numeric_ge"
-                                      "numeric_lt" "numeric_le") :test #'string=) :bool)
-                      ((string= name "numeric_cmp") :int4)
-                      (t :numeric))
-          :typmod -1)))
+(defun sql-numeric-smaller (left right)
+  "Choose the right operand on a tie, preserving its display scale."
+  (if (minusp (sql-numeric-compare left right)) left right))
 
-(defun eval-numeric-helper-function (name args)
-  "Evaluate strict numeric helpers; equal extrema select the second argument.
-Selecting the argument itself preserves its display scale."
-  (when (member +null+ args) (return-from eval-numeric-helper-function +null+))
-  (let ((left (first args)) (right (second args)))
-    (cond ((string= name "numeric_inc") (sql-numeric-arithmetic "+" left 1))
-          ((string= name "numeric_uminus") (sql-numeric-negate left))
-          ((string= name "numeric_uplus") left)
-          (t (let ((cmp (sql-numeric-compare left right)))
-               (cond ((string= name "numeric_cmp") cmp)
-                     ((string= name "numeric_eq") (zerop cmp))
-                     ((string= name "numeric_ne") (not (zerop cmp)))
-                     ((string= name "numeric_gt") (plusp cmp))
-                     ((string= name "numeric_ge") (not (minusp cmp)))
-                     ((string= name "numeric_lt") (minusp cmp))
-                     ((string= name "numeric_le") (not (plusp cmp)))
-                     ((string= name "numeric_smaller") (if (minusp cmp) left right))
-                     (t (if (plusp cmp) left right))))))))
+(defun sql-numeric-larger (left right)
+  "Choose the right operand on a tie, preserving its display scale."
+  (if (plusp (sql-numeric-compare left right)) left right))
 
 (defun numeric-arithmetic-function-p (name)
   "Recognize immutable numeric arithmetic function names."
@@ -1575,7 +1557,6 @@ so a nested argument error keeps its own diagnostics."
          (analyze-log-function name args))
         ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
          (analyze-power-function name args))
-        ((numeric-helper-function-p name) (analyze-numeric-helper-function name args))
         ((numeric-arithmetic-function-p name) (analyze-numeric-arithmetic-function name args)))
     (pg-error (condition)
       (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
@@ -3905,7 +3886,6 @@ still requires deferred sort projection."
       (float-catalog-alias name)
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
-      (numeric-helper-function-p name)
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -5060,7 +5040,6 @@ expression identity has been resolved."
      (cond ((string= name "pi") pi)
            ((member +null+ arguments) +null+)
            (t (sql-float-trig name arguments))))
-    ((numeric-helper-function-p name) (eval-numeric-helper-function name arguments))
     ((numeric-arithmetic-function-p name)
      (eval-numeric-arithmetic-function name arguments type))
     ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
