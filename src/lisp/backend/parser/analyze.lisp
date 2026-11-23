@@ -4610,8 +4610,11 @@ the full 64-bit ID as a signed value."
         ((and (eq source-type :numeric) (eq target-type :numeric))
          (or (< target-typmod 4)
              (and (>= source-typmod 4)
-                  (= (ldb (byte 11 0) (- source-typmod 4)) (ldb (byte 11 0) (- target-typmod 4)))
-                  (<= (ldb (byte 16 16) (- source-typmod 4)) (ldb (byte 16 16) (- target-typmod 4))))))
+                  (multiple-value-bind (source-precision source-scale)
+                      (sql-numeric-typmod-components source-typmod)
+                    (multiple-value-bind (target-precision target-scale)
+                        (sql-numeric-typmod-components target-typmod)
+                      (and (= source-scale target-scale) (<= source-precision target-precision)))))))
         (t (and (eq source-type target-type) (= source-typmod target-typmod)))))
 
 (defun eval-expr-with-origin (expression environment origins)

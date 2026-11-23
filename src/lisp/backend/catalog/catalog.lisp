@@ -1137,7 +1137,8 @@ from advancing the shared WAL generation between a failed save and rollback."
     (:numeric (if (< typmod 4) "numeric"
                   (multiple-value-bind (precision scale) (sql-numeric-typmod-components typmod)
                     (format nil "numeric(~d,~d)" precision scale))))
-    (:varchar (if (< typmod 4) "varchar" (format nil "varchar(~d)" (- typmod 4))))
+    (:varchar (let ((length (sql-varchar-typmod-length typmod)))
+                (if length (format nil "varchar(~d)" length) "varchar")))
     (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     ((:int2 :int4 :int8 :float4 :float8 :bool :text :json :jsonb :bytea :name
             :oid :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array)
@@ -1633,7 +1634,8 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
              (let ((size
                      (case type
                        (:varchar
-                        (and (>= typmod 4) (+ 4 (* 4 (- typmod 4)))))
+                        (let ((length (sql-varchar-typmod-length typmod)))
+                          (when length (+ 4 (* 4 length)))))
                        (:numeric
                         (and (>= typmod 4)
                              (+ 8 (* 2 (floor (+ (sql-numeric-typmod-components typmod) 6) 4)))))

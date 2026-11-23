@@ -741,6 +741,11 @@ packed-field access. Standard interval syntax and qualified casts use
 the same supported ranges. Coercion and catalog replay read the same
 packed fields. The regressions pin the canonical two-argument spelling
 for an hour-to-minute cast and verify its use in a default after restart.
+Varchar assignment, stored SQL, and TOAST estimation decode the character
+limit through `pg/sql-types`. Numeric origin preservation uses the shared
+precision and signed scale decoder. A regression distinguishes the raw
+zero-character typmod from an unconstrained value and checks origin
+preservation for negative-scale widening, narrowing, and scale changes.
 
 ### A17 follow-up evidence
 

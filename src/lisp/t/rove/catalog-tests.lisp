@@ -206,6 +206,21 @@
       (rove:ok (= 9 (pg-sequence-last-value sequence)))
       (rove:ok (equal '(("t")) (pg-publication-tables publication)))))
 
+(rove:deftest type-modifier-widths-preserve-coercion-and-origin-rules
+    (rove:ok (null (sql-varchar-typmod-length -1)))
+  (rove:ok (null (sql-varchar-typmod-length 3)))
+  (rove:ok (= 0 (sql-varchar-typmod-length 4)))
+  (rove:ok (= 2 (sql-varchar-typmod-length (sql-varchar-typmod 2))))
+  (rove:ok (string= "" (sql-varchar-cast-value "é" 4)))
+  (let ((source (sql-numeric-typmod 4 -2))
+        (widened (sql-numeric-typmod 6 -2))
+        (changed-scale (sql-numeric-typmod 6 2)))
+    (rove:ok (datum-origin-coercion-compatible-p :numeric source :numeric widened))
+    (rove:ok (not (datum-origin-coercion-compatible-p :numeric widened :numeric source)))
+    (rove:ok (not (datum-origin-coercion-compatible-p :numeric source :numeric changed-scale)))
+    (rove:ok (datum-origin-coercion-compatible-p :numeric source :numeric -1))
+    (rove:ok (not (datum-origin-coercion-compatible-p :numeric -1 :numeric source)))))
+
 (rove:deftest catalog-replay-keeps-numeric-and-timestamp-type-modifiers
     (let* ((typmod (sql-numeric-typmod 9 -3))
            (numeric (make-pg-column :name "n" :type :numeric :typmod typmod))

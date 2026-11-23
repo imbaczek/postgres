@@ -174,9 +174,14 @@
     (ereport "22023" "length for type varchar cannot exceed 10485760"))
   (+ length 4))
 
+(defun sql-varchar-typmod-length (typmod)
+  "Return the character limit from TYPMOD, or NIL for unconstrained varchar."
+  (when (>= typmod 4)
+    (- typmod 4)))
+
 (defun constrain-varchar-value (value typmod explicit-p)
-  (let ((maximum (- typmod 4)))
-    (if (and (>= maximum 0) (or explicit-p (> (length value) maximum)))
+  (let ((maximum (sql-varchar-typmod-length typmod)))
+    (if (and maximum (or explicit-p (> (length value) maximum)))
         (progn
           (when (and (not explicit-p)
                      (position-if-not (lambda (character) (char= character #\Space)) value :start maximum))
