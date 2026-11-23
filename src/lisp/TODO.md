@@ -400,6 +400,13 @@ from the registry. They still dispatch through the shared replay operation.
 The physical regressions exercise registry dispatch during a resource
 pause and standby promotion. The C differential checks all four recovery
 guards on a primary and the pause-state arity diagnostic.
+`chr(int4)` uses the same builtin registry. Its strict evaluator preserves
+Unicode validation and its analyzer still defers decorated-call coercion.
+The C differential covers smallint widening, unknown input, NULL, wrong
+arity, bigint rejection, and surrogate rejection. Immutable folding
+also recognizes `chr` through the registry. The differential checks error
+precedence on both sides of a false HAVING conjunct and verifies that an
+invalid default fails only when an INSERT demands it.
 
 ### A9 follow-up evidence
 

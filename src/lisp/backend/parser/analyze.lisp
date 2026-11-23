@@ -447,6 +447,9 @@ exist\" messages."
                    (make-replay-control-builtin "pg_wal_replay_resume" :void)
                    (make-replay-control-builtin "pg_is_wal_replay_paused" :bool)
                    (make-replay-control-builtin "pg_get_wal_replay_pause_state" :text)
+                   (make-scalar-builtin :name "chr" :argument-types '(:int4) :result-type :text
+                                        :volatility :immutable :strict-p t :evaluator 'sql-chr
+                                        :implicit-arguments-p t)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
@@ -578,15 +581,12 @@ after this step any surviving tie is ambiguous."
           :type :json :typmod -1)))
 
 (defun analyze-render-function (name arguments)
-  "Resolve chr, string_to_array and array_to_string against supported types."
+  "Resolve string_to_array and array_to_string against supported types."
   (when (and (string= name "array_to_string") (member (length arguments) '(2 3))
              (in-unknown-constant-p (first arguments)))
     (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-  (let ((types (cond ((string= name "chr") '(:int4))
-                     ((string= name "string_to_array") '(:text :text :text))
-                     (t '(nil :text :text)))))
-    (unless (and (if (string= name "chr") (= (length arguments) 1)
-                     (member (length arguments) '(2 3)))
+  (let ((types (if (string= name "string_to_array") '(:text :text :text) '(nil :text :text))))
+    (unless (and (member (length arguments) '(2 3))
                  (loop for argument in arguments for type in types
                        always (if type
                                   (or (in-unknown-constant-p argument)
@@ -635,32 +635,31 @@ A NULL delimiter splits at character boundaries; empty input yields an empty arr
                         :dimensions (when (plusp size) (list size))
                         :lower-bounds (when (plusp size) '(1)))))))
 
-(defun eval-render-function (name arguments)
-  "Render a UTF-8 codepoint or join unquoted array elements as PostgreSQL text.
-Omit NULL elements unless a non-NULL replacement is supplied."
-  (if (string= name "chr")
-      (sql-strict-let ((code (first arguments)))
-        (cond ((minusp code) (ereport "22023" "character number must be positive"))
-              ((zerop code) (ereport "54000" "null character not permitted"))
-              ((> code #x10ffff)
-               (ereport "54000" "requested character too large for encoding: ~d" code))
-              ((<= #xd800 code #xdfff)
-               (ereport "54000" "requested character not valid for encoding: ~d" code))
-              (t (string (code-char code)))))
-      (sql-strict-let ((array (first arguments)) (separator (second arguments)))
-        (let ((replacement (third arguments))
-              (printed nil))
-          (with-output-to-string (stream)
-            (loop for value across (sql-array-elements array)
-                  for index from 0
-                  do (when (zerop (mod index 4096)) (check-for-interrupts))
-                     (unless (and (eq value +null+)
-                                  (or (null replacement) (eq replacement +null+)))
-                       (when printed (write-string separator stream))
-                       (write-string (if (eq value +null+) replacement
-                                         (value->text value (sql-array-element-type-id array)))
-                                     stream)
-                       (setf printed t))))))))
+(defun sql-chr (code)
+  (cond ((minusp code) (ereport "22023" "character number must be positive"))
+        ((zerop code) (ereport "54000" "null character not permitted"))
+        ((> code #x10ffff)
+         (ereport "54000" "requested character too large for encoding: ~d" code))
+        ((<= #xd800 code #xdfff)
+         (ereport "54000" "requested character not valid for encoding: ~d" code))
+        (t (string (code-char code)))))
+
+(defun eval-array-to-string (arguments)
+  "Join unquoted array elements, omitting NULL unless a replacement is supplied."
+  (sql-strict-let ((array (first arguments)) (separator (second arguments)))
+    (let ((replacement (third arguments))
+          (printed nil))
+      (with-output-to-string (stream)
+        (loop for value across (sql-array-elements array)
+              for index from 0
+              do (when (zerop (mod index 4096)) (check-for-interrupts))
+                 (unless (and (eq value +null+)
+                              (or (null replacement) (eq replacement +null+)))
+                   (when printed (write-string separator stream))
+                   (write-string (if (eq value +null+) replacement
+                                     (value->text value (sql-array-element-type-id array)))
+                                 stream)
+                   (setf printed t)))))))
 
 (defun analyze-minmax-function (name arguments)
   "Coerce GREATEST and LEAST inputs to a common, orderable type."
@@ -1798,7 +1797,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-substr-function name args)))
-      ((member name '("chr" "array_to_string" "string_to_array") :test #'string=)
+      ((member name '("array_to_string" "string_to_array") :test #'string=)
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
@@ -3948,7 +3947,7 @@ checks still apply."
                      "jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
                      "jsonb_build_array" "jsonb_build_object"
                      "substr" "substring" "length" "char_length" "character_length" "octet_length"
-                     "chr" "array_to_string" "string_to_array" "greatest" "least"
+                     "array_to_string" "string_to_array" "greatest" "least"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -4731,8 +4730,7 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_stat_get_wal_receiver") (wal-receiver-result))
     ((string= name "pg_control_checkpoint") (native-control-checkpoint-result))
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
-    ((member name '("chr" "array_to_string") :test #'string=)
-     (eval-render-function name args))
+    ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((string= name "string_to_array") (eval-string-to-array args))
     ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))

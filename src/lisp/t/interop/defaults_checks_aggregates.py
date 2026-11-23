@@ -7,6 +7,16 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.chr(233::smallint), chr('65'), chr(NULL::int4)",
+    "SELECT chr(65::bigint)",
+    "SELECT chr()",
+    "SELECT chr(55296)",
+    "SELECT 1 HAVING chr(0) = 'x' AND false",
+    "SELECT 1 HAVING false AND chr(0) = 'x'",
+    "CREATE TABLE dc_chr_default(v text DEFAULT chr(0))",
+    "INSERT INTO dc_chr_default VALUES ('supplied')",
+    "INSERT INTO dc_chr_default DEFAULT VALUES",
+    "SELECT v FROM dc_chr_default",
     "SELECT pg_catalog.pg_wal_replay_pause()",
     "SELECT pg_catalog.pg_wal_replay_resume()",
     "SELECT pg_catalog.pg_is_wal_replay_paused()",
