@@ -918,6 +918,10 @@ Its reload checks wait for receiver reconnection and verify that replay
 remains paused. It creates persisted slot fixtures with the slot creation
 path so startup can restore a persistent slot and remove a temporary slot.
 The full follow script passed with Patroni 4.1.5 and the matching C client.
+The control-data promotion script uses the pinned Patroni interpreter for
+all Patroni probes and compares recovered rows with the restartpoint seed.
+Both live promotion cuts stayed transitional until readiness, then reported
+production and clean shutdown.
 
 ### A18 runner diagnostics
 

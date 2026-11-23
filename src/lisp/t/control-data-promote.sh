@@ -47,7 +47,7 @@ for point in after-child-control-rename after-retire-pending; do
     if [ "$point" = after-retire-pending ]; then
         python3 "$BASE/t/interop/promotion-primary-inspect.py" drop-retired "$CASE/data"
     fi
-    python3 "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'in crash recovery'
+    "$PATRONI_PYTHON" "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'in crash recovery'
     sleep 1.2
     kill -0 "$HELPER"
     if grep -q 'timeline PASS' "$CASE/helper.log"; then exit 1; fi
@@ -55,9 +55,11 @@ for point in after-child-control-rename after-retire-pending; do
     wait "$HELPER"
     HELPER=
     grep -q 'timeline PASS' "$CASE/helper.log"
-    python3 "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'in production'
-    test "$(PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM data')" = 5
+    "$PATRONI_PYTHON" "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'in production'
+    PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
+        -qAt -v ON_ERROR_STOP=1 -c 'SELECT id FROM data ORDER BY id' >"$CASE/recovered.rows"
+    diff -u "$SEED/target.rows" "$CASE/recovered.rows"
     kill -INT "$SERVER"; wait "$SERVER"; SERVER=
-    python3 "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'shut down'
+    "$PATRONI_PYTHON" "$BASE/t/interop/control-data-inspect.py" "$CASE/data" 'shut down'
     echo "control-data-promote: $point remains transitional until ready PASS"
 done
