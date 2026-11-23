@@ -271,6 +271,9 @@ CASES = (
     "SELECT 1::int2 & 3::int4, 1::int8 | 2::int2, 1::int2 << 15, -8::int8 >> 2",
     "SELECT 1 << 31, -2147483648 >> 31, 1::int8 << 63, -9223372036854775808::int8 >> 63",
     "SELECT int2and(3::int2,1::int2),int4or(2,1),int8xor(7,3),int4not(0),int2shl(1::int2,15),int8shr(-8,2),int4abs(-3)",
+    "SELECT pg_catalog.int2mod('7','3'), pg_catalog.int8shl('1', 40::smallint), int2not(NULL), int2abs('-32767')",
+    "SELECT pg_catalog.int8shl('bad',1::bigint)",
+    "CREATE TABLE dc_integer_alias_default (a smallint DEFAULT int2mod('7','3'), b bigint DEFAULT int8shl('1',40))",
     "SELECT @ NULL::int4, ~ NULL::int8, 1 & NULL::int4, NULL::int2 << 1, |/ NULL::float8, ||/ NULL::float8",
     "SELECT @ '2'",
     "SELECT ~ '2'",
@@ -1358,6 +1361,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_integer_alias_default DEFAULT VALUES RETURNING a,b",
                     "INSERT INTO dc_float_alias_default DEFAULT VALUES RETURNING a,b,c",
                     "INSERT INTO dc_trig_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_arithmetic_registry_default DEFAULT VALUES RETURNING v,w",

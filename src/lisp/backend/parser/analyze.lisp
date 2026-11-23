@@ -384,6 +384,26 @@ exist\" messages."
   (make-numeric-builtin name (make-list arity :initial-element :float8) :float8
                         (lambda (x &optional y) (sql-float-trig name x y))))
 
+(defun make-integer-bitwise-builtin (name type operator right-type)
+  (make-numeric-builtin name (list type right-type) type
+                        (lambda (left right) (sql-integer-bitwise operator left right type))))
+
+(defun integer-catalog-builtins ()
+  "Describe each integer-width helper using the shared operator implementations."
+  (loop for (prefix type) in '(("int2" :int2) ("int4" :int4) ("int8" :int8))
+        append
+        (list (make-numeric-builtin (concatenate 'string prefix "abs") (list type) type
+                                    (let ((width type))
+                                      (lambda (value) (sql-integer-abs value width))))
+              (make-numeric-builtin (concatenate 'string prefix "not") (list type) type 'lognot)
+              (make-numeric-builtin (concatenate 'string prefix "mod") (list type type) type
+                                    'sql-integer-mod)
+              (make-integer-bitwise-builtin (concatenate 'string prefix "and") type "&" type)
+              (make-integer-bitwise-builtin (concatenate 'string prefix "or") type "|" type)
+              (make-integer-bitwise-builtin (concatenate 'string prefix "xor") type "#" type)
+              (make-integer-bitwise-builtin (concatenate 'string prefix "shl") type "<<" :int4)
+              (make-integer-bitwise-builtin (concatenate 'string prefix "shr") type ">>" :int4))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -680,6 +700,8 @@ exist\" messages."
                    (make-scalar-builtin :name "set_bit" :argument-types '(:bit :int4 :int4) :result-type :bit
                                         :volatility :immutable :strict-p t :evaluator 'sql-bit-set-bit
                                         :implicit-arguments-p t :defer-decorated-coercion-p nil)))
+      (push builtin (gethash (scalar-builtin-name builtin) registry)))
+    (dolist (builtin (integer-catalog-builtins))
       (push builtin (gethash (scalar-builtin-name builtin) registry)))
     registry))
 
@@ -1065,8 +1087,7 @@ names and unknown types.  setseed has no catalog argument names."
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow"
-                     "width_bucket") :test #'string=)
-      (integer-catalog-alias-p name)))
+                     "width_bucket") :test #'string=)))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
@@ -1075,8 +1096,6 @@ names and unknown types.  setseed has no catalog argument names."
                (gethash name *scalar-builtin-descriptors*)))
         ((string= name "width_bucket") (member count '(2 4)))
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
-        ((integer-catalog-alias-p name)
-         (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
         ((member name '("numeric_log" "power" "pow") :test #'string=)
          (= count 2))
         (t (= count 1))))
@@ -1493,50 +1512,12 @@ Zone-west breaks ties after comparing time plus zone-west in microseconds."
         ((= (length args) 2) (sql-width-bucket-array (first args) (second args)))
         (t (sql-width-bucket-range args))))
 
-(defun integer-catalog-alias-p (name)
-  "Recognize supported integer catalog function names, retaining call identity.
-The declared operand types are resolved during analysis; execution shares the
-corresponding operator implementation without rewriting the analyzed call."
-  (and (>= (length name) 5)
-       (member (subseq name 0 4) '("int2" "int4" "int8") :test #'string=)
-       (member (subseq name 4) '("and" "or" "xor" "not" "shl" "shr" "abs" "mod") :test #'string=)))
-
-(defun analyze-integer-catalog-function (name args &optional schema)
-  "Resolve a supported integer pg_proc helper without changing its call identity.
-NAME must name a supported helper. Shift functions take int4 as their second
-argument; other binary helpers take two operands of the named integer type.
-Check the complete signature before coercing unknown literals, so resolution
-errors precede input errors."
-  (let* ((type (cdr (assoc (subseq name 0 4)
-                           '(("int2" . :int2) ("int4" . :int4) ("int8" . :int8))
-                           :test #'string=)))
-         (suffix (subseq name 4))
-         (unary (member suffix '("not" "abs") :test #'string=))
-         (shift (member suffix '("shl" "shr") :test #'string=))
-         (types (if unary (list type) (list type (if shift :int4 type)))))
-    (unless (and (= (length args) (length types))
-                 (every (lambda (arg target)
-                          (or (in-unknown-constant-p arg)
-                              (sql-implicit-coercion-p (expr-type arg) target)))
-                        args types))
-      (let ((wrong-count (/= (length args) (length types))))
-        (ereport "42883" "function ~a(~a) does not exist"
-                 (if schema (format nil "~a.~a" schema name) name)
-                 (call-signature args)
-                 :detail (if wrong-count
-                             "No function of that name accepts the given number of arguments."
-                             "No function of that name accepts the given argument types.")
-                 :hint (unless wrong-count "You might need to add explicit type casts."))))
-    (list :func name (mapcar #'coerce-common-expression args types)
-          :type type :typmod -1)))
-
 (defun analyze-numeric-function (name args schema &optional signature)
   "Resolve a numeric catalog call, retaining its original diagnostic signature.
 Argument transformation and named-notation validation happen before this call,
 so a nested argument error keeps its own diagnostics."
   (handler-case
       (cond
-        ((integer-catalog-alias-p name) (analyze-integer-catalog-function name args schema))
         ((gethash name *scalar-builtin-descriptors*)
          (analyze-scalar-builtin name (gethash name *scalar-builtin-descriptors*) args
                                  *defer-function-constant-coercion-p*))
@@ -3870,12 +3851,11 @@ still requires deferred sort projection."
 
 (defun legacy-immutable-function-p (name)
   "Recognize immutable scalar functions whose signatures still have separate analyzers."
-  (or (integer-catalog-alias-p name)
-      (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
-                     "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
-                     "log" "log10" "numeric_log" "power" "pow"
-                     "width_bucket")
-              :test #'string=)))
+  (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
+                 "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
+                 "log" "log10" "numeric_log" "power" "pow"
+                 "width_bucket")
+          :test #'string=))
 
 (defun analyzed-function-volatile-p (name)
   "Treat unclassified calls as volatile for aggregate and CTE planning."
@@ -4973,20 +4953,16 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
 (defun sql-bit-set-bit (value index bit)
   (sql-byte-bit-operation value index :bit t t bit))
 
+(defun sql-integer-abs (input type)
+  (let ((value (abs input)))
+    (when (and (eq type :int8) (> value +int8-max+))
+      (ereport "22003" "bigint out of range"))
+    (sql-cast-value value type type -1)))
+
 (defun eval-analyzed-function (name arguments type &optional first-argument)
   "Evaluate a resolved call using its coerced argument values and result type.
 Arguments have already been evaluated in order, including for strict calls."
   (cond
-    ((integer-catalog-alias-p name)
-     (if (member +null+ arguments) +null+
-         (let ((suffix (subseq name 4)))
-           (cond ((string= suffix "abs") (eval-analyzed-function "abs" arguments type))
-                 ((string= suffix "not") (lognot (first arguments)))
-                 ;; Share remainder and zero-divisor semantics after preserving call identity.
-                 ((string= suffix "mod") (sql-arith "%" (first arguments) (second arguments)))
-                 (t (sql-integer-bitwise
-                     (cdr (assoc suffix '(("and" . "&") ("or" . "|") ("xor" . "#") ("shl" . "<<") ("shr" . ">>")) :test #'string=))
-                     (first arguments) (second arguments) type))))))
     ((and (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor")
                   :test #'string=)
           (member +null+ arguments))
@@ -5022,10 +4998,7 @@ Arguments have already been evaluated in order, including for strict calls."
              ((eq type :numeric) (sql-numeric-exp value))
              (t (sql-float-exp value)))))
     ((and (string= name "abs") (member type '(:int2 :int4 :int8)))
-     (let ((value (abs (first arguments))))
-       (when (and (eq type :int8) (> value +int8-max+))
-         (ereport "22003" "bigint out of range"))
-       (sql-cast-value value type type -1)))
+     (sql-integer-abs (first arguments) type))
     (t (eval-func name arguments first-argument))))
 
 (defun sql-integer-bitwise (op l r type)

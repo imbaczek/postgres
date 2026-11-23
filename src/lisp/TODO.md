@@ -569,6 +569,12 @@ declared registry signatures. Stored expressions retain the catalog
 names. The 1,424 C comparisons covered input width, qualified calls,
 and diagnostic precedence. Float and numeric power defaults passed
 after a fresh-process restart.
+The 24 fixed integer aliases derive their signatures from operand
+width, with `int4` shift counts. The registry binds each alias to the
+shared absolute-value, remainder, or bitwise implementation. The
+1,427 C comparisons covered qualified lookup, narrowing rejection,
+and shift width. Stored smallint remainder and bigint shift defaults
+were also checked after restart.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name
