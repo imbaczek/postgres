@@ -1210,6 +1210,14 @@ fresh strict compilation in 53.71 seconds. The live WAL crash suite passed.
 The timing ledger retains the selection and logs under
 `architecture-wal-components`. Live wall time was unmeasured.
 
+The page-image type, fork IDs, location-bound checksums, and WAL8 payload
+codec now load in their own ASDF component after page accessors and WAL
+record framing. The ten moved forms retain their original source.
+A warm image encoded a pre-reload object to the same bytes and decoded its
+visibility fork and contributor. The standalone CRC runner passed 58,082
+checks. Eight physical heads passed with fresh strict compilation, and live
+standby replay passed.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local
