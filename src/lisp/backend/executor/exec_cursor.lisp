@@ -717,15 +717,14 @@ source itself.  Closing the result closes the sort and its source."
         (lambda () (close-sql-iterator input)))))
     (:nested-loop-join (make-physical-join-iterator node relations))
     ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct :sorted-distinct)
-     (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
+     (let ((child (physical-buffered-node-child node)))
        ;; If a key needs an SRF value, keep expansion below sort instead of
        ;; moving it above the sort and changing the key's evaluation point.
        (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
          (when set-node
            (return-from %make-physical-plan-iterator
              (make-sorted-project-set-iterator node child set-node width calls relations)))))
-     (let* ((child (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
-                       (fourth node) (third node)))
+     (let* ((child (physical-buffered-node-child node))
             (deferred (sort-projection-deferred-slots node child))
             (*query-sort-project* (and deferred (cons child deferred)))
             (input (make-physical-plan-iterator child relations))
@@ -733,11 +732,7 @@ source itself.  Closing the result closes the sort and its source."
               (make-buffered-sql-iterator
                (lambda (emit)
                  (flet ((source (callback) (map-sql-iterator input callback)))
-                   (case (first node)
-                     ((:sort :top-n)
-                      (stream-select-sort #'source (second node) emit
-                                          :limit (and (eq (first node) :top-n) (third node))))
-                     (otherwise (stream-physical-group-node node #'source emit)))))
+                   (stream-physical-buffered-node node #'source emit)))
                input)))
        (if deferred
            (make-mapping-sql-iterator

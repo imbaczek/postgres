@@ -183,6 +183,9 @@ Both drivers use the same ProjectSet postponement rule for sort and
 top-N. A sort key that depends on a generated value keeps expansion
 before sorting. The live DML harness checks set-returning target values,
 volatility, LIMIT, and portal resumption against PostgreSQL C.
+Sort and top-N now use the same buffered node dispatch and child layout
+in both drivers. Deferred projection still runs as each driver delivers
+a sorted row, including after portal suspension.
 
 The first A3 slice registers the four JSON and JSONB inspection functions.
 Analysis, runtime dispatch, aggregate and CTE volatility checks, and HAVING

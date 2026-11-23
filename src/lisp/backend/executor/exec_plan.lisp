@@ -1979,23 +1979,25 @@ ROW's source environment.  Only final target origins leave this projection."
                          (funcall emit row))
                        (funcall emit row))))))))
 
+(defun physical-buffered-node-child (node)
+  "Read the child after a sort bound or aggregate specification, when present."
+  (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
+      (fourth node)
+      (third node)))
+
 (defun execute-physical-order (node emit run-child)
-  (let* ((top-n-p (eq (first node) :top-n))
-         (child (if top-n-p (fourth node) (third node)))
+  (let* ((child (physical-buffered-node-child node))
          (deferred (sort-projection-deferred-slots node child))
          (*query-sort-project* (and deferred (cons child deferred))))
-    (stream-select-sort
-     (lambda (sort-callback)
-       (funcall run-child child sort-callback))
-     (second node)
+    (stream-physical-buffered-node
+     node (lambda (sort-callback) (funcall run-child child sort-callback))
      (lambda (row)
        (if deferred
            (multiple-value-bind (projected origins)
                (finish-sort-project-row row (second child) deferred)
              (let ((*query-row-origins* origins))
                (funcall emit projected)))
-           (funcall emit row)))
-     :limit (and top-n-p (third node)))))
+           (funcall emit row))))))
 
 (defun execute-physical-join (node registered-relations emit run-child run-node)
   (let* ((join (second node))
@@ -2022,9 +2024,12 @@ ROW's source environment.  Only final target origins leave this projection."
            (funcall run-child right right-callback))
          join emit))))
 
-(defun stream-physical-group-node (node source emit)
-  "Run DISTINCT or aggregation over a driver-owned row source."
+(defun stream-physical-buffered-node (node source emit)
+  "Run sorting, DISTINCT or aggregation over a driver-owned row source."
   (ecase (first node)
+    ((:sort :top-n)
+     (stream-select-sort source (second node) emit
+                         :limit (and (eq (first node) :top-n) (third node))))
     (:sorted-distinct
      (stream-sorted-distinct source (second node) emit))
     (:hash-distinct
@@ -2040,7 +2045,7 @@ ROW's source environment.  Only final target origins leave this projection."
                                    emit run-child run-node)
   "Execute one physical node using the instrumented callbacks from RUN-NODE."
   (when (member (first node) '(:sort :top-n))
-    (let ((child (if (eq (first node) :top-n) (fourth node) (third node))))
+    (let ((child (physical-buffered-node-child node)))
       (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
         (when set-node
           (let ((input (make-sorted-project-set-iterator
@@ -2110,11 +2115,10 @@ ROW's source environment.  Only final target origins leave this projection."
                       (stream-project-set environment (second node) emit))))))
     (:project (execute-physical-projection node emit run-child))
     ((:sorted-distinct :hash-distinct :hash-aggregate :sorted-aggregate)
-     (let ((child (if (member (first node) '(:hash-aggregate :sorted-aggregate))
-                      (fourth node) (third node))))
+     (let ((child (physical-buffered-node-child node)))
        (flet ((source (callback) (funcall run-child child callback)))
          (declare (dynamic-extent #'source))
-         (stream-physical-group-node node #'source emit))))
+         (stream-physical-buffered-node node #'source emit))))
     ((:sort :top-n) (execute-physical-order node emit run-child))
     (:limit
      (let ((limit (check-select-limit (second node)))
