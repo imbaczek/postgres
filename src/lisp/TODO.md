@@ -491,6 +491,10 @@ and return type. Name validation still models C regclass input at
 analysis time for unknown literals, and stored calls keep native
 sequence names. The registry also supplies default-folding strictness
 and sort-projection volatility.
+Catalog inventory and DDL validation share the stored sequence
+dependency walk. It recognizes sequence calls through the builtin
+registry and visits executable operands, including inactive CASE
+branches. A NULL sequence name contributes no dependency.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

@@ -1046,19 +1046,28 @@ from advancing the shared WAL generation between a failed save and rollback."
                    (and table (or (null oid) (= oid (pg-class-oid table))))))
                (pg-publication-tables publication)))))
 
-(defun catalog-expression-sequence-names (expression)
-  ;; Stored expressions admit only constant sequence names, making their
-  ;; dependencies available to publication and bootstrap inventory.
+(defun catalog-expression-sequence-names (expression &key validate-p)
+  "Collect stored sequence dependencies, optionally validating their names."
+  ;; The registry's structure is defined after the catalog loads.
+  (declare (special *scalar-builtin-descriptors*)
+           (notinline scalar-builtin-implicit-arguments-p))
   (let ((names nil))
-    (labels ((walk (node)
-               (when (consp node)
-                 (when (and (eq (first node) :func)
-                            (member (second node) '("nextval" "currval" "setval") :test #'string=))
-                   (let ((argument (first (third node))))
-                     (when (and (eq (first argument) :const) (stringp (second argument)))
-                       (pushnew (strip-schema (second argument)) names :test #'string=))))
-                 (walk (car node)) (walk (cdr node)))))
-      (walk expression))
+    (some-local-plan-expression
+     (lambda (node walk)
+       (declare (ignore walk))
+       (when (and (eq (first node) :func) (let ((builtin (first (gethash (second node) *scalar-builtin-descriptors*))))
+                                            (and builtin (eq (scalar-builtin-implicit-arguments-p builtin) :sequence))))
+         (let* ((argument (first (third node)))
+                (value (and (eq (first argument) :const) (second argument))))
+           (cond ((stringp value)
+                  (let ((name (strip-schema value)))
+                    (when (and validate-p (not (lookup-sequence name)))
+                      (ereport "42P01" "sequence ~a does not exist" name))
+                    (pushnew name names :test #'string=)))
+                 ((and validate-p (not (eq value +null+)))
+                  (ereport "0A000" "stored expressions require a constant sequence name")))))
+       nil)
+     expression)
     names))
 
 (defun catalog-table-sequence-names (table)

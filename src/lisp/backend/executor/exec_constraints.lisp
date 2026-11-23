@@ -18,27 +18,6 @@
                    (progn (walk (car node)) (walk (cdr node)))))))
     (walk form)))
 
-(defun stored-expression-sequences (form)
-  "Validate sequence dependencies; NULL names have no dependency.
-Only constant names can be tracked for persisted expressions and replication."
-  (let ((names nil))
-    (labels ((walk (node)
-               (when (consp node)
-                 (when (and (eq (first node) :func)
-                            (member (second node) '("nextval" "currval" "setval") :test #'string=))
-                   (let ((argument (first (third node))))
-                     (unless (and (eq (first argument) :const)
-                                  (or (stringp (second argument)) (eq (second argument) +null+)))
-                       (ereport "0A000" "stored expressions require a constant sequence name"))
-                     (when (stringp (second argument))
-                       (let ((name (strip-schema (second argument))))
-                         (unless (lookup-sequence name)
-                           (ereport "42P01" "sequence ~a does not exist" name))
-                         (pushnew name names :test #'string=)))))
-                 (walk (car node)) (walk (cdr node)))))
-      (walk form))
-    names))
-
 (defun default-strict-function-p (name)
   "Use declared strictness for registered calls when folding a demanded default."
   (let ((builtins (gethash name *scalar-builtin-descriptors*)))
@@ -180,7 +159,7 @@ those arguments therefore occur before any row execution or sequence effects."
          (expression (analyze-expr raw nil)))
     (when (analyzed-expression-contains-set-p expression)
       (ereport "0A000" "set-returning functions are not allowed in DEFAULT"))
-    (stored-expression-sequences expression)
+    (catalog-expression-sequence-names expression :validate-p t)
     (analyze-subquery-assignment expression column)))
 
 (defun table-constraint-name-used-p (table name)
@@ -222,7 +201,7 @@ those arguments therefore occur before any row execution or sequence effects."
       (ereport "0A000" "set-returning functions are not allowed in CHECK"))
     (when (table-constraint-name-used-p table name)
       (ereport "42710" "constraint ~a for relation ~a already exists" name (pg-class-name table)))
-    (stored-expression-sequences expression)
+    (catalog-expression-sequence-names expression :validate-p t)
     (multiple-value-bind (sql parsed)
         (canonical-stored-expression expression (getf raw :sql) (getf raw :expression) table)
       (setf (getf raw :sql) sql (getf raw :expression) parsed)

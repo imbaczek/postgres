@@ -108,6 +108,21 @@
           (rove:ok (eq (dml-one-time-qualification-p call)
                        (not (null (member expected '(:immutable :stable))))))))))
 
+(rove:deftest stored-sequence-dependencies-use-executable-operands
+    (let* ((sequence '(:func "nextval" ((:const "public.real_seq" :type :text)) :type :int8))
+           (metadata '(:func "setval" ((:const "fake_seq" :type :text)) :type :int8))
+           (null-name (list :func "currval" (list (list :const +null+ :type :text)) :type :int8))
+           (expression (list :case (list (list '(:bool nil) sequence))
+                             null-name :type :int8 :saved metadata)))
+      (rove:ok (equal (catalog-expression-sequence-names expression) '("real_seq")))
+      (rove:ok (null (catalog-expression-sequence-names null-name :validate-p t)))
+      (let ((condition (handler-case
+                           (catalog-expression-sequence-names
+                            '(:func "nextval" ((:parameter 1 :type :text)) :type :int8)
+                            :validate-p t)
+                         (pg-error (error) error))))
+        (rove:ok (and condition (equal (pg-error-sqlstate condition) "0A000"))))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))
