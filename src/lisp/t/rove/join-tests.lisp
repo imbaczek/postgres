@@ -105,3 +105,41 @@
                                                       (rove:ok (= right-next 3))))
                                    (close-sql-iterator iterator))
                                  (rove:ok (= closed 1)))))))
+
+(rove:deftest nested-loop-drivers-reserve-work-memory-for-right-matches
+    (let* ((right-row (vector (make-string 128 :initial-element #\x)))
+           ;; The pull replay index costs sixteen bytes per buffered row.
+           (*query-work-memory-bytes* (+ 16 (query-spill-record-size (list right-row nil nil))))
+           (*query-temp-file-limit-bytes* 0)
+           (*query-temp-directory* (uiop:temporary-directory))
+           (*query-row-presence* nil)
+           (*datum-origin-capture* nil))
+      (dolist (type '(:inner :full))
+        (let ((join (list :type type :qual '(:bool t) :left-width 1 :right-width 1))
+              (expected (if (eq type :full) "53400" :row)))
+          (flet ((outcome (operation)
+                   (handler-case (funcall operation)
+                     (pg-error (error) (pg-error-sqlstate error))))
+                 (single-row (row)
+                   (let ((pending t))
+                     (make-sql-iterator
+                      (lambda ()
+                        (when pending
+                          (setf pending nil)
+                          (values row t)))))))
+            (rove:ok
+             (equal expected
+                    (outcome (lambda ()
+                               (block pushed
+                                 (stream-select-join-environments
+                                  (lambda (emit) (funcall emit #(1)))
+                                  (lambda (emit) (funcall emit right-row))
+                                  join (lambda (row) (declare (ignore row)) (return-from pushed :row))))))))
+            (with-query-temp-files ()
+                                   (let ((iterator (make-nested-loop-iterator join (single-row #(1)) (single-row right-row))))
+                                     (unwind-protect
+                                          (rove:ok
+                                           (equal expected (outcome (lambda ()
+                                                                      (when (nth-value 1 (sql-iterator-next iterator))
+                                                                        :row)))))
+                                       (close-sql-iterator iterator)))))))))

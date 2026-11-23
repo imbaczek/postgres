@@ -398,6 +398,10 @@ or match map. The pull regression uses a one-byte work budget and zero
 spill quota, and checks one-row pulls, origin and presence propagation,
 early close, and repeated EOF. The join streaming and portal lifecycle
 process tests also passed.
+Push and pull nested-loop joins now use the same work-memory split
+between the replay spool and right-row match map. A zero-spill-quota
+regression checks that both drivers can keep an inner join in memory
+at a budget where a full join needs to spill.
 
 | Audit item | Implementation evidence and remaining verification |
 |---|---|

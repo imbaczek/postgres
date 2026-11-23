@@ -1685,6 +1685,16 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (when (true-p (eval-expr qual joined))
       (values joined origins presence))))
 
+(defun nested-loop-spool-memory (track-right-p)
+  "Reserve half the work memory for right-row matches when the join needs them."
+  (max 1 (if track-right-p
+             (floor *query-work-memory-bytes* 2)
+             *query-work-memory-bytes*)))
+
+(defun nested-loop-match-memory (spool-memory)
+  "Use the remaining work memory for the match map, with a one-byte minimum."
+  (max 1 (- *query-work-memory-bytes* spool-memory)))
+
 (defun stream-select-join-environments (left-stream right-stream join callback)
   (let* ((join-type (getf join :type))
          (qual (getf join :qual))
@@ -1694,9 +1704,8 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
          (null-right (make-array right-width :initial-element +null+))
          (right/full-p (member join-type '(:right :full)))
          (capture-p *datum-origin-capture*)
-         (work-memory (max 1 *query-work-memory-bytes*))
-         (spool-memory (if right/full-p (max 1 (floor work-memory 2)) work-memory))
-         (match-memory (max 1 (- work-memory spool-memory))))
+         (spool-memory (nested-loop-spool-memory right/full-p))
+         (match-memory (nested-loop-match-memory spool-memory)))
     (with-query-temp-files ()
                            (with-query-row-spool (right-spool spool-memory)
                              (labels ((run-join (matched-right)
