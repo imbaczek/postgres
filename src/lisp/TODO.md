@@ -436,6 +436,9 @@ Standby storage requires the WAL namespace established by verified recovery
 preparation. A cold process with that field missing refused before rotating
 storage or writing control and succeeded after the verified field was
 restored. Both strict cold recovery heads and live static standby passed.
+Base and retained overlap capture also require that verified namespace.
+The boundary fixture rejected missing namespace even with a valid legacy
+file present, then captured the same bytes under explicit legacy provenance.
 The archive migration test selects legacy seed files explicitly, and promotion
 tests still cover legacy parent proofs. A read-only inventory of the repository
 tree and the documented

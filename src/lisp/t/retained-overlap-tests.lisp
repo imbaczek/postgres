@@ -85,6 +85,10 @@
                                                         :manifest-digest 77 :files (list entry)))
                                            (path (merge-pathnames (first entry) root)))
         (pg::wal-atomic-write-bytes path bytes)
+        (let ((unverified (copy-list state)))
+          (remf unverified :wal-namespace)
+          (ok (intake-fails-p
+               (lambda () (pg::physical-retained-overlap-capture unverified root)))))
         (multiple-value-bind (loaded captured) (pg::physical-retained-overlap-capture state root)
           (let ((image (pg::physical-retained-overlap-encode loaded captured)))
             (delete-file path)

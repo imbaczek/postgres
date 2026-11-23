@@ -74,6 +74,6 @@ and control reference must provide authority for later use of this object."
                           :base-timeline (getf state :timeline) :base (getf state :end)
                           :manifest-digest (getf state :manifest-digest)
                           :checkpoint-start (physical-manifest-checkpoint-start state)
-                          :namespace (getf state :wal-namespace :legacy) :file entry)))
+                          :namespace (getf state :wal-namespace) :file entry)))
       (physical-retained-overlap-check metadata bytes)
       (values metadata bytes))))
