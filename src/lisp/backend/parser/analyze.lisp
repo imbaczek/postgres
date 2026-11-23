@@ -497,6 +497,12 @@ exist\" messages."
                    (make-scalar-builtin :name "chr" :argument-types '(:int4) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-chr
                                         :implicit-arguments-p t)
+                   (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text)
+                                        :result-type :text-array :volatility :immutable
+                                        :evaluator 'sql-string-to-array :implicit-arguments-p t)
+                   (make-scalar-builtin :name "string_to_array" :argument-types '(:text :text :text)
+                                        :result-type :text-array :volatility :immutable
+                                        :evaluator 'sql-string-to-array :implicit-arguments-p t)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
@@ -642,36 +648,32 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
                 (when pretty (list (coerce-common-expression pretty :bool))))
           :type :json :typmod -1)))
 
-(defun analyze-render-function (name arguments)
-  "Resolve string_to_array and array_to_string against supported types."
-  (when (and (string= name "array_to_string") (member (length arguments) '(2 3))
-             (in-unknown-constant-p (first arguments)))
-    (ereport "42804" "could not determine polymorphic type because input has type unknown"))
-  (let ((types (if (string= name "string_to_array") '(:text :text :text) '(nil :text :text))))
+(defun analyze-array-to-string (name arguments)
+  "Resolve the polymorphic array input and coerce the text arguments."
+  (let ((array (first arguments)))
+    (when (and (member (length arguments) '(2 3)) (in-unknown-constant-p array))
+      (ereport "42804" "could not determine polymorphic type because input has type unknown"))
     (unless (and (member (length arguments) '(2 3))
-                 (loop for argument in arguments for type in types
-                       always (if type
-                                  (or (in-unknown-constant-p argument)
-                                      (sql-implicit-coercion-p (expr-type argument) type))
-                                  (or (eq (expr-type argument) :int2vector)
-                                      (sql-array-element-type (expr-type argument))))))
+                 (or (eq (expr-type array) :int2vector)
+                     (sql-array-element-type (expr-type array)))
+                 (every (lambda (argument)
+                          (or (in-unknown-constant-p argument)
+                              (sql-implicit-coercion-p (expr-type argument) :text)))
+                        (rest arguments)))
       (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
     (list :func name
-          (loop for argument in arguments for type in types
-                collect (cond (type (coerce-common-expression argument type))
-                              ((eq (expr-type argument) :int2vector)
-                               (list :cast argument :type :int2-array :typmod -1))
-                              (t argument)))
-          :type (if (string= name "string_to_array") :text-array :text) :typmod -1)))
+          (cons (if (eq (expr-type array) :int2vector)
+                    (list :cast array :type :int2-array :typmod -1)
+                    array)
+                (mapcar (lambda (argument) (coerce-common-expression argument :text))
+                        (rest arguments)))
+          :type :text :typmod -1)))
 
-(defun eval-string-to-array (arguments)
+(defun sql-string-to-array (text separator &optional null-string)
   "Split text at delimiters, replacing fields equal to the optional NULL string.
 A NULL delimiter splits at character boundaries; empty input yields an empty array."
-  (let ((text (first arguments))
-        (separator (second arguments))
-        (null-string (third arguments))
-        (elements (make-array 0 :adjustable t :fill-pointer 0)))
-    (when (eq text +null+) (return-from eval-string-to-array +null+))
+  (when (eq text +null+) (return-from sql-string-to-array +null+))
+  (let ((elements (make-array 0 :adjustable t :fill-pointer 0)))
     (labels ((emit (field)
                (check-for-interrupts)
                (when (>= (length elements) +max-varlena-array-elements+)
@@ -1791,11 +1793,11 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
          (analyze-substr-function name args)))
-      ((member name '("array_to_string" "string_to_array") :test #'string=)
+      ((string= name "array_to_string")
        (let ((*defer-function-constant-coercion-p*
                (or (getf (cdddr expr) :call-distinct)
                    (getf (cdddr expr) :call-order))))
-         (analyze-render-function name args)))
+         (analyze-array-to-string name args)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
       ((string= name "array_length") (analyze-array-length-function name args))
@@ -3945,7 +3947,7 @@ still requires deferred sort projection."
                  (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
                                 "json_build_array" "json_build_object"
                                 "jsonb_build_array" "jsonb_build_object"
-                                "array_to_string" "string_to_array" "greatest" "least")
+                                "array_to_string" "greatest" "least")
                          :test #'string=))))))
 
 (defun analyzed-expression-volatile-p (form)
@@ -4766,7 +4768,6 @@ the full 64-bit ID as a signed value."
     ((member name '("substr" "substring") :test #'string=) (eval-substr-function args))
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
-    ((string= name "string_to_array") (eval-string-to-array args))
     ((logical-helper-function-p name)
      (eval-logical-helper-function name args))
     (t

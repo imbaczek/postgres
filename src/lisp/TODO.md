@@ -502,6 +502,10 @@ volatility now come from that descriptor.
 The scalar registry also supplies signatures, evaluators, and C catalog
 volatility for `pg_stat_get_wal_receiver` and `pg_control_checkpoint`.
 Scalar and expanded projections share their fixed record field definitions.
+Both `string_to_array` arities use the scalar registry for text coercion,
+immutable classification, and non-strict evaluation. The recursive CTE
+differential passed 137 cases, including NULL delimiters, NULL field
+replacement, multibyte text, implicit varchar inputs, and arity errors.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default
