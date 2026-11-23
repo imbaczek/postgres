@@ -1334,15 +1334,16 @@ with platform guards appear in the inventory even when skipped at runtime.
 The combined runner and its inventory use a private ASDF output cache under
 the temporary directory and remove it on exit. This keeps their compilation
 separate from live servers using the default cache.
-The direct runner honors
-`SBCL` and normal init files. If
-`PG_LISP_TEST_RUN_DIR` is absent, it enters the test RAM-disk wrapper, which
-requires a provisioned RAM mount. `PG_LISP_TEST_SEED` may be a nonnegative
+The direct runner honors `SBCL` and normal init files. If
+`PG_LISP_TEST_RUN_DIR` is absent, it creates a private workspace under `TMPDIR`
+or `/tmp`, with its own temporary data, cache, and logs. Use a disk-backed parent
+for full suites. To opt into a provisioned RAM mount for a focused run, invoke
+`./t/test-ramdisk.sh run ./t/run-system-tests.sh` explicitly.
+`PG_LISP_TEST_SEED` may be a nonnegative
 integer; unset or empty leaves the normal random state. Phase and per-head timings
 are reported, with CPU times for the parent only; compiler CPU is in the log
 at the printed path. The strict compiler cache and log remain in the
-temporary work directory for archiving or explicit cleanup by their owner;
-the RAM-disk wrapper places that directory in the owned RAM root.
+temporary work directory for archiving or explicit cleanup by their owner.
 
 Set `PG_LISP_TEST_COVERAGE_DIR` to write an SBCL coverage report for a direct
 test run:

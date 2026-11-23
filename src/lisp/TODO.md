@@ -846,6 +846,11 @@ injected error printed its message, counted as a failure, and left the next
 selected test running. The runner still reports per-head timing and returns a
 failing status if any selected head fails.
 
+The direct runner creates a private workspace under `TMPDIR` or `/tmp` by
+default. The launcher probe verified disk-backed placement, a caller-owned
+workspace, and an explicit `TMPDIR` override. RAM execution uses the explicit
+RAM-disk wrapper.
+
 ### A15 slot retention extraction
 
 The storage ASDF components load slot retention after WAL core. The module
