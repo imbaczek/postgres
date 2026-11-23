@@ -395,6 +395,11 @@ replay timestamp, and postmaster start timestamp signatures. Recovery
 checks exercise absent receiver and replay data, a recorded replay
 timestamp, and both primary-only WAL position guards through normal
 builtin dispatch.
+The four replay-pause commands also take their signatures and volatility
+from the registry. They still dispatch through the shared replay operation.
+The physical regressions exercise registry dispatch during a resource
+pause and standby promotion. The C differential checks all four recovery
+guards on a primary and the pause-state arity diagnostic.
 
 ### A9 follow-up evidence
 

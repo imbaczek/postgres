@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.pg_wal_replay_pause()",
+    "SELECT pg_catalog.pg_wal_replay_resume()",
+    "SELECT pg_catalog.pg_is_wal_replay_paused()",
+    "SELECT pg_catalog.pg_get_wal_replay_pause_state()",
+    "SELECT pg_get_wal_replay_pause_state(1)",
     "SELECT pg_catalog.pg_is_in_recovery(), pg_catalog.pg_last_wal_receive_lsn() IS NULL, pg_catalog.pg_last_wal_replay_lsn() IS NULL, pg_catalog.pg_last_xact_replay_timestamp() IS NULL",
     "SELECT pg_catalog.pg_postmaster_start_time() IS NOT NULL, pg_current_wal_lsn() >= pg_current_wal_flush_lsn()",
     "SELECT pg_is_in_recovery(1)",

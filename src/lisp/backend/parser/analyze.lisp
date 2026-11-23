@@ -417,6 +417,11 @@ exist\" messages."
 (defstruct scalar-builtin name argument-types result-type volatility strict-p evaluator
   implicit-arguments-p (defer-decorated-coercion-p t))
 
+(defun make-replay-control-builtin (name result-type)
+  "Register the SQL signature and pass its name to the shared replay operation."
+  (make-scalar-builtin :name name :result-type result-type :volatility :volatile
+                       :strict-p t :evaluator (lambda () (physical-replay-pause-command name))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -438,6 +443,10 @@ exist\" messages."
                                         :volatility :volatile :strict-p t :evaluator 'sql-last-xact-replay-timestamp)
                    (make-scalar-builtin :name "pg_postmaster_start_time" :result-type :timestamptz
                                         :volatility :stable :strict-p t :evaluator 'postmaster-start-timestamp)
+                   (make-replay-control-builtin "pg_wal_replay_pause" :void)
+                   (make-replay-control-builtin "pg_wal_replay_resume" :void)
+                   (make-replay-control-builtin "pg_is_wal_replay_paused" :bool)
+                   (make-replay-control-builtin "pg_get_wal_replay_pause_state" :text)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
@@ -1077,10 +1086,7 @@ then argument types. Only ambiguity and type failures carry the cast hint."
   (when args
     (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
   (list :func name args
-        :type (cond ((string= name "pg_is_wal_replay_paused") :bool)
-                    ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume") :test #'string=) :void)
-                    ((string= name "pg_lisp_cluster_identity") :varchar)
-                    (t :text))
+        :type (if (string= name "pg_lisp_cluster_identity") :varchar :text)
         :typmod -1))
 
 (defun analyze-trig-function (name args)
@@ -1806,8 +1812,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
        (analyze-metadata-function name args))
       ((member name '("version" "pg_lisp_runtime"
-                      "pg_wal_replay_pause" "pg_wal_replay_resume"
-                      "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state"
                       "pg_lisp_cluster_identity" "pg_export_snapshot"
                       "current_database" "current_schema"
                       "current_catalog" "current_user" "session_user" "user")
@@ -4745,9 +4749,6 @@ the full 64-bit ID as a signed value."
     ((string= name "pg_lisp_runtime")
      (format nil "~a ~a" (lisp-implementation-type)
              (lisp-implementation-version)))
-    ((member name '("pg_wal_replay_pause" "pg_wal_replay_resume"
-                    "pg_is_wal_replay_paused" "pg_get_wal_replay_pause_state") :test #'string=)
-     (physical-replay-pause-command name))
     ((string= name "pg_lisp_cluster_identity")
      (catalog-cluster-identity *catalog*))
     ((string= name "pg_export_snapshot") (export-transaction-snapshot))

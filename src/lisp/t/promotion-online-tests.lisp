@@ -9,7 +9,7 @@
       (pg::check-physical-recovery-work)
       (ok (null pg::*physical-shutdown-state*))
       (dolist (name '("pg_wal_replay_pause" "pg_wal_replay_resume"))
-        (let ((condition (handler-case (pg::physical-replay-pause-command name)
+        (let ((condition (handler-case (pg::eval-func name nil)
                            (pg::pg-error (condition) condition))))
           (ok (typep condition 'pg::pg-error))
           (ok (string= "55000" (pg::pg-error-sqlstate condition)))
