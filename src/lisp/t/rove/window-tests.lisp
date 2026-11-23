@@ -23,6 +23,20 @@
                (setf rank next-rank dense next-dense))
           always (and (= rank start) (= dense groups)))))
 
+(rove:deftest window-sort-key-invariance-keeps-query-boundaries
+    (let* ((outer '(:outer-ref 1 (:func "random" nil :type :float8) :type :float8))
+           (fixed (list :subplan (make-sql-subplan :kind :scalar :plan '(:result))))
+           (correlated (list :subplan (make-sql-subplan :kind :scalar :plan '(:result) :depths '(1)))))
+      (rove:ok (window-invariant-sort-key-p outer))
+      (rove:ok (window-invariant-sort-key-p fixed))
+      (rove:ok (not (window-invariant-sort-key-p correlated)))
+      (dolist (operand (list outer fixed '(:col 1 :type :float8)))
+        (rove:ok (not (window-invariant-sort-key-p
+                       (list :func "abs" (list (list :cast operand :type :float8)))))))
+      (rove:ok (window-invariant-sort-key-p
+                '(:func "abs" ((:func "abs" ((:const -1 :type :int4)) :type :int4))
+                  :type :int4)))))
+
 (rove:deftest quantified-window-expression-keys-compare-by-value
     (flet ((comparison (kind)
              (list :subplan

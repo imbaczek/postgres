@@ -9,20 +9,26 @@
                                (getf descriptor :frame))))
 
 (defun window-invariant-sort-key-p (expression)
-  (case (first expression)
-    ((:const :bool :outer-ref) t)
-    (:subplan
-     (let ((descriptor (second expression)))
-       (and (sql-subplan-plan descriptor)
-            (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
-            (not (member 1 (sql-subplan-depths descriptor))))))
-    (:binop (and (window-invariant-sort-key-p (third expression))
-                 (window-invariant-sort-key-p (fourth expression))))
-    (:unary (window-invariant-sort-key-p (third expression)))
-    (:cast (window-invariant-sort-key-p (second expression)))
-    (:func (and (not (analyzed-expression-volatile-p expression))
-                (every #'window-invariant-sort-key-p (third expression))))
-    (otherwise nil)))
+  "Classify a key without rescanning its arguments under each enclosing call."
+  (labels ((invariant-p (node inside-call-p)
+             (case (first node)
+               ((:const :bool) t)
+               (:outer-ref
+                (or (not inside-call-p) (not (analyzed-expression-volatile-p node))))
+               (:subplan
+                (let ((descriptor (second node)))
+                  (and (not inside-call-p)
+                       (sql-subplan-plan descriptor)
+                       (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
+                       (not (member 1 (sql-subplan-depths descriptor))))))
+               (:binop (and (invariant-p (third node) inside-call-p)
+                            (invariant-p (fourth node) inside-call-p)))
+               (:unary (invariant-p (third node) inside-call-p))
+               (:cast (invariant-p (second node) inside-call-p))
+               (:func (and (not (analyzed-function-volatile-p (second node)))
+                           (loop for argument in (third node) always (invariant-p argument t))))
+               (otherwise nil))))
+    (invariant-p expression nil)))
 
 (defun window-plan-stages (prepared)
   ;; Share stages by specification; function slots remain independently assigned.

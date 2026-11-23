@@ -479,6 +479,10 @@ HAVING literal detection shares the analyzed IN operand visitor with
 other local inspections. The regression checks that a row reference in
 each typed operand slot prevents constant evaluation, while opaque
 metadata is ignored.
+Window sort-key classification checks each call's volatility as it
+walks the key, avoiding repeated scans under nested calls. The Rove
+regression covers fixed and correlated subplans, outer references, and
+nested immutable calls.
 
 The A9 grouped-column rewriter and aggregate-signature builder in `9fc72bda044` share the
 scoped operand mapper. A Rove regression supplies column-shaped literal and
