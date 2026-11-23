@@ -554,6 +554,11 @@ strict immutable registry path. The 1,415 C comparisons covered special
 value ordering, NULLs, and decorated lookup errors. The restart check
 verified that a stored extrema default still preserves the right
 operand's display scale on ties.
+Numeric arithmetic aliases and the supported `mod`, `gcd`, and `lcm`
+overloads share registry dispatch and the existing arithmetic kernels.
+The 1,417 C comparisons covered mixed integer widths, unknown arguments,
+ambiguity, special values, and overflow. A fresh process read stored
+defaults for smallint remainder and numeric truncating division.
 Text and bytea length calls use the scalar registry. Unknown unary inputs
 prefer text, following the string-category preference in C's
 `func_select_candidate`. Stored calls can retain their varchar or name

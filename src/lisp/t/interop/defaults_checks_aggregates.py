@@ -549,6 +549,8 @@ CASES = (
     "SELECT scale(1::float8)",
     "SELECT div(7::numeric,2::numeric),div((-7)::numeric,2::numeric),numeric_div_trunc(7,2),mod((-7),3)",
     "SELECT mod(1::smallint,2::smallint),mod(5::bigint,3::integer),mod(5::integer,2::smallint)",
+    "SELECT pg_catalog.mod(7::smallint,'3'), pg_catalog.gcd(24::integer,'18'), pg_catalog.lcm(21::bigint,'6')",
+    "CREATE TABLE dc_arithmetic_registry_default (v smallint DEFAULT mod(7::smallint,'3'), w numeric DEFAULT numeric_div_trunc(7,2))",
     "SELECT mod('7','3')",
     "SELECT mod('7',3),mod(7,'3'),mod(7.50::numeric,2),numeric_mod(7.50,2)",
     "SELECT numeric_add(1.20,2),numeric_sub(1,2),numeric_mul(1.20,2),numeric_div(1,2)",
@@ -1349,6 +1351,7 @@ def check_restart(reference, native):
         for peer in peers:
             peer.observe("SET TIME ZONE 'UTC'")
         for sql in ("INSERT INTO dc_json_constructor DEFAULT VALUES RETURNING v",
+                    "INSERT INTO dc_arithmetic_registry_default DEFAULT VALUES RETURNING v,w",
                     "INSERT INTO dc_numeric_helper_default DEFAULT VALUES RETURNING v",
                     "INSERT INTO dc_array_length_restart DEFAULT VALUES RETURNING v",
                       "INSERT INTO dc_bit_index DEFAULT VALUES RETURNING first_bit, octets",

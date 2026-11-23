@@ -369,6 +369,17 @@ exist\" messages."
                         (lambda (left right)
                           (funcall predicate (sql-numeric-compare left right)))))
 
+(defun make-numeric-arithmetic-builtin (name operator)
+  (make-numeric-builtin name '(:numeric :numeric) :numeric
+                        (lambda (left right)
+                          (sql-numeric-arithmetic operator left right))))
+
+(defun make-gcd-lcm-builtin (name type lcm-p)
+  (make-numeric-builtin name (list type type) type
+                        (if (eq type :numeric)
+                            (lambda (left right) (sql-numeric-gcd-lcm left right lcm-p))
+                            (lambda (left right) (sql-integer-gcd-lcm left right type lcm-p)))))
+
 (defparameter *scalar-builtin-descriptors*
   (let ((registry (make-hash-table :test #'equal)))
     (dolist (builtin
@@ -532,6 +543,23 @@ exist\" messages."
                    (make-numeric-builtin "numeric_inc" '(:numeric) :numeric 'sql-numeric-increment)
                    (make-numeric-builtin "numeric_uminus" '(:numeric) :numeric 'sql-numeric-negate)
                    (make-numeric-builtin "numeric_uplus" '(:numeric) :numeric 'identity)
+                   (make-numeric-arithmetic-builtin "numeric_add" "+")
+                   (make-numeric-arithmetic-builtin "numeric_sub" "-")
+                   (make-numeric-arithmetic-builtin "numeric_mul" "*")
+                   (make-numeric-arithmetic-builtin "numeric_div" "/")
+                   (make-numeric-arithmetic-builtin "numeric_mod" "%")
+                   (make-numeric-arithmetic-builtin "mod" "%")
+                   (make-numeric-builtin "div" '(:numeric :numeric) :numeric 'sql-numeric-div-trunc)
+                   (make-numeric-builtin "numeric_div_trunc" '(:numeric :numeric) :numeric 'sql-numeric-div-trunc)
+                   (make-numeric-builtin "mod" '(:int2 :int2) :int2 'sql-integer-mod)
+                   (make-numeric-builtin "mod" '(:int4 :int4) :int4 'sql-integer-mod)
+                   (make-numeric-builtin "mod" '(:int8 :int8) :int8 'sql-integer-mod)
+                   (make-gcd-lcm-builtin "gcd" :int4 nil)
+                   (make-gcd-lcm-builtin "gcd" :int8 nil)
+                   (make-gcd-lcm-builtin "gcd" :numeric nil)
+                   (make-gcd-lcm-builtin "lcm" :int4 t)
+                   (make-gcd-lcm-builtin "lcm" :int8 t)
+                   (make-gcd-lcm-builtin "lcm" :numeric t)
                    (make-numeric-builtin "scale" '(:numeric) :int4 'sql-finite-numeric-scale)
                    (make-numeric-builtin "min_scale" '(:numeric) :int4 'sql-finite-numeric-min-scale)
                    (make-numeric-builtin "trim_scale" '(:numeric) :numeric 'sql-numeric-trim-scale)
@@ -995,8 +1023,7 @@ names and unknown types.  setseed has no catalog argument names."
                      "width_bucket") :test #'string=)
       (trig-function-p name)
       (float-catalog-alias name)
-      (integer-catalog-alias-p name)
-      (numeric-arithmetic-function-p name)))
+      (integer-catalog-alias-p name)))
 
 (defun numeric-function-argument-count-p (name count)
   "Match the supported numeric pg_proc overloads before checking argument names."
@@ -1008,9 +1035,8 @@ names and unknown types.  setseed has no catalog argument names."
         ((member name '("round" "trunc" "log") :test #'string=) (member count '(1 2)))
         ((integer-catalog-alias-p name)
          (= count (if (member (subseq name 4) '("not" "abs") :test #'string=) 1 2)))
-        ((or (numeric-arithmetic-function-p name)
-             (member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
-                            "atan2" "atan2d") :test #'string=))
+        ((member name '("numeric_log" "power" "pow" "numeric_power" "dpow"
+                        "atan2" "atan2d") :test #'string=)
          (= count 2))
         (t (= count 1))))
 
@@ -1256,35 +1282,6 @@ include different type categories."
 (defun sql-numeric-larger (left right)
   "Choose the right operand on a tie, preserving its display scale."
   (if (plusp (sql-numeric-compare left right)) left right))
-
-(defun numeric-arithmetic-function-p (name)
-  "Recognize immutable numeric arithmetic function names."
-  (member name '("div" "mod" "numeric_div_trunc" "numeric_mod"
-                 "numeric_add" "numeric_sub" "numeric_mul" "numeric_div" "gcd" "lcm")
-          :test #'string=))
-
-(defun analyze-numeric-arithmetic-function (name args)
-  "Resolve two-argument arithmetic functions using the supported catalog overloads.
-MOD, GCD and LCM select numeric or the widest known integer type; two unknown
-arguments are ambiguous. GCD and LCM also reject two smallint arguments as
-ambiguous. The other names resolve to numeric, subject to implicit coercion."
-  (unless (= (length args) 2)
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-  (let* ((known (remove-if #'in-unknown-constant-p args))
-         (type (cond ((not (member name '("mod" "gcd" "lcm") :test #'string=)) :numeric)
-                     ((null known) (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
-                     ((some (lambda (arg) (eq (expr-type arg) :numeric)) known) :numeric)
-                     ((some (lambda (arg) (eq (expr-type arg) :int8)) known) :int8)
-                     ((some (lambda (arg) (eq (expr-type arg) :int4)) known) :int4)
-                     ((and (not (string= name "mod"))
-                           (every (lambda (arg) (eq (expr-type arg) :int2)) known))
-                      (ereport "42725" "function ~a(~a) is not unique" name (call-signature args)))
-                     (t :int2))))
-    (unless (every (lambda (arg) (or (in-unknown-constant-p arg)
-                                     (sql-implicit-coercion-p (expr-type arg) type))) args)
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature args)))
-    (list :func name (mapcar (lambda (arg) (coerce-common-expression arg type)) args)
-          :type type :typmod -1)))
 
 (defun analyze-log-function (name args)
   "Resolve one-argument or numeric two-argument logarithm overloads."
@@ -1556,8 +1553,7 @@ so a nested argument error keeps its own diagnostics."
         ((member name '("log" "log10" "numeric_log") :test #'string=)
          (analyze-log-function name args))
         ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
-         (analyze-power-function name args))
-        ((numeric-arithmetic-function-p name) (analyze-numeric-arithmetic-function name args)))
+         (analyze-power-function name args)))
     (pg-error (condition)
       (if (member (pg-error-sqlstate condition) '("42883" "42725") :test #'string=)
           (report-numeric-function-resolution-error
@@ -3885,7 +3881,6 @@ still requires deferred sort projection."
   (or (integer-catalog-alias-p name)
       (float-catalog-alias name)
       (trig-function-p name)
-      (numeric-arithmetic-function-p name)
       (member name '("abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -4626,26 +4621,8 @@ Stop at the first difference, leaving later field types and counts unchecked."
              (setf result (* result factor)))
     (sql-numeric-result result 0)))
 
-(defun eval-numeric-arithmetic-function (name args type)
-  "Evaluate strict arithmetic calls on already evaluated, coerced arguments.
-DIV truncates toward zero, integer MOD uses integer remainder, and the numeric
-aliases share the corresponding numeric operator implementation."
-  (when (member +null+ args) (return-from eval-numeric-arithmetic-function +null+))
-  (let ((left (first args)) (right (second args)))
-    (cond ((member name '("gcd" "lcm") :test #'string=)
-           (if (eq type :numeric)
-               (sql-numeric-gcd-lcm left right (string= name "lcm"))
-               (sql-integer-gcd-lcm left right type (string= name "lcm"))))
-          ((member name '("div" "numeric_div_trunc") :test #'string=)
-           (sql-numeric-div-trunc left right))
-          ((and (string= name "mod") (member type '(:int2 :int4 :int8)))
-           (sql-arith "%" left right))
-          (t (let ((operator (cond ((string= name "numeric_add") "+")
-                                   ((string= name "numeric_sub") "-")
-                                   ((string= name "numeric_mul") "*")
-                                   ((string= name "numeric_div") "/")
-                                   (t "%"))))
-               (sql-numeric-arithmetic operator left right))))))
+(defun sql-integer-mod (left right)
+  (sql-arith "%" left right))
 
 (defun sql-backend-pid ()
   (if *backend* (backend-pid *backend*) 0))
@@ -5040,8 +5017,6 @@ expression identity has been resolved."
      (cond ((string= name "pi") pi)
            ((member +null+ arguments) +null+)
            (t (sql-float-trig name arguments))))
-    ((numeric-arithmetic-function-p name)
-     (eval-numeric-arithmetic-function name arguments type))
     ((member name '("power" "pow" "numeric_power" "dpow") :test #'string=)
      (cond ((member +null+ arguments) +null+)
            ((eq type :numeric) (sql-numeric-power (first arguments) (second arguments)))
