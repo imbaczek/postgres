@@ -471,6 +471,10 @@ canonical values. The regression distinguishes equal independently built
 window comparisons from different functions. The expanded 172-case window
 differential also compares repeated quantified window expressions in
 `SELECT DISTINCT` and `ORDER BY`.
+The shared visitor and mapper recognize analyzed `IN` nodes explicitly.
+They visit scalar operands and the coerced array and comparison operands
+used by execution, while leaving the surrounding option fields opaque.
+The regression places a column solely in a typed comparison pair.
 
 ## Open development tasks
 

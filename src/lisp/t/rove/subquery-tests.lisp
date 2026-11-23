@@ -36,6 +36,23 @@
                            :relations (list (list :cte cte :cte-levelsup 0)))))
       (rove:ok (equal '(1 2 3 4) (prepared-query-outer-depths prepared)))))
 
+(rove:deftest analyzed-in-visits-typed-operands-and-keeps-metadata-opaque
+    (let* ((reference '(:col 7 :type :int4))
+           (metadata '(:col 99 :type :int4))
+           (source (list :in '(:const 1) '((:const 2)) nil :type :bool
+                         :comparisons (list (list reference '(:const 2)))
+                         :saved metadata))
+           (mapped (map-local-expression-operands
+                    (lambda (form) (if (eq form reference) :mapped form))
+                    source)))
+      (rove:ok (expression-contains-column-p source))
+      (rove:ok (not (some-local-plan-expression
+                     (lambda (form walk) (declare (ignore walk)) (eq form metadata))
+                     source)))
+      (rove:ok (eq :mapped (caar (getf (cddddr mapped) :comparisons))))
+      (rove:ok (eq reference (caar (getf (cddddr source) :comparisons))))
+      (rove:ok (eq metadata (getf (cddddr mapped) :saved)))))
+
 (rove:deftest lateral-legality-inspects-unused-cte-without-rewriting
     (let* ((predicate (list :bool t))
            (outer (list :outer-ref 2 '(:col 1 :type :int4)))

@@ -47,7 +47,18 @@
     ((:func :set-func :single-record :whole-row) :third)
     (:outer-ref :outer-ref)
     (:subplan :subplan)
+    (:in :in)
     (otherwise :structural)))
+
+(defun some-analyzed-in-operand (predicate form)
+  "Visit scalar and typed IN operands, skipping the surrounding option plist."
+  (let ((options (cddddr form)))
+    (or (funcall predicate (second form))
+        (some predicate (third form))
+        (let ((left (getf options :array-left)))
+          (and left (funcall predicate left)))
+        (some predicate (getf options :array-items))
+        (some (lambda (pair) (some predicate pair)) (getf options :comparisons)))))
 
 (defun some-local-plan-expression (predicate expression)
   "Visit local expression nodes until PREDICATE succeeds.
@@ -65,6 +76,7 @@ may still contain expression lists and are traversed structurally."
                      (unless skip-children-p
                        (ecase (local-expression-operand-shape (first form))
                          (:leaf nil)
+                         (:in (some-analyzed-in-operand #'walk form))
                          (:subplan
                           (let ((subplan (second form)))
                             (and (sql-subplan-p subplan) (walk (sql-subplan-test subplan)))))
@@ -86,6 +98,7 @@ may still contain expression lists and are traversed structurally."
      (let ((copy (copy-list form)))
        (setf (third copy) (funcall function (third form)))
        copy))
+    (:in (map-analyzed-in-operands function form))
     (:structural (mapcar function form))))
 
 (defun map-prepared-query-expressions (function prepared &optional (depth 0))
