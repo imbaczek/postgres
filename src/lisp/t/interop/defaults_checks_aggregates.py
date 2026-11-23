@@ -7,6 +7,11 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.pg_wal_lsn_diff('FFFFFFFF/FFFFFFFF', '0/0')",
+    "SELECT pg_wal_lsn_diff(NULL::pg_lsn, '0/1'), pg_wal_lsn_diff('0/1', '0/2')",
+    "SELECT pg_wal_lsn_diff(1, 2)",
+    "SELECT length(pg_catalog.pg_walfile_name('0/1')), pg_walfile_name(NULL::pg_lsn)",
+    "SELECT pg_walfile_name()",
     "SELECT pg_catalog.chr(233::smallint), chr('65'), chr(NULL::int4)",
     "SELECT chr(65::bigint)",
     "SELECT chr()",

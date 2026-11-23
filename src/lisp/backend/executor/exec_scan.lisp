@@ -890,7 +890,6 @@ Mark direct scalar function sources through their aliases."
       (numeric-helper-function-p name)
       (member name '("jsonb_set" "jsonb_insert"
                      "lower" "substr" "substring" "length" "char_length" "character_length" "octet_length"
-                     "pg_wal_lsn_diff" "pg_walfile_name"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"

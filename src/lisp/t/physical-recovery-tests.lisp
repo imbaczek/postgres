@@ -491,11 +491,11 @@
 (cl-spec:defproperty wal-lsn-difference-is-exact-and-antisymmetric
     ((left (range integer 0 18446744073709551615))
      (right (range integer 0 18446744073709551615)))
-  (:about pg::eval-wal-lsn-diff)
+  (:about pg::sql-wal-lsn-diff)
   (:trials (:normal 200))
-  (let ((difference (pg::eval-wal-lsn-diff (list left right))))
+  (let ((difference (pg::sql-wal-lsn-diff left right)))
     (and (= left (+ right difference))
-         (= difference (- (pg::eval-wal-lsn-diff (list right left)))))))
+         (= difference (- (pg::sql-wal-lsn-diff right left))))))
 
 (deftest generated-wal-lsn-difference
     (let ((data (cl-spec:result-data

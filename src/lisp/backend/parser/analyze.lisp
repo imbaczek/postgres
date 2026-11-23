@@ -375,40 +375,17 @@ exist\" messages."
           (sql-lower-c (first args))
           (sql-setting-value (first args) (second args)))))
 
-(defun analyze-wal-lsn-diff (name arguments)
-  "Resolve xlogfuncs.c's strict (pg_lsn, pg_lsn) -> numeric function."
-  (unless (and (= (length arguments) 2)
-               (every (lambda (argument)
-                        (or (eq (expr-type argument) :pg-lsn)
-                            (in-unknown-constant-p argument)))
-                      arguments))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (list :func name
-        (mapcar (lambda (argument) (coerce-in-constant argument :pg-lsn)) arguments)
-        :type :numeric :typmod -1))
-
-(defun eval-wal-lsn-diff (arguments)
+(defun sql-wal-lsn-diff (left right)
   "Match pg_lsn_mi without signed-int64 truncation or floating point."
-  (sql-strict-let ((left (first arguments)) (right (second arguments)))
-    (- left right)))
+  (- left right))
 
-(defun analyze-wal-filename (name arguments)
-  "Resolve xlogfuncs.c's strict pg_walfile_name(pg_lsn) -> text."
-  (unless (and (= (length arguments) 1)
-               (or (eq (expr-type (first arguments)) :pg-lsn)
-                   (in-unknown-constant-p (first arguments))))
-    (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-  (list :func name (list (coerce-in-constant (first arguments) :pg-lsn))
-        :type :text :typmod -1))
-
-(defun eval-wal-filename (arguments)
-  "Compute XLogFileName; native WAL storage is not C disk compatible."
-  (sql-strict-let ((location (first arguments)))
-    (when (recovery-in-progress-p)
-      (ereport "55000" "recovery is in progress"
-               :hint "pg_walfile_name() cannot be executed during recovery."))
-    (subseq (wal-segment-filename (floor location +wal-segment-size+)
-                                  *wal-insert-timeline* :timeline) 0 24)))
+(defun sql-wal-filename (location)
+  "Compute the PostgreSQL filename for LOCATION on the current timeline."
+  (when (recovery-in-progress-p)
+    (ereport "55000" "recovery is in progress"
+             :hint "pg_walfile_name() cannot be executed during recovery."))
+  (subseq (wal-segment-filename (floor location +wal-segment-size+)
+                                *wal-insert-timeline* :timeline) 0 24))
 
 (defun cast-expression-to-text (argument)
   (if (eq (expr-type argument) :text) argument
@@ -447,6 +424,12 @@ exist\" messages."
                    (make-replay-control-builtin "pg_wal_replay_resume" :void)
                    (make-replay-control-builtin "pg_is_wal_replay_paused" :bool)
                    (make-replay-control-builtin "pg_get_wal_replay_pause_state" :text)
+                   (make-scalar-builtin :name "pg_wal_lsn_diff" :argument-types '(:pg-lsn :pg-lsn)
+                                        :result-type :numeric :volatility :immutable :strict-p t
+                                        :evaluator 'sql-wal-lsn-diff :defer-decorated-coercion-p nil)
+                   (make-scalar-builtin :name "pg_walfile_name" :argument-types '(:pg-lsn)
+                                        :result-type :text :volatility :immutable :strict-p t
+                                        :evaluator 'sql-wal-filename :defer-decorated-coercion-p nil)
                    (make-scalar-builtin :name "chr" :argument-types '(:int4) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-chr
                                         :implicit-arguments-p t)
@@ -1804,8 +1787,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
          (analyze-render-function name args)))
       ((getf (cdddr expr) :minmax-syntax-p)
        (analyze-minmax-function name args))
-      ((string= name "pg_wal_lsn_diff") (analyze-wal-lsn-diff name args))
-      ((string= name "pg_walfile_name") (analyze-wal-filename name args))
       ((member name '("lower" "current_setting") :test #'string=)
        (analyze-setting-function name args))
       ((member name '("array_length" "pg_get_expr" "pg_get_replica_identity_index") :test #'string=)
@@ -4733,8 +4714,6 @@ the full 64-bit ID as a signed value."
     ((string= name "array_to_string") (eval-array-to-string args))
     ((member name '("greatest" "least") :test #'string=) (eval-minmax-function name args))
     ((string= name "string_to_array") (eval-string-to-array args))
-    ((string= name "pg_wal_lsn_diff") (eval-wal-lsn-diff args))
-    ((string= name "pg_walfile_name") (eval-wal-filename args))
     ((member name '("lower" "current_setting") :test #'string=)
      (eval-setting-function name args))
     ((string= name "pg_get_expr")

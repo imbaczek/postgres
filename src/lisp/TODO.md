@@ -407,6 +407,12 @@ arity, bigint rejection, and surrogate rejection. Immutable folding
 also recognizes `chr` through the registry. The differential checks error
 precedence on both sides of a false HAVING conjunct and verifies that an
 invalid default fails only when an INSERT demands it.
+`pg_wal_lsn_diff(pg_lsn, pg_lsn)` and `pg_walfile_name(pg_lsn)` share
+signature resolution, strict NULL dispatch, and immutable classification
+through the registry. The physical suite checks exact unsigned LSN
+arithmetic and antisymmetry. The C differential checks qualified calls,
+unknown input coercion, NULLs, signed differences, filename length, and
+signature errors.
 
 ### A9 follow-up evidence
 
