@@ -73,6 +73,23 @@
               (funcall original :gate-owner gate-owner :ownership ownership)
             (setf *native-imported-main-slots-restored* t)))))
 
+(when (equal "1" (uiop:getenv "PG_NATIVE_MAIN_CHECK_RETAINED_UNLINK"))
+  (let ((original (symbol-function 'logical-slot-imported-check-startup-retained)))
+    (setf (symbol-function 'logical-slot-imported-check-startup-retained)
+          (lambda (gate ownership proof selections)
+            (let* ((archive (physical-recovery-retained-directory))
+                   (candidate (physical-retained-object-path archive :inventory 0))
+                   (certificate (getf (logical-slot-copy-check-source-proof proof) :certificate))
+                   (root (getf (getf certificate :retained-reference) :root-id)))
+              (assert (null (funcall original gate ownership proof selections
+                                     (list :inventory root))))
+              (assert (probe-file (physical-retained-object-path archive :inventory root)))
+              (with-open-file (stream candidate :direction :output :if-exists :error)
+                (write-char #\x stream))
+              (assert (funcall original gate ownership proof selections '(:inventory 0)))
+              (assert (not (probe-file candidate)))
+              (format t "~&IMPORTED-MAIN-RETAINED-UNLINK-PASS~%"))))))
+
 (let ((original (symbol-function 'catalog-init)))
   (setf (symbol-function 'catalog-init)
         (lambda ()

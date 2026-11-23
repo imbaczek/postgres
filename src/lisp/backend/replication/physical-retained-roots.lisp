@@ -539,6 +539,18 @@ retains protection until readback reconciliation or durable retirement."
                      (not (gethash owner *physical-retained-root-updates*)))
           (error "required retained WAL root is absent, rebound, or uncertain"))))))
 
+(defun physical-retained-root-unlink-under-lock (directory fd kind id)
+  "Unlink an already checked candidate and sync its held archive directory."
+  (physical-retained-root-require-lock)
+  (let* ((name (file-namestring (physical-retained-object-path directory kind id)))
+         (path (slot-state-fd-path fd name)))
+    (when (wal-namespace-file-stat path t)
+      (physical-retained-check-archive-binding directory fd)
+      (unless (zerop (port-unlinkat fd name 0))
+        (error "could not delete retained WAL object ~a: errno ~d" name (sb-alien:get-errno))))
+    (sb-posix:fsync fd)
+    t))
+
 (defun physical-retained-root-delete-unprotected (directory kind id)
   "Delete an unprotected object using a held archive directory descriptor.
 
@@ -550,11 +562,4 @@ WAL locks while holding the archive mutex."
         (unless (or (physical-retained-root-protected-under-lock
                      directory kind id (physical-retained-archive-key fd))
                     (physical-retained-root-archive-fenced-p directory fd))
-          (let* ((name (file-namestring (physical-retained-object-path directory kind id)))
-                 (path (slot-state-fd-path fd name)))
-            (when (wal-namespace-file-stat path t)
-              (physical-retained-check-archive-binding directory fd)
-              (unless (zerop (port-unlinkat fd name 0))
-                (error "could not delete retained WAL object ~a: errno ~d" name (sb-alien:get-errno)))
-              (sb-posix:fsync fd)
-              t)))))))
+          (physical-retained-root-unlink-under-lock directory fd kind id))))))

@@ -151,8 +151,9 @@
               (call-with-logical-slot-imported-receive-retained
                root proof (lambda (selection check) (funcall check) selection))))))))
 
-(defun logical-slot-imported-check-startup-retained (gate ownership proof selections)
-  "Verify root registrations after slot restoration with the receive control held."
+(defun logical-slot-imported-check-startup-retained (gate ownership proof selections &optional deletion)
+  "Verify the restored selections and optionally unlink one unprotected (kind id).
+Keep postmaster and receive ownership through the archive operation."
   (destructuring-bind (primary expected-receive) selections
     (call-with-logical-slot-imported-host-startup-owner
      gate ownership
@@ -183,4 +184,15 @@
                            (sb-thread:with-mutex (*physical-retained-inventory-publish-lock*)
                              (physical-retained-check-required-roots-under-lock
                               archive-key (remove nil (list (list token (getf reference :root-id))
-                                                            primary receive))))))))))))))))))))
+                                                            primary receive)))
+                             (when deletion
+                               (destructuring-bind (kind id) deletion
+                                 (let ((directory (merge-pathnames "pg_physical_retained/"
+                                                                   (physical-image-fd-path root))))
+                                   (unless (physical-retained-root-protected-under-lock
+                                            directory kind id archive-key)
+                                     (postmaster-check-ownership ownership)
+                                     (physical-image-check-target
+                                      (postmaster-ownership-directory ownership) root)
+                                     (physical-retained-root-unlink-under-lock
+                                      directory archive-fd kind id))))))))))))))))))))))

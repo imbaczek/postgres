@@ -476,8 +476,14 @@ still has work outstanding.
   the archive registrations. All 36 strict retained-root tests passed.
   Native restart and proof-loss cases passed with both a surviving
   receive spool and a fixture with the spool absent.
-  Enabling GC still requires carrying these ownership checks through
-  the archive unlink.
+  The explicit startup unlink path carries host and receive ownership
+  through the archive mutex, required-root check, and descriptor-relative
+  unlink. All 36 strict retained-root tests passed. With
+  `PG_NATIVE_MAIN_CHECK_RETAINED_UNLINK=1`, the native observer verified
+  that the protected root survives and an unreferenced candidate is
+  removed on each of three boots. Proof-loss refusal passed.
+  Production scheduling and verification of its candidate selection
+  remain open.
 
 - [x] Allow detached index builds to overlap logical DDL on other tables.
   Capture schema-before and validate subscriber state at final catalog publication,
