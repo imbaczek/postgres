@@ -857,6 +857,13 @@ All 92 selected tests passed under strict compilation. The combined unit suite
 passed, including 1,172 legacy checks. The live retention test passed replay,
 recycling and restart, including durable slot loss after a source crash.
 
+The two floor calculations now take minima during traversal. They retain the
+XID lock for the active XID scan and check every slot for uncertain state,
+including when the minimum is already zero. With 64 entries in each of the
+XID, snapshot and slot tables, a REPL probe of 10,000 pairs of calculations
+measured 40,972,752 bytes consed before the change and zero afterward. Both
+versions returned the same two segment floors.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

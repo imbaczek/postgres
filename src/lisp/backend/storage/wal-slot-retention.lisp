@@ -26,30 +26,32 @@ Native WAL starts at segment zero, so clamp there rather than C's segment one."
 
 (defun wal-independent-retention-segment (redo-segment current keep-mb)
   "Combine redo, wal_keep_size, active XID and snapshot floors independent of slots.
-The caller holds WAL; take the XID lock to copy active positions. CURRENT is the
-checkpoint endpoint used for both the initial calculation and later rechecks."
-  (let ((positions
-          (append
-           (sb-thread:with-mutex (*xid-lock*)
-             (loop for lsn being the hash-values of *wal-xid-first-lsn* collect lsn))
-           (loop for lsn being the hash-values of *wal-snapshot-retention-pins* collect lsn))))
+The caller holds WAL. Take the XID lock while finding the oldest active position.
+CURRENT is the checkpoint endpoint used for the initial calculation and rechecks."
+  (let ((oldest nil))
+    (sb-thread:with-mutex (*xid-lock*)
+      (loop for lsn being the hash-values of *wal-xid-first-lsn*
+            do (setf oldest (if oldest (min oldest lsn) lsn))))
+    (loop for lsn being the hash-values of *wal-snapshot-retention-pins*
+          do (setf oldest (if oldest (min oldest lsn) lsn)))
     (min redo-segment
          (if (plusp keep-mb) (wal-keep-retention-segment current keep-mb) redo-segment)
-         (if positions (floor (reduce #'min positions) +wal-segment-size+) redo-segment))))
+         (if oldest (floor oldest +wal-segment-size+) redo-segment))))
 
 (defun wal-slot-removal-segment (redo-segment independent-segment current policy)
   "Combine independent retention with reserved slot floors under the WAL lock.
 The standard policy rounds its limit down to whole WAL segments."
-  (let* ((positions (loop for slot being the hash-values of *wal-replication-slots*
-                          when (wal-slot-reserved-p slot)
-                            collect (wal-replication-slot-restart-lsn slot)))
-         (limit (wal-slot-retention-limit policy))
-         (slot-segment (when positions (floor (reduce #'min positions) +wal-segment-size+))))
-    (when (and slot-segment limit (eq :segments (wal-slot-retention-mode policy)))
-      (setf slot-segment
-            (max slot-segment (- (floor current +wal-segment-size+)
-                                 (floor limit +wal-segment-size+)))))
-    (min redo-segment independent-segment (or slot-segment redo-segment))))
+  (let ((oldest nil))
+    (loop for slot being the hash-values of *wal-replication-slots*
+          for restart = (wal-slot-reserved-p slot)
+          when restart do (setf oldest (if oldest (min oldest restart) restart)))
+    (let ((limit (wal-slot-retention-limit policy))
+          (slot-segment (when oldest (floor oldest +wal-segment-size+))))
+      (when (and slot-segment limit (eq :segments (wal-slot-retention-mode policy)))
+        (setf slot-segment
+              (max slot-segment (- (floor current +wal-segment-size+)
+                                   (floor limit +wal-segment-size+)))))
+      (min redo-segment independent-segment (or slot-segment redo-segment)))))
 
 (declaim (ftype function physical-slot-recovery-write-lsn))
 
