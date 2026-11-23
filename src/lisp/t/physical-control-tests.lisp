@@ -239,7 +239,7 @@
                    (arguments (append
                                (when selected '(:applied-timeline 2 :history-target 2 :history-digest 99))
                                (when pending '(:promotion-child 3 :promotion-generation 7
-                                               :promotion-source-namespace :legacy))
+                                               :promotion-source-namespace :timeline))
                                (when retained '(:retained-reference
                                                 (:root-id 9 :base-timeline 1 :base 32
                                                  :manifest-digest 456 :end 256 :end-digest 8)))))
@@ -325,7 +325,7 @@
                               '(:applied-timeline 2 :history-target 2 :history-digest 99))
                             (when pending
                               '(:promotion-child 3 :promotion-generation 7
-                                :promotion-source-namespace :legacy))))
+                                :promotion-source-namespace :timeline))))
          (bytes (apply #'pg::physical-recovery-control-image
                        (if pending 3 2) 123 1 456 32 applied 1003 :resource-fact fact arguments))
          (decoded (pg::physical-recovery-decode-control bytes)))

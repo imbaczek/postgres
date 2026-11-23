@@ -4,7 +4,7 @@
 (defun pending-test-control (&rest options)
   (apply #'pg::physical-recovery-control-image 3 123 1 77 32 96 50
          (append options (list :state-time 12345 :promotion-child 2
-                               :promotion-generation 987 :promotion-source-namespace :legacy))))
+                               :promotion-generation 987 :promotion-source-namespace :timeline))))
 
 (deftest pending-control-retained-reference-is-exact-and-crc-bound
     (dolist (root '(0 18446744073709551615))
@@ -90,7 +90,7 @@
       (ok (eq :passed (getf data :status)) (format nil "~s" data))))
 
 (deftest pending-promotion-control-binds-source-child-and-exact-generation
-    (dolist (namespace '(:legacy :timeline))
+    (let ((namespace :timeline))
       (let* ((bytes (pending-test-control :promotion-source-namespace namespace))
              (control (pg::physical-recovery-decode-control bytes)))
         (ok (= 88 (length bytes)))
@@ -111,7 +111,7 @@
 (deftest pending-control-preserves-exhausted-visibility-without-reserving-child-xids
     (let* ((bytes (pg::physical-recovery-control-image
                    3 123 1 77 32 96 18446744073709551616 :state-time 12345
-                   :promotion-child 2 :promotion-generation 0 :promotion-source-namespace :legacy))
+                   :promotion-child 2 :promotion-generation 0 :promotion-source-namespace :timeline))
            (control (pg::physical-recovery-decode-control bytes)))
       (ok (zerop (pg::wal-u64 bytes 48)))
       (ok (logbitp 31 (pg::wal-u32 bytes 8)))
@@ -137,10 +137,15 @@
     (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bytes))))))
 
 (deftest pending-control-crc-covers-every-new-identity-and-boundary-field
-    (dolist (offset '(8 12 16 24 32 40 48 56 60 68 72 76 83))
-      (let ((bytes (pending-test-control)))
-        (setf (aref bytes offset) (logxor 1 (aref bytes offset)))
-        (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bytes)))))))
+    (let ((bytes (pending-test-control)))
+      (pg::wal-set-u32 bytes 72 0)
+      (pg::wal-set-u32 bytes 84 0)
+      (pg::wal-set-u32 bytes 84 (pg::wal-crc32 bytes))
+      (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bytes)))))
+  (dolist (offset '(8 12 16 24 32 40 48 56 60 68 72 76 83))
+    (let ((bytes (pending-test-control)))
+      (setf (aref bytes offset) (logxor 1 (aref bytes offset)))
+      (ok (intake-fails-p (lambda () (pg::physical-recovery-decode-control bytes)))))))
 
 (deftest pending-control-cannot-be-rewritten-as-ordinary-progress
     (with-physical-store-directory (root)
@@ -195,10 +200,10 @@
 
 (cl-spec:defproperty pending-promotion-identities-roundtrip-without-committing-child
     ((child (range integer 2 4294967295)) (generation (range integer 0 18446744073709551615))
-                                          (next (range integer 3 18446744073709551616)) (kind (range integer 0 1)))
+                                          (next (range integer 3 18446744073709551616)))
   (:about pg::physical-recovery-control-image)
   (:trials (:normal 200))
-  (let* ((namespace (nth kind '(:legacy :timeline)))
+  (let* ((namespace :timeline)
          (bytes (pg::physical-recovery-control-image
                  3 123 1 77 32 96 next :state-time 12345 :promotion-child child
                  :promotion-generation generation :promotion-source-namespace namespace))

@@ -282,7 +282,7 @@
           (multiple-value-bind (bytes pending)
               (physical-promotion-make-pending
                state metadata (make-array 0 :element-type '(unsigned-byte 8))
-               9 :legacy 4 0 nil :promotion-full-page-writes desired)
+               9 :timeline 4 0 nil :promotion-full-page-writes desired)
             (let ((control (physical-recovery-decode-control bytes)))
               (rove:ok (equal before metadata))
               (rove:ok (get-properties control '(:promotion-full-page-writes)))

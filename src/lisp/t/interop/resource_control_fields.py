@@ -151,6 +151,8 @@ def recovery_control_fields(data):
         assert pending and size in (132, 148)
     assert crc32c(data[:-4] + bytes(4)) == int.from_bytes(data[-4:], "little")
     selected = size in ((104, 148) if pending else (88,))
+    if pending:
+        assert int.from_bytes(data[72:76], "little") == 1
     offset = (84 if pending else 68) if selected else 12
     applied, applied_timeline = int.from_bytes(data[40:48], "little"), int.from_bytes(data[offset:offset + 4], "little")
     resources = None

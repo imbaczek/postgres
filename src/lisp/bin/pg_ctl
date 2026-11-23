@@ -85,6 +85,8 @@ def recovery_phase(root):
     saved = struct.unpack_from("<I", data, len(data) - 4)[0]
     if crc32c(data[:-4] + b"\0" * 4) != saved:
         raise ValueError("native recovery control checksum mismatch")
+    if pending and struct.unpack_from("<I", data, 72)[0] != 1:
+        raise ValueError("native promotion requires timeline-qualified WAL")
     selected = size in ((104, 148) if pending else (88,))
     timeline_offset = (84 if pending else 68) if selected else 12
     applied_timeline = struct.unpack_from("<I", data, timeline_offset)[0]

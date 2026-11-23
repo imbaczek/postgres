@@ -16,7 +16,7 @@
             (ok (eq level configured))))
         (let* ((bytes (pg::physical-recovery-control-image
                        3 42 1 4 32 152 50 :state-time 0 :promotion-child 4
-                       :promotion-generation 9 :promotion-source-namespace :legacy
+                       :promotion-generation 9 :promotion-source-namespace :timeline
                        :promotion-logical-decoding-enabled enabled :promotion-wal-level level))
                (control (pg::physical-recovery-decode-control bytes)))
           (ok (eql enabled (getf control :promotion-logical-decoding-enabled)))
@@ -28,7 +28,7 @@
   (ok (intake-fails-p
        (lambda () (pg::physical-recovery-control-image
                    3 42 1 4 32 152 50 :state-time 0 :promotion-child 4
-                   :promotion-generation 9 :promotion-source-namespace :legacy
+                   :promotion-generation 9 :promotion-source-namespace :timeline
                    :promotion-wal-level :replica)))))
 
 (deftest pending-control-binds-standby-logical-slot-evidence
@@ -36,7 +36,7 @@
                         :end 152 :end-digest 5))
            (fact (source-logical-promotion-fact t 119))
            (arguments (list 3 42 1 4 32 152 50 :state-time 0 :promotion-child 4
-                                               :promotion-generation 9 :promotion-source-namespace :legacy
+                                               :promotion-generation 9 :promotion-source-namespace :timeline
                                                :logical-fact fact :promotion-full-page-writes t
                                                :promotion-logical-decoding-enabled t :promotion-wal-level :replica))
            (bytes (apply #'pg::physical-recovery-control-image
@@ -612,7 +612,7 @@
     (apply #'pg::physical-recovery-control-image
            (append
             (list 3 42 1 4 32 152 50 :state-time 0 :promotion-child 4
-                                     :promotion-generation 9 :promotion-source-namespace :legacy
+                                     :promotion-generation 9 :promotion-source-namespace :timeline
                                      :history-target (when selected 3) :history-digest (when selected 7)
                                      :retained-reference
                                      (when retained '(:root-id 1 :base-timeline 1 :base 32 :manifest-digest 4 :end 152 :end-digest 7))
@@ -660,9 +660,9 @@
 
 (deftest promotion-logical-control-composes-intents-with-every-optional-layout
     (ok (equal
-         '(((88 16590158288205227922) (356 3657234055354259330))
-           ((105 1046427146213484383) (373 8669646262245995252))
-           ((105 623693058593181923) (373 9753913470866187585)))
+         '(((88 12635493871729179692) (356 6163991117470437862))
+           ((105 4159487844344421465) (373 14621441373600419012))
+           ((105 2121051351573625297) (373 14404711673711277345)))
          (loop for fpw in '(:absent nil t) collect
                                            (loop for full in '(nil t) collect
                                                                       (let ((bytes (promotion-logical-codec-image
@@ -718,7 +718,7 @@
     (let* ((bytes (pg::physical-recovery-control-image
                    3 42 1 4 32 152 18446744073709551616
                    :state-time 0 :promotion-child 4 :promotion-generation 9
-                   :promotion-source-namespace :legacy :promotion-full-page-writes nil
+                   :promotion-source-namespace :timeline :promotion-full-page-writes nil
                    :promotion-logical-decoding-enabled logical
                    :promotion-wal-level (if logical :logical :replica)))
            (decoded (pg::physical-recovery-decode-control bytes)))

@@ -8,7 +8,7 @@
                 (if exhausted 18446744073709551616 3) :state-time 0
                 :applied-timeline 1 :history-target (when selected 3) :history-digest (when selected 7)
                 :promotion-child (when pending 4) :promotion-generation (when pending 9)
-                :promotion-source-namespace (when pending :legacy)
+                :promotion-source-namespace (when pending :timeline)
                 :retained-reference (when retained '(:root-id 1 :base-timeline 1 :base 32
                                                      :manifest-digest 4 :end 80 :end-digest 7))
                 :resource-fact (when resources

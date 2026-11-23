@@ -480,7 +480,11 @@ Backup manifests and bundle intake require qualified WAL file entries. A
 checksummed version 3 manifest with a legacy entry reached file-entry
 rejection. Eighty-three strict recovery and promotion heads, three cold
 policy heads, and live qualified bootstrap passed.
-Tighten the primary and pending control codecs for callers outside server
+Pending promotion control requires a timeline-qualified source in the server
+codec and the standalone `pg_ctl` reader. The control layout stays at
+`PGRSTAT4`. A CRC-valid legacy namespace is rejected in both readers.
+All 117 focused strict physical heads and all 1,639 unit heads passed.
+Tighten the primary control codec for callers outside server
 startup. Use the prior build's
 namespace migration operation for stopped legacy primaries. Regenerate legacy
 base backups or reseed affected standbys before moving them to the cutover build.

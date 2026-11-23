@@ -64,7 +64,12 @@ def main():
             fpw_fact = struct.pack("<8sIIQQIIQQIIQ", b"PGFPWFC1", 3, 0,
                                    32, end, 1, 1, 32, end, 1, 0, 0)
             utility["validate_fpw_fact"](fpw_fact, end, 1)
+        legacy = bytearray(image(pending=True))
+        struct.pack_into("<I", legacy, 72, 0)
+        struct.pack_into("<I", legacy, len(legacy) - 4, 0)
+        struct.pack_into("<I", legacy, len(legacy) - 4, utility["crc32c"](legacy))
         invalid = [
+            legacy,
             image(fact=fact(through=159)),
             image(fact=fact(interval=True, interval_start=1)),
             image(fact=b"BADMAGIC" + fact()[8:]),

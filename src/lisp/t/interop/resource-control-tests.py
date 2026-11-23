@@ -258,7 +258,7 @@ class ResourceControlTests(unittest.TestCase):
                         struct.pack_into("<Iq", data, 56, 5, 0)
                         selected = layout in ((104, 148) if pending else (88,))
                         if pending:
-                            struct.pack_into("<IIQ", data, 68, 3, 0, 7)
+                            struct.pack_into("<IIQ", data, 68, 3, 1, 7)
                         offset = 84 if pending else 68
                         if selected:
                             struct.pack_into("<IIQ", data, offset, 2, 2, 99)
@@ -303,7 +303,7 @@ class ResourceControlTests(unittest.TestCase):
         selected = layout in ((104, 148) if pending else (88,))
         offset, applied_timeline = (84 if pending else 68), (2 if selected else 1)
         if pending:
-            struct.pack_into("<IIQ", data, 68, 3, 0, 7)
+            struct.pack_into("<IIQ", data, 68, 3, 1, 7)
         if selected:
             struct.pack_into("<IIQ", data, offset, 2, 2, 99)
             offset += 16

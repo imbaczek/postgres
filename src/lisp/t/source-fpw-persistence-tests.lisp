@@ -52,7 +52,7 @@
          (let ((bytes (pg::physical-recovery-control-image
                        3 42 1 4 32 80 3 :state-time 0
                        :applied-timeline 1 :history-target 3 :history-digest 7
-                       :promotion-child 4 :promotion-generation 9 :promotion-source-namespace :legacy
+                       :promotion-child 4 :promotion-generation 9 :promotion-source-namespace :timeline
                        :retained-reference '(:root-id 1 :base-timeline 1 :base 32
                                              :manifest-digest 4 :end 80 :end-digest 7)
                        :resource-fact '(:resource-parameters (100 8 10 0 128)
@@ -85,7 +85,7 @@
                (let* ((bytes (pg::physical-recovery-control-image
                               3 42 1 4 32 80 (if exhausted 18446744073709551616 3) :state-time 0
                               :applied-timeline 1 :history-target 3 :history-digest 7
-                              :promotion-child 4 :promotion-generation 9 :promotion-source-namespace :legacy
+                              :promotion-child 4 :promotion-generation 9 :promotion-source-namespace :timeline
                               :retained-reference '(:root-id 1 :base-timeline 1 :base 32
                                                     :manifest-digest 4 :end 80 :end-digest 7)
                               :resource-fact '(:resource-parameters (100 8 10 0 128)

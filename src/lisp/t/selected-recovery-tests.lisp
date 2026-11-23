@@ -20,7 +20,7 @@
                       :applied-timeline 2 :history-target 2 :history-digest 99))
            (pending (pg::physical-recovery-control-image
                      3 123 1 456 64 128 100 :state-time 42
-                     :promotion-child 2 :promotion-generation 7 :promotion-source-namespace :legacy)))
+                     :promotion-child 2 :promotion-generation 7 :promotion-source-namespace :timeline)))
       (ok (= 88 (length ordinary) (length pending)))
       (ok (= 2 (getf (pg::physical-recovery-decode-control ordinary) :phase)))
       (ok (= 3 (getf (pg::physical-recovery-decode-control pending) :phase)))
@@ -30,7 +30,7 @@
     (let* ((bytes (pg::physical-recovery-control-image
                    3 123 1 456 64 128 100 :state-time 42
                    :applied-timeline 2 :history-target 2 :history-digest 99
-                   :promotion-child 3 :promotion-generation 7 :promotion-source-namespace :legacy))
+                   :promotion-child 3 :promotion-generation 7 :promotion-source-namespace :timeline))
            (control (pg::physical-recovery-decode-control bytes)))
       (ok (= 104 (length bytes)))
       (ok (= 4 (getf control :control-version)))
@@ -45,7 +45,7 @@
        (pg::physical-recovery-control-path root)
        (pg::physical-recovery-control-image
         3 123 1 456 64 128 100 :applied-timeline 2 :history-target 2 :history-digest 99
-                               :promotion-child 3 :promotion-generation 7 :promotion-source-namespace :legacy))
+                               :promotion-child 3 :promotion-generation 7 :promotion-source-namespace :timeline))
       (ok (= 2 (getf (pg::physical-recovery-read-control root) :applied-timeline)))))
 
 (deftest selected-recovery-control-rejects-contradictory-extensions
@@ -63,7 +63,7 @@
   (ok (signals (pg::physical-recovery-control-image
                 3 123 1 456 64 128 100
                 :applied-timeline 2 :history-target 2 :history-digest 99
-                :promotion-child 2 :promotion-generation 7 :promotion-source-namespace :legacy) 'error)))
+                :promotion-child 2 :promotion-generation 7 :promotion-source-namespace :timeline) 'error)))
 
 (deftest selected-recovery-control-checks-extension-after-crc
     (let ((bytes (pg::physical-recovery-control-image

@@ -88,9 +88,8 @@ level must be supplied together as a valid pair, distinct from the source fact."
          (if (= phase 3)
              (and (typep promotion-child '(integer 2 4294967295))
                   (> promotion-child applied-timeline)
-                  (or (eql timeline 1) (eq promotion-source-namespace :timeline))
                   (typep promotion-generation '(unsigned-byte 64))
-                  (member promotion-source-namespace '(:legacy :timeline))
+                  (eq promotion-source-namespace :timeline)
                   (eql db-state +db-in-archive-recovery+))
              (and (null promotion-child)
                   (null promotion-generation) (null promotion-source-namespace)))
@@ -174,7 +173,7 @@ extensions do not change the format version."
       (wal-set-i64 bytes 60 state-time)
       (when pending
         (wal-set-u32 bytes 68 promotion-child)
-        (wal-set-u32 bytes 72 (ecase promotion-source-namespace (:legacy 0) (:timeline 1)))
+        (wal-set-u32 bytes 72 1)
         (wal-set-u64 bytes 76 promotion-generation))
       (when selected
         (wal-set-u32 bytes extension-start applied-timeline)
@@ -254,7 +253,7 @@ A logical intent yields both its status and configured WAL level."
           (when pending
             (setf (getf control :promotion-child) (wal-u32 bytes 68)
                   (getf control :promotion-source-namespace)
-                  (case (wal-u32 bytes 72) (0 :legacy) (1 :timeline))
+                  (when (= (wal-u32 bytes 72) 1) :timeline)
                   (getf control :promotion-generation) (wal-u64 bytes 76)))
           (when selected
             (setf (getf control :applied-timeline) (wal-u32 bytes extension-start)

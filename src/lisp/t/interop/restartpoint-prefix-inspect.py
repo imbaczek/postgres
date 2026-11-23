@@ -347,7 +347,7 @@ def prepare_pending(target, source, snapshot):
     fields = (root / "global" / "pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6"
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
-    source_namespace = {b"legacy": 0, b"timeline": 1}[fields[5]]
+    assert fields[5] == b"timeline"
     pending = bytearray(len(ordinary) + 16)
     pending[:68] = ordinary[:68]
     pending[84:-4] = ordinary[68:-4]
@@ -355,7 +355,7 @@ def prepare_pending(target, source, snapshot):
     struct.pack_into("<I", pending, 8, (phase & 0xC0000000) | 3)
     struct.pack_into("<I", pending, 56, 5)  # DB_IN_ARCHIVE_RECOVERY
     # Schema alone is insufficient: this fixture deliberately lacks generation ownership.
-    struct.pack_into("<IIQ", pending, 68, 2, source_namespace, digest ^ 1)
+    struct.pack_into("<IIQ", pending, 68, 2, 1, digest ^ 1)
     struct.pack_into("<I", pending, len(pending) - 4, crc32c(pending))
     path.write_bytes(pending)
     pathlib.Path(snapshot).write_text(json.dumps(storage_snapshot(root), sort_keys=True))

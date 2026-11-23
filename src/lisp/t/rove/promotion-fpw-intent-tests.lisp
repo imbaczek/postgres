@@ -18,7 +18,7 @@
   (apply #'physical-recovery-control-image
          (append
           (list 3 42 1 4 32 80 3 :state-time 0 :promotion-child 4
-                                 :promotion-generation 9 :promotion-source-namespace :legacy
+                                 :promotion-generation 9 :promotion-source-namespace :timeline
                                  :applied-timeline 1 :history-target (when selected 3) :history-digest (when selected 7)
                                  :retained-reference (when retained '(:root-id 1 :base-timeline 1 :base 32
                                                                       :manifest-digest 4 :end 80 :end-digest 7))

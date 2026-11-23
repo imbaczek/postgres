@@ -17,7 +17,7 @@ when each recorded check ran.
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |
 | Physical bootstrap source pin | `PGPHYSPIN2`. Follow pins use a separate codec. |
 | Physical receive control | `PGPHYS03`, with the current base, history-selection, and retained-root forms. |
-| Physical recovery control | `PGRSTAT3` for ordinary recovery and `PGRSTAT4` for pending promotion. |
+| Physical recovery control | `PGRSTAT3` for ordinary recovery and `PGRSTAT4` for pending promotion with a timeline-qualified source. |
 | Physical backup manifest | Version 3 with an explicit checkpoint start. |
 | Standby restartpoint | `PGRPGEN2` with metadata version 4. |
 | Catalog and relation pages | Catalog images carry a cluster identity and OIDs for stored publications. B-tree pages use the current page flags for the page type. |

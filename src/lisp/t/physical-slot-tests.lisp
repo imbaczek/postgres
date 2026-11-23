@@ -481,7 +481,7 @@
             (multiple-value-bind (control-image pending)
                 (pg::physical-promotion-make-pending
                  '(:system-id 41 :timeline 1 :manifest-digest 2 :checkpoint 32)
-                 '(:lsn 128 :next-xid 55) #() 5 :legacy 2 0 reference
+                 '(:lsn 128 :next-xid 55) #() 5 :timeline 2 0 reference
                  :promotion-logical-decoding-enabled t :promotion-wal-level :replica
                  :logical-slot-source-entries (list entry))
               (let ((encoded (pg::physical-recovery-decode-control control-image)))
