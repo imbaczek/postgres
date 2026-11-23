@@ -243,6 +243,12 @@ TEXT-P requests the text form, for which JSON null becomes SQL NULL."
                           (loop for child across item do (push (cons child (1+ depth)) pending))))))
         (make-sql-jsonb result)))))
 
+(defun sql-jsonb-set-call (document path replacement &optional (create-if-missing t))
+  (sql-jsonb-set document path replacement create-if-missing))
+
+(defun sql-jsonb-insert-call (document path replacement &optional insert-after)
+  (sql-jsonb-set document path replacement t :insert-p t :after-p insert-after))
+
 (defun jsonb-array-without-index (array index)
   "Copy ARRAY without its INDEX, allocating only the result vector."
   (let ((result (make-array (1- (length array)))))

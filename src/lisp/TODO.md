@@ -506,6 +506,11 @@ Both `string_to_array` arities use the scalar registry for text coercion,
 immutable classification, and non-strict evaluation. The recursive CTE
 differential passed 137 cases, including NULL delimiters, NULL field
 replacement, multibyte text, implicit varchar inputs, and arity errors.
+`jsonb_set` and `jsonb_insert` share registry coercion, strictness, and
+immutable classification. Their optional flags retain the C defaults
+of true and false respectively. The unit suite and 1,393 C comparisons
+passed, including SQL NULL versus JSON null, decorated-call error order,
+and a strict NULL default that leaves its sequence untouched.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

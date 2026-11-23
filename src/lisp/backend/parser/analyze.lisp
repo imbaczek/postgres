@@ -505,6 +505,22 @@ exist\" messages."
                                         :evaluator 'sql-string-to-array :implicit-arguments-p t)
                    (make-scalar-builtin :name "json_typeof" :argument-types '(:json) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-json-source-kind)
+                   (make-scalar-builtin :name "jsonb_set"
+                                        :argument-types '(:jsonb :text-array :jsonb)
+                                        :result-type :jsonb :volatility :immutable :strict-p t
+                                        :evaluator 'sql-jsonb-set-call :implicit-arguments-p t)
+                   (make-scalar-builtin :name "jsonb_set"
+                                        :argument-types '(:jsonb :text-array :jsonb :bool)
+                                        :result-type :jsonb :volatility :immutable :strict-p t
+                                        :evaluator 'sql-jsonb-set-call :implicit-arguments-p t)
+                   (make-scalar-builtin :name "jsonb_insert"
+                                        :argument-types '(:jsonb :text-array :jsonb)
+                                        :result-type :jsonb :volatility :immutable :strict-p t
+                                        :evaluator 'sql-jsonb-insert-call :implicit-arguments-p t)
+                   (make-scalar-builtin :name "jsonb_insert"
+                                        :argument-types '(:jsonb :text-array :jsonb :bool)
+                                        :result-type :jsonb :volatility :immutable :strict-p t
+                                        :evaluator 'sql-jsonb-insert-call :implicit-arguments-p t)
                    (make-scalar-builtin :name "jsonb_typeof" :argument-types '(:jsonb) :result-type :text
                                         :volatility :immutable :strict-p t :evaluator 'sql-jsonb-kind)
                    (make-scalar-builtin :name "json_array_length" :argument-types '(:json) :result-type :int4
@@ -595,20 +611,6 @@ Use :ALWAYS for signatures whose unknown inputs already used runtime casts."
            :type (scalar-builtin-result-type builtin) :typmod -1
            (when (eq (scalar-builtin-result-type builtin) :record)
              (list :fields (scalar-record-builtin-fields name))))))
-
-(defun analyze-jsonb-set-function (name arguments)
-  "Resolve jsonb_set(jsonb, text[], jsonb [, boolean])."
-  (let ((types '(:jsonb :text-array :jsonb :bool)))
-    (unless (and (member (length arguments) '(3 4))
-                 (loop for argument in arguments for type in types
-                       always (or (eq (expr-type argument) type)
-                                  (in-unknown-constant-p argument)
-                                  (sql-implicit-coercion-p (expr-type argument) type))))
-      (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
-    (list :func name
-          (loop for argument in arguments for type in types
-                collect (coerce-common-expression argument type))
-          :type :jsonb :typmod -1)))
 
 (defun analyze-to-jsonb-function (name arguments)
   "Resolve to_jsonb's polymorphic argument within supported scalar and array types."
@@ -1777,11 +1779,6 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
            (ereport "42804" "VARIADIC argument must be an array")))
        (list :func name args :type (if (search "jsonb_" name) :jsonb :json) :typmod -1
                              :variadic (getf (cdddr expr) :variadic)))
-      ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
-       (let ((*defer-function-constant-coercion-p*
-               (or (getf (cdddr expr) :call-distinct)
-                   (getf (cdddr expr) :call-order))))
-         (analyze-jsonb-set-function name args)))
       ((member name '("pg_stat_get_wal_senders" "pg_stat_get_activity") :test #'string=)
        (analyze-source-status-function name args))
       (builtins
@@ -3930,8 +3927,7 @@ still requires deferred sort projection."
       (trig-function-p name)
       (numeric-arithmetic-function-p name)
       (numeric-helper-function-p name)
-      (member name '("jsonb_set" "jsonb_insert"
-                     "substr" "substring"
+      (member name '("substr" "substring"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
@@ -5056,13 +5052,6 @@ Map float catalog names and dispatch integer catalog names only here, after
 expression identity has been resolved."
   (setf name (or (second (float-catalog-alias name)) name))
   (cond
-    ((member name '("jsonb_set" "jsonb_insert") :test #'string=)
-     (if (member +null+ arguments) +null+
-         (if (string= name "jsonb_insert")
-             (sql-jsonb-set (first arguments) (second arguments) (third arguments) t
-                            :insert-p t :after-p (and (= (length arguments) 4) (fourth arguments)))
-             (sql-jsonb-set (first arguments) (second arguments) (third arguments)
-                            (if (fourth arguments) (fourth arguments) (= (length arguments) 3))))))
     ((integer-catalog-alias-p name)
      (if (member +null+ arguments) +null+
          (let ((suffix (subseq name 4)))

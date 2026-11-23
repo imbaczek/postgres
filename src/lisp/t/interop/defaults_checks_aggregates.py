@@ -7,6 +7,14 @@ from pathlib import Path
 from subqueries import QueryConnection
 
 CASES = (
+    "SELECT pg_catalog.jsonb_set('{}', ARRAY['a'::varchar], '1'), jsonb_set('{}', '{a}', '1', false)",
+    "SELECT jsonb_insert('[1,2]', '{0}', '3'), jsonb_insert('[1,2]', '{0}', '3', true)",
+    "SELECT jsonb_set('{}', '{a}', '1', NULL), jsonb_insert('{}', '{a}', 'null')",
+    "SELECT jsonb_insert(DISTINCT 'invalid', '{a}', '1')",
+    "CREATE SEQUENCE dc_jsonb_strict_seq",
+    "CREATE TABLE dc_jsonb_strict_default(v jsonb DEFAULT jsonb_set(NULL::jsonb, '{a}', to_jsonb(nextval('dc_jsonb_strict_seq'))))",
+    "INSERT INTO dc_jsonb_strict_default DEFAULT VALUES RETURNING v",
+    "SELECT nextval('dc_jsonb_strict_seq')",
     "CREATE TABLE dc_registry_replica_no_index (id int)",
     "CREATE TABLE dc_registry_replica (id int PRIMARY KEY)",
     "SELECT relname, pg_catalog.pg_get_replica_identity_index(oid) IS NULL FROM pg_catalog.pg_class WHERE relname IN ('dc_registry_replica_no_index', 'dc_registry_replica') ORDER BY relname",
