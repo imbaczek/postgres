@@ -454,9 +454,17 @@ cast inserted by signature resolution.
 HAVING recognizes overloaded names when every registered signature is
 immutable. The C differential checks error precedence for an invalid
 `get_bit` input on either side of a false conjunct.
-The live TOAST run passed the varchar length assertion and proceeded to
-the later snapshot rewrite fixture, where it stalled at
-`VACUUM FULL rewrite_snapshot`. The full TOAST run remains unverified.
+The complete live TOAST DML suite passed, including the varchar length
+and direct TOAST projection checks. See the A17 fixture evidence below.
+
+### A17 follow-up evidence
+
+A focused backend trace located the TOAST rewrite fixture wait in
+`ACQUIRE-SCHEMA-WRITE-LOCK`. The repeatable-read session held a schema
+read lock while the fixture waited synchronously for `VACUUM FULL`.
+The fixture now verifies the exact old value after plain VACUUM with the
+snapshot open, commits the reader, and verifies the exact replacement
+value after the full rewrite. The complete `t/toast-dml.sh` suite passed.
 
 ### A9 follow-up evidence
 

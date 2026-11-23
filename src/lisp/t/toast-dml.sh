@@ -1131,14 +1131,15 @@ until grep -q '^ready$' "$TMP/rewrite-reader.out"; do
     sleep 0.1
 done
 run -c "update rewrite_snapshot set v = '$other' where id = 1" >/dev/null
-run -c 'vacuum full rewrite_snapshot' >/dev/null
+# Plain VACUUM must retain the old TOAST value for the open snapshot.
 run -c 'vacuum rewrite_snapshot' >/dev/null
 printf "select v = '%s' from rewrite_snapshot where id = 1; commit;\n\\q\n" "$big" >&3
 exec 3>&-
 wait "$READER"
 READER=
 grep -q '^t$' "$TMP/rewrite-reader.out"
-run -c 'vacuum rewrite_snapshot' >/dev/null
+# FULL needs the schema write lock, so wait for the reader to commit first.
+run -c 'vacuum full rewrite_snapshot' >/dev/null
 [ "$(run -c "select v = '$other' from rewrite_snapshot where id = 1")" = t ]
 run -c 'alter table storage_restart alter column v set storage plain' >/dev/null
 [ "$(run -c 'select length(v) from storage_restart')" = 20000 ]
