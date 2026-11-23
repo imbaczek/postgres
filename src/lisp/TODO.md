@@ -390,6 +390,10 @@ creates the CLOG file required for an owned restart of the source.
 The WAL control encoder defaults to the timeline namespace. Production callers
 pass the current, source, or child namespace explicitly, and historical fixtures
 request legacy control images explicitly where they create legacy-named WAL.
+Fresh Lisp images also start with the timeline namespace. The cursor fencing
+fixtures inject legacy as the mismatched namespace in memory and on disk.
+Sixteen strict namespace heads passed. The combined unit suite also passed,
+including all 1,172 legacy checks.
 The export-origin fixtures bind the current timeline-qualified namespace for
 the WAL and sender. All 17 strict heads passed, including stale timeline
 rejection and retained progress across publication failure.
@@ -459,6 +463,12 @@ namespace fields. Migrate positive legacy fixtures to qualified names and
 keep independently generated legacy bytes for rejection checks. Verify that
 startup refuses legacy artifacts before writing controls, renaming files, or
 changing the selected timeline.
+Apply the startup check under PGDATA ownership before PID repair or startup
+reconciliation. Cover ordinary, imported, and single-user startup. Tighten
+the primary and pending control codecs, backup manifest inventory, and retained
+overlap metadata for callers outside server startup. Use the prior build's
+namespace migration operation for stopped legacy primaries. Regenerate legacy
+base backups or reseed affected standbys before moving them to the cutover build.
 
 For B16, the three `collect-select-*-rows` wrappers had no production callers.
 The joined collector was the only caller of `stream-select-joined-rows`, which

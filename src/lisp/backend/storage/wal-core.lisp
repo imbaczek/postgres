@@ -356,7 +356,7 @@ logical catalog horizons covered by replay."
 (defvar *wal-prev-timeline* 1
   "Previous recovery timeline, as C XLogCtl PrevTimeLineID; persists across checkpoints.")
 
-(defvar *wal-segment-namespace* :legacy
+(defvar *wal-segment-namespace* :timeline
   "Explicit filename grammar; changing insertion TLI never reinterprets old names.")
 
 (defvar *wal-checkpoint-snapshot* nil
