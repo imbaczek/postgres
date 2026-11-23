@@ -92,6 +92,22 @@
       (rove:ok (eq (getf (cdddr folded-setting) :saved) metadata))
       (rove:ok (eq (getf (cddr retained) :saved) metadata))))
 
+(rove:deftest scalar-builtin-family-volatility-is-conservative
+    (let ((*scalar-builtin-descriptors* (make-hash-table :test #'equal))
+          (call '(:func "mixed" nil :type :bool)))
+      (dolist (signature-states '(((:immutable :stable) :stable)
+                                  ((:stable nil) nil)
+                                  ((nil :volatile) :volatile)
+                                  ((:immutable :immutable) :immutable)))
+        (destructuring-bind (states expected) signature-states
+          (setf (gethash "mixed" *scalar-builtin-descriptors*)
+                (mapcar (lambda (state) (make-scalar-builtin :volatility state)) states))
+          (rove:ok (eq (scalar-builtin-family-volatility "mixed") expected))
+          (rove:ok (eq (having-immutable-function-p "mixed") (eq expected :immutable)))
+          (rove:ok (eq (sort-projection-volatile-p call) (eq expected :volatile)))
+          (rove:ok (eq (dml-one-time-qualification-p call)
+                       (not (null (member expected '(:immutable :stable))))))))))
+
 (rove:deftest basic-aggregate-null-and-type-semantics
     (dolist (case '(("SELECT count(NULL),count(false),count(0),min(NULL),max(NULL)" ((0 1 1 :null :null)))
                     ("SELECT count(d.x),min(d.x),max(d.x) FROM (SELECT 2 AS x UNION ALL SELECT NULL UNION ALL SELECT 1) d" ((2 1 2)))

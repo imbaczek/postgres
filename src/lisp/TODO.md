@@ -478,6 +478,10 @@ These signatures retain native OID representation and eager numeric
 OID conversion. The SQL differential checks replica identity for
 tables with and without a primary index, strict NULLs, and missing
 signatures.
+One overload-family volatility query now serves aggregate and CTE
+planning, HAVING, sort projection, and joined DML. The regression
+checks mixed immutable, stable, unclassified, and volatile signatures.
+Legacy immutable functions share the same fallback list.
 Default folding reads strictness from the scalar registry. The C
 differential covers a demanded default that folds a strict
 `current_setting` call to NULL and a non-strict `set_config` default

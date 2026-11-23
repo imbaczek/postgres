@@ -3911,28 +3911,46 @@ checks still apply."
                (contains-aggregate-p (car form))
                (contains-aggregate-p (cdr form))))))
 
-(defun analyzed-function-volatile-p (name)
-  "Treat unclassified calls as volatile for aggregate and CTE planning."
-  (not (or (let ((builtins (gethash name *scalar-builtin-descriptors*)))
-             (and builtins
-                  (every (lambda (builtin)
-                           (member (scalar-builtin-volatility builtin) '(:immutable :stable)))
-                         builtins)))
-           (integer-catalog-alias-p name)
-           (float-catalog-alias name)
-           (trig-function-p name)
-           (numeric-arithmetic-function-p name)
-           (numeric-helper-function-p name)
-           (member name
-                   '("jsonb_set" "jsonb_insert" "to_jsonb" "to_json" "row_to_json" "array_to_json" "json_build_array" "json_build_object"
-                     "jsonb_build_array" "jsonb_build_object"
+(defun scalar-builtin-family-volatility (name)
+  "Return the most restrictive known volatility and whether NAME is registered.
+An unclassified overload prevents folding and sharing. A volatile overload
+still requires deferred sort projection."
+  (let ((builtins (gethash name *scalar-builtin-descriptors*))
+        (volatility :immutable))
+    (unless builtins (return-from scalar-builtin-family-volatility (values nil nil)))
+    (dolist (builtin builtins (values volatility t))
+      (ecase (scalar-builtin-volatility builtin)
+        (:volatile (return (values :volatile t)))
+        ((nil) (setf volatility nil))
+        (:stable (when volatility (setf volatility :stable)))
+        (:immutable)))))
+
+(defun legacy-immutable-function-p (name)
+  "Recognize immutable scalar functions whose signatures still have separate analyzers."
+  (or (integer-catalog-alias-p name)
+      (float-catalog-alias name)
+      (trig-function-p name)
+      (numeric-arithmetic-function-p name)
+      (numeric-helper-function-p name)
+      (member name '("jsonb_set" "jsonb_insert"
                      "substr" "substring"
-                     "array_to_string" "string_to_array" "greatest" "least"
                      "abs" "numeric_abs" "sign" "round" "trunc" "ceil" "ceiling" "floor"
                      "sqrt" "numeric_sqrt" "exp" "numeric_exp" "ln" "numeric_ln"
                      "log" "log10" "numeric_log" "power" "pow" "numeric_power" "dpow"
                      "scale" "min_scale" "trim_scale" "width_bucket")
-                   :test #'string=))))
+              :test #'string=)))
+
+(defun analyzed-function-volatile-p (name)
+  "Treat unclassified calls as volatile for aggregate and CTE planning."
+  (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
+    (if registered-p
+        (not (member volatility '(:immutable :stable)))
+        (not (or (legacy-immutable-function-p name)
+                 (member name '("to_jsonb" "to_json" "row_to_json" "array_to_json"
+                                "json_build_array" "json_build_object"
+                                "jsonb_build_array" "jsonb_build_object"
+                                "array_to_string" "string_to_array" "greatest" "least")
+                         :test #'string=))))))
 
 (defun analyzed-expression-volatile-p (form)
   "Only known stable or immutable builtins may share an aggregate transition."

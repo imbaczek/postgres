@@ -1781,18 +1781,18 @@ Expressions wrapping a set result must remain in a separate projection."
    (lambda (form walk)
      (declare (ignore walk))
      (when (eq (first form) :func)
-       (let* ((name (second form))
-              (builtins (gethash name *scalar-builtin-descriptors*)))
-         (if builtins
-             (some (lambda (builtin) (eq (scalar-builtin-volatility builtin) :volatile)) builtins)
-             (member name
-                     '("nextval" "currval" "setval" "random" "setseed"
-                       "pg_cancel_backend" "pg_terminate_backend" "pg_promote"
-                       "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
-                       "pg_replication_slot_advance" "pg_control_checkpoint"
-                       "pg_read_binary_file" "pg_stat_file"
-                       "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
-                     :test #'string=)))))
+       (let ((name (second form)))
+         (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
+           (if registered-p
+               (eq volatility :volatile)
+               (member name
+                       '("nextval" "currval" "setval" "random" "setseed"
+                         "pg_cancel_backend" "pg_terminate_backend" "pg_promote"
+                         "pg_create_physical_replication_slot" "pg_create_logical_replication_slot"
+                         "pg_replication_slot_advance" "pg_control_checkpoint"
+                         "pg_read_binary_file" "pg_stat_file"
+                         "pg_drop_replication_slot" "pg_lisp_acquire_subscription")
+                       :test #'string=))))))
    expression))
 
 (defun project-set-expression-dependent-p (expression width count targets)

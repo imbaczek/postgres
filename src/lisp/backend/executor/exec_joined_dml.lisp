@@ -71,9 +71,10 @@
                    t)))
         (:func
          (let ((name (second node)))
-           (if (gethash name *scalar-builtin-descriptors*)
-               (analyzed-function-volatile-p name)
-               (not (having-immutable-function-p name)))))))
+           (multiple-value-bind (volatility registered-p) (scalar-builtin-family-volatility name)
+             (if registered-p
+                 (not (member volatility '(:immutable :stable)))
+                 (not (legacy-immutable-function-p name))))))))
     expression)))
 
 (defun prepare-joined-dml-qualifications (prepared)
