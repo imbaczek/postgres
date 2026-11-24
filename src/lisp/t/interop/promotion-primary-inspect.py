@@ -207,6 +207,16 @@ def checkpoint_bytes(expected):
     return start, record
 
 
+def retire_pending_namespace(target):
+    path = pathlib.Path(target) / "physical-recovery.control"
+    state = bytearray(path.read_bytes())
+    assert state[:8] == b"PGRSTAT4" and struct.unpack_from("<I", state, 72)[0] == 1
+    struct.pack_into("<I", state, 72, 0)
+    struct.pack_into("<I", state, len(state) - 4, 0)
+    struct.pack_into("<I", state, len(state) - 4, crc32c(state))
+    path.write_bytes(state)
+
+
 def damage(target, expected_path, kind, committed=None):
     root = pathlib.Path(target)
     expected = json.loads(pathlib.Path(expected_path).read_text())
@@ -269,4 +279,4 @@ def damage(target, expected_path, kind, committed=None):
 if __name__ == "__main__":
     {"expected": save_expected, "check": check_primary, "check-follow-transfer": check_follow_transfer,
      "drop-retired": drop_retired,
-     "damage": damage}[sys.argv[1]](*sys.argv[2:])
+     "damage": damage, "retire-pending-namespace": retire_pending_namespace}[sys.argv[1]](*sys.argv[2:])

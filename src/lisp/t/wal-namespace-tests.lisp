@@ -1,4 +1,4 @@
-;;;; Explicit timeline/segment identity; legacy names remain timeline one.
+;;;; Explicit timeline and segment identity with legacy namespace refusal.
 (in-package #:pg-physical-tests)
 
 (deftest raw-directory-inventory-preserves-hidden-and-dangling-entries
@@ -22,13 +22,13 @@
 
 (deftest timeline-qualified-segment-names-use-c-log-and-segment-fields
     (ok (equal "000000030000000100000002.wal" (pg::wal-segment-filename 258 3 :timeline)))
-  (ok (equal "0000000000000102.wal" (pg::wal-segment-filename 258 1 :legacy)))
+  (ok (intake-fails-p (lambda () (pg::wal-segment-filename 258 1 :legacy))))
   (multiple-value-bind (timeline segment)
       (pg::wal-parse-segment-name "000000030000000100000002" :timeline)
     (ok (= timeline 3)) (ok (= segment 258)))
-  (multiple-value-bind (timeline segment)
-      (pg::wal-parse-segment-name "0000000000000102" :legacy)
-    (ok (= timeline 1)) (ok (= segment 258)))
+  (ok (null (pg::wal-parse-segment-name "0000000000000102" :legacy)))
+  (ok (null (pg::wal-parse-segment-name "0000000000000102" :timeline)))
+  (ok (pg::wal-retired-segment-name-p "0000000000000102.wal"))
   (ok (intake-fails-p (lambda () (pg::wal-segment-filename 258 3 :legacy))))
   (dolist (name '("000000000000000000000000" "000000010000000000000100"
                   "00000001000000000000000a" "../000000010000000000000001"))
@@ -56,7 +56,7 @@
                         "000000020000000000000002.wal" "000000020000000000000003.wal"))
           (pg::wal-atomic-write-bytes (merge-pathnames (concatenate 'string "pg_wal/" name) root)
                                       (make-array 0 :element-type '(unsigned-byte 8))))
-        (ok (equal '(1) (pg::wal-discover-segments 1 :legacy)))
+        (ok (null (pg::wal-discover-segments 1 :legacy)))
         (ok (equal '(2) (pg::wal-discover-segments 1 :timeline)))
         (ok (equal '(2 3) (pg::wal-discover-segments 2 :timeline)))
         (ok (null (pg::wal-discover-segments 3 :timeline))))))
@@ -83,7 +83,9 @@
     (dolist (namespace '(:legacy :timeline))
       (with-physical-store-directory (root)
         (let* ((pg::*pgdata* root) (pg::*wal-ready* nil) (pg::*wal-segment-namespace* :legacy)
-                                   (path (pg::wal-segment-path 99 1 namespace)))
+                                   (path (if (eq namespace :legacy)
+                                             (merge-pathnames "pg_wal/0000000000000063.wal" root)
+                                             (pg::wal-segment-path 99 1 :timeline))))
           (ensure-directories-exist path)
           (sb-posix:symlink "missing-wal-target" (namestring path))
           (ok (intake-fails-p #'pg::wal-init))

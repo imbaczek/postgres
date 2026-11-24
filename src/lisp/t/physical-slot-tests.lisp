@@ -110,7 +110,7 @@
              (pg::*physical-recovery-state* nil)
              (pg::*physical-recovery-failed-p* nil)
              (pg::*wal-insert-timeline* 1)
-             (pg::*wal-segment-namespace* :legacy)
+             (pg::*wal-segment-namespace* :timeline)
              (pg::*wal-durable-lsn* 96)
              (pg::*wal-replication-slots* (make-hash-table :test #'equal))
              (system-id (pg::catalog-system-identifier durable-catalog))
@@ -201,7 +201,7 @@
                (pg::*catalog* (pg::make-catalog :cluster-identity "slot-startup-sync"))
                (pg::*physical-recovery-state* nil)
                (pg::*physical-recovery-failed-p* nil)
-               (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+               (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :timeline)
                (pg::*wal-durable-lsn* 96)
                (pg::*wal-replication-slots* (make-hash-table :test #'equal))
                (pg::*max-replication-slots* 10)
@@ -626,7 +626,7 @@
            (pg::*physical-recovery-state* nil)
            (pg::*wal-poisoned* nil)
            (pg::*wal-insert-timeline* 1)
-           (pg::*wal-segment-namespace* :legacy)
+           (pg::*wal-segment-namespace* :timeline)
            (pg::*wal-replication-slots* (make-hash-table :test #'equal))
            (pg::*physical-source-senders* (make-hash-table :test #'equal))
            (pg::*physical-source-pins* (make-hash-table :test #'equal))
@@ -635,7 +635,7 @@
            (system-id (pg::catalog-system-identifier))
            (pin (pg::make-physical-source-pin :name name :system-id system-id))
            (owner (pg::make-physical-sender :name name :pin pin :backend pg::*backend*
-                                            :system-id system-id :timeline 1 :namespace :legacy)))
+                                            :system-id system-id :timeline 1 :namespace :timeline)))
       (setf (gethash name pg::*physical-source-pins*) pin
             (gethash name pg::*physical-source-senders*) owner)
       (pg::physical-source-confirm-xmin owner 20 18)
@@ -668,7 +668,7 @@
              (pg::*physical-recovery-state* nil)
              (pg::*wal-poisoned* nil)
              (pg::*wal-insert-timeline* 1)
-             (pg::*wal-segment-namespace* :legacy)
+             (pg::*wal-segment-namespace* :timeline)
              (pg::*physical-source-pins* (make-hash-table :test #'equal))
              (pg::*physical-source-senders* (make-hash-table :test #'equal))
              (pg::*wal-replication-slots* (make-hash-table :test #'equal))
@@ -679,7 +679,7 @@
              (pin (pg::make-physical-source-pin :name pin-name :system-id system-id))
              (owner (pg::make-physical-sender
                      :name pin-name :pin pin :public-name name :public-slot slot
-                     :backend pg::*backend* :system-id system-id :timeline 1 :namespace :legacy)))
+                     :backend pg::*backend* :system-id system-id :timeline 1 :namespace :timeline)))
         (setf (gethash name pg::*wal-replication-slots*) slot
               (gethash pin-name pg::*physical-source-pins*) pin
               (gethash pin-name pg::*physical-source-senders*) owner

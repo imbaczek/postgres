@@ -175,7 +175,7 @@
                              (*query-temp-file-limit-bytes* nil) (*logical-capture-memory-bytes* (* 1024 1024))
                              (*wal-fpw-state* nil) (*wal-control-metadata* nil)
                              (*wal-insert-timeline* 1) (*wal-checkpoint-timeline* 1)
-                             (*wal-segment-namespace* :legacy) (*wal-prev-timeline* 1)
+                             (*wal-segment-namespace* :timeline) (*wal-prev-timeline* 1)
                              (*wal-checkpoint-snapshot* nil) (*wal-xid-reserved-through* nil)
                              (*catalog* nil)
                              ;; This fixture owns a fresh host. The filesystem can reuse a deleted test host's inode.

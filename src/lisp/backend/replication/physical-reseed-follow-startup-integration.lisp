@@ -45,8 +45,10 @@
           (setf before
                 (physical-reseed-follow-check-terminal-startup
                  (physical-reseed-follow-startup-observation lock phase)))
-          (when (and check-ordinary-before-pid (eq :ordinary (getf before :branch)))
-            (funcall check-ordinary-before-pid)))
+          (when (eq :ordinary (getf before :branch))
+            ;; Check pending-promotion WAL identity before PID repair or signal cleanup.
+            (physical-recovery-read-control *pgdata* :missing-ok t)
+            (when check-ordinary-before-pid (funcall check-ordinary-before-pid))))
          (:owned-pid
           (setf after (physical-reseed-follow-startup-observation lock phase before)))))
      :startup-reconcile

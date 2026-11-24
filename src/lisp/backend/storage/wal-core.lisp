@@ -699,33 +699,25 @@ names an existing context directory; check its binding and sync it in place."
     path))
 
 (defun wal-segment-filename (segment timeline namespace)
-  "C's 24-hex timeline/log/segment identity, with the native .wal suffix.
-Legacy 16-hex segment names always belong to timeline 1."
+  "Encode the C timeline/log/segment identity with the native .wal suffix."
   (unless (and (typep segment '(integer 0 1099511627775))
                (typep timeline '(integer 1 4294967295))
-               (member namespace '(:legacy :timeline))
-               (or (eq namespace :timeline) (= timeline 1)))
+               (eq namespace :timeline))
     (error "invalid native WAL segment identity"))
-  (if (eq namespace :legacy)
-      (format nil "~16,'0X.wal" segment)
-      (let ((per-id (floor (ash 1 32) +wal-segment-size+)))
-        (format nil "~8,'0X~8,'0X~8,'0X.wal"
-                timeline (floor segment per-id) (mod segment per-id)))))
+  (let ((per-id (floor (ash 1 32) +wal-segment-size+)))
+    (format nil "~8,'0X~8,'0X~8,'0X.wal"
+            timeline (floor segment per-id) (mod segment per-id))))
 
 (defun wal-parse-segment-name (name namespace)
-  "Decode one canonical filename stem without guessing its timeline or grammar."
-  (when (and (stringp name)
-             (= (length name) (ecase namespace (:legacy 16) (:timeline 24)))
+  "Decode a canonical timeline-qualified WAL filename stem."
+  (when (and (eq namespace :timeline) (stringp name) (= (length name) 24)
              (every (lambda (char) (find char "0123456789ABCDEF")) name))
-    (if (eq namespace :legacy)
-        (let ((segment (parse-integer name :radix 16)))
-          (when (<= segment 1099511627775) (values 1 segment)))
-        (let* ((timeline (parse-integer name :start 0 :end 8 :radix 16))
-               (log (parse-integer name :start 8 :end 16 :radix 16))
-               (low (parse-integer name :start 16 :end 24 :radix 16))
-               (per-id (floor (ash 1 32) +wal-segment-size+)))
-          (when (and (plusp timeline) (< low per-id))
-            (values timeline (+ (* log per-id) low)))))))
+    (let* ((timeline (parse-integer name :start 0 :end 8 :radix 16))
+           (log (parse-integer name :start 8 :end 16 :radix 16))
+           (low (parse-integer name :start 16 :end 24 :radix 16))
+           (per-id (floor (ash 1 32) +wal-segment-size+)))
+      (when (and (plusp timeline) (< low per-id))
+        (values timeline (+ (* log per-id) low))))))
 
 (defun wal-segment-path (segment &optional (timeline *wal-insert-timeline*)
                                    (namespace *wal-segment-namespace*))
@@ -1885,12 +1877,16 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
                        :element-type '(unsigned-byte 8) :mode mode)
     (write-sequence bytes stream)))
 
+(defun wal-retired-segment-name-p (name)
+  "Recognize an old primary WAL filename solely for startup refusal."
+  (and (= 20 (length name))
+       (string= name ".wal" :start1 16)
+       (every (lambda (char) (find char "0123456789ABCDEF")) (subseq name 0 16))
+       (<= (parse-integer name :end 16 :radix 16) 1099511627775)))
+
 (defun wal-require-qualified-segment-names ()
   "Refuse legacy WAL names, including dangling directory entries."
-  (when (some (lambda (name)
-                (and (= 20 (length name))
-                     (wal-parse-segment-name (subseq name 0 16) :legacy)))
-              (wal-segment-entry-names))
+  (when (some #'wal-retired-segment-name-p (wal-segment-entry-names))
     (error "startup requires timeline-qualified WAL; migrate the data with the previous build")))
 
 (defun wal-check-serving-namespace-before-pid ()

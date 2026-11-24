@@ -62,9 +62,7 @@ both policies reject end-of-recovery inside an open batch."
                (or (null record-reader) (logical-wal-record-provider-p record-reader))
                (<= (count-if #'identity (list archive segment-reader record-reader)) 1)
                (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
-               (<= start end) (member namespace '(:legacy :timeline))
-               (or (eq namespace :timeline)
-                   (every (lambda (entry) (= 1 (timeline-history-entry-timeline entry))) history)))
+               (<= start end) (eq namespace :timeline))
     (error "invalid logical WAL cursor scope"))
   (unless (ecase role
             (:prefix-end (timeline-prefix-boundary-p owner start history))

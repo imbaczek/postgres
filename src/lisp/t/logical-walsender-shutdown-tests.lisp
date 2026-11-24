@@ -71,7 +71,7 @@
      (let* ((pg::*catalog* (pg::make-catalog :cluster-identity "logical-shutdown"))
             (pg::*wal-ready* t) (pg::*wal-poisoned* nil)
             (pg::*physical-recovery-state* nil) (pg::*physical-recovery-failed-p* nil)
-            (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+            (pg::*wal-insert-timeline* 1) (pg::*wal-segment-namespace* :timeline)
             (pg::*wal-lock* (sb-thread:make-mutex :name "logical shutdown WAL fixture"))
             (pg::*live-operation-count* 0)
             (pg::*live-operation-backend-counts* (make-hash-table :test #'eq))
@@ -135,7 +135,7 @@
            (let ((pg::*catalog* (pg::make-catalog :cluster-identity "another-logical-source")))
              (refused))
            (let ((pg::*wal-insert-timeline* 2)) (refused))
-           (let ((pg::*wal-segment-namespace* :timeline)) (refused))
+           (let ((pg::*wal-segment-namespace* :legacy)) (refused))
            (let ((pg::*wal-storage-incarnation* (gensym "REPLACED-STORE-"))) (refused))
            (let ((name (pg::wal-replication-slot-name slot)))
              (unwind-protect
@@ -384,15 +384,15 @@
              (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*)
              (system-id (pg::catalog-system-identifier))
              (token pg::*wal-sender-stream-token*))
-         (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256) 'error))
+         (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256) 'error))
          (setf (pg::wal-sender-stream-token-limit token) 512)
-         (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256) 'error))
+         (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256) 'error))
          (setf (pg::wal-sender-stream-token-limit token) 128)
          (let ((pg::*wal-storage-incarnation* (gensym "REPLACED-STORE-")))
-           (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256) 'error)))
+           (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256) 'error)))
          (ok (null (pg::wal-sender-stream-token-target token)))
          (ok (not pg::*live-operation-shutdown-drain-open*))
-         (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256)
+         (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256)
          (ok (= 128 (pg::wal-sender-shutdown-target)))
          (ok (= 256 (pg::wal-sender-shutdown-plan-endpoint pg::*wal-sender-shutdown-plan*)))
          (ok (eq :draining (pg::wal-sender-shutdown-plan-stage pg::*wal-sender-shutdown-plan*)))
@@ -416,11 +416,11 @@
                (system-id (pg::catalog-system-identifier)))
            (if marked
                (progn
-                 (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256)
+                 (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256)
                  (ok (= 128 (pg::wal-sender-shutdown-target)))
                  (ok (eq :abandoned (pg::wal-sender-stream-token-outcome pg::*wal-sender-stream-token*))))
                (progn
-                 (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :legacy 256) 'error))
+                 (ok (signals (pg::wal-sender-publish-shutdown-target system-id 1 :timeline 256) 'error))
                  (ok (not pg::*live-operation-shutdown-drain-open*)))))))))
 
 (deftest logical-target-capture-leaves-physical-only-plans-without-an-extra-flush
@@ -481,7 +481,7 @@
                        (ecase phase
                          (:capture (pg::wal-sender-capture-logical-shutdown-target))
                          (:publish (pg::wal-sender-publish-shutdown-target
-                                    (pg::catalog-system-identifier) 1 :legacy 256)))
+                                    (pg::catalog-system-identifier) 1 :timeline 256)))
                        'error))
                   (ok (= 2 checks))
                   (ok (null (pg::wal-sender-stream-token-target token)))
@@ -503,7 +503,7 @@
        (setf (pg::wal-sender-stream-token-limit pg::*wal-sender-stream-token*) 128)
        (let ((pg::*live-operation-admission-open* nil)
              (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
-         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :legacy 256)
+         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :timeline 256)
          (setf (pg::wal-sender-status-sent-lsn registration) 128
                (pg::wal-replication-slot-confirmed-flush-lsn slot) 128)
          (ok (not (pg::wal-sender-acknowledge-logical-shutdown slot 127)))
@@ -529,7 +529,7 @@
        (setf (pg::wal-sender-stream-token-limit pg::*wal-sender-stream-token*) 128)
        (let ((pg::*live-operation-admission-open* nil)
              (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
-         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :legacy 256)
+         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :timeline 256)
          (ok (signals (pg::wal-sender-check-logical-shutdown-completion slot) 'error))
          (setf (pg::wal-sender-status-sent-lsn registration) 128
                (pg::wal-replication-slot-confirmed-flush-lsn slot) 128)
@@ -556,7 +556,7 @@
        (setf (pg::wal-sender-stream-token-limit pg::*wal-sender-stream-token*) 0)
        (let ((pg::*live-operation-admission-open* nil)
              (pg::*live-operation-quiescence-owner-thread* sb-thread:*current-thread*))
-         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :legacy 128)
+         (pg::wal-sender-publish-shutdown-target (pg::catalog-system-identifier) 1 :timeline 128)
          (ok (null (pg::wal-sender-status-sent-lsn registration)))
          (ok (not (pg::wal-sender-acknowledge-logical-shutdown slot 0)))
          (pg::wal-sender-note-sent registration 0)

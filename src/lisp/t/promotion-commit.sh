@@ -33,6 +33,22 @@ else
     PENDING=$(sed -n 's/^promotion-prefix: artifacts=//p' "$TMP/prefix.log")
 fi
 inspect() { python3 "$BASE/t/interop/promotion-primary-inspect.py" "$@"; }
+CASE=$TMP/reject-legacy-pending
+mkdir -m 700 "$CASE"
+cp -a "$PENDING/after-child-unlink/data" "$CASE/data"
+inspect retire-pending-namespace "$CASE/data"
+# The seed's stale PID and a promotion request must survive a rejected startup.
+test -s "$CASE/data/postmaster.pid"
+cp "$CASE/data/postmaster.pid" "$CASE/postmaster.pid"
+touch "$CASE/data/promote"
+python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --snapshot-storage "$CASE/data" "$CASE/before.json"
+startup_status=0
+timeout -k 2 60 "$BASE/pg-lisp.sh" -p "$PORT" -D "$CASE/data" >"$CASE/startup.log" 2>&1 || startup_status=$?
+test "$startup_status" -eq 1
+grep -F 'legacy WAL namespace in pending promotion control' "$CASE/startup.log"
+cmp "$CASE/postmaster.pid" "$CASE/data/postmaster.pid"
+test -f "$CASE/data/promote"
+python3 "$BASE/t/interop/restartpoint-prefix-inspect.py" --verify-pending "$CASE/data" "$CASE/before.json"
 sql() {
     PGCONNECT_TIMEOUT=2 "$PSQL" -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"
 }

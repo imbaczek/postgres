@@ -4,26 +4,25 @@
 (defun timeline-test-staging-files ()
   (directory (merge-pathnames ".timeline-*" (pg::wal-directory))))
 
-(deftest timeline-prefix-staging-copies-only-parent-prefix-in-both-namespaces
-    (dolist (namespace '(:legacy :timeline))
-      (with-physical-store-directory (root)
-        (let* ((pg::*pgdata* root) (pg::*wal-segment-namespace* namespace)
-                                   (first (lineage-test-record 0)) (tail (lineage-test-record 33 33 9))
-                                   (parent (pg::wal-segment-path 0 1 namespace))
-                                   (before (list pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*
-                                                 pg::*wal-end-lsn* pg::*wal-durable-lsn* pg::*physical-recovery-state*)))
-          (pg::wal-atomic-write-bytes parent (concatenate '(vector (unsigned-byte 8)) first tail))
-          (let ((temporary (pg::wal-stage-timeline-prefix 1 33)))
-            (unwind-protect
-                 (progn
-                   (ok (equalp first (lineage-test-bytes temporary)))
-                   (ok (equalp (concatenate '(vector (unsigned-byte 8)) first tail)
-                               (lineage-test-bytes parent)))
-                   (ok (equal before (list pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*
-                                           pg::*wal-end-lsn* pg::*wal-durable-lsn* pg::*physical-recovery-state*)))
-                   (ok (not (probe-file (pg::wal-segment-path 0 2 :timeline))))
-                   (ok (equal '(0) (pg::wal-discover-segments 1 namespace))))
-              (delete-file temporary)))))))
+(deftest timeline-prefix-staging-copies-only-the-qualified-parent-prefix
+    (with-physical-store-directory (root)
+      (let* ((pg::*pgdata* root) (pg::*wal-segment-namespace* :timeline)
+                                 (first (lineage-test-record 0)) (tail (lineage-test-record 33 33 9))
+                                 (parent (pg::wal-segment-path 0 1 :timeline))
+                                 (before (list pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*
+                                               pg::*wal-end-lsn* pg::*wal-durable-lsn* pg::*physical-recovery-state*)))
+        (pg::wal-atomic-write-bytes parent (concatenate '(vector (unsigned-byte 8)) first tail))
+        (let ((temporary (pg::wal-stage-timeline-prefix 1 33)))
+          (unwind-protect
+               (progn
+                 (ok (equalp first (lineage-test-bytes temporary)))
+                 (ok (equalp (concatenate '(vector (unsigned-byte 8)) first tail)
+                             (lineage-test-bytes parent)))
+                 (ok (equal before (list pg::*wal-insert-timeline* pg::*wal-checkpoint-timeline*
+                                         pg::*wal-end-lsn* pg::*wal-durable-lsn* pg::*physical-recovery-state*)))
+                 (ok (not (probe-file (pg::wal-segment-path 0 2 :timeline))))
+                 (ok (equal '(0) (pg::wal-discover-segments 1 :timeline))))
+            (delete-file temporary))))))
 
 (deftest timeline-prefix-staging-boundary-needs-no-parent-file
     (with-physical-store-directory (root)

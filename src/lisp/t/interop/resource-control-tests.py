@@ -34,10 +34,9 @@ class ResourceControlTests(unittest.TestCase):
                                            timeline, 1, 0, 0, 0))
         record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 120, 0, 0, 0) + snapshot)
         struct.pack_into("<I", record, 28, crc32c(record))
-        namespace = "legacy" if timeline == 1 else "timeline"
-        filename = "0000000000000000.wal" if timeline == 1 else f"{timeline:08X}0000000000000000.wal"
+        filename = f"{timeline:08X}0000000000000000.wal"
         (self.root / "pg_wal" / filename).write_bytes(record)
-        fields = ["PGWAL6", "120", "120", str(timeline), str(timeline), namespace, snapshot.hex()]
+        fields = ["PGWAL6", "120", "120", str(timeline), str(timeline), "timeline", snapshot.hex()]
         if metadata:
             fields += ["42", "6", "0"]
         if retained:
@@ -62,12 +61,12 @@ class ResourceControlTests(unittest.TestCase):
         fields[12:14] = ["96", "1"]
         record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
         struct.pack_into("<I", record, 28, crc32c(record))
-        filename = "0000000000000000.wal" if timeline == 1 else f"{timeline:08X}0000000000000000.wal"
+        filename = f"{timeline:08X}0000000000000000.wal"
         (self.root / "pg_wal" / filename).write_bytes(bytes(128) + record)
         self.write(fields)
         return fields, snapshot
 
-    def test_utility_accepts_legacy_and_extended_shapes(self):
+    def test_utility_accepts_base_and_extended_control_shapes(self):
         for metadata, retained, resources in ((False, False, False), (True, False, False),
                                                (True, True, False), (True, False, True),
                                                (True, True, True)):
@@ -210,7 +209,7 @@ class ResourceControlTests(unittest.TestCase):
                 self.write(fields)
                 record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", 8, 4, 168, 128, 0, 0) + snapshot)
                 struct.pack_into("<I", record, 28, crc32c(record))
-                (self.root / "pg_wal/0000000000000000.wal").write_bytes(bytes(128) + record)
+                (self.root / "pg_wal/000000010000000000000000.wal").write_bytes(bytes(128) + record)
                 facts, _ = CHECKPOINT(self.root)
                 self.assertEqual(policy is not None, "full_page_writes" in facts)
                 if policy is not None:
@@ -239,7 +238,7 @@ class ResourceControlTests(unittest.TestCase):
             for version in (6, 7, 8, 9):
                 record = bytearray(struct.pack("<4sHHIQQI", b"PGWL", version, 4, 120, 0, 0, 0) + snapshot)
                 struct.pack_into("<I", record, 28, crc32c(record))
-                (self.root / "pg_wal/0000000000000000.wal").write_bytes(record)
+                (self.root / "pg_wal/000000010000000000000000.wal").write_bytes(record)
                 if version != 8:
                     with self.assertRaises(AssertionError):
                         CHECKPOINT(self.root)

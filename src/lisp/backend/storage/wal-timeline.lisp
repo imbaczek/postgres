@@ -31,8 +31,7 @@ DIRECTORY-FD, when supplied, is the caller-held WAL directory descriptor."
   (declare (notinline open-exclusive-temporary-file sb-posix:unlink))
   (unless (and (typep fork '(unsigned-byte 64))
                (typep source-timeline '(integer 1 4294967295))
-               (member namespace '(:legacy :timeline))
-               (or (eq namespace :timeline) (= source-timeline 1)))
+               (eq namespace :timeline))
     (error "invalid parent WAL prefix identity"))
   (multiple-value-bind (segment offset) (wal-segment-and-offset fork)
     (when (and prefix-p

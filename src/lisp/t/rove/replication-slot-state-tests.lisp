@@ -880,7 +880,7 @@
          (*wal-replication-slots* (make-hash-table :test #'equal))
          (*wal-poisoned* nil) (*wal-ready* nil)
          (*wal-durable-lsn* 100) (*wal-end-lsn* 100)
-         (*wal-insert-timeline* 1) (*wal-segment-namespace* :legacy)
+         (*wal-insert-timeline* 1) (*wal-segment-namespace* :timeline)
          (*physical-recovery-state* nil) (*physical-recovery-failed-p* nil)
          (*logical-capture-live-slots* 0) (*wal-logical-policy* nil)
          (*logical-capture-force* nil) (*backend* nil)

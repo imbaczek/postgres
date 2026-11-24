@@ -128,9 +128,7 @@ an empty range checks no record boundary. :STOP also reports whether END was rea
 This is not yet an operational recovery path and grants no writer authority."
   (timeline-check-lineage history)
   (unless (and (typep start '(unsigned-byte 64)) (typep end '(unsigned-byte 64))
-               (<= start end) (member namespace '(:legacy :timeline))
-               (or (eq namespace :timeline)
-                   (every (lambda (entry) (= 1 (timeline-history-entry-timeline entry))) history)))
+               (<= start end) (eq namespace :timeline))
     (error "invalid lineage WAL scan bounds or namespace"))
   (let ((cursor start) (previous-file-timeline 0) (used nil) (gap nil))
     (loop while (< cursor end)

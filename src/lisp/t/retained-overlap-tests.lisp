@@ -55,10 +55,12 @@
         (let ((bad (copy-tree metadata)))
           (setf (getf bad (first change)) (second change))
           (ok (intake-fails-p (lambda () (pg::physical-retained-overlap-encode bad bytes))))))
-      (let* ((legacy (overlap-test-metadata 184 bytes :namespace :legacy))
-             (image (pg::physical-retained-envelope-encode
-                     #(80 71 82 79 86 76 48 49) legacy bytes)))
-        (ok (intake-fails-p (lambda () (pg::physical-retained-overlap-decode image)))))
+      (let ((legacy (copy-tree metadata)))
+        (setf (getf legacy :namespace) :legacy
+              (first (getf legacy :file)) "pg_wal/0000000000000000.wal")
+        (let ((image (pg::physical-retained-envelope-encode
+                      #(80 71 82 79 86 76 48 49) legacy bytes)))
+          (ok (intake-fails-p (lambda () (pg::physical-retained-overlap-decode image))))))
       (dolist (key '(:base :unknown))
         (let ((bad (copy-tree metadata)))
           (setf (first bad) key)

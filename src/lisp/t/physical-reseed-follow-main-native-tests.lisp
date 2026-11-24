@@ -157,7 +157,7 @@
          (pg::*wal-checkpoint-lsn* 0) (pg::*wal-checkpoint-snapshot* nil)
          (pg::*wal-xid-reserved-through* nil)
          (pg::*wal-insert-timeline* 1) (pg::*wal-checkpoint-timeline* 1)
-         (pg::*wal-prev-timeline* 1) (pg::*wal-segment-namespace* :legacy)
+         (pg::*wal-prev-timeline* 1) (pg::*wal-segment-namespace* :timeline)
          (pg::*wal-output-stream* nil) (pg::*wal-output-segment* nil)
          (pg::*wal-new-segments* nil)
          (pg::*wal-page-cache* (make-hash-table :test #'equal))

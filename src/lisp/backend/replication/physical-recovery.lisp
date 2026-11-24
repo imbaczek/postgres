@@ -239,6 +239,8 @@ A logical intent yields both its status and configured WAL level."
                      (= crc (wal-crc32 copy))
                      (or (not exhausted) (zerop (wal-u64 bytes 48))))
           (error "corrupt or unsupported physical recovery control"))
+        (when (and pending (zerop (wal-u32 bytes 72)))
+          (error "legacy WAL namespace in pending promotion control"))
         (when (and (or promotion-fpw-intent-p promotion-logical-intent-p) (not pending))
           (error "promotion policy intent requires pending recovery control"))
         (let ((control
@@ -288,9 +290,12 @@ A logical intent yields both its status and configured WAL level."
             (error "corrupt or unsupported physical recovery control"))
           control)))))
 
-(defun physical-recovery-read-control (directory)
-  (physical-recovery-decode-control
-   (recovery-read-bytes (physical-recovery-control-path directory) :maximum +physical-recovery-control-maximum-bytes+)))
+(defun physical-recovery-read-control (directory &key missing-ok)
+  "Read and validate recovery control. With MISSING-OK, allow an absent file."
+  (let ((path (physical-recovery-control-path directory)))
+    (when (or (not missing-ok) (wal-namespace-file-stat path t))
+      (physical-recovery-decode-control
+       (recovery-read-bytes path :maximum +physical-recovery-control-maximum-bytes+)))))
 
 (defvar *physical-recovery-control-test-hook* nil
   "Optional deterministic hook for recovery control publication failures.")

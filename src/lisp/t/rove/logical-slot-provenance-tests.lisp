@@ -561,7 +561,7 @@
                              (wal-copy-replication-slot-with-profile slot)))
                 (:pin (setf *wal-snapshot-retention-pins* (make-hash-table :test #'eq)))
                 (:timeline (setf *wal-insert-timeline* 4))
-                (:namespace (setf *wal-segment-namespace* :timeline)))
+                (:namespace (setf *wal-segment-namespace* :legacy)))
               (setf rejected (handler-case (progn (wal-retained-slot-scan-next scan) nil)
                                (error () t)))))
            (rove:ok rejected (format nil "~a change invalidates the scan" change))

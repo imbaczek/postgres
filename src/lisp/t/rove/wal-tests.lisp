@@ -11,7 +11,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
          (*wal-checkpoint-snapshot* nil)
          (*wal-durable-lsn* durable-lsn)
          (*wal-insert-timeline* 1)
-         (*wal-segment-namespace* :legacy))
+         (*wal-segment-namespace* :timeline))
     (ensure-directories-exist (wal-directory))
     (unwind-protect
          (progn
@@ -1579,7 +1579,7 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                 (wal-scan-lineage
                  (lambda (&rest arguments) (declare (ignore arguments)))
                  (list (make-timeline-history-entry :timeline 1 :begin 0))
-                 0 end :namespace :legacy)
+                 0 end :namespace :timeline)
                 nil)
             (error (condition)
               (search "rotation gap" (princ-to-string condition))))

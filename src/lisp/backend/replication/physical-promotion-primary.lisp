@@ -163,10 +163,9 @@ even when that parent is itself a child. Invalid committed control is an error."
   (multiple-value-bind (checkpoint durable snapshot insertion checkpoint-timeline) (wal-read-control-fields)
     (declare (ignore checkpoint durable snapshot))
     (when (and insertion (> insertion 1))
-      (when (wal-namespace-file-stat (physical-recovery-control-path) t)
-        (let ((control (physical-recovery-read-control *pgdata*)))
-          (when (and (= (getf control :phase) 3) (= insertion (getf control :timeline)))
-            (return-from physical-promotion-startup-primary-p nil))))
+      (let ((control (physical-recovery-read-control *pgdata* :missing-ok t)))
+        (when (and (eql (getf control :phase) 3) (= insertion (getf control :timeline)))
+          (return-from physical-promotion-startup-primary-p nil)))
       (wal-require-supported-timelines insertion checkpoint-timeline)
       (physical-promotion-retire-recovery)
       t)))
@@ -176,8 +175,7 @@ even when that parent is itself a child. Invalid committed control is an error."
 Hold command and reload locks, then close admission for reconstruction, child
 commit and primary initialization. Return true only after all three succeed.
 Return NIL when there is no pending request; propagate any validation failure."
-  (when (and (wal-namespace-file-stat (physical-recovery-control-path) t)
-             (eql 3 (getf (physical-recovery-read-control *pgdata*) :phase)))
+  (when (eql 3 (getf (physical-recovery-read-control *pgdata* :missing-ok t) :phase))
     (sb-thread:with-mutex (*physical-follow-command-lock*)
       (sb-thread:with-mutex (*reload-run-lock*)
         (with-live-operation-quiescence

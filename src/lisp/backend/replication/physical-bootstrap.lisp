@@ -12,8 +12,7 @@
 (defun physical-bootstrap-standby-control-p ()
   "Return true when existing recovery control requires ordinary standby preparation.
 Malformed control is an error, not permission to fall back to primary startup."
-  (when (wal-namespace-file-stat (physical-recovery-control-path) t)
-    (member (getf (physical-recovery-read-control *pgdata*) :phase) '(0 1 2))))
+  (member (getf (physical-recovery-read-control *pgdata* :missing-ok t) :phase) '(0 1 2)))
 
 (defun physical-recovery-signal-found-p (name)
   "Check NAME for a recovery request, following symlinks as stat does.
