@@ -144,6 +144,7 @@
                    (:file "exec_cursor_window")
                    (:file "exec_cursor")
                    (:file "exec_cte")
+                   (:file "exec_owner")
                    (:file "exec_subplan")
                    (:file "exec_analyze")
                    (:file "exec_insert")
