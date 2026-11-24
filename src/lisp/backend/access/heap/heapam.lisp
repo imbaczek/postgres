@@ -351,12 +351,12 @@ validation, allocation, or materialization is performed."
       (page-set-u32 bytes (+ 10 width) relation)
       bytes)))
 
-(defun heap-decode-external-varlena (bytes offset)
+(defun heap-decode-external-varlena (bytes offset &optional (limit (length bytes)))
   "Decode an on-disk descriptor at OFFSET and return it and its exclusive end.
 Check the header, supported tag, and bounds; preserve field bits without
 validating TOAST semantics. The result does not retain or own BYTES."
   (unless (and (integerp offset) (<= 0 offset)
-               (<= (+ offset 2) (length bytes))
+               (<= (+ offset 2) limit)
                (= (aref bytes offset) 1))
     (error "Invalid external varlena header"))
   (let* ((tag (aref bytes (1+ offset)))
@@ -364,7 +364,7 @@ validating TOAST semantics. The result does not retain or own BYTES."
                       ((= tag +vartag-ondisk-oid8+) 8)
                       (t (error "Unsupported external varlena tag"))))
          (end (+ offset +external-varlena-fixed-size+ width)))
-    (when (> end (length bytes))
+    (when (> end limit)
       (error "Truncated external varlena"))
     (values (make-heap-external-varlena
              :raw-size (page-u32 bytes (+ offset 2))
@@ -422,28 +422,28 @@ returns NIL, and does not allocate the result vector."
                                         :end2 (- copy-end chunk-start))))
         result))))
 
-(defun heap-inline-varlena-range (bytes offset)
+(defun heap-inline-varlena-range (bytes offset &optional (limit (length bytes)))
   "Return inclusive start and exclusive end offsets into BYTES, without copying.
 Accept only little-endian inline short or uncompressed four-byte headers;
 reject external and compressed datums and lengths outside BYTES."
-  (when (>= offset (length bytes))
+  (when (>= offset limit)
     (error "Truncated varlena header"))
   (let* ((header (aref bytes offset))
          (shortp (oddp header)))
     (when (or (= header 1) (and (not shortp) (logbitp 1 header)))
       (error "Unsupported external or compressed varlena datum"))
-    (unless (or shortp (<= (+ offset 4) (length bytes)))
+    (unless (or shortp (<= (+ offset 4) limit))
       (error "Truncated varlena header"))
     (let* ((header-size (if shortp 1 4))
            (total (if shortp (ash header -1) (ash (page-u32 bytes offset) -2)))
            (end (+ offset total)))
-      (unless (and (>= total header-size) (<= end (length bytes)))
+      (unless (and (>= total header-size) (<= end limit))
         (error "Invalid varlena length"))
       (values (+ offset header-size) end))))
 
-(defun heap-decode-inline-compressed (bytes offset)
+(defun heap-decode-inline-compressed (bytes offset &optional (limit (length bytes)))
   "Decode one aligned inline PGLZ datum and return its bytes and physical end."
-  (unless (<= (+ offset 8) (length bytes))
+  (unless (<= (+ offset 8) limit)
     (ereport "XX001" "truncated compressed varlena"))
   (let* ((header (page-u32 bytes offset))
          (total (ash header -2))
@@ -451,36 +451,36 @@ reject external and compressed datums and lengths outside BYTES."
          (info (page-u32 bytes (+ offset 4)))
          (raw-size (logand info #x3fffffff)))
     (unless (and (= (logand header 3) 2) (> total 8)
-                 (<= end (length bytes)) (zerop (ash info -30))
+                 (<= end limit) (zerop (ash info -30))
                  (> raw-size 0))
       (ereport "XX001" "invalid compressed varlena"))
     (values (pglz-decompress bytes raw-size :start (+ offset 8) :end end) end)))
 
-(defun heap-inline-varlena-bytes (bytes offset)
+(defun heap-inline-varlena-bytes (bytes offset &optional (limit (length bytes)))
   "Return a fresh uncompressed payload and the physical end of an inline datum."
   (if (= (logand (aref bytes offset) 3) 2)
-      (heap-decode-inline-compressed bytes offset)
-      (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset)
+      (heap-decode-inline-compressed bytes offset limit)
+      (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset limit)
         (values (subseq bytes start end) end))))
 
-(defun heap-varlena-physical-end-and-raw-size (bytes offset)
+(defun heap-varlena-physical-end-and-raw-size (bytes offset &optional (limit (length bytes)))
   "Return an inline or external datum's physical end and uncompressed datum size."
   (cond ((= (aref bytes offset) 1)
-         (multiple-value-bind (pointer end) (heap-decode-external-varlena bytes offset)
+         (multiple-value-bind (pointer end) (heap-decode-external-varlena bytes offset limit)
            (values end (heap-external-varlena-raw-size pointer))))
         ((= (logand (aref bytes offset) 3) 2)
-         (unless (<= (+ offset 8) (length bytes)) (ereport "XX001" "truncated compressed varlena"))
+         (unless (<= (+ offset 8) limit) (ereport "XX001" "truncated compressed varlena"))
          (let* ((total (ash (page-u32 bytes offset) -2))
                 (info (page-u32 bytes (+ offset 4)))
                 (end (+ offset total)))
-           (unless (and (> total 8) (<= end (length bytes)) (zerop (ash info -30))
+           (unless (and (> total 8) (<= end limit) (zerop (ash info -30))
                         (> (logand info #x3fffffff) 0))
              (ereport "XX001" "invalid compressed varlena"))
            (values end (+ 4 (logand info #x3fffffff)))))
-        (t (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset)
+        (t (multiple-value-bind (start end) (heap-inline-varlena-range bytes offset limit)
              (values end (+ 4 (- end start)))))))
 
-(defmacro heap-decode-case (type cursor &body clauses)
+(defmacro heap-decode-case (type cursor limit &body clauses)
   "Decode fixed-width values and advance by the width declared in the SQL type registry."
   `(case ,type
      ,@(loop for (key . forms) in clauses
@@ -491,38 +491,51 @@ reject external and compressed datums and lengths outside BYTES."
                         (width (sql-expression-type-length (first types))))
                    (assert (and (plusp width)
                                 (every (lambda (item) (= width (sql-expression-type-length item))) types)))
-                   `(,key ,@forms (incf ,cursor ,width)))))))
+                   `(,key
+                     (when (> (+ ,cursor ,width) ,limit)
+                       (ereport "XX001" "truncated heap attribute"))
+                     ,@forms
+                     (incf ,cursor ,width)))))))
 
-(defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value)
+(defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value
+                                          (start 0) (limit (length bytes)))
   "Return values, XIDs, command ID, infomask, and successor TID.
 Inline compressed attributes are decompressed, and inline :bytea values are
 fresh octet vectors independent of BYTES. External :varchar, :text, :json,
 :jsonb, :bytea and :numeric attributes remain physical descriptors; TOAST fetching and
-external decompression are deferred."
+external decompression are deferred. START and LIMIT give the inclusive start and
+exclusive end of the tuple. Decoded values do not retain the input page."
+  (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
+    (ereport "XX001" "invalid heap tuple bounds"))
   (let* ((natts (length columns))
-         (xmin (page-u32 bytes +heap-tuple-xmin-off+))
-         (xmax (page-u32 bytes +heap-tuple-xmax-off+))
-         (cid (page-u32 bytes +heap-tuple-cid-off+))
-         (ctid-block (page-u32 bytes +heap-tuple-ctid-block-off+))
-         (ctid-offnum (page-u16 bytes +heap-tuple-ctid-offnum-off+))
-         (infomask (page-u16 bytes +heap-tuple-infomask-off+))
-         (hoff (aref bytes +heap-tuple-hoff-off+))
+         (xmin (page-u32 bytes (+ start +heap-tuple-xmin-off+)))
+         (xmax (page-u32 bytes (+ start +heap-tuple-xmax-off+)))
+         (cid (page-u32 bytes (+ start +heap-tuple-cid-off+)))
+         (ctid-block (page-u32 bytes (+ start +heap-tuple-ctid-block-off+)))
+         (ctid-offnum (page-u16 bytes (+ start +heap-tuple-ctid-offnum-off+)))
+         (infomask (page-u16 bytes (+ start +heap-tuple-infomask-off+)))
+         (hoff (aref bytes (+ start +heap-tuple-hoff-off+)))
          (values (make-array natts :initial-element +null+))
          (physical-compressed nil)
-         (cursor hoff))
+         (cursor (+ start hoff)))
+    (unless (<= (+ start +size-of-heap-tuple-header+) cursor limit)
+      (ereport "XX001" "invalid heap tuple header length"))
+    (when (and (logtest infomask +heap-hasnull+)
+               (> (+ start +size-of-heap-tuple-header+ (ceiling natts 8)) cursor))
+      (ereport "XX001" "truncated heap null bitmap"))
     (loop for i from 0 below natts
           for col = (aref columns i)
           do (let ((is-null
                      (and (logtest infomask +heap-hasnull+)
                           (logbitp (mod i 8)
-                                   (aref bytes (+ +size-of-heap-tuple-header+
+                                   (aref bytes (+ start +size-of-heap-tuple-header+
                                                   (floor i 8)))))))
                (unless is-null
                  (let* ((type (pg-column-type col))
                         (varlena-p (heap-varlena-type-p type)))
-                   (unless (and varlena-p (not (zerop (aref bytes cursor))))
-                     (setf cursor (align-up cursor (column-align col))))
-                   (heap-decode-case type cursor
+                   (unless (and varlena-p (< cursor limit) (not (zerop (aref bytes cursor))))
+                     (setf cursor (+ start (align-up (- cursor start) (column-align col)))))
+                   (heap-decode-case type cursor limit
                      (:timetz
                       (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
                         (when (logbitp 63 micros) (decf micros #x10000000000000000))
@@ -557,30 +570,38 @@ external decompression are deferred."
                         (setf (aref values i) v)))
                      (otherwise
                       (when varlena-p
-                        (multiple-value-bind (physical-end raw-size)
-                            (heap-varlena-physical-end-and-raw-size bytes cursor)
-                          (cond ((and demand (/= i demand)) (setf cursor physical-end))
-                                ((and max-varlena-size (> raw-size max-varlena-size))
-                                 (setf (aref values i) wide-value cursor physical-end))
-                                (t (if (= (aref bytes cursor) 1)
-                                       (multiple-value-bind (pointer end)
-                                           (heap-decode-external-varlena bytes cursor)
-                                         (setf (aref values i) pointer cursor end))
-                                       (multiple-value-bind (payload end)
-                                           (heap-inline-varlena-bytes bytes cursor)
-                                         (when (= (logand (aref bytes cursor) 3) 2)
-                                           (unless physical-compressed
-                                             (setf physical-compressed (make-array natts :initial-element nil)))
-                                           (setf (aref physical-compressed i)
-                                                 (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
-                                         (setf (aref values i) (case type
-                                                                 (:bytea payload)
-                                                                 (:jsonb (sql-jsonb-from-octets payload))
-                                                                 (:numeric (sql-numeric-from-varlena-payload payload))
-                                                                 ((:bytea-array :json-array :jsonb-array)
-                                                                  (sql-varlena-array-decode payload (heap-varlena-array-element-type type)))
-                                                                 (otherwise (bytes->string payload)))
-                                               cursor end)))))))))))))
+                        (when (>= cursor limit) (ereport "XX001" "truncated heap attribute"))
+                        (if (and (null demand) (null max-varlena-size)
+                                 (member type '(:text :varchar :json))
+                                 (/= 1 (aref bytes cursor))
+                                 (/= 2 (logand 3 (aref bytes cursor))))
+                            (multiple-value-bind (start end) (heap-inline-varlena-range bytes cursor limit)
+                              (setf (aref values i) (bytes->string bytes :start start :end end)
+                                    cursor end))
+                            (multiple-value-bind (physical-end raw-size)
+                                (heap-varlena-physical-end-and-raw-size bytes cursor limit)
+                              (cond ((and demand (/= i demand)) (setf cursor physical-end))
+                                    ((and max-varlena-size (> raw-size max-varlena-size))
+                                     (setf (aref values i) wide-value cursor physical-end))
+                                    (t (if (= (aref bytes cursor) 1)
+                                           (multiple-value-bind (pointer end)
+                                               (heap-decode-external-varlena bytes cursor limit)
+                                             (setf (aref values i) pointer cursor end))
+                                           (multiple-value-bind (payload end)
+                                               (heap-inline-varlena-bytes bytes cursor limit)
+                                             (when (= (logand (aref bytes cursor) 3) 2)
+                                               (unless physical-compressed
+                                                 (setf physical-compressed (make-array natts :initial-element nil)))
+                                               (setf (aref physical-compressed i)
+                                                     (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
+                                             (setf (aref values i) (case type
+                                                                     (:bytea payload)
+                                                                     (:jsonb (sql-jsonb-from-octets payload))
+                                                                     (:numeric (sql-numeric-from-varlena-payload payload))
+                                                                     ((:bytea-array :json-array :jsonb-array)
+                                                                      (sql-varlena-array-decode payload (heap-varlena-array-element-type type)))
+                                                                     (otherwise (bytes->string payload)))
+                                                   cursor end))))))))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
 
 (defun heapam-get-tuple (relfilenode block offnum columns &optional toast-visibility-p)
@@ -877,9 +898,11 @@ when supplied, its result is returned as a sixth value."
         (when (heap-tuple-visible-p xmin xmax cid snapshot
                                     (and *backend* (backend-xid *backend*)) infomask
                                     committed-xid-cache)
+          ;; Deform within this line pointer's bounds while the page is held.
+          ;; The resulting values can outlive the page and its buffer.
           (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
                                 ctid-block ctid-offnum physical-compressed)
-              (deform-heap-tuple (subseq page off (+ off len)) columns)
+              (deform-heap-tuple page columns :start off :limit (+ off len))
             (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
             (let ((tuple (make-htup :block block :offnum offnum
                                     :ctid-block ctid-block :ctid-offnum ctid-offnum

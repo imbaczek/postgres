@@ -2370,7 +2370,9 @@
                      (columns (subseq targets 0 field-count)))
                  (with-open-file (out path-a :direction :output :element-type '(unsigned-byte 8)
                                              :if-exists :supersede)
-                   (send-select-data-row out row columns))
+                   (send-select-data-row out row columns t
+                                         (make-array +select-data-row-buffer-size+
+                                                     :element-type '(unsigned-byte 8))))
                  (with-open-file (out path-b :direction :output :element-type '(unsigned-byte 8)
                                              :if-exists :supersede)
                    (send-data-row-text out

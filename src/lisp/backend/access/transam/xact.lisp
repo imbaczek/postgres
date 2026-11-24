@@ -714,7 +714,7 @@ Independent schema changers may overlap; relation/catalog locks order DDL."
 
 Old-cycle heap XIDs are frozen before their low 32 bits can be reused."
   (let ((xid (logand xid +xid-mask+)))
-    (if (< xid +first-normal-xid+)
+    (if (or (< xid +first-normal-xid+) (<= 0 reference (1- +xid-cycle+)))
         xid
         (let* ((epoch (floor reference +xid-cycle+))
                (candidate (+ (* epoch +xid-cycle+) xid)))

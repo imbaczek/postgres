@@ -815,15 +815,39 @@ if a registered TOAST index is missing."
     :test #'eql)
    #'<))
 
+;; Plain vectors use the same representation in memory and in a spill run.
+;; Terminal wire sorts can retain only projected values. Other consumers need
+;; the row and its origin and presence metadata.
+(defstruct (query-sort-item (:type vector)
+                            (:constructor make-query-sort-item (sequence keys row)))
+  sequence
+  keys
+  row)
+
+(defstruct (query-sort-item-with-metadata
+            (:type vector)
+            (:include query-sort-item)
+            (:constructor make-query-sort-item-with-metadata (sequence keys row origins presence)))
+  origins
+  presence)
+
+(declaim (inline query-sort-item-key))
+(defun query-sort-item-key (item entry position)
+  "Get the evaluated key, or a projected output slot when keys were omitted."
+  (let ((keys (query-sort-item-keys item)))
+    (if keys
+        (aref keys position)
+        (aref (query-sort-item-row item) (1- (second (car entry)))))))
+
 (defun select-sort-item-less-p (left right order)
   (loop for entry in order
         for position from 0
         for comparison =
-                       (order-compare (aref (third left) position)
-                                      (aref (third right) position))
+                       (order-compare (query-sort-item-key left entry position)
+                                      (query-sort-item-key right entry position))
         unless (zerop comparison)
           return (if (cdr entry) (> comparison 0) (< comparison 0))
-        finally (return (< (second left) (second right)))))
+        finally (return (< (query-sort-item-sequence left) (query-sort-item-sequence right)))))
 
 (defun write-query-sort-run (items order)
   "Write a stable sorted run and return its path and leading key bounds.
@@ -838,8 +862,8 @@ Bounds are fixnums when available, so they remain valid after arena reset."
           (write-query-sort-spill-item output pathname buffer item)
           (setf last-item item)))
       ;; Only keep immediate scalar bounds, even when the run lives in an arena.
-      (let ((start (and order sorted (aref (third (first sorted)) 0)))
-            (end (and order last-item (aref (third last-item) 0))))
+      (let ((start (and order sorted (query-sort-item-key (first sorted) (first order) 0)))
+            (end (and order last-item (query-sort-item-key last-item (first order) 0))))
         (values pathname (and (typep start 'fixnum) start) (and (typep end 'fixnum) end))))))
 
 (defun disjoint-query-sort-runs (runs descending-p)
@@ -940,7 +964,7 @@ The surrounding temporary-file scope owns all paths on an error or interrupt."
                     (car group)
                     (merge-query-sort-runs group order))))
 
-(defun stream-select-sort (streamer order callback &key on-complete limit)
+(defun stream-select-sort (streamer order callback &key on-complete limit projected-only-p)
   "Sort a stream with bounded in-memory runs and stable external merges."
   (when (and limit (zerop (check-select-limit limit)))
     (return-from stream-select-sort (when on-complete (funcall on-complete))))
@@ -948,7 +972,7 @@ The surrounding temporary-file scope owns all paths on an error or interrupt."
     (return-from stream-select-sort
       (call-with-query-sort-arena
        (lambda (arena)
-         (stream-select-sort-with-arena streamer order callback arena on-complete)))))
+         (stream-select-sort-with-arena streamer order callback arena on-complete nil projected-only-p)))))
   (let ((remaining limit)
         (stopped nil))
     (call-with-query-sort-arena
@@ -1014,18 +1038,26 @@ sorter for spill and origins, and emit each row as (projected . projected)."
          origins)))
 
 (defun top-n-spill-item (item)
-  (list :query-sort-item (select-top-n-item-sequence item)
-        (select-top-n-item-keys item) (select-top-n-item-row item)
-        (datum-origins-for-spill (select-top-n-item-origins item))
-        (select-top-n-item-presence item)))
+  (make-query-sort-item-with-metadata (select-top-n-item-sequence item)
+                                      (select-top-n-item-keys item) (select-top-n-item-row item)
+                                      (datum-origins-for-spill (select-top-n-item-origins item))
+                                      (select-top-n-item-presence item)))
 
-(defun stream-select-sort-with-arena (streamer order callback arena &optional on-complete limit)
-  "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK."
+(defun stream-select-sort-with-arena (streamer order callback arena
+                                      &optional on-complete limit projected-only-p)
+  "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK.
+PROJECTED-ONLY-P is for a terminal consumer that needs only projected values.
+When all keys refer to output slots, those values also supply the sort keys."
   (with-query-temp-files ()
                          (let ((buffer '())
                                (buffer-bytes 0)
                                (max-item-bytes 1)
                                (sequence 0)
+                               (single-order-key (and (null (cdr order)) (caar order)))
+                               (projected-keys-p (and projected-only-p
+                                                      (every (lambda (entry)
+                                                               (eq (caar entry) :sort-output))
+                                                             order)))
                                (runs '())
                                (memory-limit (max 1 *query-work-memory-bytes*))
                                (top-n (when limit
@@ -1057,21 +1089,34 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                       (when (>= buffer-bytes memory-limit)
                                         (flush-run)))
                                     (make-item (row)
-                                      (let ((sequence-number sequence))
+                                      (let ((sequence-number sequence)
+                                            (keys (unless projected-keys-p
+                                                    (if single-order-key
+                                                        (vector (select-order-value single-order-key row))
+                                                        (map 'vector
+                                                             (lambda (entry) (select-order-value (car entry) row))
+                                                             order)))))
                                         (incf sequence)
-                                        (list :query-sort-item sequence-number
-                                              (map 'vector
-                                                   (lambda (entry) (select-order-value (car entry) row))
-                                                   order)
-                                              row
-                                              (and *datum-origin-capture*
-                                                   (datum-origins-for-spill *query-row-origins*))
-                                              *query-row-presence*)))
-                                    (emit-item (item)
-                                      (let ((*query-row-origins* (and *datum-origin-capture*
-                                                                      (datum-origins-from-spill (fifth item))))
-                                            (*query-row-presence* (sixth item)))
-                                        (funcall callback (fourth item)))))
+                                        (if projected-only-p
+                                            (make-query-sort-item sequence-number keys (car row))
+                                            (make-query-sort-item-with-metadata
+                                             sequence-number keys row
+                                             (and *datum-origin-capture*
+                                                  (datum-origins-for-spill *query-row-origins*))
+                                             *query-row-presence*))))
+                                    (emit-item (item &optional copy-p)
+                                      (let* ((row (query-sort-item-row item))
+                                             (row (if copy-p (copy-query-sort-value row) row))
+                                             (presence (unless projected-only-p
+                                                         (query-sort-item-with-metadata-presence item)))
+                                             (*query-row-origins* (and *datum-origin-capture*
+                                                                       (not projected-only-p)
+                                                                       (datum-origins-from-spill
+                                                                        (query-sort-item-with-metadata-origins item))))
+                                             (*query-row-presence* (if copy-p
+                                                                       (copy-query-sort-value presence)
+                                                                       presence)))
+                                        (funcall callback (if projected-only-p (cons row nil) row)))))
                              (unwind-protect
                                   (progn
                                     (funcall
@@ -1106,17 +1151,8 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                                       (select-sort-item-less-p left right order))))
                                             (check-for-interrupts)
                                             ;; Consumers, including instrumentation, can retain rows.
-                                            (let ((*query-row-origins* (and *datum-origin-capture*
-                                                                            (datum-origins-from-spill (fifth item))))
-                                                  (*query-row-presence* (if arena
-                                                                            (copy-query-sort-value (sixth item))
-                                                                            (sixth item))))
-                                              (when (eq (funcall callback
-                                                                 (if arena
-                                                                     (copy-query-sort-value (fourth item))
-                                                                     (fourth item)))
-                                                        :stop)
-                                                (return-from stream-select-sort-with-arena :stop)))))
+                                            (when (eq (emit-item item arena) :stop)
+                                              (return-from stream-select-sort-with-arena :stop))))
                                         (progn
                                           (flush-run)
                                           (let* ((ordered (nreverse runs))
@@ -2058,6 +2094,10 @@ ROW's source environment.  Only final target origins leave this projection."
       (fourth node)
       (third node)))
 
+(defvar *select-terminal-sort-node* nil
+  "The root node of a wire SELECT that only consumes projected values.
+Only this node can discard source rows and their metadata during sorting.")
+
 (defun execute-physical-order (node emit run-child)
   (let* ((child (physical-buffered-node-child node))
          (deferred (sort-projection-deferred-slots node child))
@@ -2070,7 +2110,11 @@ ROW's source environment.  Only final target origins leave this projection."
                (finish-sort-project-row row (second child) deferred)
              (let ((*query-row-origins* origins))
                (funcall emit projected)))
-           (funcall emit row))))))
+           (funcall emit row)))
+     (and (eq node *select-terminal-sort-node*)
+          (eq (first node) :sort)
+          (null deferred)
+          (not *datum-origin-capture*)))))
 
 (defun physical-join-rescans-inner-p (join right)
   "Recognize LATERAL and parameterized IndexScan inputs from the physical plan."
@@ -2096,12 +2140,13 @@ ROW's source environment.  Only final target origins leave this projection."
            (funcall run-child right right-callback))
          join emit))))
 
-(defun stream-physical-buffered-node (node source emit)
+(defun stream-physical-buffered-node (node source emit &optional projected-only-p)
   "Run sorting, DISTINCT or aggregation over a driver-owned row source."
   (ecase (first node)
     ((:sort :top-n)
      (stream-select-sort source (second node) emit
-                         :limit (and (eq (first node) :top-n) (third node))))
+                         :limit (and (eq (first node) :top-n) (third node))
+                         :projected-only-p projected-only-p))
     (:sorted-distinct
      (stream-sorted-distinct source (second node) emit))
     (:hash-distinct
@@ -2641,13 +2686,17 @@ Compare the advertised column shape, independently of result format codes."
 
 (defun exec-select (stream ast)
   (multiple-value-bind (plan targets columns) (prepare-select-result ast)
-    (let ((row-count 0))
+    (let ((row-count 0)
+          (frame-buffer nil)
+          (*select-terminal-sort-node* (query-plan-physical plan)))
       (when *select-suppress-description*
         (check-result-column-shape columns *select-expected-result-columns*))
       (flet ((send-row (row)
                ;; Flush the first row promptly. Complete small frames
                ;; after it can share the socket buffer.
-               (send-select-row stream row targets (zerop row-count))
+               (when (= row-count 1)
+                 (setf frame-buffer (make-array +select-data-row-buffer-size+ :element-type '(unsigned-byte 8))))
+               (send-select-row stream row targets (zerop row-count) frame-buffer)
                (incf row-count)))
         (call-with-admitted-select-plan
          plan (lambda (registered)

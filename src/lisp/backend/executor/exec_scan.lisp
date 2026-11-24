@@ -1930,13 +1930,70 @@ SIZE includes the four-byte length word and excludes the message type byte."
             (incf position (length octets))))))
     frame))
 
-(defun send-select-data-row (stream values targets &optional (flush-p t))
+(defconstant +select-data-row-buffer-size+ 4096)
+
+(declaim (inline store-select-data-row-u32))
+(defun store-select-data-row-u32 (buffer position value)
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum position)
+           (type (unsigned-byte 32) value))
+  (setf (aref buffer position) (ldb (byte 8 24) value)
+        (aref buffer (+ position 1)) (ldb (byte 8 16) value)
+        (aref buffer (+ position 2)) (ldb (byte 8 8) value)
+        (aref buffer (+ position 3)) (ldb (byte 8 0) value)))
+
+(defun encode-small-select-data-row (values targets buffer)
+  "Build a complete text DataRow in BUFFER and return its exclusive end.
+Return NIL when a field or the frame cannot fit, leaving BUFFER as scratch.
+The caller owns BUFFER and can reuse it after the frame is written."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer))
+  (let ((position 7)
+        (width (length targets))
+        (limit (length buffer)))
+    (declare (type fixnum position))
+    (loop for value across values for target in targets
+          for writer = (select-row-field-writer value (getf target :type))
+          for octets = (cond ((null writer) nil)
+                             ((and (stringp writer) (<= (length writer) 1024))
+                              (string->bytes writer))
+                             (t (return-from encode-small-select-data-row nil)))
+          do (let* ((size (length octets))
+                    (end (+ position 4 size)))
+               (when (> end limit) (return-from encode-small-select-data-row nil))
+               (store-select-data-row-u32 buffer position (if octets size #xffffffff))
+               (when octets (replace buffer octets :start1 (+ position 4)))
+               (setf position end)))
+    (setf (aref buffer 0) (char-code #\D)
+          (aref buffer 5) (ldb (byte 8 8) width)
+          (aref buffer 6) (ldb (byte 8 0) width))
+    (store-select-data-row-u32 buffer 1 (1- position))
+    position))
+
+(defun write-small-select-data-row (stream buffer end flush-p)
+  "Write BUFFER through END, closing the connection if transmission fails.
+FLUSH-P controls whether the completed frame is flushed immediately."
+  (let ((complete nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (sb-sys:with-local-interrupts
+             (write-sequence buffer stream :end end)
+             (when flush-p (force-output stream))
+             (setf complete t))
+        (unless complete (ignore-errors (close stream :abort t)))))))
+
+(defun send-select-data-row (stream values targets &optional (flush-p t) frame-buffer)
   "Preflight every field, then write a DataRow.
+FRAME-BUFFER, when supplied, is reusable scratch for small text frames.
 Small encoded frames may stay in the stream buffer when FLUSH-P is false.
 Large fields are emitted in chunks and checked against their preflight values.
 Close the stream on a failed write, since a partial frame cannot be retried."
   (unless (and (= (length values) (length targets)) (<= (length targets) #xffff))
     (error "invalid DataRow width"))
+  (when (and frame-buffer (null *select-result-formats*))
+    (let ((end (encode-small-select-data-row values targets frame-buffer)))
+      (when end
+        (write-small-select-data-row stream frame-buffer end flush-p)
+        (return-from send-select-data-row (values)))))
   (let ((fields nil) (size (+ 6 (* 4 (length targets)))) (cached-bytes 0)
                      (all-encoded-p t))
     (when (and *select-result-formats* (/= (length *select-result-formats*) (length targets)))
@@ -2001,8 +2058,8 @@ Close the stream on a failed write, since a partial frame cannot be retried."
             (unless complete (ignore-errors (close stream :abort t))))))))
   (values))
 
-(defun send-select-row (stream row targets &optional (flush-p t))
-  (send-select-data-row stream (car row) targets flush-p))
+(defun send-select-row (stream row targets &optional (flush-p t) frame-buffer)
+  (send-select-data-row stream (car row) targets flush-p frame-buffer))
 
 (defun select-path-description (table path)
   (case (select-scan-path-kind path)

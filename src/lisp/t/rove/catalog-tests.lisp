@@ -35,7 +35,11 @@
       (setf (aref values 0) +null+)
       (let ((with-null (form-heap-tuple values columns 1 0 0 0 1)))
         (rove:ok (= 32 (aref with-null +heap-tuple-hoff-off+)))
-        (rove:ok (equalp values (nth-value 0 (deform-heap-tuple with-null columns)))))))
+        (rove:ok (equalp values (nth-value 0 (deform-heap-tuple with-null columns))))
+        (rove:ok (rove:signals
+                  (deform-heap-tuple with-null columns :limit (1- (length with-null)))
+                  'pg-error)
+                 "a fixed-width attribute cannot read past the tuple bound"))))
 
 (rove:deftest test-btree-split-balances-bytes
     (flet ((key (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 1)))

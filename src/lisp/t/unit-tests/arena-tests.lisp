@@ -172,7 +172,7 @@
                      (declare (ignore order))
                      ;; Deliberately borrow diagnostic text from arena data.
                      (error (make-condition 'pg-error :sqlstate state
-                                                      :message (aref (car (fourth (first items))) 1)))))
+                                                      :message (aref (car (query-sort-item-row (first items))) 1)))))
              (handler-case
                  (sort-arena-test-stream (list (vector 1 (copy-seq "arena diagnostic")))
                                          (lambda (row) (declare (ignore row))))
