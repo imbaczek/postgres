@@ -217,10 +217,9 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
      (lambda () (close-sql-iterator input)))))
 
 (defun make-project-set-iterator (input calls &key attempt-function)
-  ;; Keep each input row until all its sets are exhausted. Each pull zips the
-  ;; sets, padding exhausted ones with NULL and suppressing an all-empty row.
-  ;; ATTEMPT-FUNCTION may step sets in target order before the remaining steps.
-  (let ((environment nil) (input-origins nil) (input-presence nil) (sets nil) (ended nil))
+  "Keep the current input row until all of its sets are exhausted."
+  (let ((width (length calls))
+        (environment nil) (input-origins nil) (input-presence nil) (sets nil))
     (make-sql-iterator
      (lambda ()
        (loop
@@ -229,35 +228,17 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
              (declare (ignore toast))
              (unless present (return (values nil nil)))
              (setf environment row input-origins origins input-presence presence
-                   sets (make-array (length calls) :initial-element nil)
-                   ended (make-array (length calls) :element-type 'bit :initial-element 0))))
-         (let ((values (make-array (length calls) :initial-element +null+))
-               (visited (make-array (length calls) :element-type 'bit :initial-element 0))
-               (any nil)
-               (*query-row-origins* input-origins)
-               (*query-row-presence* input-presence))
-           (flet ((step-set (index)
-                    (check-for-interrupts)
-                    (when (and (zerop (aref visited index)) (zerop (aref ended index)))
-                      (setf (aref visited index) 1)
-                      ;; Argument expressions run only when this target entry is
-                      ;; first reached, preserving scalar/SRF target-list order.
-                      (unless (aref sets index)
-                        (setf (aref sets index)
-                              (make-sql-set-function-iterator (nth index calls) environment)))
-                      (multiple-value-bind (value present) (funcall (aref sets index))
-                        (if present
-                            (setf any t (aref values index) value)
-                            (setf (aref ended index) 1))))))
-             (when attempt-function (funcall attempt-function environment values #'step-set))
-             (dotimes (index (length calls)) (step-set index)))
-           (if any
+                   sets (map 'simple-vector #'identity calls))))
+         (let* ((*query-row-origins* input-origins)
+                (*query-row-presence* input-presence)
+                (values (project-set-next-values environment sets attempt-function)))
+           (if values
                (return (values (concatenate 'vector environment values) t
-                               (project-set-row-origins input-origins (length environment) (length values))
+                               (project-set-row-origins input-origins (length environment) width)
                                nil input-presence))
-               (setf sets nil ended nil)))))
+               (setf sets nil)))))
      (lambda ()
-       (setf sets nil ended nil environment nil input-origins nil)
+       (setf sets nil environment nil input-origins nil)
        (close-sql-iterator input)))))
 
 (defun make-project-set-projection-iterator (input calls targets width)

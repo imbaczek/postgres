@@ -1655,28 +1655,41 @@ scope owns sort spills. A consumer's :STOP ends further group consumption."
       (when origins (replace result origins :end1 (min input-width (length origins))))
       result)))
 
-(defun stream-set-iterator-rows (environment iterators callback)
-  "Zip independent sets, pad exhausted calls with NULL, and suppress all-empty rows."
-  (loop
-    (let ((any-row-p nil)
-          (values (make-array (length iterators) :initial-element +null+)))
-      (declare (type simple-vector values))
-      (loop for iterator in iterators for position from 0
-            do (check-for-interrupts)
-               (multiple-value-bind (value present-p) (funcall iterator)
-                 (when present-p
-                   (setf (aref values position) value any-row-p t))))
-      (unless any-row-p (return))
-      (let ((*query-row-origins*
-              (project-set-row-origins *query-row-origins* (length environment) (length values))))
-        (when (eq (funcall callback (concatenate 'vector environment values)) :stop)
-          (return :stop))))))
+(defun project-set-next-values (environment sets &optional attempt-function)
+  "Advance each set at most once, padding exhausted calls and suppressing an all-empty row.
+ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
+  (let* ((width (length sets))
+         (values (make-array width :initial-element +null+))
+         (visited (when attempt-function (make-array width :element-type 'bit :initial-element 0)))
+         (any-row-p nil))
+    (flet ((step-set (index)
+             (check-for-interrupts)
+             (let ((state (aref sets index)))
+               ;; Each slot holds its call form, its iterator, or T when exhausted.
+               (when (and (not (eq state t))
+                          (or (null visited) (zerop (aref visited index))))
+                 (when visited (setf (aref visited index) 1))
+                 (unless (functionp state)
+                   (setf state (make-sql-set-function-iterator state environment)
+                         (aref sets index) state))
+                 (multiple-value-bind (value present-p) (funcall state)
+                   (if present-p
+                       (setf any-row-p t (aref values index) value)
+                       (setf (aref sets index) t)))))))
+      (declare (dynamic-extent #'step-set))
+      (when attempt-function (funcall attempt-function environment values #'step-set))
+      (dotimes (index width) (step-set index)))
+    (when any-row-p values)))
 
-(defun stream-project-set (environment calls callback)
-  (stream-set-iterator-rows
-   environment
-   (mapcar (lambda (call) (make-sql-set-function-iterator call environment)) calls)
-   callback))
+(defun stream-project-set (environment calls sets callback)
+  (replace sets calls)
+  (let ((width (length sets)))
+    (loop for values = (project-set-next-values environment sets)
+          while values
+          do (let ((*query-row-origins*
+                     (project-set-row-origins *query-row-origins* (length environment) width)))
+               (when (eq (funcall callback (concatenate 'vector environment values)) :stop)
+                 (return :stop))))))
 
 (defun project-append-row (coercions environment input-origins)
   "Apply one UNION ALL arm's coercions and return its owned output row and origins."
@@ -2060,9 +2073,11 @@ ROW's source environment.  Only final target origins leave this projection."
      (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
                           (second node) emit))
     (:project-set
-     (let ((targets (and *query-project-set*
-                         (eq node (car *query-project-set*))
-                         (cdr *query-project-set*))))
+     (let* ((targets (and *query-project-set*
+                          (eq node (car *query-project-set*))
+                          (cdr *query-project-set*)))
+            (calls (second node))
+            (sets (unless targets (make-array (length calls)))))
        (funcall run-child (third node)
                 (lambda (environment)
                   (if targets
@@ -2079,7 +2094,7 @@ ROW's source environment.  Only final target origins leave this projection."
                                 input (second node) targets (fourth node))))
                         (unwind-protect (map-sql-iterator projected emit)
                           (close-sql-iterator projected)))
-                      (stream-project-set environment (second node) emit))))))
+                      (stream-project-set environment calls sets emit))))))
     (:project (execute-physical-projection node emit run-child))
     ((:sorted-distinct :hash-distinct :hash-aggregate :sorted-aggregate)
      (let ((child (physical-buffered-node-child node)))
