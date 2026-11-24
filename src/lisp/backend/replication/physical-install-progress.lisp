@@ -1,5 +1,12 @@
 (in-package #:pg)
 
+(defun physical-install-step-image (crc step)
+  "Allocate a canonical STEP line for a journal write.
+Use FORMAT to keep the writer independent of the reader's scratch encoder."
+  (string->bytes
+   (format nil "STEP ~d ~8,'0X~%" step
+           (wal-crc32 (string->bytes (format nil "~8,'0X ~d" crc step))))))
+
 (defun physical-install-read-progress (bytes position body-crc last-step label &key allow-tail)
   "Return the completed step, valid end position and partial-step flag.
 ALLOW-TAIL leaves bytes after the final complete step for the caller to check."

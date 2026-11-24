@@ -144,7 +144,7 @@
       (error "adoption follow image exceeds its bound"))
     (flet ((emit (bytes) (loop for byte across bytes do (vector-push-extend byte image))))
       (emit header) (emit body) (emit #(10))
-      (loop for index from 1 to step do (emit (physical-adoption-install-step-image crc index))))
+      (loop for index from 1 to step do (emit (physical-install-step-image crc index))))
     image))
 
 (defun physical-adoption-retire-marker-image (crc)

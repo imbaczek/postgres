@@ -119,10 +119,13 @@
                          :base-lsn fork :floor-lsn fork :flushed-lsn horizon
                          :selection (list :history (logical-slot-copy-source-proof-parent-history facts)
                                           :target parent)))
-             (seed (list fork parent next (getf completed :source-checkpoint)
-                         (getf prefix :reservation) (getf prefix :source-xids)
-                         (getf prefix :applied-resource-fact) (getf prefix :applied-fpw-fact)
-                         (getf completed :logical-fact)))
+             (seed (make-physical-replay-seed
+                    :start fork :timeline parent :next-xid next
+                    :checkpoint (getf completed :source-checkpoint)
+                    :reservation (getf prefix :reservation) :source-xids (getf prefix :source-xids)
+                    :resource-fact (getf prefix :applied-resource-fact)
+                    :fpw-fact (getf prefix :applied-fpw-fact)
+                    :logical-fact (getf completed :logical-fact)))
              (seen-eor nil))
         (setf (getf base :required-resource-fact) (getf prefix :applied-resource-fact)
               (getf base :required-fpw-fact) (getf prefix :applied-fpw-fact)

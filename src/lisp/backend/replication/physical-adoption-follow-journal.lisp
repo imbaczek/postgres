@@ -70,7 +70,7 @@
          (sb-posix:fsync fd)
          (physical-adoption-install-test-point :after-follow-progress-truncate path))
        (physical-adoption-install-write-bytes
-        fd (physical-adoption-install-step-image (getf state :body-crc) next)
+        fd (physical-install-step-image (getf state :body-crc) next)
         (getf state :valid-length) path
         :limit *physical-adoption-follow-progress-write-limit* :point :after-follow-progress-write-chunk)
        (sb-posix:fsync fd)

@@ -86,10 +86,13 @@ This private cursor does not validate the archive or confer authority."
                      :selection (list :history (getf facts :history)
                                       :target (timeline-history-entry-timeline
                                                (first (getf facts :history))))))
-         (seed (list (getf base :end) (getf base :timeline) (getf base :next-xid)
-                     (getf base :source-checkpoint) (getf base :source-reservation) nil
-                     (getf base :base-source-resource-fact)
-                     (getf base :base-source-fpw-fact) (getf base :base-source-logical-fact)))
+         (seed (make-physical-replay-seed
+                :start (getf base :end) :timeline (getf base :timeline)
+                :next-xid (getf base :next-xid) :checkpoint (getf base :source-checkpoint)
+                :reservation (getf base :source-reservation)
+                :resource-fact (getf base :base-source-resource-fact)
+                :fpw-fact (getf base :base-source-fpw-fact)
+                :logical-fact (getf base :base-source-logical-fact)))
          (scan
            (multiple-value-list
             (physical-follow-scan-replay-from-seed-core

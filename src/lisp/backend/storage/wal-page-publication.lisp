@@ -2,6 +2,130 @@
 
 (in-package #:pg)
 
+(defstruct (wal-page-publication (:constructor %make-wal-page-publication))
+  ;; Before FIFO handoff the stack normally closes SPOOL on exit. A transaction's
+  ;; CLOG reservation retains the owner after its terminal attempt starts, so
+  ;; cleanup leaves the spool even if handoff fails. The FIFO retains the sealed
+  ;; spool, dirty maps, CLOG completion and WAL identity through head retirement. A transaction
+  ;; completion points back to this owner; maintenance has XID zero and no
+  ;; completion. NEXT links owners in terminal order.
+  spool (state :stack) prepared-p pages contributors resets split-p xid
+  next completion pressure-ticket (kind :transaction)
+  incarnation timeline terminal-end replacement-pages replacement-contributors)
+
+(defvar *wal-pending-page-publication* nil
+  "Head of the page publication FIFO, protected with its tail by *WAL-LOCK*.")
+
+(defvar *wal-pending-page-publication-tail* nil)
+
+(defvar *wal-page-publication-appender* nil)
+
+(defun wal-check-page-publication-queue-under-lock ()
+  "Validate FIFO links, identity and increasing terminal ends under WAL lock."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (let ((last nil) (previous-end 0))
+    (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+          while owner
+          do (unless (and (wal-page-publication-p owner)
+                          (member (wal-page-publication-state owner) '(:pending :applied :retiring))
+                          (or (null last) (eq :pending (wal-page-publication-state owner)))
+                          (eq *wal-storage-incarnation* (wal-page-publication-incarnation owner))
+                          (eql *wal-insert-timeline* (wal-page-publication-timeline owner))
+                          (typep (wal-page-publication-terminal-end owner)
+                                 '(integer 1 18446744073709551615))
+                          (< previous-end (wal-page-publication-terminal-end owner))
+                          (<= (wal-page-publication-terminal-end owner) *wal-end-lsn*))
+               (wal-invalid-input "invalid pending page publication queue"))
+             (setf last owner previous-end (wal-page-publication-terminal-end owner)))
+    (unless (eq last *wal-pending-page-publication-tail*)
+      (wal-invalid-input "pending page publication tail differs from its chain")))
+  (values))
+
+(defun wal-require-no-pending-page-publication ()
+  "Reject page debt at a storage identity or lifecycle boundary.
+Transaction and maintenance publishers enqueue and settle before return;
+synchronous barriers settle predecessors first. Caller holds *WAL-LOCK* or has
+lifecycle quiescence."
+  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+    (wal-invalid-input "pending page publication prevents another storage publisher"))
+  (values))
+
+(defun wal-check-page-publication-owner-under-lock (owner)
+  (wal-check-page-publication-queue-under-lock)
+  (unless (loop for entry = *wal-pending-page-publication* then (wal-page-publication-next entry)
+                while entry thereis (eq owner entry))
+    (wal-invalid-input "page publication is not installed in this WAL store"))
+  owner)
+
+(defun wal-pending-page-reference (key)
+  "Return the newest queued page, presence flag and matching contributors under WAL lock."
+  (when *wal-pending-page-publication*
+    (wal-check-page-publication-queue-under-lock)
+    (let ((reference nil) (present nil) (contributors nil))
+      (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+            while owner
+            do (multiple-value-bind (candidate found)
+                   (gethash key (wal-page-publication-pages owner))
+                 (when found
+                   (setf reference candidate present t
+                         contributors (gethash key (wal-page-publication-contributors owner))))))
+      (values reference present contributors))))
+
+(defun wal-pending-page-contributors (key)
+  (nth-value 2 (wal-pending-page-reference key)))
+
+(defun wal-close-primary-page-spool (spool)
+  "Close SPOOL and require its temporary-file cleanup to finish."
+  (wal-close-owned-spool spool))
+
+(defun call-with-wal-primary-page-spool (function)
+  "Call FUNCTION with a stack-owned spool and its publication owner.
+The spool is adopted before it is published to the owner. Cleanup closes an
+untransferred spool unless a transaction's terminal attempt has begun. Its CLOG
+reservation then retains the owner even if queue handoff fails."
+  (call-with-wal-temp-cleanup-domain
+   (lambda ()
+     (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+       (wal-check-page-publication-queue-under-lock)
+       (when (wal-page-publication-resets *wal-pending-page-publication-tail*)
+         (wal-invalid-input "relation reset publication must finish before another publisher")))
+     (let* ((owner (%make-wal-page-publication :incarnation *wal-storage-incarnation*
+                                               :timeline *wal-insert-timeline*))
+            (*wal-page-publication-appender* owner))
+       (unwind-protect
+            (progn
+              (sb-sys:without-interrupts
+                (setf (wal-page-publication-spool owner) (make-wal-owned-spool)))
+              (funcall function (wal-page-publication-spool owner) owner))
+         (when (and (eq :stack (wal-page-publication-state owner))
+                    (or (null (wal-page-publication-completion owner))
+                        (clog-release-unattempted-publication-under-wal-lock
+                         (wal-page-publication-completion owner) owner)))
+           (when (wal-page-publication-spool owner)
+             (wal-close-primary-page-spool (wal-page-publication-spool owner)))
+           (setf (wal-page-publication-state owner) :released)))))))
+
+(defun wal-map-pending-publication-pages (function)
+  "Visit the queued page maps in terminal order under WAL exclusion."
+  (when *wal-pending-page-publication*
+    (wal-check-page-publication-queue-under-lock)
+    (loop for owner = *wal-pending-page-publication* then (wal-page-publication-next owner)
+          while owner do (funcall function (wal-page-publication-pages owner))))
+  (values))
+
+(defun wal-check-publication-append ()
+  "Check outstanding page debt before a WAL append."
+  (when (or *wal-pending-page-publication* *wal-pending-page-publication-tail*)
+    (if (and (sb-thread:holding-mutex-p *wal-lock*)
+             (wal-page-publication-p *wal-page-publication-appender*)
+             (eq :stack (wal-page-publication-state *wal-page-publication-appender*))
+             (eq *wal-storage-incarnation*
+                 (wal-page-publication-incarnation *wal-page-publication-appender*))
+             (eql *wal-insert-timeline*
+                  (wal-page-publication-timeline *wal-page-publication-appender*)))
+        (wal-check-page-publication-queue-under-lock)
+        (wal-require-no-pending-page-publication))))
+
 (defun wal-prepare-page-publication-under-lock (owner xid resets split-p &key (kind :transaction))
   "Seal the spool and prepare empty replacement maps before the terminal record.
 Record the current maps and WAL identity while the caller holds *WAL-LOCK*."
@@ -48,26 +172,24 @@ Install the preallocated empty maps by pointer, without changing references."
     (unless (and (wal-page-publication-p owner)
                  (eq :stack (wal-page-publication-state owner))
                  (wal-page-publication-prepared-p owner)
-                 (eq *wal-page-cache* (wal-page-publication-pages owner))
-                 (eq *wal-page-cache-xids* (wal-page-publication-contributors owner))
+                 (wal-dirty-cache-handoff-ready-p
+                  (wal-page-publication-pages owner) (wal-page-publication-contributors owner)
+                  (wal-page-publication-replacement-pages owner)
+                  (wal-page-publication-replacement-contributors owner))
                  (eq *wal-storage-incarnation* (wal-page-publication-incarnation owner))
                  (eql *wal-insert-timeline* (wal-page-publication-timeline owner))
                  (typep end '(integer 1 18446744073709551615))
                  (<= end *wal-end-lsn*)
                  (null (wal-page-publication-next owner))
                  (or (null *wal-pending-page-publication-tail*)
-                     (> end (wal-page-publication-terminal-end *wal-pending-page-publication-tail*)))
-                 (hash-table-p (wal-page-publication-replacement-pages owner))
-                 (zerop (hash-table-count (wal-page-publication-replacement-pages owner)))
-                 (hash-table-p (wal-page-publication-replacement-contributors owner))
-                 (zerop (hash-table-count (wal-page-publication-replacement-contributors owner))))
+                     (> end (wal-page-publication-terminal-end *wal-pending-page-publication-tail*))))
       (wal-invalid-input "page publication preparation changed before handoff"))
     (clog-check-publication-handoff-under-wal-lock owner end)
+    (wal-install-dirty-cache-replacement-under-lock
+     (wal-page-publication-replacement-pages owner)
+     (wal-page-publication-replacement-contributors owner))
     (setf (wal-page-publication-terminal-end owner) end
           (wal-page-publication-state owner) :pending
-          *wal-page-cache* (wal-page-publication-replacement-pages owner)
-          *wal-page-cache-xids* (wal-page-publication-replacement-contributors owner)
-          *wal-pending-btree-split* nil
           (wal-page-publication-replacement-pages owner) nil
           (wal-page-publication-replacement-contributors owner) nil)
     (if *wal-pending-page-publication-tail*

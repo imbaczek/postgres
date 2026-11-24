@@ -139,8 +139,7 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 
 (defun physical-history-observe-record (record observed fpw-fact logical-fact identity removed)
   "Check child initialization, track source XIDs, then validate the batch record."
-  (physical-replay-check-child-initialization record observed fpw-fact logical-fact)
-  (let ((next (physical-replay-observed-next-xid record observed)))
+  (let ((next (physical-replay-check-and-observe-xid record observed fpw-fact logical-fact)))
     (physical-history-accept-record record identity removed)
     next))
 

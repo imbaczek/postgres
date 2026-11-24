@@ -235,7 +235,7 @@ archive reference; pending promotion may retain one."
                    (or (= insertion 1) (eq namespace :timeline))
                    (equal snapshot actual)
                    (= (physical-manifest-checkpoint-start manifest)
-                      (if actual (getf actual :start) (- checkpoint +wal-header-size+)))
+                      (wal-checkpoint-record-start checkpoint actual))
                    (or (eql 3 (getf control :phase)) (null (getf metadata :retained-reference))))
         (error "native recovery control differs from its immutable base checkpoint"))
       (when (> insertion 1)
@@ -322,7 +322,7 @@ and then the verified selected checkpoint for a standby. Never use local setting
                recovery-timeline (getf control :applied-timeline (getf control :timeline)))))
       (list :system-id system-id :db-state state :state-time time
             :checkpoint (if snapshot (getf snapshot :start)
-                            (max 0 (- checkpoint +wal-header-size+)))
+                            (wal-checkpoint-record-start checkpoint nil))
             :checkpoint-timeline (if snapshot (getf snapshot :timeline) checkpoint-id) :snapshot snapshot
             :resource-parameters resources
             :page-checksum-version (unless control (getf metadata :page-checksum-version))

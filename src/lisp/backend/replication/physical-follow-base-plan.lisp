@@ -127,7 +127,10 @@
           (getf base :required-logical-fact) (physical-logical-copy-fact (getf (getf binding :recovery) :logical-fact)))
     (physical-follow-scan-replay-from-seed-core
      model base pair pair observed
-     (list end timeline observed (copy-tree checkpoint) (copy-tree reservation) nil resource fpw logical)
+     (make-physical-replay-seed
+      :start end :timeline timeline :next-xid observed
+      :checkpoint (copy-tree checkpoint) :reservation (copy-tree reservation)
+      :resource-fact resource :fpw-fact fpw :logical-fact logical)
      (lambda (function start)
        (declare (ignore function))
        (unless (= start end) (error "empty-base replay cannot skip WAL"))

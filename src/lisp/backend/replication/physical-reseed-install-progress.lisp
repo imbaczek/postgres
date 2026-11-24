@@ -59,7 +59,7 @@
                  (unless (or (= step previous) (= step (1+ previous)))
                    (error "reseed progress skipped a journal step"))
                  (when (> step previous)
-                   (incf valid-length (length (physical-reseed-install-step-image (getf state :body-crc) step))))
+                   (incf valid-length (length (physical-install-step-image (getf state :body-crc) step))))
                  (multiple-value-bind (actual actual-prefix) (funcall namespace-check)
                    (unless (and (equal (getf state :plan) (getf actual :plan))
                                 (= step (getf actual :step)) (= observed actual-prefix)
@@ -171,7 +171,7 @@
                             (funcall ready)
                             (let ((*physical-adoption-install-test-hook* #'physical-reseed-install-test-point))
                               (physical-adoption-install-write-bytes
-                               fd (physical-reseed-install-step-image (getf before :body-crc) step)
+                               fd (physical-install-step-image (getf before :body-crc) step)
                                (getf before :valid-length) path :limit *physical-reseed-install-progress-write-limit*
                                :point :after-install-step-write-chunk))
                             (funcall refresh step observed)

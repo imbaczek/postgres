@@ -2,56 +2,6 @@
 
 (in-package #:pg)
 
-(defun coerce-value (value type typmod)
-  (cond
-    ((eq value +null+) +null+)
-    ((eq type :json) (sql-json-input value))
-    ((eq type :jsonb) (if (sql-jsonb-p value) value (sql-jsonb-input value)))
-    ((eq type :timetz) (sql-cast-value value (if (stringp value) :text :timetz) :timetz typmod t))
-    ((eq type :interval) (sql-cast-value value (if (stringp value) :text :interval) :interval typmod t))
-    ((eq type :date) (if (stringp value) (sql-cast-value value :text :date -1 t) value))
-    ((member type '(:timestamp :timestamptz))
-     (sql-cast-value value (if (stringp value) :text type) type typmod))
-    ((eq type :time) (if (stringp value) (sql-cast-value value :text :time typmod t)
-                         (sql-time-adjust-typmod value typmod)))
-    ((member type '(:float4 :float8))
-     (sql-cast-value value (if (stringp value) :text (if (floatp value) type :numeric)) type typmod))
-    ((eq type :int2)
-     (sql-cast-value value (if (stringp value) :text :int8) :int2 typmod))
-    ((eq type :int4)
-     (let ((n (cond
-                ((integerp value) value)
-                ((stringp value)
-                 (handler-case-nonfatal
-                  (parse-integer value :junk-allowed nil)
-                  (e
-                   (ereport "22P02"
-                            "invalid input syntax for type integer: \"~a\""
-                            value))))
-                (t (ereport "22P02" "invalid input syntax for type integer")))))
-       (unless (<= +int4-min+ n +int4-max+)
-         (ereport "22003" "integer out of range"))
-       n))
-    ((eq type :int8)
-     (let ((n (cond
-                ((integerp value) value)
-                ((stringp value)
-                 (handler-case-nonfatal
-                  (parse-integer value :junk-allowed nil)
-                  (e
-                   (ereport "22P02"
-                            "invalid input syntax for type bigint: \"~a\""
-                            value))))
-                (t (ereport "22P02" "invalid input syntax for type bigint")))))
-       (unless (<= +int8-min+ n +int8-max+)
-         (ereport "22003" "bigint out of range"))
-       n))
-    ((eq type :numeric)
-     (sql-numeric-apply-typmod (if (stringp value) (sql-numeric-input value) value) typmod))
-    ((eq type :varchar)
-     (sql-varchar-assignment-value (if (stringp value) value (princ-to-string value)) typmod))
-    (t value)))
-
 (defun check-not-null (values columns)
   (loop for i from 0 below (length columns)
         for col = (aref columns i)

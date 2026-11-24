@@ -479,13 +479,17 @@ reconciliation; active bindings require durable-state checks before admission."
         (error "follow recovery history witness is ahead of the old receive selection"))))
   binding)
 
+(defstruct physical-replay-seed
+  start timeline next-xid checkpoint reservation source-xids
+  resource-fact fpw-fact logical-fact)
+
 (defun physical-follow-replay-seed (store base applied restartpoint)
   "Check RESTARTPOINT against the durable pointer and choose a replay seed.
 A published generation supplies the seed. Without one, use BASE and require
 the full prefix. Check the seed's timeline, history and
 prefix digest against STORE, and require the seed not to pass APPLIED. The
 caller supplies a verified BASE and protects PGDATA and the retained root.
-Return nine values, including optional resource, FPW and logical facts."
+Return a replay seed with any resource, FPW and logical facts."
   (multiple-value-bind (metadata catalog prefix digest) (physical-restartpoint-read base)
     (declare (ignore catalog prefix))
     (unless (equal restartpoint
@@ -519,11 +523,12 @@ Return nine values, including optional resource, FPW and logical facts."
                      (or (not (getf reservation :complete))
                          (<= next (1+ (getf reservation :bound)))))
           (error "follow replay seed has an invalid allocation frontier")))
-      (values start timeline next snapshot reservation
-              (when metadata (copy-tree (getf metadata :source-xids)))
-              (physical-restartpoint-resource-seed metadata base store start)
-              (physical-restartpoint-fpw-seed metadata base store start)
-              (physical-restartpoint-logical-seed metadata base store start)))))
+      (make-physical-replay-seed
+       :start start :timeline timeline :next-xid next :checkpoint snapshot
+       :reservation reservation :source-xids (copy-tree (getf metadata :source-xids))
+       :resource-fact (physical-restartpoint-resource-seed metadata base store start)
+       :fpw-fact (physical-restartpoint-fpw-seed metadata base store start)
+       :logical-fact (physical-restartpoint-logical-seed metadata base store start)))))
 
 ;; Keep optional policy facts at the applied and required boundaries.
 
@@ -538,19 +543,41 @@ Return nine values, including optional resource, FPW and logical facts."
 ;; value holds the logical fact and checkpoint at the last completed boundary.
 ;; With an open tail, terminal T can precede the fully consumed horizon L.
 
+(defun physical-follow-check-restartpoint-witness (witness terminal timeline next resource fpw logical)
+  "Check the completed boundary and each fact field present in WITNESS."
+  (let ((length (length witness)))
+    (unless (and (equal (subseq witness 0 3) (list terminal timeline next))
+                 (or (< length 4) (equal (fourth witness) resource))
+                 (or (< length 5) (equal (fifth witness) fpw))
+                 (or (< length 6) (equal (sixth witness) logical)))
+      (error "follow replay differs from its restartpoint visibility"))))
+
+(defun physical-follow-initialize-replay-context (seed required)
+  "Bind the private replay state's checkpoint and required position to this scan."
+  (setf (getf *physical-recovery-state* :replay-timeline) (physical-replay-seed-timeline seed)
+        (getf *physical-recovery-state* :source-checkpoint) (physical-replay-seed-checkpoint seed)
+        (getf *physical-recovery-state* :required-applied) (first required)
+        (getf *physical-recovery-state* :required-timeline) (second required)))
+
 ;; Shared read-only scan from a supplied seed and record mapper.  Callers must
 ;; establish the seed and durable-position authority appropriate to their use.
 (defun physical-follow-scan-replay-from-seed-core
     (candidate verified-base applied required observed seed map-records allow-open-tail &optional witness)
-  "Scan a stable candidate without redo or publication. SEED supplies the replay
-position, timeline, XID, checkpoint, reservation, source XIDs and optional
-resource, FPW and logical facts. APPLIED and REQUIRED are clean boundaries.
+  "Scan from SEED without redo or publication. APPLIED and REQUIRED are clean boundaries.
 If REQUIRED precedes SEED, check visibility and required FPW and logical
 coverage, retaining saved minimum facts at their own boundary. A historical
 WITNESS has LSN, timeline and next XID, optionally followed by resource, FPW
 and logical facts. Return the disposition and copied facts at both boundaries.
 A policy fence must leave a clean batch boundary; an allowed open tail may remain."
-  (destructuring-bind (start timeline next snapshot reservation source-xids &optional resource-fact fpw-fact logical-fact) seed
+  (let ((start (physical-replay-seed-start seed))
+        (timeline (physical-replay-seed-timeline seed))
+        (next (physical-replay-seed-next-xid seed))
+        (snapshot (physical-replay-seed-checkpoint seed))
+        (reservation (physical-replay-seed-reservation seed))
+        (source-xids (physical-replay-seed-source-xids seed))
+        (resource-fact (physical-replay-seed-resource-fact seed))
+        (fpw-fact (physical-replay-seed-fpw-fact seed))
+        (logical-fact (physical-replay-seed-logical-fact seed)))
     (let* ((*physical-recovery-state* (copy-tree verified-base))
            (*physical-receive-store* candidate)
            (terminal start) (disposition nil) (applied-seen nil) (required-seen nil) (required-next nil)
@@ -563,10 +590,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
            (applied-fpw-fact nil) (required-fpw-fact nil)
            (history (lambda () (physical-recovery-resource-history candidate *physical-recovery-state*)))
            (removed (make-hash-table :test #'eql)))
-      (setf (getf *physical-recovery-state* :replay-timeline) timeline
-            (getf *physical-recovery-state* :source-checkpoint) snapshot
-            (getf *physical-recovery-state* :required-applied) (first required)
-            (getf *physical-recovery-state* :required-timeline) (second required))
+      (physical-follow-initialize-replay-context seed required)
       (when fpw-fact (physical-fpw-check-fact fpw-fact (funcall history) start timeline))
       (setf logical-fact
             (physical-recovery-scan-checkpoint-logical snapshot logical-fact start timeline))
@@ -583,12 +607,8 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
               required-fpw-fact (physical-fpw-copy-fact (getf verified-base :required-fpw-fact))))
       (labels ((note-boundary ()
                  (when (and witness (= terminal (first witness)))
-                   (unless (and (equal (subseq witness 0 3) (list terminal timeline next))
-                                (or (< (length witness) 4)
-                                    (equal (fourth witness) resource-fact))
-                                (or (< (length witness) 5) (equal (fifth witness) fpw-fact))
-                                (or (< (length witness) 6) (equal (sixth witness) logical-fact)))
-                     (error "follow replay differs from its restartpoint visibility"))
+                   (physical-follow-check-restartpoint-witness
+                    witness terminal timeline next resource-fact fpw-fact logical-fact)
                    (setf witness-seen t))
                  (when (equal applied (list terminal timeline))
                    (setf applied-seen t applied-resource-fact (copy-tree resource-fact)
@@ -621,23 +641,18 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                              reservation (physical-source-reservation-next reservation record next)
                              source-xids (physical-source-xids-next source-xids record next))
                        (progn
-                         (physical-replay-check-child-initialization record next fpw-fact logical-fact)
-                         (setf next (physical-replay-observed-next-xid record next)
-                               reservation (physical-source-reservation-next reservation record next)
-                               source-xids (physical-source-xids-next source-xids record next))
+                         (multiple-value-setq (next reservation source-xids)
+                           (physical-replay-observe-source-record
+                            record next reservation source-xids fpw-fact logical-fact))
                          (physical-history-accept-record
                           record (getf verified-base :cluster-identity) removed)
                          (when (= (wal-record-type record) +wal-record-checkpoint+)
                            (setf (getf *physical-recovery-state* :source-checkpoint)
                                  (wal-checkpoint-record-snapshot record)))))
                    (unless *wal-recovery-group-active*
-                     (setf resource-fact
-                           (physical-resource-fact-next
-                            resource-fact record timeline
-                            (lambda () (physical-recovery-resource-history
-                                        candidate *physical-recovery-state*))))
-                     (multiple-value-setq (fpw-fact logical-fact)
-                       (physical-replay-policy-facts-next fpw-fact logical-fact record timeline history))
+                     (multiple-value-setq (resource-fact fpw-fact logical-fact)
+                       (physical-replay-terminal-facts-next
+                        resource-fact fpw-fact logical-fact record timeline history))
                      (setf terminal (wal-record-end record)
                            completed-checkpoint (getf *physical-recovery-state* :source-checkpoint))
                      (note-boundary)))
@@ -668,10 +683,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
   "Check the durable required position, then scan a stable candidate from SEED."
   (let ((*physical-recovery-state* (copy-tree verified-base))
         (*physical-receive-store* candidate))
-    (setf (getf *physical-recovery-state* :replay-timeline) (second seed)
-          (getf *physical-recovery-state* :source-checkpoint) (fourth seed)
-          (getf *physical-recovery-state* :required-applied) (first required)
-          (getf *physical-recovery-state* :required-timeline) (second required))
+    (physical-follow-initialize-replay-context seed required)
     (physical-recovery-check-store-point candidate (first required) (second required)))
   (physical-follow-scan-replay-from-seed-core
    candidate verified-base applied required observed seed map-records allow-open-tail witness))
@@ -681,7 +693,7 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
   "Validate the durable seed and scan its retained suffix without redo."
   (physical-follow-scan-replay-from-seed
    candidate verified-base applied required observed
-   (multiple-value-list (physical-follow-replay-seed candidate verified-base applied restartpoint))
+   (physical-follow-replay-seed candidate verified-base applied restartpoint)
    (lambda (function start)
      (physical-store-map-durable-records candidate function :start-lsn start))
    allow-open-tail))
@@ -924,21 +936,24 @@ Return the scan disposition; it is not a numeric reconciliation success value."
                          (if metadata
                              (getf metadata :lsn) (getf base :end))))
            (pair (list applied (physical-store-prefix-timeline candidate applied)))
-           (seed (multiple-value-list (physical-follow-replay-seed candidate base pair token))))
+           (seed (physical-follow-replay-seed candidate base pair token)))
       (when (getf policy :target)
-        (dolist (point (list pair required (subseq seed 0 2)))
+        (dolist (point (list pair required (list (physical-replay-seed-start seed) (physical-replay-seed-timeline seed))))
           (physical-recovery-policy-check-pair point (getf policy :history))))
-      (if (< (first required) (first seed))
+      (if (< (first required) (physical-replay-seed-start seed))
           (physical-follow-scan-replay-from-seed
            candidate base pair required (getf control :next-xid)
-           (list (getf base :end) (getf base :timeline) (getf base :next-xid)
-                 (copy-tree (getf base :source-checkpoint))
-                 (copy-tree (getf base :source-reservation)) nil
-                 (copy-tree (getf base :base-source-resource-fact))
-                 (physical-fpw-copy-fact (getf base :base-source-fpw-fact))
-                 (physical-logical-copy-fact (getf base :base-source-logical-fact)))
+           (make-physical-replay-seed
+            :start (getf base :end) :timeline (getf base :timeline) :next-xid (getf base :next-xid)
+            :checkpoint (copy-tree (getf base :source-checkpoint))
+            :reservation (copy-tree (getf base :source-reservation))
+            :resource-fact (copy-tree (getf base :base-source-resource-fact))
+            :fpw-fact (physical-fpw-copy-fact (getf base :base-source-fpw-fact))
+            :logical-fact (physical-logical-copy-fact (getf base :base-source-logical-fact)))
            (lambda (function start) (physical-follow-map-active-prefix candidate index function start policy))
-           t (append (subseq seed 0 3) (list (seventh seed) (eighth seed) (ninth seed))))
+           t (list (physical-replay-seed-start seed) (physical-replay-seed-timeline seed)
+                   (physical-replay-seed-next-xid seed) (physical-replay-seed-resource-fact seed)
+                   (physical-replay-seed-fpw-fact seed) (physical-replay-seed-logical-fact seed)))
           (physical-follow-scan-replay-from-seed
            candidate base pair required (getf control :next-xid) seed
            (lambda (function start)

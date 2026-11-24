@@ -148,7 +148,7 @@
          (error "adoption journal append position changed"))
        (physical-adoption-install-test-point :before-progress-write path)
        (physical-adoption-install-write-bytes
-        fd (physical-adoption-install-step-image (getf state :body-crc) step)
+        fd (physical-install-step-image (getf state :body-crc) step)
         (getf state :valid-length) path :limit *physical-adoption-install-progress-write-limit*
         :point :after-progress-write-chunk)
        (physical-adoption-install-test-point :before-progress-fsync path)

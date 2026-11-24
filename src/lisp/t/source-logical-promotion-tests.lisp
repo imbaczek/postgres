@@ -279,7 +279,7 @@
     (:follow
      (getf
       (pg::physical-follow-scan-replay-from-seed-core
-       store pg::*physical-recovery-state* (list end 2) '(32 1) 50 '(32 1 50 nil nil nil nil nil)
+       store pg::*physical-recovery-state* (list end 2) '(32 1) 50 (pg::make-physical-replay-seed :start 32 :timeline 1 :next-xid 50)
        (lambda (function start)
          (pg::physical-recovery-map-permitted-records store function :start-lsn start))
        nil)

@@ -130,11 +130,6 @@
 (defun physical-adoption-install-last-step (plan)
   (+ 1 (length (getf plan :old)) (length (getf plan :new))))
 
-(defun physical-adoption-install-step-image (crc step)
-  (string->bytes
-   (format nil "STEP ~d ~8,'0X~%" step
-           (wal-crc32 (string->bytes (format nil "~8,'0X ~d" crc step))))))
-
 (defun physical-adoption-install-image (plan step)
   (let* ((plan (physical-adoption-install-copy plan))
          (body (string->bytes (physical-bootstrap-manifest-text plan)))
@@ -149,7 +144,7 @@
                (error "adoption installation journal exceeds its bound"))
              (loop for byte across bytes do (vector-push-extend byte image))))
       (emit header) (emit body) (emit #(10))
-      (loop for index from 1 to step do (emit (physical-adoption-install-step-image crc index))))
+      (loop for index from 1 to step do (emit (physical-install-step-image crc index))))
     image))
 
 (defun physical-adoption-install-decode (bytes)

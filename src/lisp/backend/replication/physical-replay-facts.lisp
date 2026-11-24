@@ -47,18 +47,38 @@ until a status record or checkpoint establishes it."
     (physical-logical-fact-next prior record timeline
                                 (if (functionp history) (funcall history) history))))
 
+(defun call-with-physical-replay-boundary-history (history function)
+  "Resolve supplied HISTORY at most once, and only if a fact needs it."
+  (if (functionp history)
+      (let ((resolved-p nil) (selection nil))
+        (flet ((resolve ()
+                 (unless resolved-p
+                   (setf selection (funcall history) resolved-p t))
+                 selection))
+          (declare (dynamic-extent #'resolve))
+          (funcall function #'resolve)))
+      (funcall function history)))
+
+(defun physical-replay-advance-policy-facts (fpw-fact logical-fact record timeline selection)
+  (values (physical-replay-fpw-fact-next fpw-fact record timeline selection)
+          (physical-replay-logical-fact-next logical-fact record timeline selection)))
+
 (defun physical-replay-policy-facts-next (fpw-fact logical-fact record timeline history)
-  "Advance both source policies at a caller-validated complete terminal.
-HISTORY may resolve lazily so unknown facts do not require a history read."
-  (values (physical-replay-fpw-fact-next fpw-fact record timeline history)
-          (physical-replay-logical-fact-next logical-fact record timeline history)))
+  "Advance both source policies at a caller-validated complete terminal."
+  (flet ((advance (selection)
+           (physical-replay-advance-policy-facts fpw-fact logical-fact record timeline selection)))
+    (declare (dynamic-extent #'advance))
+    (call-with-physical-replay-boundary-history history #'advance)))
 
 (defun physical-replay-terminal-facts-next (resource-fact fpw-fact logical-fact record timeline history)
-  "Validate the candidate facts before redo can modify standby storage."
-  (let ((resource (physical-resource-fact-next resource-fact record timeline history)))
-    (multiple-value-bind (fpw logical)
-        (physical-replay-policy-facts-next fpw-fact logical-fact record timeline history)
-      (values resource fpw logical))))
+  "Validate candidate facts together against one selected history before publication."
+  (flet ((advance (selection)
+           (let ((resource (physical-resource-fact-next resource-fact record timeline selection)))
+             (multiple-value-bind (fpw logical)
+                 (physical-replay-advance-policy-facts fpw-fact logical-fact record timeline selection)
+               (values resource fpw logical)))))
+    (declare (dynamic-extent #'advance))
+    (call-with-physical-replay-boundary-history history #'advance)))
 
 (defun physical-recovery-resource-history (store state)
   (let ((selection (and store (physical-store-selection store))))

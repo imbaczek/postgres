@@ -443,27 +443,44 @@ sorting and adjacent equality. The remaining key order controls sort priority."
                         input)))
     (finish-select-plan-tree input prepared physical-p)))
 
-(defun query-plan-relation-node-p (node)
-  "Relation handles occupy slot two; rebasing must cover every such IR node."
-  (and (consp node)
-       (member (first node) '(:scan :seq-scan :index-scan :subquery-scan :cte-scan :worktable-scan))))
+(defun query-plan-node-shape (node)
+  "Return NODE's child layout and whether slot two is a relation handle."
+  (when (consp node)
+    (case (first node)
+      ((:scan :seq-scan :index-scan :cte-scan :worktable-scan)
+       (values :leaf t))
+      (:subquery-scan (values :fourth t))
+      (:result :leaf)
+      ((:with-ctes :window-input :window :filter :project :sort :limit
+         :distinct :hash-distinct :sorted-distinct :project-set)
+       :third)
+      ((:top-n :aggregate :hash-aggregate :sorted-aggregate) :fourth)
+      ((:join :nested-loop-join :recursive-union) :pair)
+      (:append :append))))
 
-(defun query-plan-operator-p (node)
-  (and (consp node)
-       (or (query-plan-relation-node-p node)
-           (member (first node)
-                   '(:recursive-union :with-ctes :window-input :window :append :result :filter :join :nested-loop-join :project :aggregate
-                     :sort :top-n :limit :project-set :hash-aggregate :sorted-aggregate :distinct :hash-distinct :sorted-distinct)
-                   :test #'eq))))
+(defun query-plan-relation-node-p (node)
+  "Whether NODE carries a relation handle in slot two."
+  (nth-value 1 (query-plan-node-shape node)))
+
+(defun map-query-plan-children (function node &optional (shape (query-plan-node-shape node)))
+  "Visit immediate plan children in execution tree order.
+CTE definitions and expression subplans belong to their own plan domains."
+  (flet ((visit (child)
+           (when child (funcall function child))))
+    (case shape
+      (:third (visit (third node)))
+      (:fourth (visit (fourth node)))
+      (:pair (visit (third node)) (visit (fourth node)))
+      (:append (dolist (arm (second node)) (visit (second arm)))))))
 
 (defun collect-query-plan-nodes (tree)
-  (let ((nodes '()))
-    (labels ((visit (form)
-               (when (consp form)
-                 (when (query-plan-operator-p form)
-                   (push form nodes))
-                 (visit (car form))
-                 (visit (cdr form)))))
+  "Collect the local plan nodes in preorder, leaving metadata opaque."
+  (let ((nodes nil))
+    (labels ((visit (node)
+               (let ((shape (query-plan-node-shape node)))
+                 (when shape
+                   (push node nodes)
+                   (map-query-plan-children #'visit node shape)))))
       (visit tree))
     (nreverse nodes)))
 
@@ -2352,13 +2369,9 @@ projection or filter forms fall back to ordinary full materialization."
 (register-query-plan-backend :interpreter :executor #'interpret-query-plan)
 
 (defun physical-plan-node-children (node)
-  (case (first node)
-    (:append (mapcar #'second (second node)))
-    ((:with-ctes :window-input :window :filter :project :sort :limit :hash-distinct :sorted-distinct :project-set) (list (third node)))
-    ((:top-n :subquery-scan) (list (fourth node)))
-    ((:nested-loop-join :recursive-union) (list (third node) (fourth node)))
-    ((:hash-aggregate :sorted-aggregate) (list (fourth node)))
-    (otherwise nil)))
+  (let ((children nil))
+    (map-query-plan-children (lambda (child) (push child children)) node)
+    (nreverse children)))
 
 (defun reconcile-query-plan-access-paths (plan registered-relations)
   "Keep the physical tree and metadata in sync with registered read paths."

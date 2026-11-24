@@ -86,6 +86,14 @@ only declines the fast path and does not add a new cycle error."
   "Encode the canonical sized header for a literal or journal body."
   (string->bytes (format nil "~a ~d ~8,'0X~%" magic size crc)))
 
+(defun metadata-sized-literal-image (magic maximum value label)
+  "Frame a caller-validated bounded literal with magic, length, CRC and newline."
+  (let* ((body (string->bytes (physical-bootstrap-manifest-text value)))
+         (header (metadata-sized-literal-header magic (length body) (wal-crc32 body))))
+    (unless (<= (+ (length header) (length body) 1) maximum)
+      (error "~a exceeds its bound" label))
+    (concatenate '(vector (unsigned-byte 8)) header body #(10))))
+
 (defun metadata-sized-literal-span (bytes magic maximum maximum-body label
                                     &key maximum-header maximum-size-digits)
   "Validate a sized header and body checksum, returning body start, end and CRC.

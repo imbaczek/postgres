@@ -1602,6 +1602,16 @@
                     :source :command-line))
         (ok (intake-fails-p (lambda () (pg::startup-resource-capacity-plan settings)))))))
 
+(deftest synchronous-commit-metadata-and-normalization-share-canonical-choices
+    (let* ((name "synchronous_commit")
+           (row (pg::startup-settings-row name '(:value "on" :source :default) nil))
+           (choices (pg::sql-array-elements (aref row 6))))
+      (ok (equalp #("local" "remote_write" "remote_apply" "on" "off") choices))
+      (loop for choice across choices
+            do (ok (equal choice (pg::startup-normalize-setting name (string-upcase choice))))
+               (ok (equal choice (pg::session-normalize-synchronous-commit choice))))
+      (ok (equal "off" (pg::session-normalize-synchronous-commit "false")))))
+
 (deftest wal-settings-match-c-enum-aliases-defaults-and-context
     (call-with-startup-settings-reader-test
      (lambda ()

@@ -122,8 +122,11 @@
        (declare (ignore root))
        (let* ((state (copy-tree pg::*physical-recovery-state*))
               (fact (copy-tree (getf state :source-resource-fact)))
-              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
-                          (getf state :source-reservation) (getf state :source-xids) fact)))
+              (seed (pg::make-physical-replay-seed :start 192 :timeline 1 :next-xid pg::*next-xid*
+                                                   :checkpoint (getf state :source-checkpoint)
+                                                   :reservation (getf state :source-reservation)
+                                                   :source-xids (getf state :source-xids)
+                                                   :resource-fact fact)))
          (flet ((scan (witness)
                   (pg::physical-follow-scan-replay-from-seed
                    store state '(192 1) '(192 1) pg::*next-xid* seed
@@ -141,8 +144,11 @@
               (fact (copy-tree (getf state :source-resource-fact)))
               (required (list :resource-parameters (list 50 8 10 0 128)
                               :resource-lsn 288 :resource-timeline 1))
-              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
-                          (getf state :source-reservation) (getf state :source-xids) fact))
+              (seed (pg::make-physical-replay-seed :start 192 :timeline 1 :next-xid pg::*next-xid*
+                                                   :checkpoint (getf state :source-checkpoint)
+                                                   :reservation (getf state :source-reservation)
+                                                   :source-xids (getf state :source-xids)
+                                                   :resource-fact fact))
               (before (lineage-test-bytes (pg::physical-recovery-control-path root))))
          (append-resource-test-parameter store 50)
          (setf (getf state :required-resource-fact) required)
@@ -169,8 +175,11 @@
        (declare (ignore root))
        (let* ((state (copy-tree pg::*physical-recovery-state*))
               (fact (copy-tree (getf state :source-resource-fact)))
-              (seed (list 192 1 pg::*next-xid* (getf state :source-checkpoint)
-                          (getf state :source-reservation) (getf state :source-xids) fact)))
+              (seed (pg::make-physical-replay-seed :start 192 :timeline 1 :next-xid pg::*next-xid*
+                                                   :checkpoint (getf state :source-checkpoint)
+                                                   :reservation (getf state :source-reservation)
+                                                   :source-xids (getf state :source-xids)
+                                                   :resource-fact fact)))
          (append-resource-test-parameter store 50)
          (let ((result (pg::physical-follow-scan-replay-from-seed
                         store state '(192 1) '(192 1) pg::*next-xid* seed

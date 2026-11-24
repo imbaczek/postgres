@@ -27,7 +27,7 @@
 (defun logical-slot-copy-base-proof-image (value)
   (unless (logical-slot-copy-base-proof-valid-p value)
     (error "invalid logical copy base verification proof"))
-  (logical-slot-copy-literal-image
+  (metadata-sized-literal-image
    "PGLOGICALBASE1" +logical-slot-copy-base-proof-maximum-bytes+ value
    "logical copy base verification proof"))
 

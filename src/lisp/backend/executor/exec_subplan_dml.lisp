@@ -373,7 +373,8 @@
                   (analyze-subquery-assignment (list :const value :type :int8 :typmod -1) column) #()))))))
 
 (defun subquery-update-values (table sets old &optional (environment old))
-  ;; All assignments read the same old row, including volatile expressions.
+  "Evaluate typed assignments against one old row, preserving compatible datum origins.
+Assignment evaluation already coerces to the destination typmod and checks origin bytes."
   (let* ((columns (pg-class-columns table))
          (new (copy-seq old))
          (compressed (make-array (length columns) :initial-element nil))
@@ -386,13 +387,9 @@
             (if (eq expression :default)
                 (values (coerce-dml-column-default column) nil nil)
                 (eval-dml-assignment-with-origin expression environment column))
-          (let* ((coerced (coerce-value value (pg-column-type column) (pg-column-typmod column)))
-                 (unchanged (and (or origin descriptor)
-                                 (equalp (aref (nth-value 2 (heap-tuple-layout (vector value) (vector column))) 0)
-                                         (aref (nth-value 2 (heap-tuple-layout (vector coerced) (vector column))) 0)))))
-            (setf (aref new i) coerced
-                  (aref compressed i) (and unchanged origin)
-                  (aref descriptors i) (and unchanged descriptor))))))
+          (setf (aref new i) value
+                (aref compressed i) origin
+                (aref descriptors i) descriptor))))
     (check-not-null new columns)
     (check-table-constraints table new)
     (values new compressed descriptors)))

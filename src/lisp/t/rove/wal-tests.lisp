@@ -2162,11 +2162,11 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                                                 (wal-encode-relation-reset 7311 :main)))
                      (rove:ok (= 2 (smgr-nblocks 7311)) "an unterminated reset changes no storage")
                      (rove:ok (handler-case
-                                  (progn (wal-recovery-validate-logical-terminal :other) nil)
+                                  (progn (wal-check-batch-logical-terminal :other nil *wal-recovery-relation-resets* nil nil) nil)
                                 (error () t))
                               "a reset cannot attach to a maintenance or catalog terminal")
                      (rove:ok (handler-case
-                                  (progn (wal-recovery-validate-logical-terminal :commit 45) nil)
+                                  (progn (wal-check-batch-logical-terminal :commit 45 *wal-recovery-relation-resets* nil nil) nil)
                                 (error () t))
                               "a reset belongs to its exact committing transaction")
                      ;; A new batch discards a reset left by a crashed transaction.

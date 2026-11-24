@@ -76,10 +76,10 @@
                                                 :initial-element 10)))
                (complete (apply #'concatenate '(vector (unsigned-byte 8)) base
                                 (loop for step from 1 to last-step
-                                      collect (pg::physical-adoption-install-step-image crc step))))
+                                      collect (pg::physical-install-step-image crc step))))
                (partial (concatenate '(vector (unsigned-byte 8)) base
-                                     (pg::physical-adoption-install-step-image crc 1)
-                                     (subseq (pg::physical-adoption-install-step-image crc 2) 0 3))))
+                                     (pg::physical-install-step-image crc 1)
+                                     (subseq (pg::physical-install-step-image crc 2) 0 3))))
           (dolist (image (list base complete partial))
             (dolist (shape '(:simple :adjustable :fill-pointer :displaced))
               (let ((bytes (metadata-codec-test-storage image shape)))

@@ -84,8 +84,10 @@
                 (result
                   (pg::physical-follow-scan-replay-from-seed-core
                    store (progn (remf base :required-resource-fact) base) (list end 1) (list end 1) next
-                   (list start 1 next snapshot nil nil
-                         (pg::wal-copy-control-resource-fields snapshot) nil seed)
+                   (pg::make-physical-replay-seed :start start :timeline 1 :next-xid next
+                                                  :checkpoint snapshot
+                                                  :resource-fact (pg::wal-copy-control-resource-fields snapshot)
+                                                  :logical-fact seed)
                    (lambda (function position)
                      (pg::physical-store-map-durable-records store function :start-lsn position))
                    nil))
@@ -120,8 +122,10 @@
            (multiple-value-bind (result completed)
                (pg::physical-follow-scan-replay-from-seed-core
                 store base (list start 1) (list start 1) next
-                (list start 1 next snapshot nil nil
-                      (pg::wal-copy-control-resource-fields snapshot) nil seed)
+                (pg::make-physical-replay-seed :start start :timeline 1 :next-xid next
+                                               :checkpoint snapshot
+                                               :resource-fact (pg::wal-copy-control-resource-fields snapshot)
+                                               :logical-fact seed)
                 (lambda (visit from)
                   (pg::physical-store-map-durable-records store visit :start-lsn from))
                 (eq mode :open))
@@ -269,8 +273,11 @@
                                                       (start (getf snapshot :end)) (end pg::*last-replay-lsn*)
                                                       (logical (pg::physical-logical-fact-from-checkpoint snapshot))
                                                       (reservation (copy-tree (getf state :source-reservation)))
-                                                      (seed (list start 1 (getf snapshot :next-xid) snapshot reservation nil
-                                                                  (pg::wal-copy-control-resource-fields snapshot) nil logical)))
+                                                      (seed (pg::make-physical-replay-seed :start start :timeline 1 :next-xid (getf snapshot :next-xid)
+                                                                                           :checkpoint snapshot
+                                                                                           :reservation reservation
+                                                                                           :resource-fact (pg::wal-copy-control-resource-fields snapshot)
+                                                                                           :logical-fact logical)))
            (setf (getf reservation :through) start)
            (labels ((scan (input base &optional witness (required end))
                       (let ((candidate (pg::physical-follow-copy-replay-candidate store)))
@@ -285,8 +292,9 @@
                (incf (getf (sixth witness) :coverage-start))
                (ok (pg::physical-logical-fact-at-p (sixth witness) end 1))
                (ok (intake-fails-p (lambda () (scan seed state witness)))))
-             (let ((bad (copy-tree seed)))
-               (setf (getf (ninth bad) :through) (1- start))
+             (let ((bad (pg::copy-physical-replay-seed seed)))
+               (setf (pg::physical-replay-seed-logical-fact bad) (copy-tree logical)
+                     (getf (pg::physical-replay-seed-logical-fact bad) :through) (1- start))
                (ok (intake-fails-p (lambda () (scan bad state)))))
              (let ((base (copy-tree state)))
                (setf (getf base :required-logical-fact) (copy-tree logical)
@@ -342,8 +350,10 @@
            (labels ((scan (fact)
                       (pg::physical-follow-scan-replay-from-seed-core
                        store base (list start 1) (list start 1) next
-                       (list start 1 next snapshot nil nil
-                             (pg::wal-copy-control-resource-fields snapshot) nil fact)
+                       (pg::make-physical-replay-seed :start start :timeline 1 :next-xid next
+                                                      :checkpoint snapshot
+                                                      :resource-fact (pg::wal-copy-control-resource-fields snapshot)
+                                                      :logical-fact fact)
                        (lambda (visit from)
                          (pg::physical-store-map-durable-records store visit :start-lsn from))
                        nil)))
@@ -363,9 +373,11 @@
                 (end pg::*last-replay-lsn*) (start (getf snapshot :end))
                 (unknown (copy-tree base))
                 (reservation (copy-list (getf base :source-reservation)))
-                (seed (list start 1 pg::*next-xid* snapshot reservation nil
-                            (pg::wal-copy-control-resource-fields snapshot)
-                            nil (pg::physical-logical-fact-from-checkpoint snapshot)))
+                (seed (pg::make-physical-replay-seed :start start :timeline 1 :next-xid pg::*next-xid*
+                                                     :checkpoint snapshot
+                                                     :reservation reservation
+                                                     :resource-fact (pg::wal-copy-control-resource-fields snapshot)
+                                                     :logical-fact (pg::physical-logical-fact-from-checkpoint snapshot)))
                 (binding (list :required (list end 1) :recovery (list :phase 2))))
            (remf unknown :source-logical-fact)
            (remf unknown :required-logical-fact)
@@ -409,13 +421,12 @@
                  (pg::physical-recovery-write-control state 2 required pg::*next-xid*)
                  pg::*last-replay-lsn* required)
            (let* ((candidate (pg::physical-follow-copy-replay-candidate store))
-                  (seed (multiple-value-list
-                         (pg::physical-follow-replay-seed
-                          candidate pg::*physical-recovery-state* (list end 1)
-                          (multiple-value-bind (metadata catalog prefix digest)
-                              (pg::physical-restartpoint-read pg::*physical-recovery-state*)
-                            (declare (ignore catalog prefix))
-                            (list (getf metadata :lsn) digest)))))
+                  (seed (pg::physical-follow-replay-seed
+                         candidate pg::*physical-recovery-state* (list end 1)
+                         (multiple-value-bind (metadata catalog prefix digest)
+                             (pg::physical-restartpoint-read pg::*physical-recovery-state*)
+                           (declare (ignore catalog prefix))
+                           (list (getf metadata :lsn) digest))))
                   (before (pg::recovery-read-bytes (pg::physical-recovery-control-path root)))
                   (result (pg::physical-follow-scan-replay-from-seed-core
                            candidate pg::*physical-recovery-state* (list end 1) (list required 1)

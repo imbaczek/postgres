@@ -29,7 +29,7 @@
            (expected (pg::string->bytes (format nil "~a 13 DCC50ACA~%(:LABEL \"é\")~%" magic)))
            (bound (length expected)))
       (flet ((encode (literal)
-               (pg::logical-slot-copy-literal-image magic bound literal "test literal")))
+               (pg::metadata-sized-literal-image magic bound literal "test literal")))
         (ok (equalp expected (encode value)))
         (ok (equal value (pg::logical-slot-copy-literal-decode expected magic bound #'encode "test literal"))))))
 

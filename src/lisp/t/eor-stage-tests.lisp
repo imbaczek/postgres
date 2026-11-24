@@ -23,10 +23,25 @@
       (:readiness (pg::physical-promotion-awaiting-child-initialization-p))
       (:follow
        (pg::physical-follow-scan-replay-from-seed-core
-        store state (list end 3) '(32 1) 50 '(32 1 50 nil nil nil nil nil)
+        store state (list end 3) '(32 1) 50 (pg::make-physical-replay-seed :start 32 :timeline 1 :next-xid 50)
         (lambda (function start)
           (pg::physical-recovery-map-permitted-records store function :start-lsn start))
         nil)))))
+
+(rove:deftest replay-history-is-resolved-lazily-at-each-boundary
+    (let ((reads 0) (selected nil))
+      (flet ((history () (incf reads) selected))
+        (ok (eq :unchecked
+                (pg::call-with-physical-replay-boundary-history
+                 #'history (lambda (resolve) (declare (ignore resolve)) :unchecked))))
+        (ok (zerop reads))
+        (dolist (boundary '((nil 1) (:child 2)))
+          (setf selected (first boundary))
+          (pg::call-with-physical-replay-boundary-history
+           #'history (lambda (resolve)
+                       (ok (eq selected (funcall resolve)))
+                       (ok (eq selected (funcall resolve)))))
+          (ok (= reads (second boundary)))))))
 
 (rove:deftest successive-eor-replay-requires-a-child-checkpoint-before-publication
     (let ((pg::*physical-replay-restarting-p* t))

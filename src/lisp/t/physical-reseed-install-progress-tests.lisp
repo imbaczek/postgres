@@ -298,7 +298,7 @@
        :pid nil :opaque opaque :before-count 0 :after-count 0)))
 
 (deftest reseed-install-advance-recovers-every-partial-step-byte
-    (let ((step-length (length (pg::physical-reseed-install-step-image 0 1))))
+    (let ((step-length (length (pg::physical-install-step-image 0 1))))
       (loop for cut from 1 to step-length
             do (call-with-reseed-namespace-fixture
                 (lambda (root stage incoming quarantine plan)

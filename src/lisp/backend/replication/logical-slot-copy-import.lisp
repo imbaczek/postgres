@@ -132,7 +132,7 @@ require D <= F < H. Active controls cannot contain deferred rows."
 (defun logical-slot-copy-import-image (value)
   "Validate and frame a canonical bounded import control image."
   (logical-slot-copy-import-check value)
-  (logical-slot-copy-literal-image
+  (metadata-sized-literal-image
    "PGLOGICALIMPORT1" +logical-slot-copy-import-maximum-bytes+ value
    "logical import control"))
 
@@ -193,8 +193,8 @@ require D <= F < H. Active controls cannot contain deferred rows."
             (error "duplicate or unordered standby logical promotion slot"))
           (setf (gethash generation generations) t
                 previous (first row))))))
-  (logical-slot-copy-literal-image "PGSTANDBYSLOTFORK" +logical-slot-copy-import-maximum-bytes+
-                                   value "standby logical promotion evidence"))
+  (metadata-sized-literal-image "PGSTANDBYSLOTFORK" +logical-slot-copy-import-maximum-bytes+
+                                value "standby logical promotion evidence"))
 
 (defun logical-slot-promotion-evidence-decode (bytes)
   "Decode a bounded canonical handoff image without granting slot authority."

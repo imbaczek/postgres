@@ -118,7 +118,7 @@
                        :cluster-identity "seed-context" :next-xid 42 :observed-next-xid 42))
            (model (pg::physical-follow-empty-base-model base))
            (required '(152 9))
-           (seed (list 152 1 42 nil nil nil nil))
+           (seed (pg::make-physical-replay-seed :start 152 :timeline 1 :next-xid 42))
            (pg::*physical-recovery-state* (list :sentinel t))
            (pg::*physical-receive-store* :sentinel)
            (original (symbol-function 'pg::physical-recovery-check-store-point))

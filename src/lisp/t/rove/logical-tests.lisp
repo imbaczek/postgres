@@ -6706,17 +6706,13 @@
                "row changes cannot become visible at a catalog terminal")
       (rove:ok (handler-case
                    (progn
-                     (let ((*wal-recovery-logical-catalog-event-p* t)
-                           (*wal-recovery-logical-chunk-count* nil))
-                       (wal-recovery-validate-logical-terminal :commit 9))
+                     (wal-check-batch-logical-terminal :commit 9 nil t nil)
                      nil)
                  (error () t))
                "WAL recovery rejects a catalog event followed by a row commit")
       (rove:ok (handler-case
                    (progn
-                     (let ((*wal-recovery-logical-catalog-event-p* nil)
-                           (*wal-recovery-logical-chunk-count* 1))
-                       (wal-recovery-validate-logical-terminal :catalog))
+                     (wal-check-batch-logical-terminal :catalog 0 nil nil 1)
                      nil)
                  (error () t))
                "WAL recovery rejects row changes followed by a catalog terminal")))

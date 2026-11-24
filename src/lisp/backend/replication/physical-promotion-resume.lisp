@@ -93,7 +93,7 @@ absence."
                      (= insertion checkpoint-timeline (getf manifest :timeline))
                      (eq namespace (getf control :promotion-source-namespace))
                      (= (physical-manifest-checkpoint-start manifest)
-                        (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
+                        (wal-checkpoint-record-start checkpoint snapshot)))
           (error "pending promotion base WAL control changed"))
         (physical-promotion-reconstruct-pending-state manifest control snapshot namespace)))))
 

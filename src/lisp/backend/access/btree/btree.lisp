@@ -502,24 +502,6 @@ below the previous minimum, so examine every entry."
                   (setf first index last index)))))
     (values first last)))
 
-(defun btree-collect-equal (relfilenode level block key acc)
-  "Push all TIDs whose key equals KEY in the subtree at BLOCK onto ACC."
-  (let ((page (buf-read relfilenode block)))
-    (unless page
-      (ereport "XX000" "index page ~a is missing" block))
-    (if (zerop level)
-        (dolist (entry (btree-page-entries page nil) acc)
-          (when (key= (first entry) key)
-            (push (cons (second entry) (third entry)) acc)))
-        (let ((entries (btree-page-entries page t)))
-          (when entries
-            (multiple-value-bind (first last) (btree-equal-child-range entries key)
-              (loop for entry in (nthcdr first entries)
-                    for index from first to last
-                    do (setf acc (btree-collect-equal
-                                  relfilenode (1- level) (cdr entry) key acc)))))
-          acc))))
-
 (defun btree-map-prefix-entries-unlocked (relfilenode prefix function)
   "Visit matching leaf entries in index order under the caller's relation lease."
   (multiple-value-bind (level root) (btree-read-meta relfilenode)
@@ -558,9 +540,10 @@ below the previous minimum, so examine every entry."
     (nreverse matches)))
 
 (defun btree-search-unlocked (relfilenode key)
-  "Return a list of (block . off) heap TIDs for entries whose key equals KEY."
-  (multiple-value-bind (level root) (btree-read-meta relfilenode)
-    (nreverse (btree-collect-equal relfilenode level root key '()))))
+  "Return matching heap TIDs in index order under the caller's relation lease."
+  (let ((cursor (open-btree-equal-cursor-unlocked relfilenode key)))
+    (loop for tid = (btree-cursor-next-tid cursor)
+          while tid collect tid)))
 
 (defun btree-search (relfilenode key)
   "Search one index while excluding its own concurrent page rewrites."
@@ -580,41 +563,39 @@ below the previous minimum, so examine every entry."
     (if (zerop level)
         (let ((entries (btree-page-entries page nil)))
           (push (make-btree-equal-cursor-frame
-                 :level 0 :entries entries :next 0 :end (1- (length entries)))
+                 :level 0 :entries (coerce entries 'simple-vector) :next 0 :end (1- (length entries)))
                 (btree-equal-cursor-stack cursor)))
         (let ((entries (btree-page-entries page t)))
           (unless (null entries)
             (multiple-value-bind (first last)
                 (btree-equal-child-range entries (btree-equal-cursor-key cursor))
               (push (make-btree-equal-cursor-frame
-                     :level level :entries entries :next first :end last)
+                     :level level :entries (coerce entries 'simple-vector) :next first :end last)
                     (btree-equal-cursor-stack cursor))))))))
 
 (defun btree-cursor-next-tid (cursor)
   (loop while (btree-equal-cursor-stack cursor)
         for frame = (first (btree-equal-cursor-stack cursor))
         for next = (btree-equal-cursor-frame-next frame)
-        do (if (> next (btree-equal-cursor-frame-end frame))
-               (pop (btree-equal-cursor-stack cursor))
-               (if (zerop (btree-equal-cursor-frame-level frame))
-                   (let* ((entry (nth next
-                                      (btree-equal-cursor-frame-entries frame)))
-                          (key-order
-                            (key-compare (first entry)
-                                         (btree-equal-cursor-key cursor)))
-                          (tid (cons (second entry) (third entry))))
-                     (incf (btree-equal-cursor-frame-next frame))
-                     (cond
-                       ((minusp key-order))
-                       ((plusp key-order)
-                        (pop (btree-equal-cursor-stack cursor)))
-                       (t (return tid))))
-                   (let* ((entries (btree-equal-cursor-frame-entries frame))
-                          (index next)
-                          (child (cdr (nth index entries)))
-                          (child-level (1- (btree-equal-cursor-frame-level frame))))
-                     (incf (btree-equal-cursor-frame-next frame))
-                     (btree-cursor-push-node cursor child-level child))))))
+        for level = (btree-equal-cursor-frame-level frame)
+        do (cond
+             ((> next (btree-equal-cursor-frame-end frame))
+              (pop (btree-equal-cursor-stack cursor)))
+             (t
+              (let ((entry (elt (btree-equal-cursor-frame-entries frame) next)))
+                (incf (btree-equal-cursor-frame-next frame))
+                (if (zerop level)
+                    (let ((order (key-compare (first entry) (btree-equal-cursor-key cursor))))
+                      (cond ((zerop order) (return (cons (second entry) (third entry))))
+                            ((plusp order) (pop (btree-equal-cursor-stack cursor)))))
+                    (btree-cursor-push-node cursor (1- level) (cdr entry))))))))
+
+(defun open-btree-equal-cursor-unlocked (relfilenode key)
+  "Start an equality scan under the caller's relation read or write lease."
+  (multiple-value-bind (level root) (btree-read-meta relfilenode)
+    (let ((cursor (make-btree-equal-cursor :relfilenode relfilenode :key key)))
+      (btree-cursor-push-node cursor level root)
+      cursor)))
 
 (defun clone-btree-equal-cursor (cursor)
   "Copy the cursor's mutable frames while sharing their immutable decoded entries."
@@ -628,10 +609,7 @@ below the previous minimum, so examine every entry."
   (call-with-btree-relation-read-lease
    relfilenode
    (lambda (lease)
-     (multiple-value-bind (level root) (btree-read-meta relfilenode)
-       (let ((cursor (make-btree-equal-cursor :relfilenode relfilenode :key key)))
-         (btree-cursor-push-node cursor level root)
-         (funcall function cursor lease))))))
+     (funcall function (open-btree-equal-cursor-unlocked relfilenode key) lease))))
 
 (defun btree-scan-equal (relfilenode key callback)
   "Stream matching TIDs to CALLBACK until it returns :STOP.

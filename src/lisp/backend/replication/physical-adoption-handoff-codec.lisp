@@ -74,30 +74,16 @@
               :workspace workspace :spool spool :spool-entries entries :intent-file intent)))))
 
 (defun physical-adoption-handoff-image (value)
-  (let* ((body (string->bytes (physical-bootstrap-manifest-text (physical-adoption-handoff-copy value))))
-         (header (string->bytes (format nil "PGADOPTIONHANDOFF1 ~d ~8,'0X~%" (length body) (wal-crc32 body)))))
-    (unless (<= (+ (length header) (length body) 1) +physical-adoption-handoff-maximum-bytes+)
-      (error "adoption handoff intent exceeds its bound"))
-    (concatenate '(vector (unsigned-byte 8)) header body #(10))))
+  (metadata-sized-literal-image "PGADOPTIONHANDOFF1" +physical-adoption-handoff-maximum-bytes+
+                                (physical-adoption-handoff-copy value) "adoption handoff intent"))
 
 (defun physical-adoption-handoff-decode (bytes)
-  (unless (and (typep bytes '(vector (unsigned-byte 8)))
-               (<= (length bytes) +physical-adoption-handoff-maximum-bytes+))
-    (error "invalid or oversized adoption handoff intent"))
-  (let* ((newline (position 10 bytes))
-         (parts (and newline (uiop:split-string (bytes->string (subseq bytes 0 newline)) :separator " "))))
-    (unless (and (= 3 (length parts)) (equal "PGADOPTIONHANDOFF1" (first parts))
-                 (plusp (length (second parts))) (every #'digit-char-p (second parts))
-                 (= 8 (length (third parts))))
-      (error "invalid adoption handoff header"))
-    (let* ((size (parse-integer (second parts)))
-           (crc (parse-integer (third parts) :radix 16))
-           (start (1+ newline))
-           (end (+ start size)))
-      (unless (and (plusp size) (= (1+ end) (length bytes)) (= 10 (aref bytes end))
-                   (= crc (wal-crc32 (subseq bytes start end)))
-                   (equal (bytes->string (subseq bytes 0 start))
-                          (format nil "PGADOPTIONHANDOFF1 ~d ~8,'0X~%" size crc)))
-        (error "adoption handoff header or checksum mismatch"))
-      (physical-adoption-handoff-copy
-       (recovery-parse-manifest-text (bytes->string (subseq bytes start end)))))))
+  (multiple-value-bind (start end)
+      (metadata-sized-literal-span bytes "PGADOPTIONHANDOFF1"
+                                   +physical-adoption-handoff-maximum-bytes+
+                                   +physical-adoption-handoff-maximum-bytes+
+                                   "adoption handoff intent" :maximum-header 64)
+    (unless (= (1+ end) (length bytes))
+      (error "unexpected data after adoption handoff intent"))
+    (physical-adoption-handoff-copy
+     (recovery-parse-manifest-text (bytes->string bytes :start start :end end)))))

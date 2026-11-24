@@ -39,7 +39,7 @@
       (dolist (suffix (list (adoption-retire-expected-marker (logxor 1 crc))
                             (concatenate '(vector (unsigned-byte 8)) marker marker)
                             (concatenate '(vector (unsigned-byte 8)) marker
-                                         (pg::physical-adoption-install-step-image crc (1+ last)))
+                                         (pg::physical-install-step-image crc (1+ last)))
                             (concatenate '(vector (unsigned-byte 8)) marker (pg::string->bytes "x"))))
         (ok (intake-fails-p
              (lambda ()

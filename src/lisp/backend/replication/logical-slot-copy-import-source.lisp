@@ -81,10 +81,13 @@ Capture the receive control and independent state image for later rechecking."
          (fork (getf control :applied))
          (parent (getf control :applied-timeline (getf control :timeline)))
          (base (logical-slot-copy-import-base-state manifest descriptor control))
-         (seed (list (getf base :end) (getf base :timeline) (getf base :next-xid)
-                     (getf base :source-checkpoint) (getf base :source-reservation) nil
-                     (getf base :base-source-resource-fact)
-                     (getf base :base-source-fpw-fact) (getf base :base-source-logical-fact))))
+         (seed (make-physical-replay-seed
+                :start (getf base :end) :timeline (getf base :timeline)
+                :next-xid (getf base :next-xid) :checkpoint (getf base :source-checkpoint)
+                :reservation (getf base :source-reservation)
+                :resource-fact (getf base :base-source-resource-fact)
+                :fpw-fact (getf base :base-source-fpw-fact)
+                :logical-fact (getf base :base-source-logical-fact))))
     (physical-slot-check-standby-receive store state fork)
     (let* ((result (physical-follow-scan-replay-from-seed
                     candidate base (list fork parent) (list fork parent)

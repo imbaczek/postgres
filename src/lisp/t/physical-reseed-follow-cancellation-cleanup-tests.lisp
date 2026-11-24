@@ -525,84 +525,15 @@
               (ok (not (probe-file (merge-pathnames "physical-reseed.follow.tmp" root)))))))))))
 
 (deftest reseed-source-closed-fences-retained-journal-close-failures
-    (dolist (fault '(:error :throw :interrupt :catalog-write))
-      (let ((completed nil))
-        (handler-case
-            (call-with-reseed-cancellation-test-fixture
-             (lambda (owner root record)
-               (setf record (pg::physical-reseed-follow-begin-cancellation owner))
-               (let ((directory-scope (symbol-function 'pg::call-with-physical-directory-root))
-                     (close-stream (symbol-function 'cl:close))
-                     (depth 0) (closed-root nil) (injected 0)
-                     (pending (pg::physical-reseed-follow-cancellation-source-closed-record
-                               record (reseed-cancellation-source-parent record :closed :aborted t))))
-                 (unwind-protect
-                      (progn
-                        (setf (symbol-function 'pg::call-with-physical-directory-root)
-                              (lambda (actual-owner function)
-                                (incf depth)
-                                (unwind-protect
-                                     (multiple-value-prog1
-                                         (funcall directory-scope actual-owner function)
-                                       (when (and (= depth 1) (eq owner actual-owner)
-                                                  (equalp (pg::physical-reseed-follow-image pending)
-                                                          (lineage-test-bytes
-                                                           (merge-pathnames "physical-reseed.follow" root))))
-                                         (setf closed-root t)))
-                                  (decf depth))))
-                        (sb-ext:without-package-locks
-                          (setf (symbol-function 'cl:close)
-                                (lambda (stream &rest arguments)
-                                  (let ((selected
-                                          (and closed-root (zerop injected)
-                                               (typep stream 'sb-sys:fd-stream)
-                                               (= (sb-posix:stat-ino
-                                                   (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
-                                                  (sb-posix:stat-ino
-                                                   (sb-posix:lstat
-                                                    (merge-pathnames "physical-reseed.follow" root)))))))
-                                    (prog1 (apply close-stream stream arguments)
-                                      (when selected
-                                        (incf injected)
-                                        (ecase fault
-                                          (:error (error "retained cancellation close failure"))
-                                          (:throw (throw 'retained-close-cut :interrupted))
-                                          (:interrupt
-                                           (sb-thread:interrupt-thread
-                                            sb-thread:*current-thread*
-                                            (lambda () (throw 'retained-close-cut :interrupted))))
-                                          (:catalog-write
-                                           (with-open-file
-                                               (out (merge-pathnames "global/pg_catalog.dat" root)
-                                                    :direction :io :if-exists :overwrite
-                                                    :element-type '(unsigned-byte 8))
-                                             (let ((byte (read-byte out)))
-                                               (file-position out 0)
-                                               (write-byte byte out)
-                                               (finish-output out)))))))))))
-                        (ok (eq :interrupted
-                                (catch 'retained-close-cut
-                                  (handler-case
-                                      (pg::physical-reseed-follow-record-cancellation-source-closed
-                                       owner (getf (getf pending :cancellation) :receipt))
-                                    (error (condition)
-                                      (if (or (equal "retained cancellation close failure" (princ-to-string condition))
-                                              (equal "cancellation image changed during resource cleanup"
-                                                     (princ-to-string condition)))
-                                          :interrupted
-                                          (error condition)))))))
-                        (ok (= 1 injected))
-                        (ok (pg::physical-reseed-follow-owner-uncertain-p owner))
-                        (ok (not (pg::physical-reseed-follow-owner-busy-p owner)))
-                        (setf completed t))
-                   (setf (symbol-function 'pg::call-with-physical-directory-root) directory-scope)
-                   (sb-ext:without-package-locks
-                     (setf (symbol-function 'cl:close) close-stream))))))
-          (error (condition)
-            (unless (and completed (eq fault :catalog-write)) (error condition))
-            (ok (equal "reseed new image metadata differs from its move prefix"
-                       (princ-to-string condition)))))
-        (ok completed))))
+    (check-reseed-retained-journal-close-failures
+     (lambda (owner record)
+       (declare (ignore record))
+       (let ((begun (pg::physical-reseed-follow-begin-cancellation owner)))
+         (pg::physical-reseed-follow-cancellation-source-closed-record
+          begun (reseed-cancellation-source-parent begun :closed :aborted t))))
+     (lambda (owner pending)
+       (pg::physical-reseed-follow-record-cancellation-source-closed
+        owner (getf (getf pending :cancellation) :receipt)))))
 
 (deftest reseed-source-closed-authority-detects-mutation-of-frozen-token-data
     (dolist (field '(:candidate :previous :bytes))

@@ -17,7 +17,7 @@
                (typep (getf value :next-oid) '(unsigned-byte 64))
                (typep (getf value :local-floor) '(integer 3 18446744073709551616)))
     (error "invalid permanent source restartpoint receipt"))
-  (logical-slot-copy-literal-image
+  (metadata-sized-literal-image
    "PGLOGICALSOURCER1" +logical-slot-copy-source-receipt-maximum-bytes+
    value "permanent source restartpoint receipt"))
 

@@ -22,6 +22,138 @@ prefixes, then receive-control snapshots. The query and WAL tracks can proceed
 in parallel wherever their inputs are stable. Keep format cutovers, replay-order
 changes and package reorganizations in separate PRs.
 
+### Refactoring completion review
+
+The completion review
+assessed `cc4f56c106a`. It found 23 of 38 audit items complete, four with
+the core work complete and a follow-up open, and eleven partially complete.
+The review inspected source, callers, producers, and recorded acceptance
+evidence. It did not rerun the SBCL suites. The
+[audit crosswalk](#refactoring-audit-crosswalk) records the implementation
+and test evidence behind the milestones.
+
+| Audit | Complete at the reviewed revision | Core work complete, follow-up open | Partially complete |
+|---|---|---|---|
+| Refactoring | A1, A3, A7, A10, A12, A13, A18 | A2, A4, A15 | A5, A6, A8, A9, A11, A14, A16, A17, A19, A20 |
+| Compatibility | B1, B2, B4–B17 | B18 | B3 |
+
+Refresh each finding against the current checkout before starting its
+implementation or recording it as complete.
+
+- **B3. Checkpoint positions.** Require a matching snapshot for a nonzero
+  checkpoint end, use its recorded start throughout recovery and control
+  projection, and remove header-size inference. Cover the zero-checkpoint
+  case, missing or mismatched snapshots, and restart and promotion with
+  valid recorded start and end positions.
+  PGWAL6 encoding and decoding now require a matching copy at nonzero
+  checkpoint ends. The recovery, promotion, reseed, scan, and control
+  projection paths use the recorded start. The focused Rove test,
+  combined unit suite, and live checkpoint snapshot regression passed.
+  The promotion-intent process test also passed all six crash boundaries
+  with the checkpoint copy required. The live promotion-resume regression
+  passed its restart and malformed-input cases with the same requirement.
+  The standby timeline and pending promotion startup guard tests also
+  passed with fixtures using valid PGWAL6 checkpoint positions and copies.
+- **A8 and A9. Types and traversal.** Move runtime casts and text conversion
+  to the type subsystem and reconcile UPDATE's extra coercion with typed
+  assignment. Give physical plans one operator and child schema, then use
+  it for collection so that expression data stays opaque.
+  A8 now loads typed casts, input parsing, and text output before the analyzer.
+  UPDATE consumes the typed result and its compatible datum origins directly.
+  Combined units, live TOAST DML, and 108 C DML comparisons passed, along with
+  the controlled concurrent DML cases.
+  A9 now uses one schema for logical and physical child enumeration,
+  local collection, and relation-handle recognition. The combined unit
+  suite passed, including a Rove regression for preorder, recursive arms,
+  repeated edges, and rebasing with plan-shaped metadata left opaque.
+  The clean C comparison passed all 112 subquery cases plus the indexed
+  self-read, concurrent DDL, and spill checks. The known semijoin EPQ
+  difference reproduced.
+- **A2, A4, and A15. WAL and replay ownership.** Separate grammar transitions
+  from spool effects, give replay callers a shared observation and completion
+  boundary with supplied history, and move recovery and FIFO state alongside
+  their transitions with an explicit dirty-page handoff.
+  A2's record and terminal checks now take their ordering facts as inputs.
+  Recovery owns page and catalog spool acquisition, reassembly, and cleanup.
+  A4 shares ordinary child-initialization and XID observation across proof,
+  follow, promotion, and redo. Completed fact checks resolve the selected
+  history lazily at each boundary. Eight focused physical tests passed,
+  and live follow passed with the pinned Patroni peer.
+  A15 keeps FIFO links, owners, and settlement in the publication module.
+  WAL core owns the dirty-map swap, which publication invokes after the
+  CLOG handoff check. The combined suite passed the publication barriers,
+  including retaining the unfinished queue on failure.
+  The live WAL crash suite passed on the polished tree, including an
+  incomplete catalog tail and recovery of the next complete batch.
+- **A5 and A6. Metadata codecs.** Use the common sized envelope for adoption
+  handoff and share the allocating STEP-image adapter between adoption and
+  reseed. Verify exact persisted bytes and incomplete-tail handling.
+  The adoption handoff and logical slot metadata use the shared sized-envelope
+  writer. The handoff parser shares the framing and CRC checks and keeps its
+  exact-length rule.
+  Three focused physical Rove tests passed for the frozen spool fixture,
+  invalid identities, and malformed or corrupted envelopes. Adoption,
+  adoption follow, and reseed use one STEP writer. The combined unit suite
+  passed, including the cl-spec comparison with the independent scratch
+  encoder and the decimal and checksum boundary cases. Three focused
+  physical journal tests also passed, including recovery from every
+  partial STEP byte.
+- **A11 and A14. Traversal and replay seeds.** Share B-tree equality traversal
+  between the collector and cursor while preserving their lock ownership.
+  Replace positional replay seed values with named fields and verify the seed
+  values at the existing replay boundaries.
+  A11 now initializes the same cursor for collected and streamed equality
+  results. Six focused physical tests passed, including nested lease release,
+  writer reentrancy, clone position, and multileaf detachment.
+  The live index regression also passed its result checks and reader/DDL
+  handoff. The contention harness now pauses the actual leased cursor.
+  All five synchronized scans over 16,384 rows returned the expected
+  duplicate keys while an unrelated INSERT committed before each release.
+  A14 now carries the replay position, checkpoint, XID state, and policy
+  facts in one named seed through follow, reseed, and logical slot copy.
+  The 18-test physical selection passed, including historical witnesses,
+  required positions before a restartpoint, and FPW and logical policy
+  checks at completed boundaries.
+- **A16 and A17. Settings and fixtures.** Consolidate shared setting
+  defaults, recognition, normalization, enum choices, and value access while
+  preserving startup and session rules. Share the fault setup used by the two
+  reseed-follow cancellation tests and exercise both cases.
+  A16 uses descriptors for session defaults, recognition, integer bounds, and
+  value formatting. Canonical enum choices serve input and reporting, including
+  the C-visible `off` choice for synchronous commit. Combined units, three
+  focused configuration tests, and the live C configuration output test passed.
+  The application-name comparison also passed startup, SQL, wire reporting,
+  transaction restoration, and live reload against C.
+  Both A17 tests now use one fixture for the journal close fault. The
+  focused physical run passed both cancellation transitions with all four
+  injections, and the checkpoint review confirmed publication and journal
+  inode selection are preserved.
+- **B18. WAL inspection tools.** Bring the checkpoint and restartpoint
+  inspectors onto the current timeline-qualified WAL filename grammar.
+  Both inspectors now require qualified names. `t/checkpoint-snapshot.sh`
+  verified checkpoint identity and retired-format rejection, and
+  `t/physical-restartpoint-auto.sh` verified the embedded prefix against
+  source WAL and refused an unproven promotion. `t/promotion-intent.sh`
+  verified the qualified source namespace at six process-crash boundaries.
+  With copies of the live fixtures, both inspectors rejected a segment
+  present only under a legacy filename and accepted the same bytes under
+  the timeline-qualified name.
+- **A19 and A20. Dependencies and operational guidance.** Finish consumer
+  migrations before narrowing package imports and ASDF dependencies. Update
+  `AGENTS.md` so its namespace and metadata guidance reflects the current
+  supported formats and historical migration instructions are clearly dated.
+  The A20 guidance now links the current format table and identifies the
+  older build required to qualify legacy primary WAL names. The historical
+  notes record the alias and next-XID checks from those migrations.
+  A19 gives WAL grammar an explicit package interface with the existing
+  symbol identities. ASDF orders the separated SQL runtime, physical reseed,
+  wire, and logical slot components. A cold load completed with zero warnings,
+  and the source-path and warm package identity checks passed.
+
+The final polish passed the fresh strict compiler, the combined Rove and legacy
+unit suites, and eight focused physical checks covering metadata bytes,
+checkpoint copies, configuration choices, and replay boundaries.
+
 ### Architecture decisions
 
 - The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table

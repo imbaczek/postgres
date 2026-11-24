@@ -1,6 +1,32 @@
 ;;;; sql-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest query-plan-walker-follows-only-declared-child-slots
+    (let* ((opaque (list :index-scan 999 :literal))
+           (seed (list :scan 1))
+           (work (list :worktable-scan 2))
+           (derived (list :subquery-scan 3 opaque work))
+           (recursive (list :recursive-union opaque seed derived))
+           (cte (list :cte-scan 4))
+           (join (list :join opaque recursive cte))
+           (aggregate (list :aggregate opaque opaque join))
+           (distinct (list :distinct opaque aggregate))
+           (append-node (list :append (list (list :arm distinct opaque)
+                                            (list :arm seed opaque))))
+           (tree (list :with-ctes (list opaque) append-node))
+           (nodes (collect-query-plan-nodes tree))
+           (rebased (rebase-select-plan-tree tree 10)))
+      (let ((expected (list tree append-node distinct aggregate join
+                            recursive seed derived work cte seed)))
+        (rove:ok (and (= (length expected) (length nodes))
+                      (every #'eq expected nodes))))
+      (rove:ok (equal (mapcar #'second (remove-if-not #'query-plan-relation-node-p
+                                                      (collect-query-plan-nodes rebased)))
+                      '(11 13 12 14 11)))
+      (rove:ok (= 999 (second (first (second rebased)))))
+      (rove:ok (= 999 (second (third (first (second (third rebased)))))))
+      (rove:ok (= 1 (second seed)))))
+
 (rove:deftest boolean-tests-coerce-unknown-operands
     (flet ((evaluate (sql)
              (let* ((ast (first (parse-statements sql)))

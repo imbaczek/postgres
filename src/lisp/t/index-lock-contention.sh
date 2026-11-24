@@ -107,13 +107,12 @@ plan=$(run -c 'explain select id from large_duplicate_scan where category = 10')
 plan_contains_indented_node "$plan" "Index Scan using large_duplicate_scan_category_idx on large_duplicate_scan" \
     || fail "large equality lookup is not an IndexScan: $plan"
 
-# The test-only B-tree wrapper pauses at the first streamed TID while the
-# relation-scoped read lease is held. An unrelated INSERT must commit before
-# the search is released, and its completion time from search start is recorded.
+# Pause the executor's index cursor after it acquires the relation read lease.
+# An unrelated INSERT must commit before the cursor is released.
 install_output=$(control <<EOF
 (defvar *contention-target-index* nil)
 (defvar *contention-target-writer-heap* nil)
-(defvar *contention-original-btree-scan-equal* nil)
+(defvar *contention-original-btree-cursor* nil)
 (defvar *contention-original-register-writer* nil)
 (defvar *contention-original-commit-transaction* nil)
 (defvar *contention-original-exec-select* nil)
@@ -129,23 +128,23 @@ install_output=$(control <<EOF
   (unless (and index table) (error "contention test catalog entries are missing"))
   (setf *contention-target-index* (pg-index-relfilenode index)
         *contention-target-writer-heap* (pg-class-relfilenode table)))
-(setf *contention-original-btree-scan-equal*
-        (symbol-function 'btree-scan-equal)
+(setf *contention-original-btree-cursor*
+        (symbol-function 'call-with-btree-equal-cursor)
       *contention-original-register-writer* (symbol-function 'register-relation-writer)
       *contention-original-commit-transaction* (symbol-function 'commit-transaction)
       *contention-original-exec-select* (symbol-function 'exec-select))
-(setf (symbol-function 'btree-scan-equal)
+(setf (symbol-function 'call-with-btree-equal-cursor)
       (lambda (relfilenode key callback)
         (if (or (/= relfilenode *contention-target-index*)
                 *contention-active-search*)
-            (funcall *contention-original-btree-scan-equal*
+            (funcall *contention-original-btree-cursor*
                      relfilenode key callback)
             (let ((n nil)
                   (start nil))
               (multiple-value-prog1
-                  (funcall *contention-original-btree-scan-equal*
+                  (funcall *contention-original-btree-cursor*
                            relfilenode key
-                           (lambda (tid)
+                           (lambda (cursor lease)
                              (unless n
                                (setf n (incf *contention-search-count*)
                                      start (get-internal-real-time)
@@ -160,7 +159,7 @@ install_output=$(control <<EOF
                                        do (sleep 0.01))
                                  (unless (probe-file release)
                                    (error "contention search gate timed out"))))
-                             (funcall callback tid)))
+                             (funcall callback cursor lease)))
                 (when n
                   (let ((elapsed
                           (/ (* 1000.0 (- (get-internal-real-time) start))
@@ -251,8 +250,8 @@ written_rows=$(run -c 'select id from unrelated_writes' | wc -l | tr -d '[:space
     || fail "some unrelated INSERTs were lost"
 
 restore_output=$(control <<'EOF'
-  (setf (symbol-function 'btree-scan-equal)
-        *contention-original-btree-scan-equal*
+(setf (symbol-function 'call-with-btree-equal-cursor)
+      *contention-original-btree-cursor*
       (symbol-function 'register-relation-writer) *contention-original-register-writer*
       (symbol-function 'commit-transaction) *contention-original-commit-transaction*
       (symbol-function 'exec-select) *contention-original-exec-select*)

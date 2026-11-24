@@ -285,13 +285,14 @@ present NIL is off and present T is on."
       (wal-checkpoint-record-snapshot record)
       record)))
 
-(defun wal-checkpoint-record-start (&optional (end *wal-checkpoint-lsn*))
-  "Return zero for END zero. Use the recorded start when the snapshot matches END.
-Otherwise subtract the legacy checkpoint header size from END."
+(defun wal-checkpoint-record-start (&optional (end *wal-checkpoint-lsn*)
+                                      (snapshot *wal-checkpoint-snapshot*))
+  "Return the recorded start of the checkpoint ending at END.
+Nonzero END requires its matching snapshot because checkpoint records vary in size."
   (cond ((zerop end) 0)
-        ((and *wal-checkpoint-snapshot* (= end (getf *wal-checkpoint-snapshot* :end)))
-         (getf *wal-checkpoint-snapshot* :start))
-        (t (- end +wal-header-size+))))
+        ((and snapshot (eql end (getf snapshot :end)))
+         (getf snapshot :start))
+        (t (error "missing or mismatched WAL checkpoint copy for end ~a" end))))
 
 (defun wal-checkpoint-snapshot-hex (snapshot)
   "Encode a supported 88, 96, 104, 112, 136, 144, 152 or 160 byte snapshot."
@@ -440,6 +441,13 @@ Return the copied metadata and whether any field was removed."
          (removed-clog-extent (remf copy :checkpoint-clog-bytes)))
     (values copy (or removed-reference removed-logical-evidence removed-checksum removed-clog-extent))))
 
+(defun wal-control-checkpoint-copy-matches-p (checkpoint timeline snapshot)
+  "Require a copy at every nonzero checkpoint and match its recorded position."
+  (if (zerop checkpoint)
+      (null snapshot)
+      (and snapshot (= checkpoint (getf snapshot :end))
+           (= timeline (getf snapshot :timeline)))))
+
 (defun wal-encode-control-image (checkpoint durable snapshot
                                  &key (timeline 1) (namespace :timeline) metadata
                                    (checkpoint-timeline (if snapshot (getf snapshot :timeline) 1)))
@@ -460,10 +468,8 @@ all fields before the CRC itself."
                (or (null metadata)
                    (and (wal-control-metadata-valid-p metadata)
                         (wal-control-resource-position-valid-p metadata durable timeline)))
-               (or (null snapshot)
-                   (and (wal-checkpoint-snapshot-valid-p snapshot)
-                        (= checkpoint (getf snapshot :end))
-                        (= checkpoint-timeline (getf snapshot :timeline)))))
+               (or (null snapshot) (wal-checkpoint-snapshot-valid-p snapshot))
+               (wal-control-checkpoint-copy-matches-p checkpoint checkpoint-timeline snapshot))
     (error "invalid WAL control checkpoint copy"))
   (let* ((prefix (format nil "PGWAL6 ~d ~d ~d ~d timeline ~a" checkpoint durable timeline
                          checkpoint-timeline
@@ -533,9 +539,8 @@ The control CRC does not verify relation pages. Resource facts may be absent."
     (let* ((payload (seventh fields))
            (snapshot (unless (equal payload "-")
                        (wal-checkpoint-snapshot-from-hex payload))))
-      (when (and snapshot (or (/= checkpoint (getf snapshot :end))
-                              (/= checkpoint-timeline (getf snapshot :timeline))))
-        (error "checkpoint control copy names another record or timeline"))
+      (unless (wal-control-checkpoint-copy-matches-p checkpoint checkpoint-timeline snapshot)
+        (error "missing or mismatched checkpoint control copy"))
       (let ((metadata (wal-decode-control-metadata metadata-fields)))
         (when logical-evidence-p
           (setf metadata

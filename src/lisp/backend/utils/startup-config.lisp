@@ -439,11 +439,19 @@ uses strtod. Return the remaining unit for the caller's conversion and rounding.
   "Decode input octets as UTF-8 for ordinary settings and include paths."
   (bytes->string (startup-input-octets input)))
 
+(defun setting-descriptor-enum-choices (spec)
+  "Return canonical names for an enum descriptor, excluding input aliases."
+  (case (and spec (startup-setting-descriptor-kind spec))
+    (:wal-level '("minimal" "replica" "logical"))
+    (:archive-mode '("always" "on" "off"))
+    (:synchronous-commit '("local" "remote_write" "remote_apply" "on" "off"))
+    (:bytea-output '("hex" "escape"))))
+
 (defun startup-parse-wal-level (text)
   "Parse WAL level names, mapping the deprecated archive and hot_standby aliases
 to replica. Feature admission separately rejects minimal."
   (let ((value (string-downcase text)))
-    (cond ((member value '("minimal" "replica" "logical") :test #'string=) value)
+    (cond ((member value (setting-descriptor-enum-choices (find-startup-setting "wal_level")) :test #'string=) value)
           ((member value '("archive" "hot_standby") :test #'string=) "replica")
           (t (error "invalid value for configuration parameter wal_level: ~s" text)))))
 
@@ -476,9 +484,9 @@ original spelling. Synchronous commit values use the session normalizer."
         (:wal-level (startup-parse-wal-level text))
         (:archive-mode
          (let ((value (string-downcase text)))
-           (cond ((equal value "always") "always")
-                 ((member value '("on" "true" "yes" "1") :test #'equal) "on")
-                 ((member value '("off" "false" "no" "0") :test #'equal) "off")
+           (cond ((member value (setting-descriptor-enum-choices spec) :test #'equal) value)
+                 ((member value '("true" "yes" "1") :test #'equal) "on")
+                 ((member value '("false" "no" "0") :test #'equal) "off")
                  (t (error "invalid value for configuration parameter archive_mode: ~s" text)))))
         (:boolean (startup-parse-boolean-setting text))
         (:timeline (startup-parse-recovery-timeline text) text)
@@ -1211,15 +1219,13 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
 (defun setting-descriptor-kind-label (spec)
   (case (and spec (startup-setting-descriptor-kind spec))
     (:integer "integer") (:boolean "bool")
-    ((:wal-level :archive-mode :synchronous-commit) "enum")
-    (t "string")))
+    (t (if (setting-descriptor-enum-choices spec) "enum" "string"))))
 
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 List canonical enum names for WAL level, archive mode and synchronous commit.
 CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
   (let* ((spec (find-startup-setting name))
-         (kind (and spec (startup-setting-descriptor-kind spec)))
          (source (getf entry :source))
          (unit (setting-descriptor-unit-label spec))
          (value (getf entry :value)))
@@ -1243,12 +1249,9 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
-            (let ((choices (case kind
-                             (:wal-level (vector "minimal" "replica" "logical"))
-                             (:archive-mode (vector "always" "on" "off"))
-                             (:synchronous-commit (vector "local" "remote_write" "remote_apply" "on")))))
+            (let ((choices (setting-descriptor-enum-choices spec)))
               (if choices
-                  (make-sql-array :element-type-id :text :elements choices
+                  (make-sql-array :element-type-id :text :elements (coerce choices 'vector)
                                   :dimensions (list (length choices)) :lower-bounds '(1))
                   +null+))
             (if (eq source :file) (or (getf entry :sourcefile) +null+) +null+)

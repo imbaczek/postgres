@@ -59,14 +59,14 @@ explicit NIL. Otherwise preserve the two-value interface."
                    (setf observed (physical-history-observe-record
                                    record observed fpw-fact logical-fact (getf state :cluster-identity) removed)))
                (unless *wal-recovery-group-active*
-                 (unless (= (wal-record-type record) +wal-record-end-of-recovery+)
-                   (setf fact (physical-resource-fact-next
-                               fact record timeline
-                               (lambda () (physical-recovery-resource-history store state)))))
-                 (multiple-value-setq (fpw-fact logical-fact)
-                   (physical-replay-policy-facts-next
-                    fpw-fact logical-fact record timeline
-                    (lambda () (physical-recovery-resource-history store state))))
+                 (flet ((history () (physical-recovery-resource-history store state)))
+                   (declare (dynamic-extent #'history))
+                   (if (= (wal-record-type record) +wal-record-end-of-recovery+)
+                       (multiple-value-setq (fpw-fact logical-fact)
+                         (physical-replay-policy-facts-next fpw-fact logical-fact record timeline #'history))
+                       (multiple-value-setq (fact fpw-fact logical-fact)
+                         (physical-replay-terminal-facts-next
+                          fact fpw-fact logical-fact record timeline #'history))))
                  (when (= (wal-record-type record) +wal-record-checkpoint+)
                    (setf (getf *physical-recovery-state* :source-checkpoint)
                          (wal-checkpoint-record-snapshot record)))
@@ -494,10 +494,9 @@ Stop before the next record when a published terminal causes a resource pause."
                        (append (when fpw-fact (list :fpw-fact fpw-fact))
                                (when logical-fact (list :logical-fact logical-fact)))))
               (progn
-                (physical-replay-check-child-initialization record next-xid fpw-fact logical-fact)
-                (setf next-xid (physical-replay-observed-next-xid record next-xid)
-                      reservation (physical-source-reservation-next reservation record next-xid)
-                      source-xids (physical-source-xids-next source-xids record next-xid))
+                (multiple-value-setq (next-xid reservation source-xids)
+                  (physical-replay-observe-source-record
+                   record next-xid reservation source-xids fpw-fact logical-fact))
                 (multiple-value-bind (candidate fpw-candidate logical-candidate)
                     (when (wal-terminal-record-type-p (wal-record-type record))
                       (physical-replay-terminal-facts-next

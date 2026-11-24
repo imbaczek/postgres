@@ -8,6 +8,28 @@
     (loop for (key value) on changes by #'cddr do (setf (getf snapshot key) value))
     snapshot))
 
+(deftest checkpoint-control-requires-a-matching-copy-at-a-nonzero-end
+    (let* ((snapshot (sample-checkpoint-snapshot))
+           (end (getf snapshot :end))
+           (encoded (pg::wal-encode-control-image end end snapshot))
+           (payload (pg::wal-checkpoint-snapshot-hex snapshot)))
+      (flet ((decode (checkpoint timeline copy)
+               (let ((prefix (format nil "PGWAL6 ~d ~d 2 ~d timeline ~a"
+                                     checkpoint end timeline copy)))
+                 (pg::wal-decode-control-line
+                  (format nil "~a ~8,'0X" prefix (pg::wal-crc32 (pg::string->bytes prefix)))))))
+        (ok (zerop (pg::wal-checkpoint-record-start 0 nil)))
+        (ok (zerop (decode 0 1 "-")))
+        (ok (= 32 (pg::wal-checkpoint-record-start end snapshot)))
+        (ok (equal snapshot (nth-value 2 (pg::wal-decode-control-line (pg::bytes->string encoded)))))
+        (ok (signals (pg::wal-checkpoint-record-start end nil) 'error))
+        (ok (signals (pg::wal-checkpoint-record-start (1- end) snapshot) 'error))
+        (ok (signals (pg::wal-encode-control-image end end nil) 'error))
+        (ok (signals (pg::wal-encode-control-image (1- end) end snapshot) 'error))
+        (ok (signals (decode end 1 "-") 'error))
+        (ok (signals (decode (1- end) 1 payload) 'error))
+        (ok (signals (decode end 2 payload) 'error)))))
+
 (deftest checkpoint-snapshot-roundtrip-distinguishes-source-counters
     (dolist (oid '(nil 0 16384 18446744073709551615))
       (let* ((snapshot (sample-checkpoint-snapshot :next-oid oid))
@@ -178,7 +200,8 @@
             (pg::wal-atomic-write-bytes (pg::physical-recovery-control-path) before)
             (pg::wal-atomic-write-bytes
              (pg::wal-control-path)
-             (pg::wal-encode-control-image 32 32 nil :timeline 2 :checkpoint-timeline 1))
+             (pg::wal-encode-control-image 152 152 (sample-checkpoint-snapshot)
+                                           :timeline 2 :checkpoint-timeline 1))
             (unwind-protect
                  (progn
                    ;; Isolate the post-provenance timeline gate; keep real control readers/writer.

@@ -709,7 +709,7 @@ checksum qualification in a copied recovery base."
                    (eql checkpoint (getf manifest :checkpoint))
                    (eql durable (getf manifest :end))
                    (= (physical-manifest-checkpoint-start manifest)
-                      (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+))))
+                      (wal-checkpoint-record-start checkpoint snapshot)))
         (error "base checkpoint control differs from manifest"))
       (physical-recovery-check-checkpoint-resources snapshot metadata)
       (setf (getf manifest :source-checkpoint) snapshot

@@ -12,7 +12,7 @@ when each recorded check ran.
 | Artifact | Current baseline |
 | --- | --- |
 | Native WAL and physical stream | Stored records use WAL8. Native peers negotiate `pg_lisp_wal_8`. Upgrade both peers before reconnecting them. |
-| Primary WAL control and checkpoint payload | `PGWAL6` with the `timeline` namespace and `PGCKPT02`. Current optional checkpoint fields preserve their existing absent-state semantics. |
+| Primary WAL control and checkpoint payload | `PGWAL6` with the `timeline` namespace. A nonzero checkpoint end requires a matching `PGCKPT02` copy with the recorded start and timeline. Individual optional fields within that copy still allow unknown values. |
 | Primary WAL filenames | Server startup requires 24 hexadecimal digits followed by `.wal`, with the timeline in the first eight digits. Follow the [legacy primary cutover procedure](#legacy-primary-cutover) to qualify an existing development primary. The receive spool has its own naming contract. |
 | Archived WAL ancestry | Full segments use timeline-qualified `.wal` names and fork prefixes use timeline-qualified `.wal.partial` names. Restore requires the matching qualified archive proof. |
 | Replication slots | `PGSLOT4` and `PGSLOT5` are still current writer outputs. `PGSLOT6` carries provenance or explicit loss causes and `PGSLOT7` carries child ownership. |

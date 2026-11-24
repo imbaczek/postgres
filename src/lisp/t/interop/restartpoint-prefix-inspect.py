@@ -267,8 +267,6 @@ def check_retained_archive(root, source, control, generation_text, *, parent_his
         segment, carrier = metadata[":SEGMENT"], metadata[":FILE-TIMELINE"]
         if source is not None:
             path = source / "pg_wal" / f"{carrier:08X}{segment // 256:08X}{segment % 256:08X}.wal"
-            if carrier == 1 and not path.exists():
-                path = source / "pg_wal" / f"{segment:016X}.wal"
             with path.open("rb") as stream:
                 assert stream.read(len(data)) == data, "retained extent differs from source WAL"
         assert fnv(data) == metadata[":PREFIX-DIGEST"]
@@ -309,9 +307,7 @@ def main(target, source):
     assert fnv(prefix) == field(text, "WAL-PREFIX-DIGEST")
     if prefix:
         segment = lsn // (16 * 1024 * 1024)
-        legacy = source / "pg_wal" / f"{segment:016X}.wal"
-        qualified = source / "pg_wal" / f"{timeline:08X}{segment // 256:08X}{segment % 256:08X}.wal"
-        path = legacy if timeline == 1 and legacy.exists() else qualified
+        path = source / "pg_wal" / f"{timeline:08X}{segment // 256:08X}{segment % 256:08X}.wal"
         with path.open("rb") as stream:
             assert stream.read(prefix_length) == prefix, "prefix differs from source WAL"
     print(f"restartpoint-prefix-inspect: PASS lsn={lsn} bytes={prefix_length}")
@@ -380,7 +376,8 @@ def snapshot_pending(target, source, snapshot):
     fields = (root / "global" / "pg_wal_control").read_bytes().split()
     assert fields[0] == b"PGWAL6"
     assert crc32c(b" ".join(fields[:-1])) == int(fields[-1], 16)
-    assert struct.unpack_from("<I", control, 72)[0] == {b"legacy": 0, b"timeline": 1}[fields[5]]
+    assert fields[5] == b"timeline"
+    assert struct.unpack_from("<I", control, 72)[0] == 1
     image = (root / "pg_physical_restartpoints" / f"{lsn:016X}-{digest:016X}.rp").read_bytes()
     text_length = struct.unpack_from("<I", image, 8)[0]
     check_retained_archive(root, pathlib.Path(source), control, image[32:32 + text_length].decode("ascii"))

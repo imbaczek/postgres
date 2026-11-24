@@ -1,6 +1,14 @@
 ;;;; Native WAL batch validation, staging, and redo.
 (in-package #:pg)
 
+(defvar *wal-recovery-page-spool-enabled* nil)
+
+(defvar *wal-recovery-page-spool* nil
+  "Recovery page spool, with an ordinary cleanup owner rather than WAL's domain.")
+
+(defvar *wal-recovery-catalog-spool* nil
+  "Owns catalog chunks until the batch terminal or recovery cleanup.")
+
 (defun wal-recovery-close-spool (spool kind)
   (when spool
     (if (logical-spool-closed-p spool)
@@ -49,6 +57,15 @@
         (wal-recovery-close-spool *wal-recovery-page-spool* "page"))
   (values))
 
+(defmacro wal-append-recovery-spool (spool bytes)
+  "Publish the recovery spool in SPOOL before the first append can acquire a file."
+  `(progn
+     (unless ,spool
+       (sb-sys:without-interrupts
+         (let ((*query-temp-file-limit-bytes* nil))
+           (setf ,spool (make-logical-spool)))))
+     (logical-spool-append ,spool ,bytes)))
+
 (defun wal-recovery-stage-page-record (record)
   "Validate one page record before retaining its bounded raw payload."
   (let* ((payload (wal-record-payload record))
@@ -58,12 +75,7 @@
     (wal-set-u32 event 0 (wal-record-version record))
     (wal-set-u64 event 4 (wal-record-end record))
     (replace event payload :start1 12)
-    (unless *wal-recovery-page-spool*
-      ;; Publish ownership before the first append can acquire a file.
-      (sb-sys:without-interrupts
-        (let ((*query-temp-file-limit-bytes* nil))
-          (setf *wal-recovery-page-spool* (make-logical-spool)))))
-    (logical-spool-append *wal-recovery-page-spool* event))
+    (wal-append-recovery-spool *wal-recovery-page-spool* event))
   (values))
 
 (defun wal-recovery-map-page-spool (function)
@@ -80,10 +92,20 @@
          (funcall function (wal-decode-page-images (subseq event 12) lsn))))))
   (values))
 
+(defun wal-recovery-close-catalog-spool ()
+  (setf *wal-recovery-catalog-spool*
+        (wal-recovery-close-spool *wal-recovery-catalog-spool* "catalog"))
+  (values))
+
+(defun wal-recovery-discard-batch-spools ()
+  "Close staged page and catalog resources before their batch state is replaced."
+  (wal-recovery-close-page-spool)
+  (wal-recovery-close-catalog-spool)
+  (values))
+
 (defun wal-recovery-reset-batch (active)
   "Discard staged batch records. ACTIVE starts a batch after a validated marker."
-  (wal-recovery-close-page-spool)
-  (setf *wal-recovery-catalog-spool* (wal-recovery-close-spool *wal-recovery-catalog-spool* "catalog"))
+  (wal-recovery-discard-batch-spools)
   (unless active (setf *wal-recovery-reservation-batch-clean-p* nil))
   (setf *wal-recovery-group-active* active
         *wal-recovery-page-images* nil
@@ -96,54 +118,32 @@
   (values))
 
 (defun wal-recovery-note-page-record ()
-  (unless *wal-recovery-group-active*
-    (error "WAL page images appear outside a batch"))
-  (when *wal-recovery-catalog-chunk-count*
-    (error "WAL page images follow catalog chunks in a batch"))
+  (wal-check-batch-page-record *wal-recovery-group-active* *wal-recovery-catalog-chunk-count*)
   (setf *wal-recovery-page-records-seen-p* t))
 
 (defun wal-recovery-stage-logical-changes (record)
-  (when *wal-recovery-logical-catalog-event-p*
-    (error "logical row changes follow a catalog event in the same batch"))
-  (when *wal-recovery-catalog-chunk-count*
-    (error "logical WAL changes follow catalog chunks in a batch"))
+  (wal-check-batch-logical-changes *wal-recovery-logical-catalog-event-p* *wal-recovery-catalog-chunk-count*)
   (wal-recovery-accept-logical-change-chunk record))
 
+(defun wal-recovery-append-catalog-chunk (bytes)
+  "Retain validated catalog bytes in the batch's bounded scratch spool."
+  (wal-append-recovery-spool *wal-recovery-catalog-spool* bytes))
+
 (defun wal-recovery-stage-catalog-chunk (record)
-  (unless *wal-recovery-group-active*
-    (error "WAL catalog chunks appear outside a batch"))
-  (when (or *wal-recovery-logical-catalog-event-p*
-            *wal-recovery-logical-chunk-count*)
-    (error "WAL catalog chunks are mixed with row or catalog events"))
-  (multiple-value-bind (index count bytes)
-      (wal-decode-catalog-chunk-payload (wal-record-payload record))
-    (unless (= index *wal-recovery-catalog-next-chunk*)
-      (error "WAL catalog chunk index ~a follows chunk ~a"
-             index *wal-recovery-catalog-next-chunk*))
-    (when (and *wal-recovery-catalog-chunk-count*
-               (/= count *wal-recovery-catalog-chunk-count*))
-      (error "WAL catalog chunk count changes within a batch"))
-    (unless *wal-recovery-catalog-spool*
-      (sb-sys:without-interrupts
-        (let ((*query-temp-file-limit-bytes* nil))
-          (setf *wal-recovery-catalog-spool* (make-logical-spool)))))
-    (logical-spool-append *wal-recovery-catalog-spool* bytes)
+  (multiple-value-bind (count bytes)
+      (wal-decode-next-catalog-chunk record *wal-recovery-group-active*
+                                     *wal-recovery-logical-catalog-event-p*
+                                     *wal-recovery-logical-chunk-count*
+                                     *wal-recovery-catalog-chunk-count*
+                                     *wal-recovery-catalog-next-chunk*)
+    (wal-recovery-append-catalog-chunk bytes)
     (setf *wal-recovery-catalog-chunk-count* count)
     (incf *wal-recovery-catalog-next-chunk*)))
 
 (defun wal-recovery-note-logical-catalog-event (record)
-  (unless *wal-recovery-group-active*
-    (error "logical catalog event appears outside a WAL batch"))
-  (unless (zerop (wal-record-xid record))
-    (error "logical catalog event must not carry a transaction ID"))
-  (when (or *wal-recovery-logical-catalog-event-p*
-            *wal-recovery-logical-chunk-count*)
-    (error "logical catalog event is mixed with other changes in a WAL batch"))
-  (let ((payload (wal-record-payload record)))
-    (unless (and (>= (length payload) 8)
-                 (plusp (wal-u32 payload 0))
-                 (= (+ 8 (wal-u32 payload 4)) (length payload)))
-      (error "logical catalog event has an invalid payload")))
+  (wal-check-batch-logical-catalog-event record *wal-recovery-group-active*
+                                         *wal-recovery-logical-catalog-event-p*
+                                         *wal-recovery-logical-chunk-count*)
   (setf *wal-recovery-logical-catalog-event-p* t))
 
 (defun wal-replay-finish-batch (terminal-preparer &optional catalog-chunks-p)
@@ -171,60 +171,23 @@
     (funcall terminal-function))
   (wal-recovery-reset-batch nil))
 
-(defun wal-recovery-validate-logical-terminal (kind &optional xid)
-  ;; A reset belongs only to a commit terminal for the same transaction.
-  (when *wal-recovery-relation-resets*
-    (unless (and (eq kind :commit)
-                 (every (lambda (reset) (eql xid (car reset))) *wal-recovery-relation-resets*))
-      (error "relation resets require their transaction's commit terminal")))
-  (ecase kind
-    (:commit
-     (when *wal-recovery-logical-catalog-event-p*
-       (error "logical catalog events are attached to a row commit"))
-     (wal-recovery-finish-logical-change-batch xid))
-    (:catalog
-     (when *wal-recovery-logical-chunk-count*
-       (error "logical row changes are attached to a catalog WAL batch")))
-    (:other
-     (when (or *wal-recovery-logical-catalog-event-p*
-               *wal-recovery-logical-chunk-count*)
-       (error "logical changes are attached to an unsupported WAL terminal"))))
-  (values))
-
 (defun wal-recovery-decode-terminal (record)
-  "Validate a complete native batch terminal before history or redo effects."
-  (unless *wal-recovery-group-active*
-    (error "WAL terminal record appears outside a batch"))
-  (let ((type (wal-record-type record))
-        (payload (wal-record-payload record)))
-    (when (and *wal-recovery-catalog-chunk-count* (/= type +wal-record-catalog-commit+))
-      (error "WAL catalog chunks lack a catalog commit record"))
-    (cond
-      ((= type +wal-record-commit+)
-       (wal-decode-commit-timestamp payload)
-       (wal-recovery-validate-logical-terminal :commit (wal-record-xid record))
-       nil)
-      ((= type +wal-record-catalog+)
-       (wal-recovery-validate-logical-terminal :catalog)
-       payload)
-      ((= type +wal-record-catalog-commit+)
-       (wal-recovery-validate-logical-terminal :catalog)
-       (multiple-value-bind (count length) (wal-decode-catalog-commit-payload payload)
-         (wal-reassemble-catalog-chunks count length)))
-      (t
-       (wal-recovery-validate-logical-terminal :other)
-       (cond
-         ((wal-empty-metadata-terminal-type-p type)
-          (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*))
-         ((= type +wal-record-clog-reset+) (wal-read-u64-payload payload))
-         ((= type +wal-record-checkpoint+) (wal-checkpoint-record-snapshot record))
-         ((= type +wal-record-maintenance+)
-          (unless (zerop (wal-record-xid record))
-            (error "WAL maintenance record must not carry a transaction ID"))
-          (unless (zerop (length payload))
-            (error "WAL maintenance record has an invalid payload"))
-          nil)
-         (t (error "unsupported WAL terminal")))))))
+  "Validate a complete native batch terminal and finish its staged resources."
+  (multiple-value-bind (decoded length)
+      (wal-decode-batch-terminal record *wal-recovery-group-active*
+                                 *wal-recovery-reservation-batch-clean-p*
+                                 *wal-recovery-catalog-chunk-count*
+                                 *wal-recovery-relation-resets*
+                                 *wal-recovery-logical-catalog-event-p*
+                                 *wal-recovery-logical-chunk-count*)
+    (let ((type (wal-record-type record)))
+      (cond
+        ((= type +wal-record-commit+)
+         (wal-recovery-finish-logical-change-batch (wal-record-xid record))
+         decoded)
+        ((= type +wal-record-catalog-commit+)
+         (wal-reassemble-catalog-chunks decoded length))
+        (t decoded)))))
 
 (defvar *wal-recovery-required-clog-reset* nil
   "First proven replacement required when startup found a short CLOG file.")
@@ -288,6 +251,12 @@ Redo and history supply their own page handling after the common ordering checks
              (wal-terminal-record-type-p (wal-record-type record)))
     (wal-replay-terminal record)))
 
+(defun wal-recovery-close-staging ()
+  "On scan exit, attempt every cleanup even if an earlier resource fails to close."
+  (unwind-protect (wal-recovery-close-page-spool)
+    (unwind-protect (wal-recovery-close-catalog-spool)
+      (wal-recovery-reset-logical-change-batch))))
+
 (defmacro with-wal-replay-staging (() &body body)
   "Isolate one native batch decoder; primary redo and history share this state."
   `(let ((*wal-recovery-reservation-batch-clean-p* nil)
@@ -306,9 +275,7 @@ Redo and history supply their own page handling after the common ordering checks
          (*wal-recovery-logical-catalog-event-p* nil))
      (unwind-protect
           (progn ,@body)
-       (unwind-protect (wal-recovery-close-page-spool)
-         (unwind-protect (wal-recovery-close-spool *wal-recovery-catalog-spool* "catalog")
-           (wal-recovery-reset-logical-change-batch))))))
+       (wal-recovery-close-staging))))
 
 (defun wal-recovery-policy-incarnation (state incarnation record completed-p)
   "Carry private FPW evidence across a completed CLOG reset's identity change.

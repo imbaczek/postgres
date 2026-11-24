@@ -15,17 +15,23 @@
                               part)))
                 parts))))
 
-(defparameter *session-format-defaults*
-  '(("datestyle" . "ISO, MDY") ("intervalstyle" . "postgres")
-    ("extra_float_digits" . 1) ("bytea_output" . "hex")
-    ("log_statement" . "none") ("log_min_duration_statement" . "-1")
-    ("log_min_error_statement" . "error")))
+(defparameter *session-setting-specs*
+  (list
+   (make-startup-setting-descriptor "datestyle" :user :datestyle "ISO, MDY")
+   (make-startup-setting-descriptor "intervalstyle" :user :intervalstyle "postgres")
+   (make-startup-setting-descriptor "extra_float_digits" :user :integer 1 -15 3)
+   (make-startup-setting-descriptor "bytea_output" :user :bytea-output "hex")
+   (make-startup-setting-descriptor "log_statement" :user :disabled-logging "none")
+   (make-startup-setting-descriptor "log_min_duration_statement" :user :disabled-logging "-1")
+   (make-startup-setting-descriptor "log_min_error_statement" :user :disabled-logging "error")
+   (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds)
+   (make-startup-setting-descriptor "application_name" :user :string "")))
 
-(defparameter *session-timeout-setting*
-  (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds))
-
-(defparameter *session-application-name-setting*
-  (make-startup-setting-descriptor "application_name" :user :string ""))
+(defun find-session-setting (name)
+  "Resolve session-only descriptors and the shared synchronous commit setting."
+  (or (find name *session-setting-specs* :key #'startup-setting-descriptor-name :test #'string=)
+      (when (string= name "synchronous_commit")
+        (find-startup-setting name))))
 
 (defun session-setting-descriptor-row (spec)
   "Report a session descriptor with the effective value and its client or SQL provenance."
@@ -48,7 +54,7 @@
 (defun session-normalize-datestyle (value)
   "Apply C's independent DateStyle and date-order settings."
   (labels ((parts (setting)
-             (let* ((text (or setting "ISO, MDY"))
+             (let* ((text (or setting (startup-setting-descriptor-boot (find-session-setting "datestyle"))))
                     (comma (position #\, text))
                     (style (if comma (subseq text 0 comma) text))
                     (order (cond ((search "DMY" text :test #'char-equal) "DMY")
@@ -87,41 +93,34 @@
         (format nil "~a, ~a" style order)))))
 
 (defun session-normalize-extra-setting (name value)
-  (cond
-    ((string= name "statement_timeout")
-     (let ((spec *session-timeout-setting*))
+  (let ((spec (find-session-setting name)))
+    (case (and spec (startup-setting-descriptor-kind spec))
+      (:integer
        (session-integer-setting name value
                                 (startup-setting-descriptor-minimum spec)
                                 (startup-setting-descriptor-maximum spec)
-                                (startup-setting-descriptor-unit spec))))
-    ;; Native SQL does not emit statement logs. Accept the settings callers
-    ;; use to suppress them, and refuse settings that would enable logging.
-    ((member name '("log_statement" "log_min_duration_statement" "log_min_error_statement")
-             :test #'string=)
-     (let ((setting (string-downcase (princ-to-string value))))
-       (unless (member setting (cond ((string= name "log_statement") '("none"))
-                                     ((string= name "log_min_duration_statement") '("-1"))
-                                     (t '("error" "log")))
-                       :test #'string=)
-         (ereport "0A000" "unsupported statement logging setting for ~a" name))
-       setting))
-    ((string= name "extra_float_digits") (session-integer-setting name value -15 3 nil))
-    ((string= name "bytea_output")
-     (unless (member value '("hex" "escape") :test #'string-equal)
-       (ereport "22023" "invalid value for parameter \"bytea_output\": \"~a\"" value))
-     (string-downcase value))
-    ((string= name "datestyle") (session-normalize-datestyle value))
-    ((string= name "intervalstyle")
-     (unless (string-equal value "postgres")
-       (ereport "0A000" "only postgres IntervalStyle is supported"))
-     "postgres")
-    (t (princ-to-string value))))
+                                (startup-setting-descriptor-unit spec)))
+      (:disabled-logging
+       ;; Native SQL does not emit statement logs. Accept only suppressing values.
+       (let ((setting (string-downcase (princ-to-string value))))
+         (unless (or (string= setting (startup-setting-descriptor-boot spec))
+                     (and (string= name "log_min_error_statement") (string= setting "log")))
+           (ereport "0A000" "unsupported statement logging setting for ~a" name))
+         setting))
+      (:bytea-output
+       (unless (member value (setting-descriptor-enum-choices spec) :test #'string-equal)
+         (ereport "22023" "invalid value for parameter \"bytea_output\": \"~a\"" value))
+       (string-downcase value))
+      (:datestyle (session-normalize-datestyle value))
+      (:intervalstyle
+       (let ((boot (startup-setting-descriptor-boot spec)))
+         (unless (string-equal value boot)
+           (ereport "0A000" "only postgres IntervalStyle is supported"))
+         boot))
+      (otherwise (princ-to-string value)))))
 
 (defun session-extra-setting-p (name)
-  (or (string= name "application_name") (string= name "statement_timeout")
-      (string= name "synchronous_commit")
-      (assoc name *session-format-defaults* :test #'string=)
-      (session-custom-setting-p name)))
+  (or (find-session-setting name) (session-custom-setting-p name)))
 
 (defun session-normalize-application-name (value)
   "Clip VALUE at 63 UTF-8 bytes without splitting a character, then escape bytes
@@ -164,10 +163,10 @@ ON and its true aliases select remote flush. LOCAL keeps local durability;
 OFF and its false aliases request asynchronous local commit."
   (let ((text (string-downcase (princ-to-string value))))
     (cond
-      ((member text '("on" "true" "yes" "1") :test #'string=) "on")
-      ((member text '("local" "remote_write" "remote_apply") :test #'string=) text)
-      ((member text '("off" "false" "no" "0") :test #'string=)
-       "off")
+      ((member text (setting-descriptor-enum-choices (find-session-setting "synchronous_commit"))
+               :test #'string=) text)
+      ((member text '("true" "yes" "1") :test #'string=) "on")
+      ((member text '("false" "no" "0") :test #'string=) "off")
       (t (ereport "22023" "invalid value for parameter synchronous_commit")))))
 
 (defun session-capture-raw-binding (settings name)
@@ -303,7 +302,7 @@ This changes in-memory state only; client reporting occurs later."
       (session-publish-application-name))))
 
 (defun session-application-name-settings-row ()
-  (session-setting-descriptor-row *session-application-name-setting*))
+  (session-setting-descriptor-row (find-session-setting "application_name")))
 
 (defun session-set-extra-setting (name value)
   "Set or reset a session setting, saving the transaction's settings before changes.
@@ -333,22 +332,19 @@ The saved settings allow an abort to restore the values in effect at transaction
     (session-extra-setting-value name)))
 
 (defun session-extra-setting-value (name)
-  (when (and *backend* (session-extra-setting-p name))
-    (multiple-value-bind (value present-p) (gethash name (backend-settings *backend*))
-      (cond
-        ((string= name "synchronous_commit") (values (session-synchronous-commit-value) t))
-        ((string= name "application_name") (values (or value "") t))
-        ((string= name "statement_timeout")
-         (let ((spec *session-timeout-setting*))
-           (values (startup-format-unit (or value (startup-setting-descriptor-boot spec))
-                                        (startup-setting-descriptor-unit spec))
-                   t)))
-        ((assoc name *session-format-defaults* :test #'string=)
-         (values (princ-to-string (if present-p value
-                                      (cdr (assoc name *session-format-defaults* :test #'string=)))) t))
-        (present-p (values value t))
-        ((nth-value 1 (gethash name (backend-settings-reset *backend*)))
-         (values (gethash name (backend-settings-reset *backend*)) t))))))
+  (when *backend*
+    (let ((spec (find-session-setting name)))
+      (when (or spec (session-custom-setting-p name))
+        (multiple-value-bind (value present-p) (gethash name (backend-settings *backend*))
+          (cond
+            ((and spec (eq :synchronous-commit (startup-setting-descriptor-kind spec)))
+             (values (session-synchronous-commit-value) t))
+            (spec
+             (let ((value (if present-p value (startup-setting-descriptor-boot spec)))
+                   (unit (startup-setting-descriptor-unit spec)))
+               (values (if unit (startup-format-unit value unit) (princ-to-string value)) t)))
+            (present-p (values value t))
+            (t (gethash name (backend-settings-reset *backend*)))))))))
 
 (defun split-session-options (text)
   "Match postinit.c:pg_split_opts: backslash escaping, with literal quotes."
@@ -413,4 +409,4 @@ The saved settings allow an abort to restore the values in effect at transaction
   (session-publish-application-name))
 
 (defun session-timeout-settings-row ()
-  (session-setting-descriptor-row *session-timeout-setting*))
+  (session-setting-descriptor-row (find-session-setting "statement_timeout")))

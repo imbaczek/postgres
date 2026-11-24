@@ -195,6 +195,18 @@ the prefix before RECORD and default to published facts; validation changes no s
              (error "child initialization checkpoint differs from its replay timeline or allocation floor"))))
         (t (error "child end-of-recovery requires its initialization checkpoint"))))))
 
+(defun physical-replay-check-and-observe-xid (record next-xid fpw-fact logical-fact)
+  "Check the selected child's initialization before observing an ordinary record."
+  (physical-replay-check-child-initialization record next-xid fpw-fact logical-fact)
+  (physical-replay-observed-next-xid record next-xid))
+
+(defun physical-replay-observe-source-record (record next-xid reservation source-xids fpw-fact logical-fact)
+  "Validate an ordinary record and advance its provisional source facts in WAL order."
+  (let ((next (physical-replay-check-and-observe-xid record next-xid fpw-fact logical-fact)))
+    (values next
+            (physical-source-reservation-next reservation record next)
+            (physical-source-xids-next source-xids record next))))
+
 (defun physical-recovery-publish-selected-history (store)
   "Publish the selected history chain after checking immutable base ancestry.
 Existing timeline files must match; a conflicting file is an error."

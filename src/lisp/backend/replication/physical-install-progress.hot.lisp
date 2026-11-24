@@ -42,7 +42,7 @@ STEP must be between 1 and 200001 inclusive."
 Return its length; only that prefix is meaningful and the next call overwrites it.
 STEP must be between 1 and 200001 inclusive.  Valid calls allocate no heap
 storage.  The journal decoders validate the body checksum before generating progress lines.
-The original journal writers remain independent format oracles."
+The allocating journal writer provides an independent encoding for comparison."
   (declare (optimize (speed 3) (safety 3))
            (type (unsigned-byte 32) body-crc)
            (type (integer 1 200001) step)

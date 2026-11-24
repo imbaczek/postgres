@@ -58,7 +58,7 @@
       (unless (and (= checkpoint durable (getf control :checkpoint) (getf control :applied))
                    (= timeline checkpoint-timeline (getf request :timeline))
                    (= (getf value :checkpoint-start)
-                      (if snapshot (getf snapshot :start) (- checkpoint +wal-header-size+)))
+                      (wal-checkpoint-record-start checkpoint snapshot))
                    (or (null metadata) (= (getf metadata :system-id) (getf request :system-id))))
         (error "target follow control images disagree")))
     (when (and anchor

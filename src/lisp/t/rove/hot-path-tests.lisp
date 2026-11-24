@@ -114,19 +114,18 @@
     (dotimes (iteration 4096) (apply function arguments))
     (- (sb-ext:get-bytes-consed) before)))
 
-(cl-spec:defproperty install-progress-scratch-matches-canonical-writers
+(cl-spec:defproperty install-progress-scratch-matches-canonical-writer
     ((crc (range integer 0 4294967295)) (step (range integer 1 200001)))
   (:about %physical-install-write-progress)
   (:trials (:normal 200))
   (let* ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255))
          (size (%physical-install-write-progress crc step scratch))
-         (expected (physical-adoption-install-step-image crc step)))
+         (expected (physical-install-step-image crc step)))
     (and (= size (length expected))
-         (equalp (subseq scratch 0 size) expected)
-         (equalp expected (physical-reseed-install-step-image crc step)))))
+         (equalp (subseq scratch 0 size) expected))))
 
 (rove:deftest install-progress-generated-scratch-encoding-contract
-    (unit-check-property 'install-progress-scratch-matches-canonical-writers))
+    (unit-check-property 'install-progress-scratch-matches-canonical-writer))
 
 (rove:deftest install-progress-scratch-covers-decimal-and-hex-boundaries
     (dolist (crc '(0 1 2147483648 4294967295))
@@ -134,7 +133,7 @@
         (dolist (step '(1 9 10 99 100 999 1000 9999 10000 99999 100000 200001))
           (let ((size (%physical-install-write-progress crc step scratch)))
             (rove:ok (equalp (subseq scratch 0 size)
-                             (physical-adoption-install-step-image crc step))))))))
+                             (physical-install-step-image crc step))))))))
 
 (rove:deftest install-progress-scratch-is-allocation-free-with-scalar-crc
     (let* ((*wal-crc32-table* (make-array 256 :element-type t :initial-contents *wal-crc32-table*))
@@ -143,7 +142,7 @@
       (rove:ok (zerop (unit-hot-call-allocated-bytes #'%physical-install-write-progress arguments)))
       (let ((size (%physical-install-write-progress 4294967295 200001 scratch)))
         (rove:ok (equalp (subseq scratch 0 size)
-                         (physical-adoption-install-step-image 4294967295 200001))))))
+                         (physical-install-step-image 4294967295 200001))))))
 
 (setf (gethash '%physical-install-write-u32-hex *unit-hot-probes*)
       (let ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))

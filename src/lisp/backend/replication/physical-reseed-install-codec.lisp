@@ -211,11 +211,6 @@
   (+ 1 (length (getf plan :old))
      (count-if (lambda (row) (not (find #\/ (first row)))) (getf plan :new))))
 
-(defun physical-reseed-install-step-image (crc step)
-  (string->bytes
-   (format nil "STEP ~d ~8,'0X~%" step
-           (wal-crc32 (string->bytes (format nil "~8,'0X ~d" crc step))))))
-
 ;; Write a canonical body with its length and CRC, followed by consecutive
 ;; checksummed progress lines.  The initial image has no progress lines.
 (defun physical-reseed-install-image (plan step)
@@ -226,7 +221,7 @@
     (unless (and (typep step '(integer 0 100012)) (<= step (physical-reseed-install-last-step plan))
                  (<= (length body) +physical-reseed-install-body-maximum+))
       (error "reseed install image or progress exceeds its bound"))
-    (let ((parts (loop for index from 1 to step collect (physical-reseed-install-step-image crc index))))
+    (let ((parts (loop for index from 1 to step collect (physical-install-step-image crc index))))
       (let ((size (+ (length header) (length body) 1 (reduce #'+ parts :key #'length :initial-value 0))))
         (unless (<= size +physical-reseed-install-maximum-bytes+) (error "oversized reseed install journal"))
         (let ((image (make-array size :element-type '(unsigned-byte 8))) (position 0))
