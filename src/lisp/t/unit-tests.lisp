@@ -40,21 +40,22 @@
                     (t :failed))))))
 
 (defmacro define-legacy-unit-group (name &body cases)
-  "Declare the legacy case inventory and instrument the same calls in execution order."
-  (labels ((case-names (form)
-             (case (first form)
-               ((let when) (loop for nested in (cddr form) append (case-names nested)))
-               (otherwise
-                (unless (and (symbolp (first form)) (null (rest form)))
-                  (error "Expected a named legacy unit case, got ~s" form))
-                (list (first form)))))
-           (report-case (form)
-             (case (first form)
-               ((let when) (list* (first form) (second form) (mapcar #'report-case (cddr form))))
-               (otherwise `(call-legacy-unit-case ',(first form) #',(first form))))))
-    (let ((names (loop for form in cases append (case-names form))))
-      `(defun ,name (&optional list-p)
-         (if list-p ',names (progn ,@(mapcar #'report-case cases)))))))
+  "Declare and instrument the same named legacy cases in execution order."
+  (let ((names nil))
+    (labels ((instrument (form)
+               (unless (consp form)
+                 (error "Expected a named legacy unit case, got ~s" form))
+               (let ((head (first form)))
+                 (case head
+                   ((let when) (list* head (second form) (mapcar #'instrument (cddr form))))
+                   (otherwise
+                    (unless (and head (symbolp head) (null (rest form)))
+                      (error "Expected a named legacy unit case, got ~s" form))
+                    (push head names)
+                    `(call-legacy-unit-case ',head #',head))))))
+      (let ((body (mapcar #'instrument cases)))
+        `(defun ,name (&optional list-p)
+           (if list-p ',(nreverse names) (progn ,@body)))))))
 
 (defun test-legacy-wait-helper-explicit-timeout ()
   (check (test-wait-until (lambda () t) 0.01)

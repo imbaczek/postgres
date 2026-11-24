@@ -55,6 +55,13 @@ table.  With no query owner there is no persistent executor to record."
 
 (defvar *query-execution-owner-generation* 0)
 
+(defmacro with-query-execution-owner-registry-update (&body body)
+  "Publish a census change and wake reload waiters under the registry lock."
+  `(sb-thread:with-mutex (*query-execution-owner-lock*)
+     ,@body
+     (incf *query-execution-owner-generation*)
+     (sb-thread:condition-broadcast *query-execution-owner-cv*)))
+
 (defvar *query-execution-owner-reload-wait-hook* nil)
 
 (defparameter *query-execution-owner-context-symbols*
@@ -154,10 +161,8 @@ Without CHECK-CANCEL, use the ordinary untimed condition wait."
           (cdr (assoc '*subquery-instrumentation-depth* context)) 0
           (cdr (assoc '*subquery-backend-entry* context)) (query-plan-backend-entry :interpreter))
     (sb-sys:without-interrupts
-      (sb-thread:with-mutex (*query-execution-owner-lock*)
-        (setf (gethash owner *query-execution-owners*) t)
-        (incf *query-execution-owner-generation*)
-        (sb-thread:condition-broadcast *query-execution-owner-cv*))
+      (with-query-execution-owner-registry-update
+        (setf (gethash owner *query-execution-owners*) t))
       (let ((complete nil))
         (unwind-protect
              (sb-sys:with-local-interrupts
@@ -294,10 +299,8 @@ Retain the snapshot and census entry while any closer needs a retry."
                    (setf (query-execution-owner-state owner) :closed
                          (query-execution-owner-bindings owner) nil
                          (query-execution-owner-backend owner) nil)
-                   (sb-thread:with-mutex (*query-execution-owner-lock*)
-                     (remhash owner *query-execution-owners*)
-                     (incf *query-execution-owner-generation*)
-                     (sb-thread:condition-broadcast *query-execution-owner-cv*))))
+                   (with-query-execution-owner-registry-update
+                     (remhash owner *query-execution-owners*))))
              (when fatal-condition (error fatal-condition))
              (values (query-execution-owner-closed-p owner) (nreverse failures))))
       (when (eq (query-execution-owner-state owner) :closing)
@@ -382,10 +385,8 @@ Retain the snapshot and census entry while any closer needs a retry."
           (setf (query-execution-owner-state owner) :closed
                 (query-execution-owner-bindings owner) nil
                 (query-execution-owner-backend owner) nil)
-          (sb-thread:with-mutex (*query-execution-owner-lock*)
-            (remhash owner *query-execution-owners*)
-            (incf *query-execution-owner-generation*)
-            (sb-thread:condition-broadcast *query-execution-owner-cv*))))
+          (with-query-execution-owner-registry-update
+            (remhash owner *query-execution-owners*))))
       (dolist (condition failures)
         (format *error-output* "~&pg-lisp: backend query cleanup: ~a~%" condition))
       (nreverse failures))))
