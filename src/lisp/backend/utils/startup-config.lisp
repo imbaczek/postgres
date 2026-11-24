@@ -1204,6 +1204,16 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
                           :dimensions '(3) :lower-bounds '(1))
           +null+ +null+ nil))
 
+(defun setting-descriptor-unit-label (spec)
+  (case (and spec (startup-setting-descriptor-unit spec))
+    (:seconds "s") (:milliseconds "ms") (:megabytes "MB") (:xblocks "8kB") (t +null+)))
+
+(defun setting-descriptor-kind-label (spec)
+  (case (and spec (startup-setting-descriptor-kind spec))
+    (:integer "integer") (:boolean "bool")
+    ((:wal-level :archive-mode :synchronous-commit) "enum")
+    (t "string")))
+
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 List canonical enum names for WAL level, archive mode and synchronous commit.
@@ -1211,8 +1221,7 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
   (let* ((spec (find-startup-setting name))
          (kind (and spec (startup-setting-descriptor-kind spec)))
          (source (getf entry :source))
-         (unit (case (and spec (startup-setting-descriptor-unit spec)) (:seconds "s") (:milliseconds "ms")
-                     (:megabytes "MB") (:xblocks "8kB") (t +null+)))
+         (unit (setting-descriptor-unit-label spec))
          (value (getf entry :value)))
     ;; The native byte option predates GUC support and can specify partial MB.
     ;; Preserve its true value, unit and provenance instead of rounding it away.
@@ -1230,10 +1239,7 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
                                        (startup-configuration-settings configuration) "archive_mode"))
                                  "off")) unit
             (if spec (string-downcase (symbol-name (startup-setting-descriptor-context spec))) "postmaster")
-            (case kind
-              (:integer "integer") (:boolean "bool")
-              ((:wal-level :archive-mode :synchronous-commit) "enum")
-              (t "string"))
+            (setting-descriptor-kind-label spec)
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))

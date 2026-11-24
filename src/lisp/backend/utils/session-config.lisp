@@ -21,6 +21,25 @@
     ("log_statement" . "none") ("log_min_duration_statement" . "-1")
     ("log_min_error_statement" . "error")))
 
+(defparameter *session-timeout-setting*
+  (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds))
+
+(defparameter *session-application-name-setting*
+  (make-startup-setting-descriptor "application_name" :user :string ""))
+
+(defun session-setting-descriptor-row (spec)
+  "Report a session descriptor with the effective value and its client or SQL provenance."
+  (let* ((name (startup-setting-descriptor-name spec))
+         (settings (and *backend* (backend-settings *backend*)))
+         (boot (startup-setting-descriptor-boot spec))
+         (value (or (and settings (gethash name settings)) boot))
+         (source (if settings (gethash (list :source name) settings "default") "default")))
+    (vector name (princ-to-string value)
+            (setting-descriptor-unit-label spec)
+            (string-downcase (symbol-name (startup-setting-descriptor-context spec)))
+            (setting-descriptor-kind-label spec)
+            source +null+ +null+ +null+ nil)))
+
 (defun session-integer-setting (name value minimum maximum unit)
   (handler-case
       (startup-parse-integer-setting name (princ-to-string value) minimum maximum unit)
@@ -70,7 +89,11 @@
 (defun session-normalize-extra-setting (name value)
   (cond
     ((string= name "statement_timeout")
-     (session-integer-setting name value 0 2147483647 :milliseconds))
+     (let ((spec *session-timeout-setting*))
+       (session-integer-setting name value
+                                (startup-setting-descriptor-minimum spec)
+                                (startup-setting-descriptor-maximum spec)
+                                (startup-setting-descriptor-unit spec))))
     ;; Native SQL does not emit statement logs. Accept the settings callers
     ;; use to suppress them, and refuse settings that would enable logging.
     ((member name '("log_statement" "log_min_duration_statement" "log_min_error_statement")
@@ -280,13 +303,7 @@ This changes in-memory state only; client reporting occurs later."
       (session-publish-application-name))))
 
 (defun session-application-name-settings-row ()
-  "Build the supported pg_settings fields for application_name."
-  (vector "application_name" (if *backend* (sql-setting-value "application_name") "")
-          +null+ "user" "string"
-          (if *backend*
-              (gethash '(:source "application_name") (backend-settings *backend*) "default")
-              "default")
-          +null+ +null+ +null+ nil))
+  (session-setting-descriptor-row *session-application-name-setting*))
 
 (defun session-set-extra-setting (name value)
   "Set or reset a session setting, saving the transaction's settings before changes.
@@ -322,10 +339,9 @@ The saved settings allow an abort to restore the values in effect at transaction
         ((string= name "synchronous_commit") (values (session-synchronous-commit-value) t))
         ((string= name "application_name") (values (or value "") t))
         ((string= name "statement_timeout")
-         (let ((milliseconds (or value 0)))
-           (values (if (zerop (mod milliseconds 1000))
-                       (startup-format-unit (/ milliseconds 1000) :seconds)
-                       (format nil "~dms" milliseconds))
+         (let ((spec *session-timeout-setting*))
+           (values (startup-format-unit (or value (startup-setting-descriptor-boot spec))
+                                        (startup-setting-descriptor-unit spec))
                    t)))
         ((assoc name *session-format-defaults* :test #'string=)
          (values (princ-to-string (if present-p value
@@ -397,8 +413,4 @@ The saved settings allow an abort to restore the values in effect at transaction
   (session-publish-application-name))
 
 (defun session-timeout-settings-row ()
-  (let* ((settings (and *backend* (backend-settings *backend*)))
-         (value (if settings (gethash "statement_timeout" settings 0) 0))
-         (source (if settings (gethash '(:source "statement_timeout") settings "default") "default")))
-    (vector "statement_timeout" (princ-to-string value) "ms" "user" "integer"
-            source +null+ +null+ +null+ nil)))
+  (session-setting-descriptor-row *session-timeout-setting*))
