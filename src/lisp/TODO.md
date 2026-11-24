@@ -1045,9 +1045,21 @@ and direct TOAST projection checks. See the A17 fixture evidence below.
 Temporal arithmetic analysis now has its own function. The binary operator
 analyzer is 104 lines and keeps the existing comparison and coercion order.
 All 138 selected unit tests passed. Live C comparisons matched ten value
-queries and two SQLSTATE checks. C also resolves TIME multiplication through
-an implicit interval cast and reports TIME plus TIME as ambiguous. The current
-native analyzer reports 42883 for both expressions.
+queries and two SQLSTATE checks. In `83625040511`, TIME uses the
+PostgreSQL TIME-to-INTERVAL cast for scaling and for an INTERVAL minus
+TIME. Exact TIME subtraction retains its overload, and TIME plus TIME
+reports ambiguity with SQLSTATE 42725. The final strict regressions and
+live C comparison passed. Before the additional subtraction case, the
+combined suite passed 1,644 Rove tests and 1,172 legacy checks, and the
+broader differential passed 1,487 C comparisons plus binary wire,
+concurrency, and fresh-image checks. Logs are archived under
+`architecture-query-type-polish`.
+In `c360cd55ede`, assignment to a date column accepts timestamp and
+timestamptz through the existing cast evaluator. Both remain assignment-only
+edges, matching `pg_cast.dat`. All nine tests in the edited component
+passed with fresh strict compilation. The live C comparison matched
+INSERT, DEFAULT, UPDATE and ON CONFLICT, including a date boundary in
+America/New_York. Logs are archived under `architecture-query-type-polish`.
 Interval input now delegates ISO numeric token handling and compact field
 expansion to separate functions. The ISO parser is 113 lines and the
 PostgreSQL-style parser is 100 lines. Both interval metadata checks
@@ -1108,6 +1120,17 @@ zero-character typmod from an unconstrained value and checks origin
 preservation for negative-scale widening, narrowing, and scale changes.
 
 ### A17 follow-up evidence
+
+In `cab196eb492`, the logical catalog, replication, and standalone-event
+fault fixtures share native startup, owned SQL readiness, and marker polling.
+The spill crash fixture also verifies that the launched PID owns the listener
+before probing SQL. The replication fixture reserves 32 slots for its complete
+publisher and subscriber fault matrix. The diagnostic rerun with 10 slots
+recorded SQLSTATE 53400 before the rename hook, and the run with 20 reached
+the subscriber cuts before exhausting capacity. All four live fixtures passed
+with the final setup. The checkpoint review traced PID ownership, failpoint
+environment forwarding, and cleanup on startup failure. The complete logs
+are archived under `architecture-logical-fault-fixtures`.
 
 The source-pin and control-data checks use the shared owned-server launcher.
 The source-pin check also uses the shared control client, with its existing
@@ -1287,6 +1310,11 @@ fix. A checkpoint review checked the revised assertions, and a fresh
 strict run of both edited components passed all 32 heads. The inventory,
 raw logs, compiler receipts, rerun patch and checksums
 are under `architecture-full-physical-124fb535` in the evidence archive.
+
+The registered physical inventory at `c7e5aa7829f` has 3,230 heads.
+Each has a passing result in the archived baseline, changed-component,
+or fixture rerun logs. This is a comparison across revisions. The current
+inventory is stored beside the baseline and fixture logs.
 
 ### A9 follow-up evidence
 
