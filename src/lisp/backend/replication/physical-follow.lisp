@@ -651,8 +651,10 @@ A policy fence must leave a clean batch boundary; an allowed open tail may remai
                                  (wal-checkpoint-record-snapshot record)))))
                    (unless *wal-recovery-group-active*
                      (multiple-value-setq (resource-fact fpw-fact logical-fact)
-                       (physical-replay-terminal-facts-next
-                        resource-fact fpw-fact logical-fact record timeline history))
+                       (pg.physical-replay-facts:physical-replay-terminal-facts-next
+                        resource-fact fpw-fact logical-fact record timeline
+                        (physical-replay-resolve-boundary-history
+                         history record resource-fact fpw-fact logical-fact t)))
                      (setf terminal (wal-record-end record)
                            completed-checkpoint (getf *physical-recovery-state* :source-checkpoint))
                      (note-boundary)))

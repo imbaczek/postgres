@@ -1,5 +1,5 @@
 ;;;; SQL text output for scalar values, arrays and records.
-(in-package #:pg)
+(in-package #:pg.sql-runtime)
 
 (defun sql-record-output (record)
   "Use C record_out's NULL fields, quoting, and doubled quote/backslash escapes."

@@ -137,6 +137,53 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 (declaim (ftype function physical-replay-check-selected-eor
                 physical-replay-check-child-initialization physical-recovery-check-store-point))
 
+(defun physical-recovery-resource-history (store state)
+  (let ((selection (and store (physical-store-selection store))))
+    (if selection (getf selection :history)
+        (timeline-read-history (getf state :timeline)))))
+
+(defun physical-recovery-scan-stage (store start state checkpoint next &key (stage-proven-p t)
+                                                                         (timeline (physical-store-prefix-timeline store start)))
+  "Build private replay state at START, clearing the checkpoint for an unproven stage.
+CHECKPOINT and NEXT must describe that prefix, never a later checkpoint or
+observed XID. A NIL checkpoint with a known NEXT can describe a child awaiting
+its initialization checkpoint. Callers that already resolved the store's prefix
+timeline at START may pass it to avoid repeating the history lookup."
+  (let ((private (copy-tree state)))
+    (unless stage-proven-p
+      (setf (getf private :source-checkpoint) nil
+            (getf private :replay-timeline) timeline)
+      (return-from physical-recovery-scan-stage private))
+    (unless (or (null next) (typep next '(integer 3 18446744073709551616)))
+      (error "suffix scan has an invalid observed XID seed"))
+    (if checkpoint
+        (progn
+          (unless (and (wal-checkpoint-snapshot-valid-p checkpoint)
+                       (<= (getf checkpoint :end) start)
+                       next (<= (getf checkpoint :next-xid) next))
+            (error "suffix scan checkpoint and XID seeds differ from its prefix"))
+          (physical-policy-check-record-owner
+           (getf checkpoint :start) (getf checkpoint :end) (getf checkpoint :timeline)
+           (physical-recovery-resource-history store state)))
+        (unless (or next (and (= timeline (getf state :timeline))
+                              (= start (getf state :end))))
+          (error "suffix scan lacks a checkpoint stage at its starting position")))
+    (setf (getf private :source-checkpoint) (copy-tree checkpoint)
+          (getf private :replay-timeline) timeline)
+    private))
+
+(defun physical-recovery-scan-policy-seeds (store state checkpoint start timeline fpw logical)
+  "Validate private policy seeds and refine them from the starting checkpoint."
+  (physical-replay-check-policy-seeds
+   fpw logical (when (or fpw logical) (physical-recovery-resource-history store state)) start timeline)
+  (values (physical-recovery-scan-checkpoint-fpw checkpoint fpw start timeline)
+          (physical-recovery-scan-checkpoint-logical checkpoint logical start timeline)))
+
+(defun physical-replay-resolve-boundary-history (provider record resource fpw logical resource-p)
+  "Acquire selected history for a boundary only when a fact needs it."
+  (when (pg.physical-replay-facts:physical-replay-needs-boundary-history-p record resource fpw logical resource-p)
+    (funcall provider)))
+
 (defun physical-history-observe-record (record observed fpw-fact logical-fact identity removed)
   "Check child initialization, track source XIDs, then validate the batch record."
   (let ((next (physical-replay-check-and-observe-xid record observed fpw-fact logical-fact)))
@@ -201,7 +248,8 @@ may use scratch files. The scan applies no database changes."
                  (multiple-value-setq (fpw-fact logical-fact)
                    (physical-replay-policy-facts-next
                     fpw-fact logical-fact record timeline
-                    (lambda () (physical-recovery-resource-history store state))))
+                    (physical-replay-resolve-boundary-history
+                     (lambda () (physical-recovery-resource-history store state)) record nil fpw-fact logical-fact nil)))
                  (when (= (wal-record-type record) +wal-record-checkpoint+)
                    (setf (getf *physical-recovery-state* :source-checkpoint)
                          (wal-checkpoint-record-snapshot record)))

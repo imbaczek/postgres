@@ -160,7 +160,7 @@ A violation is an error; the outer replay path fences recovery."
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (when (or fpw-fact logical-fact)
         (physical-replay-check-policy-seeds
-         fpw-fact logical-fact history *last-replay-lsn* (physical-recovery-replay-timeline)))
+         fpw-fact logical-fact (funcall history) *last-replay-lsn* (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*
@@ -184,9 +184,11 @@ A violation is an error; the outer replay path fences recovery."
                   (return-from physical-row-replay-prefix :deferred))
                 (physical-row-replay-preflight-with-map #'wal-recovery-map-page-spool)
                 (multiple-value-bind (candidate fpw-candidate logical-candidate)
-                    (physical-replay-terminal-facts-next
+                    (pg.physical-replay-facts:physical-replay-terminal-facts-next
                      resource-fact fpw-fact logical-fact record
-                     (physical-recovery-replay-timeline) history)
+                     (physical-recovery-replay-timeline)
+                     (physical-replay-resolve-boundary-history
+                      history record resource-fact fpw-fact logical-fact t))
                   (wal-replay-record record)
                   (setf resource-fact candidate fpw-fact fpw-candidate logical-fact logical-candidate))
                 (apply #'physical-row-replay-publish-terminal record next-xid reservation source-xids

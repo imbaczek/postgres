@@ -154,6 +154,24 @@ The final polish passed the fresh strict compiler, the combined Rove and legacy
 unit suites, and eight focused physical checks covering metadata bytes,
 checkpoint copies, configuration choices, and replay boundaries.
 
+The second completion review
+confirmed 36 items at `00082ad5afa` and identified two remaining interface
+boundaries.
+
+- **A4.** Replay drivers now resolve selected history at the starting or
+  completed boundary when facts require it. Fact transitions receive the
+  resolved history. Child validation receives the current and prior timeline,
+  selected child, and batch markers captured by the driver.
+- **A19.** SQL runtime, physical replay facts, and WAL publication use explicit
+  package imports and exports with the established `PG` symbol identities.
+  Startup policy, physical recovery, retention, follow, and slot startup each
+  have their own ASDF load group and a dependency on the preceding group.
+
+Fresh strict compilation, the combined Rove and legacy suites, seven focused
+physical tests, and live follow with Patroni 4.1.5 passed. The ASDF load plan
+resolved every source path, and cold and warm package checks verified the
+exported symbol identities.
+
 ### Architecture decisions
 
 - The [supported native formats](PHYSICAL-HA.md#supported-native-formats) table

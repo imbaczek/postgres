@@ -1,5 +1,5 @@
 ;;;; Derive and validate physical replay facts before proof or redo effects.
-(in-package #:pg)
+(in-package #:pg.physical-replay-facts)
 
 (defun physical-resource-fact-next (prior record timeline history)
   "Derive the fact at a terminal without changing replay state.
@@ -25,95 +25,53 @@ Check the fact's origin against the selected history."
     (when candidate
       (unless (<= (getf candidate :resource-timeline) timeline)
         (error "resource origin is newer than the replay timeline"))
-      (timeline-check-resource-origin candidate (if (functionp history) (funcall history) history)))))
+      (timeline-check-resource-origin candidate history))))
+
+(defun physical-replay-fpw-needs-history-p (prior record)
+  (or prior (= (wal-record-type record) +wal-record-full-page-writes-change+)
+      (and (= (wal-record-type record) +wal-record-checkpoint+)
+           (get-properties (wal-checkpoint-record-snapshot record) '(:full-page-writes)))))
 
 (defun physical-replay-fpw-fact-next (prior record timeline history)
   "Advance the source FPW fact at a complete terminal. NIL means unknown;
 known OFF is a non-NIL fact. The fact describes source history, not local policy."
-  (when (or prior
-            (= (wal-record-type record) +wal-record-full-page-writes-change+)
-            (and (= (wal-record-type record) +wal-record-checkpoint+)
-                 (get-properties (wal-checkpoint-record-snapshot record) '(:full-page-writes))))
+  (when (physical-replay-fpw-needs-history-p prior record)
     (physical-fpw-fact-next prior record timeline
-                            (if (functionp history) (funcall history) history))))
+                            history)))
+
+(defun physical-replay-logical-needs-history-p (prior record)
+  (or prior (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
+      (and (= (wal-record-type record) +wal-record-checkpoint+)
+           (get-properties (wal-checkpoint-record-snapshot record) '(:logical-decoding-enabled)))))
 
 (defun physical-replay-logical-fact-next (prior record timeline history)
   "Advance private logical evidence at a complete terminal, leaving unknown NIL
 until a status record or checkpoint establishes it."
-  (when (or prior
-            (= (wal-record-type record) +wal-record-logical-decoding-status-change+)
-            (and (= (wal-record-type record) +wal-record-checkpoint+)
-                 (get-properties (wal-checkpoint-record-snapshot record) '(:logical-decoding-enabled))))
+  (when (physical-replay-logical-needs-history-p prior record)
     (physical-logical-fact-next prior record timeline
-                                (if (functionp history) (funcall history) history))))
-
-(defun call-with-physical-replay-boundary-history (history function)
-  "Resolve supplied HISTORY at most once, and only if a fact needs it."
-  (if (functionp history)
-      (let ((resolved-p nil) (selection nil))
-        (flet ((resolve ()
-                 (unless resolved-p
-                   (setf selection (funcall history) resolved-p t))
-                 selection))
-          (declare (dynamic-extent #'resolve))
-          (funcall function #'resolve)))
-      (funcall function history)))
-
-(defun physical-replay-advance-policy-facts (fpw-fact logical-fact record timeline selection)
-  (values (physical-replay-fpw-fact-next fpw-fact record timeline selection)
-          (physical-replay-logical-fact-next logical-fact record timeline selection)))
+                                history)))
 
 (defun physical-replay-policy-facts-next (fpw-fact logical-fact record timeline history)
-  "Advance both source policies at a caller-validated complete terminal."
-  (flet ((advance (selection)
-           (physical-replay-advance-policy-facts fpw-fact logical-fact record timeline selection)))
-    (declare (dynamic-extent #'advance))
-    (call-with-physical-replay-boundary-history history #'advance)))
+  "Advance both source policies using the caller's resolved timeline history."
+  (values (physical-replay-fpw-fact-next fpw-fact record timeline history)
+          (physical-replay-logical-fact-next logical-fact record timeline history)))
 
 (defun physical-replay-terminal-facts-next (resource-fact fpw-fact logical-fact record timeline history)
-  "Validate candidate facts together against one selected history before publication."
-  (flet ((advance (selection)
-           (let ((resource (physical-resource-fact-next resource-fact record timeline selection)))
-             (multiple-value-bind (fpw logical)
-                 (physical-replay-advance-policy-facts fpw-fact logical-fact record timeline selection)
-               (values resource fpw logical)))))
-    (declare (dynamic-extent #'advance))
-    (call-with-physical-replay-boundary-history history #'advance)))
+  "Validate candidate facts against the caller's resolved history."
+  (let ((resource (physical-resource-fact-next resource-fact record timeline history)))
+    (multiple-value-bind (fpw logical)
+        (physical-replay-policy-facts-next fpw-fact logical-fact record timeline history)
+      (values resource fpw logical))))
 
-(defun physical-recovery-resource-history (store state)
-  (let ((selection (and store (physical-store-selection store))))
-    (if selection (getf selection :history)
-        (timeline-read-history (getf state :timeline)))))
-
-(defun physical-recovery-scan-stage (store start state checkpoint next &key (stage-proven-p t)
-                                                                         (timeline (physical-store-prefix-timeline store start)))
-  "Build private replay state at START, clearing the checkpoint for an unproven stage.
-CHECKPOINT and NEXT must describe that prefix, never a later checkpoint or
-observed XID. A NIL checkpoint with a known NEXT can describe a child awaiting
-its initialization checkpoint. Callers that already resolved the store's prefix
-timeline at START may pass it to avoid repeating the history lookup."
-  (let ((private (copy-tree state)))
-    (unless stage-proven-p
-      (setf (getf private :source-checkpoint) nil
-            (getf private :replay-timeline) timeline)
-      (return-from physical-recovery-scan-stage private))
-    (unless (or (null next) (typep next '(integer 3 18446744073709551616)))
-      (error "suffix scan has an invalid observed XID seed"))
-    (if checkpoint
-        (progn
-          (unless (and (wal-checkpoint-snapshot-valid-p checkpoint)
-                       (<= (getf checkpoint :end) start)
-                       next (<= (getf checkpoint :next-xid) next))
-            (error "suffix scan checkpoint and XID seeds differ from its prefix"))
-          (physical-policy-check-record-owner
-           (getf checkpoint :start) (getf checkpoint :end) (getf checkpoint :timeline)
-           (physical-recovery-resource-history store state)))
-        (unless (or next (and (= timeline (getf state :timeline))
-                              (= start (getf state :end))))
-          (error "suffix scan lacks a checkpoint stage at its starting position")))
-    (setf (getf private :source-checkpoint) (copy-tree checkpoint)
-          (getf private :replay-timeline) timeline)
-    private))
+(defun physical-replay-needs-boundary-history-p (record resource fpw logical resource-p)
+  "Report whether any candidate fact needs history validation."
+  (or (physical-replay-fpw-needs-history-p fpw record)
+      (physical-replay-logical-needs-history-p logical record)
+      (and resource-p
+           (or resource
+               (= (wal-record-type record) +wal-record-parameter-change+)
+               (and (= (wal-record-type record) +wal-record-checkpoint+)
+                    (getf (wal-checkpoint-record-snapshot record) :resource-parameters))))))
 
 (defun physical-replay-observed-next-xid (record next-xid)
   "Maintain read visibility, not a promotion-safe source allocation reservation."
@@ -264,15 +222,6 @@ The caller must establish the checkpoint and its place in the selected history."
       fact))
 
 (defun physical-replay-check-policy-seeds (fpw logical history start timeline)
-  "Check both supplied facts at one prefix in the same selected history."
-  (when (or fpw logical)
-    (let ((selected (funcall history)))
-      (when fpw (physical-fpw-check-fact fpw selected start timeline))
-      (when logical (physical-logical-check-fact logical selected start timeline)))))
-
-(defun physical-recovery-scan-policy-seeds (store state checkpoint start timeline fpw logical)
-  "Validate private policy seeds and refine them from the starting checkpoint."
-  (physical-replay-check-policy-seeds
-   fpw logical (lambda () (physical-recovery-resource-history store state)) start timeline)
-  (values (physical-recovery-scan-checkpoint-fpw checkpoint fpw start timeline)
-          (physical-recovery-scan-checkpoint-logical checkpoint logical start timeline)))
+  "Check both supplied facts at one prefix against resolved history."
+  (when fpw (physical-fpw-check-fact fpw history start timeline))
+  (when logical (physical-logical-check-fact logical history start timeline)))

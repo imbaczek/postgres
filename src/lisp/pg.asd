@@ -165,114 +165,135 @@
      ;; and physical replay entry points below.
      (:file "storage/wal-recovery")
      (:module "tcop"
+      :pathname "tcop"
+      :depends-on ("storage/wal-recovery")
       :serial t
       :components ((:file "dest")
-                   (:file "control")
-                   (:file "../replication/walsender-shutdown")
+                   (:file "control")))
+     (:module "startup-policy"
+      :pathname "tcop"
+      :depends-on ("tcop")
+      :serial t
+      :components ((:file "../replication/walsender-shutdown")
                    (:file "../utils/startup-config")
                    (:file "../libpq/auth-policy")
                    (:file "../utils/session-config")
                    (:file "../access/transam/timeline")
-                   (:file "../access/transam/timeline.hot")
-                   (:file "../replication/logical-slot-state")
-                   (:file "../replication/logical-slot-imported-state")
-                   (:file "../replication/physical-fpw")
-                   (:file "../replication/physical-logical-status")
-                   (:file "../replication/metadata-literal.hot")
-                   (:file "../replication/metadata-literal-envelope"
-                    :depends-on ("../replication/metadata-literal.hot"))
-                   (:file "../replication/physical-bootstrap.hot")
-                   (:file "../replication/physical-bootstrap"
-                    :depends-on ("../replication/metadata-literal-envelope"
-                                 "../replication/physical-bootstrap.hot"))
-                   (:file "../replication/physical-recovery"
-                    :depends-on ("../replication/metadata-literal-envelope"))
-                   (:file "../replication/physical-store-history")
-                   (:file "../replication/physical-replay-facts"
-                    :depends-on ("../replication/physical-recovery"
-                                 "../replication/physical-store-history"
-                                 "../replication/physical-fpw"
-                                 "../replication/physical-logical-status"))
-                   (:file "../replication/physical-recovery-policy")
+                   (:file "../access/transam/timeline.hot")))
+     (:module "physical-recovery-runtime"
+      :pathname "replication"
+      :depends-on ("startup-policy")
+      :serial t
+      :components ((:file "logical-slot-state")
+                   (:file "logical-slot-imported-state")
+                   (:file "physical-fpw")
+                   (:file "physical-logical-status")
+                   (:file "metadata-literal.hot")
+                   (:file "metadata-literal-envelope"
+                    :depends-on ("metadata-literal.hot"))
+                   (:file "physical-bootstrap.hot")
+                   (:file "physical-bootstrap"
+                    :depends-on ("metadata-literal-envelope"
+                                 "physical-bootstrap.hot"))
+                   (:file "physical-recovery"
+                    :depends-on ("metadata-literal-envelope"))
+                   (:file "physical-store-history")
+                   (:file "physical-replay-facts"
+                    :depends-on ("physical-recovery"
+                                 "physical-fpw"
+                                 "physical-logical-status"))
+                   (:file "physical-recovery-policy")
                    (:file "../storage/wal-namespace")
                    (:file "../storage/wal-lineage")
-                   (:file "../replication/logical-wal-record-provider")
-                   (:file "../replication/logical-wal-cursor")
-                   (:file "../replication/logical-wal-lane-provider")
+                   (:file "logical-wal-record-provider")
+                   (:file "logical-wal-cursor")
+                   (:file "logical-wal-lane-provider")
                    (:file "../storage/wal-timeline")
-                   (:file "../replication/physical-history"
-                    :depends-on ("../replication/physical-replay-facts"))
-                   (:file "../replication/physical-replay"
-                    :depends-on ("../replication/physical-replay-facts"
-                                 "../replication/physical-history"))
-                   (:file "../replication/physical-replay-history"
-                    :depends-on ("../replication/physical-replay-facts"
-                                 "../replication/physical-replay"))
-                   (:file "../replication/physical-row-replay"
-                    :depends-on ("../replication/physical-replay-facts"
-                                 "../replication/physical-replay"
-                                 "../replication/physical-replay-history"))
-                   (:file "../replication/physical-prefix")
-                   (:file "../replication/physical-follow-pin")
-                   (:file "../replication/physical-backup-lease-codec")
-                   (:file "../replication/physical-backup-lease-allocation-codec")
-                   (:file "../replication/physical-backup-lease-store")
-                   (:file "../replication/physical-backup-lease-allocation-store")
-                   (:file "../replication/physical-backup-lease-allocation-graph")
-                   (:file "../replication/physical-backup-lease-authority")
-                   (:file "../replication/physical-export-origin")
-                   (:file "../replication/physical-backup-lease-startup")
-                   (:file "../replication/physical-backup-lease-capture-owner")
-                   (:file "../replication/physical-backup-lease-capture")
-                   (:file "../replication/physical-backup-lease-allocation-authority")
-                   (:file "../replication/physical-backup-lease-allocation-context")
-                   (:file "../replication/physical-backup-lease-selected-cleanup")
-                   (:file "../replication/physical-follow-anchor")
-                   (:file "../replication/physical-backup-lease-allocation-operations")
-                   (:file "../replication/physical-backup-lease-allocation-pin-graph")
-                   (:file "../replication/physical-backup-lease-allocation-recovery")
-                   (:file "../replication/physical-backup-lease-allocation-startup")
-                   (:file "../replication/physical-retained-extent")
-                   (:file "../replication/physical-retained-overlap")
-                   (:file "../replication/physical-retained-inventory")
-                   (:file "../replication/logical-slot-continuation-fence")
-                   (:file "../replication/physical-retained-roots")
-                   (:file "../replication/physical-store-retained")
-                   (:file "../replication/physical-retained-seal")
-                   (:file "../replication/physical-retained-project")
-                   (:file "../replication/physical-restartpoint")
-                   (:file "../replication/physical-standby-backup")
-                   (:file "../replication/protocol")
-                   (:file "../replication/physical-stream")
-                   (:file "../replication/physical-client")
-                   (:file "../replication/physical-libpq")
-                   (:file "../replication/physical-backup-lease-wire")
-                   (:file "../replication/physical-backup-lease-client")
-                   (:file "../replication/physical-follow-desired")
-                   (:file "../replication/physical-follow-config")
-                   (:file "../replication/physical-follow")
-                   (:file "../replication/physical-follow-controller")
-                   (:file "../replication/physical-follow-reconcile")
-                   (:file "../replication/physical-promotion")
-                   (:file "../replication/physical-promotion-wal")
-                   (:file "../replication/physical-promotion-resume")
-                   (:file "../replication/physical-promotion-commit")
-                   (:file "../replication/physical-promotion-retained")
-                   (:file "../replication/logical-wal-archive")
-                   (:file "../replication/physical-origin-proof")
-                   (:file "../replication/physical-slot-lifetime")
-                   (:file "../replication/physical-slots")
-                   (:file "../replication/physical-promotion-primary")
-                   (:file "../utils/control-data")
-                   (:file "../replication/logical-slot-startup-types")
-                   (:file "../replication/logical-slot-startup-source")
-                   (:file "../replication/logical-slot-imported-startup-principal")
-                   (:file "../replication/logical-slot-startup-progress")
-                   (:file "../replication/logical-slot-startup")
-                   (:file "../replication/logical-slot-copy-source")))
+                   (:file "physical-history"
+                    :depends-on ("physical-replay-facts" "physical-store-history"))
+                   (:file "physical-replay"
+                    :depends-on ("physical-replay-facts"
+                                 "physical-history"))
+                   (:file "physical-replay-history"
+                    :depends-on ("physical-replay-facts"
+                                 "physical-replay"))
+                   (:file "physical-row-replay"
+                    :depends-on ("physical-replay-facts"
+                                 "physical-replay"
+                                 "physical-replay-history"))))
+     (:module "physical-retention-runtime"
+      :pathname "replication"
+      :depends-on ("physical-recovery-runtime")
+      :serial t
+      :components ((:file "physical-prefix")
+                   (:file "physical-follow-pin")
+                   (:file "physical-backup-lease-codec")
+                   (:file "physical-backup-lease-allocation-codec")
+                   (:file "physical-backup-lease-store")
+                   (:file "physical-backup-lease-allocation-store")
+                   (:file "physical-backup-lease-allocation-graph")
+                   (:file "physical-backup-lease-authority")
+                   (:file "physical-export-origin")
+                   (:file "physical-backup-lease-startup")
+                   (:file "physical-backup-lease-capture-owner")
+                   (:file "physical-backup-lease-capture")
+                   (:file "physical-backup-lease-allocation-authority")
+                   (:file "physical-backup-lease-allocation-context")
+                   (:file "physical-backup-lease-selected-cleanup")
+                   (:file "physical-follow-anchor")
+                   (:file "physical-backup-lease-allocation-operations")
+                   (:file "physical-backup-lease-allocation-pin-graph")
+                   (:file "physical-backup-lease-allocation-recovery")
+                   (:file "physical-backup-lease-allocation-startup")
+                   (:file "physical-retained-extent")
+                   (:file "physical-retained-overlap")
+                   (:file "physical-retained-inventory")
+                   (:file "logical-slot-continuation-fence")
+                   (:file "physical-retained-roots")
+                   (:file "physical-store-retained")
+                   (:file "physical-retained-seal")
+                   (:file "physical-retained-project")
+                   (:file "physical-restartpoint")
+                   (:file "physical-standby-backup")))
+     (:module "physical-follow-runtime"
+      :pathname "replication"
+      :depends-on ("physical-retention-runtime")
+      :serial t
+      :components ((:file "protocol")
+                   (:file "physical-stream")
+                   (:file "physical-client")
+                   (:file "physical-libpq")
+                   (:file "physical-backup-lease-wire")
+                   (:file "physical-backup-lease-client")
+                   (:file "physical-follow-desired")
+                   (:file "physical-follow-config")
+                   (:file "physical-follow")
+                   (:file "physical-follow-controller")
+                   (:file "physical-follow-reconcile")
+                   (:file "physical-promotion")
+                   (:file "physical-promotion-wal")
+                   (:file "physical-promotion-resume")
+                   (:file "physical-promotion-commit")
+                   (:file "physical-promotion-retained")
+                   (:file "logical-wal-archive")
+                   (:file "physical-origin-proof")
+                   (:file "physical-slot-lifetime")
+                   (:file "physical-slots")
+                   (:file "physical-promotion-primary")))
+     (:module "slot-startup-runtime"
+      :pathname "replication"
+      :depends-on ("physical-follow-runtime")
+      :serial t
+      :components ((:file "../utils/control-data")
+                   (:file "logical-slot-startup-types")
+                   (:file "logical-slot-startup-source")
+                   (:file "logical-slot-imported-startup-principal")
+                   (:file "logical-slot-startup-progress")
+                   (:file "logical-slot-startup")
+                   (:file "logical-slot-copy-source")))
      (:module "physical-reseed-runtime"
       :pathname "replication"
-      :depends-on ("tcop")
+      :depends-on ("slot-startup-runtime")
       :serial t
       :components ((:file "physical-adoption")
                    (:file "physical-adoption-startup-owner")

@@ -29,19 +29,25 @@
         nil)))))
 
 (rove:deftest replay-history-is-resolved-lazily-at-each-boundary
-    (let ((reads 0) (selected nil))
+    (let ((reads 0) (selected nil)
+                    (record (pg::make-wal-record :type pg::+wal-record-commit+)))
       (flet ((history () (incf reads) selected))
-        (ok (eq :unchecked
-                (pg::call-with-physical-replay-boundary-history
-                 #'history (lambda (resolve) (declare (ignore resolve)) :unchecked))))
+        (ok (null (pg::physical-replay-resolve-boundary-history #'history record nil nil nil t)))
         (ok (zerop reads))
-        (dolist (boundary '((nil 1) (:child 2)))
-          (setf selected (first boundary))
-          (pg::call-with-physical-replay-boundary-history
-           #'history (lambda (resolve)
-                       (ok (eq selected (funcall resolve)))
-                       (ok (eq selected (funcall resolve)))))
-          (ok (= reads (second boundary)))))))
+        (loop for (resource fpw logical selection) in
+              '((nil (:known t) nil nil)
+                (nil nil (:known t) :child)
+                ((:known t) nil nil :grandchild)
+                ((:known t) (:known t) (:known t) :grandchild))
+              for expected-reads from 1
+              do (setf selected selection)
+                 (ok (eq selected
+                         (pg::physical-replay-resolve-boundary-history
+                          #'history record resource fpw logical t)))
+                 (ok (= expected-reads reads)))
+        (ok (null (pg::physical-replay-resolve-boundary-history
+                   #'history record '(:known t) nil nil nil)))
+        (ok (= 4 reads)))))
 
 (rove:deftest successive-eor-replay-requires-a-child-checkpoint-before-publication
     (let ((pg::*physical-replay-restarting-p* t))

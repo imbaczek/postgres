@@ -147,7 +147,8 @@ rechecks after their final flush."
            (multiple-value-setq (fpw-fact logical-fact)
              (physical-replay-policy-facts-next
               fpw-fact logical-fact record timeline
-              (lambda () (physical-recovery-resource-history store *physical-recovery-state*))))
+              (physical-replay-resolve-boundary-history
+               (lambda () (physical-recovery-resource-history store *physical-recovery-state*)) record nil fpw-fact logical-fact nil)))
            (setf terminal (wal-record-end record))))
        :start-lsn *last-replay-lsn*))
     (/= timeline (getf (getf *physical-recovery-state* :source-checkpoint)

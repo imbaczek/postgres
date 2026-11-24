@@ -63,10 +63,14 @@ explicit NIL. Otherwise preserve the two-value interface."
                    (declare (dynamic-extent #'history))
                    (if (= (wal-record-type record) +wal-record-end-of-recovery+)
                        (multiple-value-setq (fpw-fact logical-fact)
-                         (physical-replay-policy-facts-next fpw-fact logical-fact record timeline #'history))
+                         (physical-replay-policy-facts-next fpw-fact logical-fact record timeline
+                                                            (physical-replay-resolve-boundary-history
+                                                             #'history record nil fpw-fact logical-fact nil)))
                        (multiple-value-setq (fact fpw-fact logical-fact)
                          (physical-replay-terminal-facts-next
-                          fact fpw-fact logical-fact record timeline #'history))))
+                          fact fpw-fact logical-fact record timeline
+                          (physical-replay-resolve-boundary-history
+                           #'history record fact fpw-fact logical-fact t)))))
                  (when (= (wal-record-type record) +wal-record-checkpoint+)
                    (setf (getf *physical-recovery-state* :source-checkpoint)
                          (wal-checkpoint-record-snapshot record)))
@@ -479,7 +483,7 @@ Stop before the next record when a published terminal causes a resource pause."
           (reservation (copy-list (getf *physical-recovery-state* :source-reservation))))
       (when (or fpw-fact logical-fact)
         (physical-replay-check-policy-seeds
-         fpw-fact logical-fact resource-history start-lsn (physical-recovery-replay-timeline)))
+         fpw-fact logical-fact (funcall resource-history) start-lsn (physical-recovery-replay-timeline)))
       (physical-recovery-note-policy-exhaustion
        (physical-recovery-map-permitted-records
         *physical-receive-store*
@@ -499,9 +503,11 @@ Stop before the next record when a published terminal causes a resource pause."
                    record next-xid reservation source-xids fpw-fact logical-fact))
                 (multiple-value-bind (candidate fpw-candidate logical-candidate)
                     (when (wal-terminal-record-type-p (wal-record-type record))
-                      (physical-replay-terminal-facts-next
+                      (pg.physical-replay-facts:physical-replay-terminal-facts-next
                        resource-fact fpw-fact logical-fact record
-                       (physical-recovery-replay-timeline) resource-history))
+                       (physical-recovery-replay-timeline)
+                       (physical-replay-resolve-boundary-history
+                        resource-history record resource-fact fpw-fact logical-fact t)))
                   (wal-replay-record record)
                   (unless *wal-recovery-group-active*
                     (setf resource-fact candidate fpw-fact fpw-candidate logical-fact logical-candidate)

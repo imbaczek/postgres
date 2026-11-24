@@ -1,5 +1,5 @@
 ;;;; SQL runtime casts and text input/output.
-(in-package #:pg)
+(in-package #:pg.sql-runtime)
 
 (defun sql-name-input (text)
   "Match C namein's UTF8-safe NAMEDATALEN-1 clipping."

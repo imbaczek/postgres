@@ -59,7 +59,7 @@
   (let* ((argument (second expression))
          (target (expr-type expression))
          (typmod (expr-typmod expression))
-         (value (sql-cast-value input-value (expr-type argument) target (if (eq target :varchar) -1 typmod))))
+         (value (pg.sql-runtime:sql-cast-value input-value (expr-type argument) target (if (eq target :varchar) -1 typmod))))
     (if (and (eq target :varchar) (not (eq value +null+)))
         (sql-varchar-assignment-value value typmod)
         value)))

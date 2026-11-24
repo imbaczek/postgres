@@ -116,7 +116,7 @@ Receipt may advance the position only when its durable owner is the replay timel
                     timeline)))
         (values (max replay (or (getf *physical-recovery-state* :receive-lsn) 0)) timeline))))
 
-(defun physical-replay-check-child-policy (record fpw-fact timeline)
+(defun physical-replay-validate-child-fpw-policy (record fpw-fact timeline active clean &optional decoded-checkpoint)
   "Check the optional child FPW change and its checkpoint policy.
 FPW-FACT describes the prefix before RECORD. A change must be the first child
 FPW change before the initialization checkpoint and occur in a clean batch;
@@ -127,18 +127,22 @@ caller state."
                           (eql timeline (getf fpw-fact :witness-timeline)))))
     (cond
       ((= (wal-record-type record) +wal-record-full-page-writes-change+)
-       (unless (and *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*
+       (unless (and active clean
                     (not marker-seen))
          (error "child initialization requires one clean FPW change batch"))
        (wal-full-page-writes-change-record-info record))
       ((and marker-seen (= (wal-record-type record) +wal-record-checkpoint+))
-       (let ((checkpoint (wal-checkpoint-record-snapshot record)))
-         (unless (and checkpoint (get-properties checkpoint '(:full-page-writes))
+       (let ((checkpoint (or decoded-checkpoint (wal-checkpoint-record-snapshot record))))
+         (unless (and (get-properties checkpoint '(:full-page-writes))
                       (eql (getf fpw-fact :enabled) (getf checkpoint :full-page-writes)))
            (error "child initialization checkpoint loses its FPW change"))))))
   t)
 
-(defun physical-replay-check-child-logical-policy (record logical-fact timeline)
+(defun physical-replay-check-child-policy (record fpw-fact timeline)
+  (physical-replay-validate-child-fpw-policy
+   record fpw-fact timeline *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*))
+
+(defun physical-replay-check-child-logical-policy (record logical-fact timeline active clean &optional decoded-checkpoint)
   "Check the child logical change batch, ordering and checkpoint agreement.
 LOGICAL-FACT describes the prefix before RECORD; this check changes no state."
   (let* ((type (wal-record-type record))
@@ -146,54 +150,65 @@ LOGICAL-FACT describes the prefix before RECORD; this check changes no state."
                            (eql timeline (getf logical-fact :witness-timeline)))))
     (cond
       ((= type +wal-record-logical-decoding-status-change+)
-       (unless (and *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*
+       (unless (and active clean
                     (not marker-seen))
          (error "child initialization requires one clean logical change batch"))
        (wal-logical-decoding-status-record-info record))
       ((and marker-seen (= type +wal-record-full-page-writes-change+))
        (error "child initialization places FPW after logical status"))
       ((and marker-seen (= type +wal-record-checkpoint+))
-       (let ((checkpoint (wal-checkpoint-record-snapshot record)))
-         (unless (and checkpoint (get-properties checkpoint '(:logical-decoding-enabled))
+       (let ((checkpoint (or decoded-checkpoint (wal-checkpoint-record-snapshot record))))
+         (unless (and (get-properties checkpoint '(:logical-decoding-enabled))
                       (eql (getf logical-fact :enabled) (getf checkpoint :logical-decoding-enabled)))
            (error "child initialization checkpoint loses its logical change"))))))
   t)
 
-(defun physical-replay-check-child-initialization (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
-                                                                     (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
-  "Check native checkpoint timeline and selected child initialization during replay.
-Only a validated selected EOR can switch the replay timeline. After EOR,
-require the child initialization checkpoint before later child work. One validated
-FPW change and one logical status change may precede it in clean batches, in
-that order. The checkpoint must preserve each change. The fact arguments describe
-the prefix before RECORD and default to published facts; validation changes no state."
+(defun physical-replay-child-inputs (record state store)
+  "Capture the current replay timeline, prior checkpoint timeline and selected child."
+  (let* ((timeline (physical-recovery-replay-timeline state))
+         (prior (getf (getf state :source-checkpoint) :timeline (getf state :timeline))))
+    (values timeline prior
+            (when (and (/= timeline prior) (= (wal-record-type record) +wal-record-checkpoint+))
+              (loop for item = (physical-store-selection store)
+                      then (getf item :previous)
+                    while item when (= timeline (getf item :target)) return item)))))
+
+(defun physical-replay-validate-child-inputs
+    (record next-xid fpw-fact logical-fact timeline prior-timeline selection active clean)
+  "Validate an ordinary record using the driver's child and batch context.
+A selected EOR starts child initialization. Clean FPW and logical changes may
+precede its checkpoint in that order. Other child work requires the checkpoint."
   (wal-require-fpw-physical-replay-supported record)
   (wal-require-logical-status-physical-replay-supported record)
-  (let* ((state *physical-recovery-state*) (timeline (physical-recovery-replay-timeline state))
-                                           (snapshot (getf state :source-checkpoint)) (type (wal-record-type record)))
-    (when (= type +wal-record-checkpoint+)
-      (let ((checkpoint (wal-checkpoint-record-snapshot record)))
-        (when (and checkpoint (/= timeline (getf checkpoint :timeline)))
-          (error "native checkpoint differs from its replay timeline"))))
-    (when (/= timeline (getf snapshot :timeline (getf state :timeline)))
-      (physical-replay-check-child-policy record fpw-fact timeline)
-      (physical-replay-check-child-logical-policy record logical-fact timeline)
+  (let* ((type (wal-record-type record))
+         (checkpoint (when (= type +wal-record-checkpoint+)
+                       (wal-checkpoint-record-snapshot record))))
+    (when (and checkpoint (/= timeline (getf checkpoint :timeline)))
+      (error "native checkpoint differs from its replay timeline"))
+    (when (/= timeline prior-timeline)
+      (physical-replay-validate-child-fpw-policy record fpw-fact timeline active clean checkpoint)
+      (physical-replay-check-child-logical-policy record logical-fact timeline active clean checkpoint)
       (cond
         ((= type +wal-record-batch-start+)
-         (when *wal-recovery-group-active* (error "child initialization has repeated batch framing")))
+         (when active (error "child initialization has repeated batch framing")))
         ((or (= type +wal-record-full-page-writes-change+)
              (= type +wal-record-logical-decoding-status-change+)) nil)
         ((= type +wal-record-checkpoint+)
-         (let* ((child (wal-checkpoint-record-snapshot record))
-                (selection (loop for item = (physical-store-selection *physical-receive-store*)
-                                   then (getf item :previous) while item
-                                 when (= timeline (getf item :target)) return item)))
-           (unless (and *wal-recovery-group-active* *wal-recovery-reservation-batch-clean-p*
-                        child selection (= timeline (getf child :timeline))
-                        (= (getf selection :parent) (getf child :prev-timeline))
-                        (<= next-xid (getf child :next-xid)))
-             (error "child initialization checkpoint differs from its replay timeline or allocation floor"))))
+         (unless (and active clean selection
+                      (= (getf selection :parent) (getf checkpoint :prev-timeline))
+                      (<= next-xid (getf checkpoint :next-xid)))
+           (error "child initialization checkpoint differs from its replay timeline or allocation floor")))
         (t (error "child end-of-recovery requires its initialization checkpoint"))))))
+
+(defun physical-replay-check-child-initialization
+    (record next-xid &optional (fpw-fact (getf *physical-recovery-state* :source-fpw-fact))
+                       (logical-fact (getf *physical-recovery-state* :source-logical-fact)))
+  "Check child initialization using inputs captured from the active replay driver."
+  (multiple-value-bind (timeline prior selection)
+      (physical-replay-child-inputs record *physical-recovery-state* *physical-receive-store*)
+    (physical-replay-validate-child-inputs record next-xid fpw-fact logical-fact
+                                           timeline prior selection *wal-recovery-group-active*
+                                           *wal-recovery-reservation-batch-clean-p*)))
 
 (defun physical-replay-check-and-observe-xid (record next-xid fpw-fact logical-fact)
   "Check the selected child's initialization before observing an ordinary record."
@@ -243,7 +258,9 @@ not end recovery or grant writer authority."
          (history (lambda () (physical-recovery-resource-history
                               *physical-receive-store* *physical-recovery-state*))))
     (multiple-value-bind (candidate logical-candidate)
-        (physical-replay-policy-facts-next fpw-fact logical-fact record child history)
+        (pg.physical-replay-facts:physical-replay-policy-facts-next fpw-fact logical-fact record child
+                                                                    (physical-replay-resolve-boundary-history
+                                                                     history record nil fpw-fact logical-fact nil))
       (physical-recovery-publish-selected-history *physical-receive-store*)
       (setf reservation (physical-source-reservation-next reservation record next-xid)
             source-xids (physical-source-xids-next source-xids record next-xid))

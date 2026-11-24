@@ -1,6 +1,6 @@
 ;;;; Preparation, handoff, and settlement of the primary WAL page FIFO.
 
-(in-package #:pg)
+(in-package #:pg.wal-publication)
 
 (defstruct (wal-page-publication (:constructor %make-wal-page-publication))
   ;; Before FIFO handoff the stack normally closes SPOOL on exit. A transaction's

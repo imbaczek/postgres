@@ -985,7 +985,7 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
                             (setf nblocks (max nblocks (1+ (third key))))))
                         map))))
       (declare (dynamic-extent #'count-map))
-      (wal-map-pending-publication-pages #'count-map)
+      (pg.wal-publication:wal-map-pending-publication-pages #'count-map)
       (count-map *wal-page-cache*)
       (count-map *wal-page-batch*))
     nblocks))
@@ -1323,7 +1323,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   *wal-output-stream*)
 
 (defun wal-append-record (type xid payload)
-  (wal-check-publication-append)
+  (pg.wal-publication:wal-check-publication-append)
   (wal-require-ordinary-record-type type)
   (wal-check-healthy)
   (handler-case

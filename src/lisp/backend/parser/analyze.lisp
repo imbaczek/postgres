@@ -1679,7 +1679,7 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
 (defun coerce-in-constant (expr type &optional (typmod -1))
   "Coerce unknown literals through the shared SQL type input functions."
   (if (in-unknown-constant-p expr)
-      (list :const (sql-cast-value (second expr) :text type typmod t) :type type :typmod typmod)
+      (list :const (pg.sql-runtime:sql-cast-value (second expr) :text type typmod t) :type type :typmod typmod)
       expr))
 
 (defun coerce-numeric-expression-to-oid (expression)
