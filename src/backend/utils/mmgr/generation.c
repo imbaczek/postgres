@@ -810,11 +810,14 @@ GenerationFree(void *pointer)
 	 * 3)	If we have no "freeblock" set, then we save a single block for
 	 *		future allocations to avoid having to malloc a new block again.
 	 *		This is useful for FIFO workloads as it avoids continual
-	 *		free/malloc cycles.
+	 *		free/malloc cycles.  Don't reuse blocks larger than what we'd
+	 *		normally allocate (maxBlockSize) though; as explained in
+	 *		GenerationContextCreate(), a reused block must not exceed
+	 *		MEMORYCHUNK_MAX_BLOCKOFFSET.
 	 */
 	if (IsKeeperBlock(set, block) || set->block == block)
 		GenerationBlockMarkEmpty(block);	/* case 1 and 2 */
-	else if (set->freeblock == NULL)
+	else if (set->freeblock == NULL && block->blksize <= set->maxBlockSize)
 	{
 		/* case 3 */
 		GenerationBlockMarkEmpty(block);
@@ -1134,7 +1137,7 @@ GenerationCheck(MemoryContext context)
 	GenerationContext *gen = (GenerationContext *) context;
 	const char *name = context->name;
 	dlist_iter	iter;
-	Size		total_allocated = 0;
+	Size		total_allocated PG_USED_FOR_ASSERTS_ONLY = 0;
 
 	/* walk all blocks in this context */
 	dlist_foreach(iter, &gen->blocks)

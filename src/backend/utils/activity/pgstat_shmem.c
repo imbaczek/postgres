@@ -800,38 +800,25 @@ pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 			PgStatShared_HashEntry *shent;
 
 			/*
-			 * We're the last referrer to this entry, try to drop the shared
-			 * entry.
+			 * We're the last referrer.  Before we get the lock, the entry may
+			 * have been reinitialized, or freed and created again, so look it
+			 * up by key.  If it is gone, it got already dropped and freed.
 			 */
+			shent = dshash_find(pgStatLocal.kind_hash[key.kind], &key, true);
 
-			/* only dropped entries can reach a 0 refcount */
-			Assert(entry_ref->shared_entry->dropped);
-
-			shent = dshash_find(pgStatLocal.kind_hash[key.kind],
-								&entry_ref->shared_entry->key, true);
-			if (!shent)
-				elog(ERROR, "could not find just referenced shared stats entry");
-
-			/*
-			 * This entry may have been reinitialized while trying to release
-			 * it, so double-check that it has not been reused while holding a
-			 * lock on its shared entry.
-			 */
-			if (pg_atomic_read_u32(&entry_ref->shared_entry->generation) ==
-				entry_ref->generation)
+			if (shent)
 			{
-				/* Same "generation", so we're OK with the removal */
-				Assert(pg_atomic_read_u32(&entry_ref->shared_entry->refcount) == 0);
-				Assert(entry_ref->shared_entry == shent);
-				pgstat_free_entry(shent, NULL);
-			}
-			else
-			{
-				/*
-				 * Shared stats entry has been reinitialized, so do not drop
-				 * its shared entry, only release its lock.
-				 */
-				dshash_release_lock(pgStatLocal.kind_hash[key.kind], shent);
+				if (shent->dropped &&
+					pg_atomic_read_u32(&shent->refcount) == 0)
+				{
+					/* Entry dropped and unreferenced, so free it. */
+					pgstat_free_entry(shent, NULL);
+				}
+				else
+				{
+					/* Entry reinitialized or created again, still in use. */
+					dshash_release_lock(pgStatLocal.kind_hash[key.kind], shent);
+				}
 			}
 		}
 	}
@@ -1242,23 +1229,51 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
 
 /*
  * Scan through the stats hashtables, dropping statistics if approved by the
- * optional do_drop() function.
+ * optional do_drop() function, or all entries if do_drop is NULL.
+ *
+ * If kind is PGSTAT_KIND_INVALID, all stats hashtables are scanned.  Otherwise,
+ * only the hashtable of the specified kind is scanned.
  */
 void
-pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
+pgstat_drop_matching_entries(PgStat_Kind kind,
+							 bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 							 Datum match_data)
 {
+	bool		filter_by_kind = (kind != PGSTAT_KIND_INVALID);
+	dshash_table **hashes;
+	int			num_hashes;
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *ps;
 	uint64		not_freed_count = 0;
 
-	for (int h = 0; h < pgStatLocal.num_var_hashes; h++)
+	if (filter_by_kind)
+	{
+		Assert(kind >= PGSTAT_KIND_MIN && kind <= PGSTAT_KIND_MAX);
+		Assert(pgStatLocal.kind_hash[kind] != NULL);
+
+		hashes = &pgStatLocal.kind_hash[kind];
+		num_hashes = 1;
+	}
+	else
+	{
+		hashes = pgStatLocal.var_hashes;
+		num_hashes = pgStatLocal.num_var_hashes;
+	}
+
+	for (int h = 0; h < num_hashes; h++)
 	{
 		/* entries are removed, take an exclusive lock */
-		dshash_seq_init(&hstat, pgStatLocal.var_hashes[h], true);
+		dshash_seq_init(&hstat, hashes[h], true);
 		while ((ps = dshash_seq_next(&hstat)) != NULL)
 		{
 			if (ps->dropped)
+				continue;
+
+			/*
+			 * A kind-specific scan may still use the shared hash, which can
+			 * contain entries for other kinds.
+			 */
+			if (filter_by_kind && ps->key.kind != kind)
 				continue;
 
 			if (do_drop != NULL && !do_drop(ps, match_data))
@@ -1291,7 +1306,7 @@ pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 void
 pgstat_drop_all_entries(void)
 {
-	pgstat_drop_matching_entries(NULL, 0);
+	pgstat_drop_matching_entries(PGSTAT_KIND_INVALID, NULL, 0);
 }
 
 static void

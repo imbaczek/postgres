@@ -55,9 +55,10 @@ static void pgoutput_truncate(LogicalDecodingContext *ctx,
 							  ReorderBufferTXN *txn, int nrelations, Relation relations[],
 							  ReorderBufferChange *change);
 static void pgoutput_message(LogicalDecodingContext *ctx,
-							 ReorderBufferTXN *txn, XLogRecPtr message_lsn,
-							 bool transactional, const char *prefix,
-							 Size sz, const char *message);
+							 ReorderBufferTXN *txn, TransactionId xid,
+							 XLogRecPtr message_lsn, bool transactional,
+							 const char *prefix, Size sz,
+							 const char *message);
 static bool pgoutput_origin_filter(LogicalDecodingContext *ctx,
 								   ReplOriginId origin_id);
 static void pgoutput_begin_prepare_txn(LogicalDecodingContext *ctx,
@@ -316,7 +317,7 @@ parse_output_parameters(List *options, PGOutputData *data)
 		{
 			unsigned long parsed;
 			char	   *endptr;
-			const char *val = strVal(defel->arg);
+			const char *val = defGetString(defel);
 
 			if (protocol_version_given)
 				ereport(ERROR,
@@ -334,8 +335,7 @@ parse_output_parameters(List *options, PGOutputData *data)
 			if (parsed > PG_UINT32_MAX)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("proto_version \"%s\" out of range",
-								strVal(defel->arg))));
+						 errmsg("proto_version \"%s\" out of range", val)));
 
 			data->protocol_version = (uint32) parsed;
 		}
@@ -351,7 +351,7 @@ parse_output_parameters(List *options, PGOutputData *data)
 			 * Pass a copy of the DefElem->arg since SplitIdentifierString
 			 * modifies its input.
 			 */
-			if (!SplitIdentifierString(pstrdup(strVal(defel->arg)), ',',
+			if (!SplitIdentifierString(pstrdup(defGetString(defel)), ',',
 									   &data->publication_names))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_NAME),
@@ -1723,11 +1723,11 @@ pgoutput_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 static void
 pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-				 XLogRecPtr message_lsn, bool transactional, const char *prefix, Size sz,
-				 const char *message)
+				 TransactionId xid, XLogRecPtr message_lsn, bool transactional,
+				 const char *prefix, Size sz, const char *message)
 {
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
-	TransactionId xid = InvalidTransactionId;
+	TransactionId stream_xid = InvalidTransactionId;
 
 	if (!data->messages)
 		return;
@@ -1737,7 +1737,7 @@ pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 * pgoutput_change.
 	 */
 	if (data->in_streaming)
-		xid = txn->xid;
+		stream_xid = xid;
 
 	/*
 	 * Output BEGIN if we haven't yet. Avoid for non-transactional messages.
@@ -1753,7 +1753,7 @@ pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_message(ctx->out,
-							 xid,
+							 stream_xid,
 							 message_lsn,
 							 transactional,
 							 prefix,
@@ -2104,9 +2104,19 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		ListCell   *lc;
 		Oid			publish_as_relid = relid;
 		int			publish_ancestor_level = 0;
-		bool		am_partition = get_rel_relispartition(relid);
 		char		relkind = get_rel_relkind(relid);
 		List	   *rel_publications = NIL;
+		List	   *ancestors = NIL;
+
+		/*
+		 * A partition whose concurrent detach has been committed but not
+		 * finalized reports no ancestors, even though relispartition is still
+		 * set. Treat it as a standalone table. Its changes are no longer
+		 * published via its former ancestors, but can still be published via
+		 * its own publications.
+		 */
+		if (get_rel_relispartition(relid))
+			ancestors = get_partition_ancestors(relid);
 
 		/* Reload publications if needed before use. */
 		if (!publications_valid)
@@ -2212,9 +2222,8 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 			{
 				List	   *exceptpubids = NIL;
 
-				if (am_partition)
+				if (ancestors)
 				{
-					List	   *ancestors = get_partition_ancestors(relid);
 					Oid			last_ancestor_relid = llast_oid(ancestors);
 
 					/*
@@ -2263,11 +2272,10 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 				 * published via this publication, which will be used as the
 				 * relation via which to publish the partition's changes.
 				 */
-				if (am_partition)
+				if (ancestors)
 				{
 					Oid			ancestor;
 					int			level;
-					List	   *ancestors = get_partition_ancestors(relid);
 
 					ancestor = GetTopMostAncestorInPublication(pub->oid,
 															   ancestors,
@@ -2365,6 +2373,7 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		list_free(pubids);
 		list_free(schemaPubids);
 		list_free(rel_publications);
+		list_free(ancestors);
 
 		entry->replicate_valid = true;
 	}

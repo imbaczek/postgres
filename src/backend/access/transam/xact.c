@@ -235,7 +235,7 @@ typedef struct SerializedTransactionState
 	FullTransactionId currentFullTransactionId;
 	CommandId	currentCommandId;
 	int			nParallelCurrentXids;
-	TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(nParallelCurrentXids) TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
 } SerializedTransactionState;
 
 /* The size of SerializedTransactionState, not including the final array. */
@@ -3417,6 +3417,14 @@ CommitTransactionCommandInternal(void)
 			if (s->blockState == TBLOCK_END)
 			{
 				Assert(s->parent == NULL);
+
+				/*
+				 * Save the characteristics again, now that the
+				 * subtransactions are committed.  A subtransaction may have
+				 * switched to read-only, which should not be inherited by the
+				 * next AND CHAIN, if any.
+				 */
+				SaveTransactionCharacteristics(&savetc);
 				CommitTransaction();
 				s->blockState = TBLOCK_DEFAULT;
 				if (s->chain)
@@ -3547,6 +3555,10 @@ static bool
 AbortCurrentTransactionInternal(void)
 {
 	TransactionState s = CurrentTransactionState;
+	SavedTransactionCharacteristics savetc;
+
+	/* Must save in case we need to restore below */
+	SaveTransactionCharacteristics(&savetc);
 
 	switch (s->blockState)
 	{
@@ -3604,6 +3616,12 @@ AbortCurrentTransactionInternal(void)
 		case TBLOCK_INPROGRESS:
 		case TBLOCK_PARALLEL_INPROGRESS:
 			AbortTransaction();
+
+			/*
+			 * AbortTransaction() has reset the transaction characteristics;
+			 * restore them for AND CHAIN.
+			 */
+			RestoreTransactionCharacteristics(&savetc);
 			s->blockState = TBLOCK_ABORT;
 			/* CleanupTransaction happens when we exit TBLOCK_ABORT_END */
 			break;
@@ -6243,9 +6261,13 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	if (standbyState == STANDBY_DISABLED)
 	{
 		/*
-		 * Mark the transaction committed in pg_xact.
+		 * Mark the transaction committed in pg_xact. We use the async commit
+		 * protocol during recovery to ensure that minRecoveryPoint is
+		 * advanced before the CLOG is written. This ensures that if we crash,
+		 * we don't see the committed status set for transactions that haven't
+		 * yet recovered.
 		 */
-		TransactionIdCommitTree(xid, parsed->nsubxacts, parsed->subxacts);
+		TransactionIdAsyncCommitTree(xid, parsed->nsubxacts, parsed->subxacts, lsn);
 	}
 	else
 	{
@@ -6261,13 +6283,8 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		RecordKnownAssignedTransactionIds(max_xid);
 
 		/*
-		 * Mark the transaction committed in pg_xact. We use async commit
-		 * protocol during recovery to provide information on database
-		 * consistency for when users try to set hint bits. It is important
-		 * that we do not set hint bits until the minRecoveryPoint is past
-		 * this commit record. This ensures that if we crash we don't see hint
-		 * bits set on changes made by transactions that haven't yet
-		 * recovered. It's unlikely but it's good to be safe.
+		 * Hot standby also needs the commit LSN so that readers can safely
+		 * set hint bits.
 		 */
 		TransactionIdAsyncCommitTree(xid, parsed->nsubxacts, parsed->subxacts, lsn);
 
@@ -6330,7 +6347,7 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		/* see equivalent call for relations above */
 		XLogFlush(lsn);
 
-		pgstat_execute_transactional_drops(parsed->nstats, parsed->stats, true);
+		pgstat_execute_transactional_drops(parsed->nstats, parsed->stats);
 	}
 
 	/*
@@ -6441,7 +6458,7 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 		/* see equivalent call for relations above */
 		XLogFlush(lsn);
 
-		pgstat_execute_transactional_drops(parsed->nstats, parsed->stats, true);
+		pgstat_execute_transactional_drops(parsed->nstats, parsed->stats);
 	}
 }
 

@@ -3435,6 +3435,33 @@ SELECT count(*) FROM testjsonb WHERE j @? '$.bar';
      0
 (1 row)
 
+-- check indexed lookup of root scalars
+INSERT INTO testjsonb VALUES('"a scalar"');
+SELECT count(*) FROM testjsonb WHERE j @@ 'strict $ == "a scalar"';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM testjsonb WHERE j @? 'strict $ ? (@ == "a scalar")';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM testjsonb WHERE j @@ 'lax $ == "a scalar"';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM testjsonb WHERE j @? 'lax $ ? (@ == "a scalar")';
+ count 
+-------
+     1
+(1 row)
+
+DELETE FROM testjsonb WHERE j = '"a scalar"';
 -- array exists - array elements should behave as keys (for GIN index scans too)
 CREATE INDEX jidx_array ON testjsonb USING gin((j->'array'));
 SELECT count(*) from testjsonb  WHERE j->'array' ? 'bar';
@@ -5714,7 +5741,8 @@ select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d"
 ERROR:  wrong flag in flag array: ""
 HINT:  Possible values are: "string", "numeric", "boolean", "key", and "all".
 select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '{}');
-ERROR:  wrong flag type, only arrays and scalars are allowed
+ERROR:  incorrect flag structure
+DETAIL:  Flags argument must be a string or array of strings.
 select jsonb_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::jsonb, '[]');
  jsonb_to_tsvector 
 -------------------

@@ -113,7 +113,7 @@ typedef struct LsnReadQueue
 	uint32		head;
 	uint32		tail;
 	uint32		size;
-	struct
+	pg_attribute_counted_by(size) struct
 	{
 		bool		io;
 		XLogRecPtr	lsn;
@@ -974,6 +974,9 @@ XLogPrefetcherBeginRead(XLogPrefetcher *prefetcher, XLogRecPtr recPtr)
 	prefetcher->begin_ptr = recPtr;
 
 	prefetcher->no_readahead_until = InvalidXLogRecPtr;
+
+	/* Forget the record we were examining, if any. */
+	prefetcher->record = NULL;
 
 	/* This will forget about any queued up records in the decoder. */
 	XLogBeginRead(prefetcher->reader, recPtr);

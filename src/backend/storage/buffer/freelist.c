@@ -90,7 +90,7 @@ typedef struct BufferAccessStrategyData
 	 * simplicity this is palloc'd together with the fixed fields of the
 	 * struct.
 	 */
-	Buffer		buffers[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(nbuffers) Buffer buffers[FLEXIBLE_ARRAY_MEMBER];
 }			BufferAccessStrategyData;
 
 
@@ -271,7 +271,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 					 * one eventually, but it's probably better to fail than
 					 * to risk getting stuck in an infinite loop.
 					 */
-					elog(ERROR, "no unpinned buffers available");
+					ereport(ERROR,
+							errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+							errmsg("could not find an unpinned shared buffer"));
 				}
 				break;
 			}
@@ -694,9 +696,6 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint64 *buf_state)
 
 /*
  * AddBufferToRing -- add a buffer to the buffer ring
- *
- * Caller must hold the buffer header spinlock on the buffer.  Since this
- * is called with the spinlock held, it had better be quite cheap.
  */
 static void
 AddBufferToRing(BufferAccessStrategy strategy, BufferDesc *buf)

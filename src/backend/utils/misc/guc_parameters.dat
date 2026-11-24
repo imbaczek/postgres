@@ -502,6 +502,15 @@
   check_hook => 'check_commit_ts_buffers',
 },
 
+{ name => 'composite_type_mismatch', type => 'enum', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Sets how version mismatches of composite values are handled.',
+  long_desc => 'Reading a composite value whose row type was altered incompatibly after the value was created normally causes PostgreSQL to report an error. This parameter controls that behavior. Anything other than "error", i.e. "warn" or "disabled", is not safe.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'composite_type_mismatch',
+  boot_val => 'COMPOSITE_TYPE_MISMATCH_ERROR',
+  options => 'composite_type_mismatch_options',
+},
+
 { name => 'compute_query_id', type => 'enum', context => 'PGC_SUSET', group => 'STATS_MONITORING',
   short_desc => 'Enables in-core computation of query identifiers.',
   variable => 'compute_query_id',
@@ -862,6 +871,13 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_async_merge_append', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of async merge-append plans.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_async_merge_append',
+  boot_val => 'true',
+},
+
 { name => 'enable_bitmapscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the planner\'s use of bitmap-scan plans.',
   flags => 'GUC_EXPLAIN',
@@ -1060,7 +1076,7 @@
 
 { name => 'extension_control_path', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_OTHER',
   short_desc => 'Sets the path for extension control files.',
-  long_desc => 'The remaining extension script and secondary control files are then loaded from the same directory where the primary control file was found.',
+  long_desc => 'The remaining extension script and secondary control files are then loaded from the same directory where the primary control file was found, unless the primary control file specifies a different directory.',
   flags => 'GUC_SUPERUSER_ONLY',
   variable => 'Extension_control_path',
   boot_val => '"$system"',
@@ -2326,6 +2342,7 @@
   flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY',
   variable => 'output_plugin_libraries_string',
   boot_val => '"pgoutput, test_decoding"',
+  check_hook => 'check_output_plugin_libraries',
 },
 
 { name => 'parallel_leader_participation', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_WORKER_PROCESSES',

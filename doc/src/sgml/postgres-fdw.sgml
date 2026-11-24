@@ -493,8 +493,9 @@ OPTIONS (ADD password_required 'false');
 
    <para>
     <filename>postgres_fdw</filename> supports asynchronous execution, which
-    runs multiple parts of an <structname>Append</structname> node
-    concurrently rather than serially to improve performance.
+    runs multiple parts of an <structname>Append</structname> or
+    <structname>MergeAppend</structname> node concurrently rather than serially
+    to improve performance.
     This execution can be controlled using the following option:
    </para>
 
@@ -523,8 +524,9 @@ OPTIONS (ADD password_required 'false');
 
       <para>
        Asynchronous execution is applied even when an
-       <structname>Append</structname> node contains subplan(s) executed
-       synchronously as well as subplan(s) executed asynchronously.
+       <structname>Append</structname> or <structname>MergeAppend</structname>
+       node contains subplan(s) executed synchronously as well as subplan(s)
+       executed asynchronously.
        In such a case, if the asynchronous subplans are ones processed using
        <filename>postgres_fdw</filename>, tuples from the asynchronous
        subplans are not returned until after at least one synchronous subplan
@@ -815,8 +817,8 @@ OPTIONS (ADD password_required 'false');
         A user mapping setting overrides the foreign server setting.
         With SCRAM pass-through authentication,
         <filename>postgres_fdw</filename> uses SCRAM-hashed secrets instead of
-        plain-text user passwords to connect to the remote server.  This
-        avoids storing plain-text user passwords in PostgreSQL system
+        cleartext user passwords to connect to the remote server.  This
+        avoids storing user passwords as cleartext in PostgreSQL system
         catalogs.
        </para>
 

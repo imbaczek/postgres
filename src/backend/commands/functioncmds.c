@@ -101,6 +101,7 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 	 * If the type name contains any modifiers like %TYPE, type[] array
 	 * syntax, or typmod decoration, it's not an input function, or at least
 	 * not one for which we'd want to automatically create a shell type.
+	 * Likewise, an input function never returns a set.
 	 *
 	 * Only C-coded functions can be I/O functions.  We enforce this
 	 * restriction here mainly to prevent littering the catalogs with shell
@@ -108,7 +109,7 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 	 */
 	attempt_shell_creation =
 		!returnType->pct_type && returnType->arrayBounds == NULL &&
-		returnType->typmods == NIL &&
+		returnType->typmods == NIL && !returnType->setof &&
 		(languageOid == INTERNALlanguageId || languageOid == ClanguageId);
 
 	typtup = LookupTypeName(NULL, returnType, NULL, false);
@@ -322,6 +323,9 @@ interpret_function_parameter_list(ParseState *pstate,
 			isinput = true;
 			if (parameterTypes_list)
 				*parameterTypes_list = lappend_oid(*parameterTypes_list, toid);
+			if (inParameterNames_list)
+				*inParameterNames_list = lappend(*inParameterNames_list,
+												 makeString(fp->name ? fp->name : pstrdup("")));
 		}
 
 		/* handle output parameters */
@@ -417,9 +421,6 @@ interpret_function_parameter_list(ParseState *pstate,
 			paramNames[i] = CStringGetTextDatum(fp->name);
 			have_names = true;
 		}
-
-		if (inParameterNames_list)
-			*inParameterNames_list = lappend(*inParameterNames_list, makeString(fp->name ? fp->name : pstrdup("")));
 
 		if (fp->defexpr)
 		{
@@ -930,9 +931,10 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 
 		pinfo->fname = funcname;
 		pinfo->nargs = list_length(parameterTypes);
+		Assert(pinfo->nargs == list_length(inParameterNames));
 		pinfo->argtypes = palloc_array(Oid, pinfo->nargs);
 		pinfo->argnames = palloc_array(char *, pinfo->nargs);
-		for (int i = 0; i < list_length(parameterTypes); i++)
+		for (int i = 0; i < pinfo->nargs; i++)
 		{
 			char	   *s = strVal(list_nth(inParameterNames, i));
 

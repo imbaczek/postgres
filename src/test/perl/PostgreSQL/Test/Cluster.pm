@@ -657,12 +657,15 @@ sub init
 	# disabled, use a previously initdb'd cluster as a template by copying it.
 	# For a lot of tests, that's substantially cheaper. It does not seem
 	# worth figuring out whether extra parameters affect compatibility, so
-	# initdb is forced if any are defined.
+	# initdb is forced if any are defined.  The template was created by the
+	# installation under test, so it can't be used for a node using a
+	# different installation.
 	#
 	# There's very similar code in pg_regress.c, but we can't easily
 	# deduplicate it until we require perl at build time.
 	if (   $params{force_initdb}
 		or defined $params{extra}
+		or defined $self->{_install_path}
 		or !defined $ENV{INITDB_TEMPLATE})
 	{
 		note("initializing database system by running initdb");
@@ -747,6 +750,24 @@ sub init
 	{
 		print $conf "wal_level = minimal\n";
 		print $conf "max_wal_senders = 0\n";
+	}
+
+	# PG_TEST_SERVER_POSTGRES_OPTS allows adding server settings via an
+	# environment variable.  Unlike PG_TEST_INITDB_EXTRA_OPTS, it does not
+	# disable the initdb template mechanism, as the options are only added to
+	# postgresql.conf and not passed to initdb.  The options are given as
+	# whitespace-separated "name=value" pairs.
+	#
+	# There's very similar code in pg_regress.c.
+	my $server_opts_env = $ENV{PG_TEST_SERVER_POSTGRES_OPTS};
+	if (defined $server_opts_env)
+	{
+		print $conf "# options from PG_TEST_SERVER_POSTGRES_OPTS\n";
+		foreach my $opt (split(/\s+/, $server_opts_env))
+		{
+			print $conf "$opt\n" if $opt ne '';
+		}
+		print $conf "# end of options from PG_TEST_SERVER_POSTGRES_OPTS\n";
 	}
 
 	print $conf "port = $port\n";

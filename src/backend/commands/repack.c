@@ -595,7 +595,8 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*- translator: first %s is name of a SQL command, eg. REPACK */
 				errmsg("cannot execute %s on a shared catalog",
-					   RepackCommandAsString(cmd)));
+					   cmd == REPACK_COMMAND_REPACK ? "REPACK ... USING INDEX" : "CLUSTER"),
+				errdetail("Marking an index as clustered on a shared catalog would only take effect in the current database."));
 
 	/*
 	 * The CONCURRENTLY case should have been rejected earlier because it does
@@ -3852,6 +3853,7 @@ start_repack_decoding_worker(Oid relid)
 	DecodingWorkerShared *shared;
 	shm_mq	   *mq;
 	BackgroundWorker bgw;
+	int			reported_phase = 0;
 
 	decoding_worker = palloc0_object(DecodingWorker);
 
@@ -3862,6 +3864,7 @@ start_repack_decoding_worker(Oid relid)
 
 	shared = (DecodingWorkerShared *) dsm_segment_address(decoding_worker->seg);
 	shared->initialized = false;
+	shared->setup_phase = 0;
 	shared->lsn_upto = InvalidXLogRecPtr;
 	shared->done = false;
 	SharedFileSetInit(&shared->sfs, decoding_worker->seg);
@@ -3879,9 +3882,13 @@ start_repack_decoding_worker(Oid relid)
 	shared->backend_pid = MyProcPid;
 	shared->backend_proc_number = MyProcNumber;
 
-	/* Transmit our timeouts to the worker too */
+	/*
+	 * Transmit any relevant settings to the worker too.  These would override
+	 * any role- or database-level configuration with that from this session.
+	 */
 	shared->lock_timeout = LockTimeout;
 	shared->transaction_timeout = TransactionTimeout;
+	shared->temp_file_limit = temp_file_limit;
 
 	mq = shm_mq_create((char *) BUFFERALIGN(shared->error_queue),
 					   REPACK_ERROR_QUEUE_SIZE);
@@ -3927,15 +3934,25 @@ start_repack_decoding_worker(Oid relid)
 	 * for any reason, otherwise the worker might end up in a deadlock,
 	 * waiting for the caller's transaction to end. Therefore wait here until
 	 * the worker indicates that it has the logical decoding initialized.
+	 * While waiting, report the phase the worker asks us to report.
 	 */
 	ConditionVariablePrepareToSleep(&shared->cv);
 	for (;;)
 	{
 		bool		initialized;
+		int			setup_phase;
 
 		SpinLockAcquire(&shared->mutex);
 		initialized = shared->initialized;
+		setup_phase = shared->setup_phase;
 		SpinLockRelease(&shared->mutex);
+
+		/* Report each phase once. */
+		if (setup_phase != reported_phase)
+		{
+			pgstat_progress_update_param(PROGRESS_REPACK_PHASE, setup_phase);
+			reported_phase = setup_phase;
+		}
 
 		if (initialized)
 			break;

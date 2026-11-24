@@ -15,6 +15,7 @@
 #define TUPDESC_H
 
 #include "access/attnum.h"
+#include "access/xlogdefs.h"
 #include "catalog/pg_attribute.h"
 #include "nodes/pg_list.h"
 
@@ -151,6 +152,23 @@ typedef struct TupleDescData
 	Oid			tdtypeid;		/* composite type ID for tuple type */
 	int32		tdtypmod;		/* typmod for tuple type */
 	int			tdrefcount;		/* reference count, or -1 if not counting */
+
+	/* ---
+	 * Version of the tuple descriptor in aggregate. Used to ensure we never
+	 * try to deform datum-style tuples with a different tupledesc than what
+	 * was used to form them.  For !RECORDOID descriptors, this is equal to
+	 *     TupleDescAttr(td, td->natts - 1)->attversion
+	 * but faster to access (due to the constant offset), except when natts=0,
+	 * in which case tdversion is 0. The descriptor-wide version is used when
+	 * forming tuples and as the fast-path when checking a datum tuple's
+	 * version (most of the time it will match, and no per-attribute version
+	 * checks are needed).
+	 *
+	 * See src/backend/catalog/README.attver.md.
+	 * ---
+	 */
+	XLogRecPtr	tdversion;
+
 	int			firstNonCachedOffsetAttr;	/* index of first compact_attrs
 											 * element without an attcacheoff */
 	int			firstNonGuaranteedAttr; /* index of the first nullable,
@@ -158,7 +176,7 @@ typedef struct TupleDescData
 										 * compact_attrs element. */
 	TupleConstr *constr;		/* constraints, or NULL if none */
 	/* compact_attrs[N] is the compact metadata of Attribute Number N+1 */
-	CompactAttribute compact_attrs[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(natts) CompactAttribute compact_attrs[FLEXIBLE_ARRAY_MEMBER];
 }			TupleDescData;
 typedef struct TupleDescData *TupleDesc;
 
@@ -215,12 +233,8 @@ extern TupleDesc CreateTupleDescTruncatedCopy(TupleDesc tupdesc, int natts);
 
 extern TupleDesc CreateTupleDescCopyConstr(TupleDesc tupdesc);
 
-#define TupleDescSize(src) \
-	(offsetof(struct TupleDescData, compact_attrs) + \
-	 (src)->natts * sizeof(CompactAttribute) + \
-	 (src)->natts * sizeof(FormData_pg_attribute))
-
-extern void TupleDescCopy(TupleDesc dst, TupleDesc src);
+extern Size TupleDescCopySize(TupleDesc src);
+extern void TupleDescCopySized(TupleDesc dst, Size dstsize, TupleDesc src);
 
 extern void TupleDescCopyEntry(TupleDesc dst, AttrNumber dstAttno,
 							   TupleDesc src, AttrNumber srcAttno);
@@ -230,6 +244,10 @@ extern void FreeTupleDesc(TupleDesc tupdesc);
 
 extern void IncrTupleDescRefCount(TupleDesc tupdesc);
 extern void DecrTupleDescRefCount(TupleDesc tupdesc);
+
+extern XLogRecPtr TupleDescGetVersion(TupleDesc tupdesc);
+extern void TupleDescSetVersion(TupleDesc tupdesc, XLogRecPtr version);
+extern XLogRecPtr TupleDescGetAttrVersion(TupleDesc tupdesc, AttrNumber attnum);
 
 #define PinTupleDesc(tupdesc) \
 	do { \

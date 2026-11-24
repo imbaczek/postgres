@@ -99,7 +99,7 @@ static JsonBehavior *transformJsonBehavior(ParseState *pstate, JsonExpr *jsexpr,
 										   JsonBehavior *behavior,
 										   JsonBehaviorType default_behavior,
 										   JsonReturning *returning);
-static Node *GetJsonBehaviorConst(JsonBehaviorType btype, int location);
+static Node *GetJsonBehaviorConst(JsonBehaviorType btype);
 static Node *make_row_comparison_op(ParseState *pstate, List *opname,
 									List *largs, List *rargs, int location);
 static Node *make_row_distinct_op(ParseState *pstate, List *opname,
@@ -2826,9 +2826,7 @@ transformCollateClause(ParseState *pstate, CollateClause *c)
 /*
  * Transform a "row compare-op row" construct
  *
- * The inputs are lists of already-transformed expressions.
- * As with coerce_type, pstate may be NULL if no special unknown-Param
- * processing is wanted.
+ * The argument lists are lists of already-transformed expressions.
  *
  * The output may be a single OpExpr, an AND or OR combination of OpExprs,
  * or a RowCompareExpr.  In all cases it is guaranteed to return boolean.
@@ -4897,7 +4895,7 @@ transformJsonBehavior(ParseState *pstate, JsonExpr *jsexpr,
 	}
 
 	if (expr == NULL && btype != JSON_BEHAVIOR_ERROR)
-		expr = GetJsonBehaviorConst(btype, location);
+		expr = GetJsonBehaviorConst(btype);
 
 	/*
 	 * Try to coerce the expression if needed.
@@ -4988,7 +4986,7 @@ transformJsonBehavior(ParseState *pstate, JsonExpr *jsexpr,
 							errmsg("cannot cast behavior expression of type %s to %s",
 								   format_type_be(exprType(expr)),
 								   format_type_be(returning->typid)),
-							parser_errposition(pstate, exprLocation(expr)));
+							parser_errposition(pstate, location));
 			}
 
 			expr = coerced_expr;
@@ -5010,7 +5008,7 @@ transformJsonBehavior(ParseState *pstate, JsonExpr *jsexpr,
  * JsonBehaviorType.
  */
 static Node *
-GetJsonBehaviorConst(JsonBehaviorType btype, int location)
+GetJsonBehaviorConst(JsonBehaviorType btype)
 {
 	Datum		val = (Datum) 0;
 	Oid			typid = JSONBOID;
@@ -5065,7 +5063,6 @@ GetJsonBehaviorConst(JsonBehaviorType btype, int location)
 	}
 
 	con = makeConst(typid, -1, InvalidOid, len, val, isnull, isbyval);
-	con->location = location;
 
 	return (Node *) con;
 }

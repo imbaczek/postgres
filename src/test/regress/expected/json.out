@@ -1986,6 +1986,17 @@ SELECT * FROM
  776 |  
 (1 row)
 
+-- anonymous record type with variable rowtype
+SELECT i,
+  json_populate_recordset(r, '[{"f1":"10000","f2":"20000","f3":"30000"}]')
+FROM (VALUES (1, row(0,0)), (2, row(0,0,0)), (3, row(0,0))) v(i, r);
+ i | json_populate_recordset 
+---+-------------------------
+ 1 | (10000,20000)
+ 2 | (10000,20000,30000)
+ 3 | (10000,20000)
+(3 rows)
+
 -- empty array is a corner case
 SELECT json_populate_recordset(null::record, '[]');
 ERROR:  could not determine row type for result of json_populate_recordset
@@ -2774,7 +2785,8 @@ select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d":
 ERROR:  wrong flag in flag array: ""
 HINT:  Possible values are: "string", "numeric", "boolean", "key", and "all".
 select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '{}');
-ERROR:  wrong flag type, only arrays and scalars are allowed
+ERROR:  incorrect flag structure
+DETAIL:  Flags argument must be a string or array of strings.
 select json_to_tsvector('english', '{"a": "aaa in bbb", "b": 123, "c": 456, "d": true, "f": false, "g": null}'::json, '[]');
  json_to_tsvector 
 ------------------

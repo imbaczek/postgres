@@ -552,14 +552,21 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 			 */
 			if (PQnfields(res) != 2 || PQntuples(res) != 1)
 			{
-				pg_log_warning("unexpected response to TIMELINE_HISTORY command: got %d rows and %d fields, expected %d rows and %d fields",
-							   PQntuples(res), PQnfields(res), 1, 2);
+				pg_log_error("unexpected response to TIMELINE_HISTORY command: got %d rows and %d fields, expected %d rows and %d fields",
+							 PQntuples(res), PQnfields(res), 1, 2);
+				PQclear(res);
+				return false;
 			}
 
 			/* Write the history file to disk */
-			writeTimeLineHistoryFile(stream,
-									 PQgetvalue(res, 0, 0),
-									 PQgetvalue(res, 0, 1));
+			if (!writeTimeLineHistoryFile(stream,
+										  PQgetvalue(res, 0, 0),
+										  PQgetvalue(res, 0, 1)))
+			{
+				/* Error message written in writeTimeLineHistoryFile() */
+				PQclear(res);
+				return false;
+			}
 
 			PQclear(res);
 		}
@@ -691,9 +698,16 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	}
 
 error:
-	if (walfile != NULL && stream->walmethod->ops->close(walfile, CLOSE_NO_RENAME) != 0)
-		pg_log_error("could not close file \"%s\": %s",
-					 walfile->pathname, GetLastWalMethodError(stream->walmethod));
+	if (walfile != NULL)
+	{
+		char		walfile_name[MAXPGPATH];
+
+		/* The close method can free walfile even on failure. */
+		strlcpy(walfile_name, walfile->pathname, sizeof(walfile_name));
+		if (stream->walmethod->ops->close(walfile, CLOSE_NO_RENAME) != 0)
+			pg_log_error("could not close file \"%s\": %s",
+						 walfile_name, GetLastWalMethodError(stream->walmethod));
+	}
 	walfile = NULL;
 	return false;
 }

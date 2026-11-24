@@ -422,6 +422,10 @@ BEGIN;
 REPACK (ANALYZE) clstr_tst;
 ROLLBACK;
 
+-- Shared rels are not allowed with USING INDEX.
+REPACK pg_database USING INDEX pg_database_oid_index;
+CLUSTER pg_database USING pg_database_oid_index;
+
 -- REPACK is allowed within a PL, as long as there's no ANALYZE.
 DO $$ BEGIN EXECUTE 'REPACK clstr_tst'; END $$;
 DO $$ BEGIN EXECUTE 'REPACK (ANALYZE) clstr_tst'; END $$;
@@ -454,6 +458,40 @@ JOIN relnodes_new n ON o.relname = n.relname
 WHERE o.relfilenode <> n.relfilenode
 ORDER BY o.relname;
 
+-- CLUSTER with rollbacked subtransaction, where the same row is inserted,
+-- updated, then rollbacked.
+BEGIN;
+-- Index scan required for CLUSTER, force it.
+SET LOCAL random_page_cost = 0.0001;
+SET LOCAL seq_page_cost = 1000;
+CREATE TABLE cluster_aborted_upd (a int, b int);
+CREATE INDEX cluster_aborted_upd_idx ON cluster_aborted_upd (b);
+INSERT INTO cluster_aborted_upd VALUES (1, 3);
+SAVEPOINT sp;
+UPDATE cluster_aborted_upd SET a = 2;
+ROLLBACK TO sp;
+CLUSTER cluster_aborted_upd USING cluster_aborted_upd_idx;
+COMMIT;
+-- One row expected.
+SELECT count(*) FROM cluster_aborted_upd;
+SELECT * FROM cluster_aborted_upd;
+
+-- REPACK must honor enable_sort and enable_seqscan when choosing a scan method.
+CREATE TABLE clstr_sort_test (a int);
+CREATE INDEX clstr_sort_test_idx ON clstr_sort_test (a);
+ANALYZE clstr_sort_test;
+SET random_page_cost = 100000;	-- make seqscan + sort the cheaper choice
+\set VERBOSITY terse
+REPACK (VERBOSE) clstr_sort_test USING INDEX clstr_sort_test_idx;
+SET enable_sort = off;
+REPACK (VERBOSE) clstr_sort_test USING INDEX clstr_sort_test_idx;
+RESET enable_sort;
+SET enable_seqscan = off;
+REPACK (VERBOSE) clstr_sort_test USING INDEX clstr_sort_test_idx;
+\set VERBOSITY default
+RESET enable_seqscan;
+RESET random_page_cost;
+
 -- clean up
 DROP TABLE clustertest;
 DROP TABLE clstr_1;
@@ -462,5 +500,7 @@ DROP TABLE clstr_3;
 DROP TABLE clstr_4;
 DROP TABLE clstr_expression;
 DROP TABLE clstrpart;
+DROP TABLE cluster_aborted_upd;
+DROP TABLE clstr_sort_test;
 
 DROP USER regress_clstr_user;

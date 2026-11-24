@@ -44,6 +44,7 @@
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -80,7 +81,7 @@ static void change_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 static void truncate_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 								int nrelations, Relation relations[], ReorderBufferChange *change);
 static void message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
-							   XLogRecPtr message_lsn, bool transactional,
+							   TransactionId xid, XLogRecPtr message_lsn, bool transactional,
 							   const char *prefix, Size message_size, const char *message);
 
 /* streaming callbacks */
@@ -97,7 +98,7 @@ static void stream_commit_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn
 static void stream_change_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 									 Relation relation, ReorderBufferChange *change);
 static void stream_message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
-									  XLogRecPtr message_lsn, bool transactional,
+									  TransactionId xid, XLogRecPtr message_lsn, bool transactional,
 									  const char *prefix, Size message_size, const char *message);
 static void stream_truncate_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 									   int nrelations, Relation relations[], ReorderBufferChange *change);
@@ -108,6 +109,39 @@ static void update_progress_txn_cb_wrapper(ReorderBuffer *cache,
 										   XLogRecPtr lsn);
 
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin);
+
+/* check_hook: validate new output_plugin_libraries value */
+bool
+check_output_plugin_libraries(char **newval, void **extra, GucSource source)
+{
+	char	   *copy;
+	List	   *components;
+	bool		ok = true;
+
+	copy = guc_strdup(LOG, *newval);
+	if (!copy)
+		return false;
+
+	/*
+	 * XXX SplitGUCList won't respect guc_malloc requirements, but this is
+	 * consistent with other check_hook implementations...
+	 */
+	if (!SplitGUCList(copy, ',', &components))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		ok = false;
+	}
+
+	/*
+	 * Like with related GUC_LIST_QUOTE variables, we check only syntax here
+	 * and not the existence of the plugins themselves.
+	 */
+
+	list_free(components);
+	guc_free(copy);
+
+	return ok;
+}
 
 /*
  * Make sure the current settings & environment are capable of doing logical
@@ -211,17 +245,9 @@ StartupDecodingContext(List *output_plugin_options,
 			/* Need a modifiable copy */
 			rawstring = pstrdup(output_plugin_libraries_string);
 
+			/* The check_hook should have already handled syntax errors. */
 			if (!SplitGUCList(rawstring, ',', &elemlist))
-			{
-				/* syntax error in list */
-				ereport(LOG,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("invalid list syntax in parameter \"%s\"",
-								"output_plugin_libraries")));
-
-				list_free(elemlist);
-				elemlist = NIL;
-			}
+				elog(ERROR, "internal error: invalid output_plugin_libraries syntax after check_hook");
 
 			foreach_ptr(char, allowed, elemlist)
 			{
@@ -1310,7 +1336,7 @@ filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, ReplOriginId origin_id)
 
 static void
 message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
-				   XLogRecPtr message_lsn, bool transactional,
+				   TransactionId xid, XLogRecPtr message_lsn, bool transactional,
 				   const char *prefix, Size message_size, const char *message)
 {
 	LogicalDecodingContext *ctx = cache->private_data;
@@ -1338,7 +1364,7 @@ message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	ctx->end_xact = false;
 
 	/* do the actual work: call callback */
-	ctx->callbacks.message_cb(ctx, txn, message_lsn, transactional, prefix,
+	ctx->callbacks.message_cb(ctx, txn, xid, message_lsn, transactional, prefix,
 							  message_size, message);
 
 	/* Pop the error context stack */
@@ -1621,7 +1647,7 @@ stream_change_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 
 static void
 stream_message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
-						  XLogRecPtr message_lsn, bool transactional,
+						  TransactionId xid, XLogRecPtr message_lsn, bool transactional,
 						  const char *prefix, Size message_size, const char *message)
 {
 	LogicalDecodingContext *ctx = cache->private_data;
@@ -1653,7 +1679,7 @@ stream_message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	ctx->end_xact = false;
 
 	/* do the actual work: call callback */
-	ctx->callbacks.stream_message_cb(ctx, txn, message_lsn, transactional, prefix,
+	ctx->callbacks.stream_message_cb(ctx, txn, xid, message_lsn, transactional, prefix,
 									 message_size, message);
 
 	/* Pop the error context stack */

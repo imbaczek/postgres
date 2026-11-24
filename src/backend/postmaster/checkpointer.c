@@ -140,7 +140,7 @@ typedef struct
 								 * buffer */
 
 	/* The ring buffer of pending checkpointer requests */
-	CheckpointerRequest requests[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(max_requests) CheckpointerRequest requests[FLEXIBLE_ARRAY_MEMBER];
 } CheckpointerShmemStruct;
 
 static CheckpointerShmemStruct *CheckpointerShmem;
@@ -230,11 +230,6 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 	pqsignal(SIGPIPE, PG_SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 	pqsignal(SIGUSR2, SignalHandlerForShutdownRequest);
-
-	/*
-	 * Reset some signals that are accepted by postmaster but not here
-	 */
-	pqsignal(SIGCHLD, PG_SIG_DFL);
 
 	/*
 	 * Initialize so that first time-driven event happens at the correct time.

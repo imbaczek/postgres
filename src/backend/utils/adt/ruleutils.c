@@ -182,8 +182,8 @@ typedef struct
 	List	   *index_tlist;	/* referent for INDEX_VAR Vars */
 	/* Special namespace representing a function signature: */
 	char	   *funcname;
-	int			numargs;
-	char	  **argnames;
+	int			numargs;		/* number of input arguments */
+	char	  **argnames;		/* names of input args (NULL if unnamed) */
 } deparse_namespace;
 
 /*
@@ -3136,6 +3136,8 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 	}
 	else
 	{
+		const char *dqmatch;
+
 		appendStringInfoString(&buf, "AS ");
 
 		tmp = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_probin, &isnull);
@@ -3154,12 +3156,14 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 		 * Since the user is likely to be editing the function body string, we
 		 * shouldn't use a short delimiter that he might easily create a
 		 * conflict with.  Hence prefer "$function$"/"$procedure$", but extend
-		 * if needed.
+		 * if needed.  Each candidate extends the previous one, so we can
+		 * resume searching at the previous match.
 		 */
 		initStringInfo(&dq);
 		appendStringInfoChar(&dq, '$');
 		appendStringInfoString(&dq, (isfunction ? "function" : "procedure"));
-		while (strstr(prosrc, dq.data) != NULL)
+		dqmatch = prosrc;
+		while ((dqmatch = strstr(dqmatch, dq.data)) != NULL)
 			appendStringInfoChar(&dq, 'x');
 		appendStringInfoChar(&dq, '$');
 
@@ -3561,19 +3565,29 @@ pg_get_function_arg_default(PG_FUNCTION_ARGS)
 static void
 print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 {
-	int			numargs;
-	Oid		   *argtypes;
-	char	  **argnames;
-	char	   *argmodes;
+	Datum		proargnames;
+	Datum		proargmodes;
+	bool		isNull;
 	deparse_namespace dpns = {0};
 	Datum		tmp;
 	Node	   *n;
 
 	dpns.funcname = pstrdup(NameStr(((Form_pg_proc) GETSTRUCT(proctup))->proname));
-	numargs = get_func_arg_info(proctup,
-								&argtypes, &argnames, &argmodes);
-	dpns.numargs = numargs;
-	dpns.argnames = argnames;
+
+	proargnames = SysCacheGetAttr(PROCOID, proctup,
+								  Anum_pg_proc_proargnames,
+								  &isNull);
+	if (isNull)
+		proargnames = PointerGetDatum(NULL);	/* just to be sure */
+
+	proargmodes = SysCacheGetAttr(PROCOID, proctup,
+								  Anum_pg_proc_proargmodes,
+								  &isNull);
+	if (isNull)
+		proargmodes = PointerGetDatum(NULL);	/* just to be sure */
+
+	dpns.numargs = get_func_input_arg_names(proargnames, proargmodes,
+											&dpns.argnames);
 
 	tmp = SysCacheGetAttrNotNull(PROCOID, proctup, Anum_pg_proc_prosqlbody);
 	n = stringToNode(TextDatumGetCString(tmp));
@@ -3838,13 +3852,6 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 	/* Set our attention on the specific plan node passed in */
 	dpns->ancestors = ancestors;
 	set_deparse_plan(dpns, plan);
-
-	/* For ModifyTable, set aliases for OLD and NEW in RETURNING */
-	if (IsA(plan, ModifyTable))
-	{
-		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
-		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
-	}
 
 	return dpcontext;
 }
@@ -5148,10 +5155,10 @@ get_rtable_name(int rtindex, deparse_context *context)
  * of a given Plan node
  *
  * This sets the plan, outer_plan, inner_plan, outer_tlist, inner_tlist,
- * and index_tlist fields.  Caller must already have adjusted the ancestors
- * list if necessary.  Note that the rtable, subplans, and ctes fields do
- * not need to change when shifting attention to different plan nodes in a
- * single plan tree.
+ * index_tlist, ret_old_alias, and ret_new_alias fields as appropriate.
+ * Caller must already have adjusted the ancestors list if necessary.
+ * Note that the rtable, subplans, and ctes fields do not need to change
+ * when shifting attention to different plan nodes in a single plan tree.
  */
 static void
 set_deparse_plan(deparse_namespace *dpns, Plan *plan)
@@ -5227,6 +5234,15 @@ set_deparse_plan(deparse_namespace *dpns, Plan *plan)
 		dpns->index_tlist = ((CustomScan *) plan)->custom_scan_tlist;
 	else
 		dpns->index_tlist = NIL;
+
+	/* Set up table aliases for OLD and NEW in RETURNING */
+	if (IsA(plan, ModifyTable))
+	{
+		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
+		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
+	}
+	else
+		dpns->ret_old_alias = dpns->ret_new_alias = NULL;
 }
 
 /*
@@ -7196,8 +7212,11 @@ get_update_query_def(Query *query, deparse_context *context)
 					 only_marker(rte),
 					 generate_relation_name(rte->relid, NIL));
 
-	/* Print the relation alias, if needed */
-	get_rte_alias(rte, query->resultRelation, false, context);
+	/*
+	 * Print the relation alias, if needed.  Always write AS, since a bare
+	 * alias named "set" would be read as the SET keyword.
+	 */
+	get_rte_alias(rte, query->resultRelation, true, context);
 
 	appendStringInfoString(buf, " SET ");
 
@@ -7400,8 +7419,11 @@ get_delete_query_def(Query *query, deparse_context *context)
 					 only_marker(rte),
 					 generate_relation_name(rte->relid, NIL));
 
-	/* Print the relation alias, if needed */
-	get_rte_alias(rte, query->resultRelation, false, context);
+	/*
+	 * Print the relation alias, if needed.  Always write AS, since a bare
+	 * alias named "set" would be read as the SET keyword.
+	 */
+	get_rte_alias(rte, query->resultRelation, true, context);
 
 	/* Add the USING clause if given */
 	get_from_clause(query, " USING ", context);
@@ -7449,8 +7471,11 @@ get_merge_query_def(Query *query, deparse_context *context)
 					 only_marker(rte),
 					 generate_relation_name(rte->relid, NIL));
 
-	/* Print the relation alias, if needed */
-	get_rte_alias(rte, query->resultRelation, false, context);
+	/*
+	 * Print the relation alias, if needed.  Always write AS, since a bare
+	 * alias named "set" would be read as the SET keyword.
+	 */
+	get_rte_alias(rte, query->resultRelation, true, context);
 
 	/* Print the source relation and join clause */
 	get_from_clause(query, " USING ", context);
@@ -8903,7 +8928,6 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 		case T_CoalesceExpr:
 		case T_MinMaxExpr:
 		case T_SQLValueFunction:
-		case T_XmlExpr:
 		case T_NextValueExpr:
 		case T_NullIfExpr:
 		case T_Aggref:
@@ -9005,6 +9029,17 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 			}
 			pg_fallthrough;
 
+		case T_XmlExpr:
+
+			/*
+			 * Function-like (name(..)), except "x IS DOCUMENT", which is a
+			 * postfix test like IS NULL.  (The IsA check is needed because
+			 * T_OpExpr falls through to here.)
+			 */
+			if (IsA(node, XmlExpr) && ((XmlExpr *) node)->op != IS_DOCUMENT)
+				return true;
+			pg_fallthrough;
+
 		case T_SubLink:
 		case T_NullTest:
 		case T_BooleanTest:
@@ -9029,13 +9064,14 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_RowExpr: /* other separators */
 				case T_CoalesceExpr:	/* own parentheses */
 				case T_MinMaxExpr:	/* own parentheses */
-				case T_XmlExpr: /* own parentheses */
 				case T_NullIfExpr:	/* other separators */
 				case T_Aggref:	/* own parentheses */
 				case T_GroupingFunc:	/* own parentheses */
 				case T_WindowFunc:	/* own parentheses */
 				case T_CaseExpr:	/* other separators */
 					return true;
+				case T_XmlExpr: /* own parentheses, except IS DOCUMENT */
+					return ((XmlExpr *) parentNode)->op != IS_DOCUMENT;
 				default:
 					return false;
 			}
@@ -9081,7 +9117,6 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_RowExpr: /* other separators */
 				case T_CoalesceExpr:	/* own parentheses */
 				case T_MinMaxExpr:	/* own parentheses */
-				case T_XmlExpr: /* own parentheses */
 				case T_NullIfExpr:	/* other separators */
 				case T_Aggref:	/* own parentheses */
 				case T_GroupingFunc:	/* own parentheses */
@@ -9089,6 +9124,8 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_CaseExpr:	/* other separators */
 				case T_JsonExpr:	/* own parentheses */
 					return true;
+				case T_XmlExpr: /* own parentheses, except IS DOCUMENT */
+					return ((XmlExpr *) parentNode)->op != IS_DOCUMENT;
 				default:
 					return false;
 			}
@@ -10141,6 +10178,9 @@ get_rule_expr(Node *node, deparse_context *context,
 						appendStringInfoString(buf, "XMLSERIALIZE(");
 						break;
 					case IS_DOCUMENT:
+						/* postfix test, like IS NULL: not self-delimiting */
+						if (!PRETTY_PAREN(context))
+							appendStringInfoChar(buf, '(');
 						break;
 				}
 				if (xexpr->op == IS_XMLPARSE || xexpr->op == IS_XMLSERIALIZE)
@@ -10248,7 +10288,9 @@ get_rule_expr(Node *node, deparse_context *context,
 							}
 							break;
 						case IS_DOCUMENT:
-							get_rule_expr_paren((Node *) xexpr->args, context, false, node);
+							Assert(list_length(xexpr->args) == 1);
+							get_rule_expr_paren((Node *) linitial(xexpr->args),
+												context, false, node);
 							break;
 					}
 				}
@@ -10264,7 +10306,11 @@ get_rule_expr(Node *node, deparse_context *context,
 				}
 
 				if (xexpr->op == IS_DOCUMENT)
+				{
 					appendStringInfoString(buf, " IS DOCUMENT");
+					if (!PRETTY_PAREN(context))
+						appendStringInfoChar(buf, ')');
+				}
 				else
 					appendStringInfoChar(buf, ')');
 			}
@@ -10759,17 +10805,63 @@ looks_like_function(Node *node)
 	switch (nodeTag(node))
 	{
 		case T_FuncExpr:
-			/* OK, unless it's going to deparse as a cast */
-			return (((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CALL ||
-					((FuncExpr *) node)->funcformat == COERCE_SQL_SYNTAX);
+			/* OK if it will print as a normal function call */
+			if (((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CALL)
+				return true;
+			/* SQL_SYNTAX needs case-by-case analysis; all else is unsafe */
+			if (((FuncExpr *) node)->funcformat != COERCE_SQL_SYNTAX)
+				return false;
+
+			/*
+			 * Most SQL-syntax functions are accepted by func_expr_windowless,
+			 * but get_func_sql_syntax() prints AT TIME ZONE, AT LOCAL,
+			 * OVERLAPS and IS xxx NORMALIZED in forms that aren't accepted.
+			 * All of the associated functions must be listed here.
+			 */
+			switch (((FuncExpr *) node)->funcid)
+			{
+					/* AT TIME ZONE: */
+				case F_TIMEZONE_INTERVAL_TIMESTAMP:
+				case F_TIMEZONE_INTERVAL_TIMESTAMPTZ:
+				case F_TIMEZONE_INTERVAL_TIMETZ:
+				case F_TIMEZONE_TEXT_TIMESTAMP:
+				case F_TIMEZONE_TEXT_TIMESTAMPTZ:
+				case F_TIMEZONE_TEXT_TIMETZ:
+					/* AT LOCAL: */
+				case F_TIMEZONE_TIMESTAMP:
+				case F_TIMEZONE_TIMESTAMPTZ:
+				case F_TIMEZONE_TIMETZ:
+					/* OVERLAPS: */
+				case F_OVERLAPS_TIMESTAMPTZ_INTERVAL_TIMESTAMPTZ_INTERVAL:
+				case F_OVERLAPS_TIMESTAMPTZ_INTERVAL_TIMESTAMPTZ_TIMESTAMPTZ:
+				case F_OVERLAPS_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ_INTERVAL:
+				case F_OVERLAPS_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ:
+				case F_OVERLAPS_TIMESTAMP_INTERVAL_TIMESTAMP_INTERVAL:
+				case F_OVERLAPS_TIMESTAMP_INTERVAL_TIMESTAMP_TIMESTAMP:
+				case F_OVERLAPS_TIMESTAMP_TIMESTAMP_TIMESTAMP_INTERVAL:
+				case F_OVERLAPS_TIMESTAMP_TIMESTAMP_TIMESTAMP_TIMESTAMP:
+				case F_OVERLAPS_TIMETZ_TIMETZ_TIMETZ_TIMETZ:
+				case F_OVERLAPS_TIME_INTERVAL_TIME_INTERVAL:
+				case F_OVERLAPS_TIME_INTERVAL_TIME_TIME:
+				case F_OVERLAPS_TIME_TIME_TIME_INTERVAL:
+				case F_OVERLAPS_TIME_TIME_TIME_TIME:
+					/* IS xxx NORMALIZED: */
+				case F_IS_NORMALIZED:
+					return false;
+				default:
+					break;
+			}
+			return true;
 		case T_NullIfExpr:
 		case T_CoalesceExpr:
 		case T_MinMaxExpr:
 		case T_SQLValueFunction:
-		case T_XmlExpr:
 		case T_JsonExpr:
 			/* these are all accepted by func_expr_common_subexpr */
 			return true;
+		case T_XmlExpr:
+			/* all but IS DOCUMENT, which is a postfix test */
+			return ((XmlExpr *) node)->op != IS_DOCUMENT;
 		default:
 			break;
 	}
@@ -11198,6 +11290,11 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
  *
  * Returns true if we successfully deparsed, false if we did not
  * recognize the function.
+ *
+ * Most of these print as constructs that func_expr_windowless accepts.
+ * But AT TIME ZONE, AT LOCAL, OVERLAPS and IS xxx NORMALIZED print as a
+ * parenthesized a_expr instead, so a function added to them, or another
+ * one printed that way, must also be listed in looks_like_function().
  */
 static bool
 get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
@@ -11942,7 +12039,9 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			/* single combining operator */
 			OpExpr	   *opexpr = (OpExpr *) sublink->testexpr;
 
-			get_rule_expr(linitial(opexpr->args), context, true);
+			/* Use get_rule_expr_paren to add parens if needed */
+			get_rule_expr_paren(linitial(opexpr->args), context, true,
+								(Node *) sublink);
 			opname = generate_operator_name(opexpr->opno,
 											exprType(linitial(opexpr->args)),
 											exprType(lsecond(opexpr->args)));

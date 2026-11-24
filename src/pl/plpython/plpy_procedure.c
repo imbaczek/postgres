@@ -18,12 +18,34 @@
 #include "plpy_util.h"
 #include "utils/builtins.h"
 #include "utils/funccache.h"
+#include "utils/hsearch.h"
 #include "utils/syscache.h"
+
+/*
+ * SD dictionaries, one per function (and per relation, for DML triggers).
+ * funccache.c may build several PLyProcedures for one function, for example
+ * one per input collation, and they must all see the same SD.
+ */
+typedef struct PLyStaticsKey
+{
+	Oid			fn_oid;			/* function OID */
+	Oid			fn_rel;			/* triggered-on relation or InvalidOid */
+} PLyStaticsKey;
+
+typedef struct PLyStaticsEntry
+{
+	PLyStaticsKey key;			/* hash key, must be first */
+	PyObject   *statics;		/* the SD dictionary */
+} PLyStaticsEntry;
+
+static HTAB *PLy_statics_hash = NULL;
 
 static void PLy_procedure_create(PLyProcedure *proc,
 								 HeapTuple procTup,
 								 Oid fn_oid,
+								 Oid fn_rel,
 								 PLyTrigType is_trigger);
+static PyObject *PLy_procedure_get_statics(Oid fn_oid, Oid fn_rel);
 static char *PLy_procedure_munge_source(const char *name, const char *src);
 static void PLy_compile_callback(FunctionCallInfo fcinfo,
 								 HeapTuple procTup,
@@ -145,6 +167,7 @@ static void
 PLy_procedure_create(PLyProcedure *proc,
 					 HeapTuple procTup,
 					 Oid fn_oid,
+					 Oid fn_rel,
 					 PLyTrigType is_trigger)
 {
 	char		procName[NAMEDATALEN + 256];
@@ -217,36 +240,16 @@ PLy_procedure_create(PLyProcedure *proc,
 		if (is_trigger == PLPY_NOT_TRIGGER)
 		{
 			Oid			rettype = procStruct->prorettype;
-			HeapTuple	rvTypeTup;
-			Form_pg_type rvTypeStruct;
 
-			rvTypeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(rettype));
-			if (!HeapTupleIsValid(rvTypeTup))
-				elog(ERROR, "cache lookup failed for type %u", rettype);
-			rvTypeStruct = (Form_pg_type) GETSTRUCT(rvTypeTup);
-
-			/* Disallow pseudotype result, except for void or record */
-			if (rvTypeStruct->typtype == TYPTYPE_PSEUDO)
-			{
-				if (rettype == VOIDOID ||
-					rettype == RECORDOID)
-					 /* okay */ ;
-				else if (rettype == TRIGGEROID || rettype == EVENT_TRIGGEROID)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("trigger functions can only be called as triggers")));
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("PL/Python functions cannot return type %s",
-									format_type_be(rettype))));
-			}
+			/* reject if function is in fact a trigger function */
+			if (rettype == TRIGGEROID || rettype == EVENT_TRIGGEROID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("trigger functions can only be called as triggers")));
 
 			/* set up output function for procedure result */
 			PLy_output_setup_func(&proc->result, proc->mcxt,
 								  rettype, -1, proc);
-
-			ReleaseSysCache(rvTypeTup);
 		}
 		else
 		{
@@ -296,9 +299,6 @@ PLy_procedure_create(PLyProcedure *proc,
 
 			for (i = pos = 0; i < total; i++)
 			{
-				HeapTuple	argTypeTup;
-				Form_pg_type argTypeStruct;
-
 				if (modes &&
 					(modes[i] == PROARGMODE_OUT ||
 					 modes[i] == PROARGMODE_TABLE))
@@ -306,28 +306,14 @@ PLy_procedure_create(PLyProcedure *proc,
 
 				Assert(types[i] == procStruct->proargtypes.values[pos]);
 
-				argTypeTup = SearchSysCache1(TYPEOID,
-											 ObjectIdGetDatum(types[i]));
-				if (!HeapTupleIsValid(argTypeTup))
-					elog(ERROR, "cache lookup failed for type %u", types[i]);
-				argTypeStruct = (Form_pg_type) GETSTRUCT(argTypeTup);
-
-				/* disallow pseudotype arguments */
-				if (argTypeStruct->typtype == TYPTYPE_PSEUDO)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("PL/Python functions cannot accept type %s",
-									format_type_be(types[i]))));
-
 				/* set up I/O function info */
 				PLy_input_setup_func(&proc->args[pos], proc->mcxt,
 									 types[i], -1,	/* typmod not known */
 									 proc);
 
 				/* get argument name */
-				proc->argnames[pos] = names ? pstrdup(names[i]) : NULL;
-
-				ReleaseSysCache(argTypeTup);
+				proc->argnames[pos] =
+					(names && names[i][0] != '\0') ? pstrdup(names[i]) : NULL;
 
 				pos++;
 			}
@@ -339,6 +325,9 @@ PLy_procedure_create(PLyProcedure *proc,
 		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
 											 Anum_pg_proc_prosrc);
 		procSource = TextDatumGetCString(prosrcdatum);
+
+		/* SD is shared with other PLyProcedures of the function */
+		proc->statics = PLy_procedure_get_statics(fn_oid, fn_rel);
 
 		PLy_procedure_compile(proc, procSource);
 
@@ -369,11 +358,9 @@ PLy_procedure_compile(PLyProcedure *proc, const char *src)
 
 	/*
 	 * SD is private preserved data between calls. GD is global data shared by
-	 * all functions
+	 * all functions.  The caller supplies SD.
 	 */
-	proc->statics = PyDict_New();
-	if (!proc->statics)
-		PLy_elog(ERROR, NULL);
+	Assert(proc->statics != NULL);
 	PyDict_SetItemString(proc->globals, "SD", proc->statics);
 
 	/*
@@ -483,20 +470,64 @@ PLy_compile_callback(FunctionCallInfo fcinfo,
 {
 	PLyProcedure *proc = (PLyProcedure *) cfunc;
 	Oid			fn_oid = fcinfo->flinfo->fn_oid;
+	Oid			fn_rel = InvalidOid;
 	PLyTrigType is_trigger;
 
 	/*
 	 * Derive the trigger type from the call context, matching what
-	 * plpython3_call_handler dispatches on.
+	 * plpython3_call_handler dispatches on.  DML triggers get one SD per
+	 * relation.  The validator has no relation.
 	 */
 	if (CALLED_AS_TRIGGER(fcinfo))
+	{
 		is_trigger = PLPY_TRIGGER;
+		if (!forValidator)
+			fn_rel = RelationGetRelid(((TriggerData *) fcinfo->context)->tg_relation);
+	}
 	else if (CALLED_AS_EVENT_TRIGGER(fcinfo))
 		is_trigger = PLPY_EVENT_TRIGGER;
 	else
 		is_trigger = PLPY_NOT_TRIGGER;
 
-	PLy_procedure_create(proc, procTup, fn_oid, is_trigger);
+	PLy_procedure_create(proc, procTup, fn_oid, fn_rel, is_trigger);
+}
+
+/*
+ * Get the SD dictionary of a function, as a new reference.
+ */
+static PyObject *
+PLy_procedure_get_statics(Oid fn_oid, Oid fn_rel)
+{
+	PLyStaticsKey key;
+	PLyStaticsEntry *entry;
+	bool		found;
+
+	if (PLy_statics_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(PLyStaticsKey);
+		ctl.entrysize = sizeof(PLyStaticsEntry);
+		PLy_statics_hash = hash_create("PL/Python SD dictionaries", 32,
+									   &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+
+	key.fn_oid = fn_oid;
+	key.fn_rel = fn_rel;
+	entry = hash_search(PLy_statics_hash, &key, HASH_ENTER, &found);
+	if (!found)
+		entry->statics = NULL;
+
+	/* A failed PyDict_New leaves the entry empty, so retry it here */
+	if (entry->statics == NULL)
+	{
+		entry->statics = PyDict_New();
+		if (entry->statics == NULL)
+			PLy_elog(ERROR, NULL);
+	}
+
+	Py_INCREF(entry->statics);
+	return entry->statics;
 }
 
 /*

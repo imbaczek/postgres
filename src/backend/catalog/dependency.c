@@ -158,6 +158,8 @@ static void reportDependentObjects(const ObjectAddresses *targetObjects,
 static void deleteOneObject(const ObjectAddress *object,
 							Relation *depRel, int32 flags);
 static void doDeletion(const ObjectAddress *object, int flags);
+static void add_target_column_dependencies(List *targetList, Oid relid,
+										   find_expr_references_context *context);
 static bool find_expr_references_walker(Node *node,
 										find_expr_references_context *context);
 static void process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
@@ -1653,6 +1655,9 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 	find_expr_references_context context;
 	RangeTblEntry rte = {0};
 
+	if (expr == NULL)
+		return;
+
 	context.addrs = new_object_addresses();
 
 	/* We gin up a rather bogus rangetable list to handle Vars */
@@ -1666,6 +1671,21 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 
 	/* Scan the expression tree for referenceable objects */
 	find_expr_references_walker(expr, &context);
+
+	/* Also add a dependency to the result type */
+	if (IsA(expr, List))
+	{
+		ListCell   *l;
+
+		foreach(l, (List *) expr)
+		{
+			add_object_address(TypeRelationId, exprType(lfirst(l)), 0,
+							   context.addrs);
+		}
+	}
+	else
+		add_object_address(TypeRelationId, exprType(expr), 0,
+						   context.addrs);
 
 	/* Remove any duplicates */
 	eliminate_duplicate_dependencies(context.addrs);
@@ -1792,6 +1812,9 @@ CheckUsageOnTypesInSingleRelExpr(Node *expr, Oid relId, Oid roleid)
 	find_expr_references_context context;
 	RangeTblEntry rte = {0};
 
+	if (expr == NULL)
+		return;
+
 	context.addrs = new_object_addresses();
 
 	/* We gin up a rather bogus rangetable list to handle Vars */
@@ -1803,9 +1826,79 @@ CheckUsageOnTypesInSingleRelExpr(Node *expr, Oid relId, Oid roleid)
 	context.rtables = list_make1(list_make1(&rte));
 
 	find_expr_references_walker(expr, &context);
+
+	/* Also check USAGE on the result type */
+	if (IsA(expr, List))
+	{
+		ListCell   *l;
+
+		foreach(l, (List *) expr)
+		{
+			add_object_address(TypeRelationId, exprType(lfirst(l)), 0,
+							   context.addrs);
+		}
+	}
+	else
+		add_object_address(TypeRelationId, exprType(expr), 0,
+						   context.addrs);
+
 	eliminate_duplicate_dependencies(context.addrs);
 	check_usage_on_types(context.addrs, roleid);
 	free_object_addresses(context.addrs);
+}
+
+/*
+ * CheckTypeDependencyInExpr - does 'expr' depend on the given type?
+ */
+bool
+CheckTypeDependencyInExpr(Node *expr, List *rtable, Oid typeId)
+{
+	ObjectAddresses *addrs = new_object_addresses();
+	ObjectAddress typeAddr;
+	bool		result;
+
+	collectDependenciesOfExpr(addrs, expr, rtable);
+
+	ObjectAddressSet(typeAddr, TypeRelationId, typeId);
+	result = object_address_present(&typeAddr, addrs);
+	free_object_addresses(addrs);
+
+	return result;
+}
+
+/*
+ * CheckTypeDependencyInSingleRelExpr - as above, for a single-rel expression
+ */
+bool
+CheckTypeDependencyInSingleRelExpr(Node *expr, Oid relId, Oid typeId)
+{
+	RangeTblEntry rte = {0};
+
+	/* We gin up a rather bogus rangetable list to handle Vars */
+	rte.type = T_RangeTblEntry;
+	rte.rtekind = RTE_RELATION;
+	rte.relid = relId;
+	rte.relkind = RELKIND_RELATION;
+	rte.rellockmode = AccessShareLock;
+
+	return CheckTypeDependencyInExpr(expr, list_make1(&rte), typeId);
+}
+
+/*
+ * Record dependencies on the target columns named in the target list of an
+ * INSERT or UPDATE query, or of an INSERT or UPDATE action of a MERGE query.
+ */
+static void
+add_target_column_dependencies(List *targetList, Oid relid,
+							   find_expr_references_context *context)
+{
+	foreach_node(TargetEntry, tle, targetList)
+	{
+		if (tle->resjunk)
+			continue;			/* ignore junk tlist items */
+		add_object_address(RelationRelationId, relid, tle->resno,
+						   context->addrs);
+	}
 }
 
 /*
@@ -2350,14 +2443,16 @@ find_expr_references_walker(Node *node,
 		}
 
 		/*
-		 * If the query is an INSERT or UPDATE, we should create a dependency
-		 * on each target column, to prevent the specific target column from
-		 * being dropped.  Although we will visit the TargetEntry nodes again
-		 * during query_tree_walker, we won't have enough context to do this
-		 * conveniently, so do it here.
+		 * If the query is an INSERT, UPDATE, or MERGE, we should create a
+		 * dependency on each target column, to prevent the specific target
+		 * column from being dropped.  Although we will visit the TargetEntry
+		 * nodes again during query_tree_walker, we won't have enough context
+		 * to do this conveniently, so do it here.  (For MERGE, the target
+		 * columns are those of its INSERT and UPDATE actions.)
 		 */
 		if (query->commandType == CMD_INSERT ||
-			query->commandType == CMD_UPDATE)
+			query->commandType == CMD_UPDATE ||
+			query->commandType == CMD_MERGE)
 		{
 			RangeTblEntry *rte;
 
@@ -2368,15 +2463,20 @@ find_expr_references_walker(Node *node,
 			rte = rt_fetch(query->resultRelation, query->rtable);
 			if (rte->rtekind == RTE_RELATION)
 			{
-				foreach(lc, query->targetList)
+				if (query->commandType == CMD_MERGE)
 				{
-					TargetEntry *tle = (TargetEntry *) lfirst(lc);
-
-					if (tle->resjunk)
-						continue;	/* ignore junk tlist items */
-					add_object_address(RelationRelationId, rte->relid, tle->resno,
-									   context->addrs);
+					foreach_node(MergeAction, action, query->mergeActionList)
+					{
+						if (action->commandType == CMD_INSERT ||
+							action->commandType == CMD_UPDATE)
+							add_target_column_dependencies(action->targetList,
+														   rte->relid,
+														   context);
+					}
 				}
+				else
+					add_target_column_dependencies(query->targetList,
+												   rte->relid, context);
 			}
 		}
 

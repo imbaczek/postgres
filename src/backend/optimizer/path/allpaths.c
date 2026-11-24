@@ -1348,10 +1348,15 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		 * If set_append_rel_size() decided the parent appendrel was
 		 * parallel-unsafe at some point after visiting this child rel, we
 		 * need to propagate the unsafety marking down to the child, so that
-		 * we don't generate useless partial paths for it.
+		 * we don't generate useless partial paths for it.  Also, zap any
+		 * partial paths that already exist from places such as
+		 * set_subquery_pathlist().
 		 */
 		if (!rel->consider_parallel)
+		{
+			childrel->partial_pathlist = NIL;
 			childrel->consider_parallel = false;
+		}
 
 		/*
 		 * Compute the child's access paths.
@@ -3567,6 +3572,17 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 	Assert(root->numOrderedAggs == 0);
 	can_hash = (agg_info->group_clauses != NIL &&
 				grouping_is_hashable(agg_info->group_clauses));
+
+	/*
+	 * Check that the operators support sorting or hashing.  The parser would
+	 * have checked that individual grouping columns support at least one, but
+	 * it doesn't verify that they all support the same method.
+	 */
+	if (!can_sort && !can_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("could not implement GROUP BY"),
+				 errdetail("Some of the datatypes only support hashing, while others only support sorting.")));
 
 	/*
 	 * Consider whether we should generate partially aggregated non-partial

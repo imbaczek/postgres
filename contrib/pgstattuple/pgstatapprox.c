@@ -20,6 +20,7 @@
 #include "commands/vacuum.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "pgstattuple.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/procarray.h"
@@ -35,6 +36,7 @@ typedef struct output_type
 	uint64		table_len;
 	double		scanned_percent;
 	uint64		tuple_count;
+	bool		tuple_count_is_unknown;
 	uint64		tuple_len;
 	double		tuple_percent;
 	uint64		dead_tuple_count;
@@ -56,6 +58,7 @@ typedef struct StatApproxReadStreamPrivate
 	BlockNumber current_blocknum;
 	BlockNumber nblocks;
 	BlockNumber scanned;		/* count of pages actually read */
+	BlockNumber scanned_new;	/* count of scanned PageIsNew pages */
 	Buffer		vmbuffer;		/* for VM lookups */
 } StatApproxReadStreamPrivate;
 
@@ -117,6 +120,7 @@ statapprox_heap(Relation rel, output_type *stat)
 {
 	BlockNumber nblocks;
 	BufferAccessStrategy bstrategy;
+	double		estimated_tuple_count;
 	TransactionId OldestXmin;
 	StatApproxReadStreamPrivate p;
 	ReadStream *stream;
@@ -132,6 +136,7 @@ statapprox_heap(Relation rel, output_type *stat)
 	p.current_blocknum = 0;
 	p.nblocks = nblocks;
 	p.scanned = 0;
+	p.scanned_new = 0;
 	p.vmbuffer = InvalidBuffer;
 
 	/*
@@ -167,7 +172,14 @@ statapprox_heap(Relation rel, output_type *stat)
 
 		stat->free_space += PageGetExactFreeSpace(page);
 
-		if (PageIsNew(page) || PageIsEmpty(page))
+		if (PageIsNew(page))
+		{
+			p.scanned_new++;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		if (PageIsEmpty(page))
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
@@ -244,17 +256,24 @@ statapprox_heap(Relation rel, output_type *stat)
 	 * tuples in all-visible pages, so no correction is needed for that, and
 	 * we already accounted for the space in those pages, too.
 	 */
-	stat->tuple_count = vac_estimate_reltuples(rel, nblocks, p.scanned,
-											   stat->tuple_count);
+	estimated_tuple_count = vac_estimate_reltuples(rel, nblocks, p.scanned,
+												   p.scanned_new,
+												   stat->tuple_count);
 
-	/* It's not clear if we could get -1 here, but be safe. */
-	stat->tuple_count = Max(stat->tuple_count, 0);
+	if (estimated_tuple_count < 0)
+		stat->tuple_count_is_unknown = true;
+	else
+		stat->tuple_count = estimated_tuple_count;
 
 	/*
 	 * Calculate percentages if the relation has one or more pages.
 	 */
 	if (nblocks != 0)
 	{
+		/*
+		 * Includes PageIsNew blocks that were read but excluded from the
+		 * live-tuple estimate.
+		 */
 		stat->scanned_percent = 100.0 * p.scanned / nblocks;
 		stat->tuple_percent = 100.0 * stat->tuple_len / stat->table_len;
 		stat->dead_tuple_percent = 100.0 * stat->dead_tuple_len / stat->table_len;
@@ -322,15 +341,7 @@ pgstattuple_approx_internal(Oid relid, FunctionCallInfo fcinfo)
 
 	rel = relation_open(relid, AccessShareLock);
 
-	/*
-	 * Reject attempts to read non-local temporary relations; we would be
-	 * likely to get wrong data since we have no visibility into the owning
-	 * session's local buffers.
-	 */
-	if (RELATION_IS_OTHER_TEMP(rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot access temporary tables of other sessions")));
+	check_relation_supported(rel);
 
 	/*
 	 * We support only relation kinds with a visibility map and a free space
@@ -357,7 +368,8 @@ pgstattuple_approx_internal(Oid relid, FunctionCallInfo fcinfo)
 
 	values[i++] = Int64GetDatum(stat.table_len);
 	values[i++] = Float8GetDatum(stat.scanned_percent);
-	values[i++] = Int64GetDatum(stat.tuple_count);
+	values[i] = Int64GetDatum(stat.tuple_count);
+	nulls[i++] = stat.tuple_count_is_unknown;
 	values[i++] = Int64GetDatum(stat.tuple_len);
 	values[i++] = Float8GetDatum(stat.tuple_percent);
 	values[i++] = Int64GetDatum(stat.dead_tuple_count);

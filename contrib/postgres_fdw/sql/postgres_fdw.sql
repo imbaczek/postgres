@@ -214,6 +214,11 @@ ALTER USER MAPPING FOR public SERVER testserver1
 ALTER USER MAPPING FOR public SERVER testserver1
 	OPTIONS (ADD oauth_client_id 'myID');
 
+-- Nor is sslkeylogfile
+ALTER SERVER testserver1 OPTIONS (ADD sslkeylogfile './noexist/log');
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD sslkeylogfile './noexist/log');
+
 ALTER FOREIGN TABLE ft1 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft2 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c1 OPTIONS (column_name 'C 1');
@@ -541,6 +546,19 @@ SELECT * FROM (
     UNION ALL
     SELECT 2 AS type,c1 FROM ft2
 ) a ORDER BY type;
+
+-- Ensure the code works correctly when sort_pathkeys is empty due to
+-- a redundant pathkey.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM (
+    (SELECT c1, c2 FROM ft1 WHERE c1 = 0 ORDER BY c1 LIMIT 1)
+    UNION
+    (SELECT c1, c2 FROM ft1 WHERE c1 = 0 ORDER BY c1)
+) a;
+
+-- Ensure the LIMIT clause is pushed to the foreign server
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT c1, c2 FROM ft7 WHERE c1 = 0 ORDER BY c1 LIMIT 1;
 
 -- ===================================================================
 -- JOIN queries
@@ -3390,6 +3408,19 @@ delete from rem2;
 
 alter server loopback options (drop batch_size);
 
+
+-- ===================================================================
+-- test COPY TO
+-- ===================================================================
+
+-- test that COPY ... TO ... (FORMAT json) works
+
+-- once with a projection (due to dropped cols)
+COPY (SELECT * FROM ft1 ORDER BY c1 LIMIT 1) TO STDOUT (FORMAT json);
+-- and once without
+COPY (SELECT * FROM ft4 ORDER BY c1 LIMIT 1) TO STDOUT (FORMAT json);
+
+
 -- ===================================================================
 -- test for TRUNCATE
 -- ===================================================================
@@ -4052,6 +4083,21 @@ DROP TRIGGER trig_row_before ON ftable;
 DROP FOREIGN TABLE ftable;
 DROP TABLE batch_table;
 
+-- The remote server can report more rows than we sent, for example when a
+-- rule on the remote table rewrites the INSERT.
+CREATE TABLE batch_table ( x int );
+CREATE TABLE batch_rule_table ( x int );
+CREATE RULE batch_rule AS ON INSERT TO batch_table
+	DO INSTEAD INSERT INTO batch_rule_table SELECT i FROM generate_series(1, 3) i;
+CREATE FOREIGN TABLE ftable ( x int ) SERVER loopback OPTIONS ( table_name 'batch_table', batch_size '10' );
+INSERT INTO ftable VALUES (1), (2);
+SELECT COUNT(*) FROM batch_rule_table;
+
+-- Clean up
+DROP FOREIGN TABLE ftable;
+DROP TABLE batch_table;
+DROP TABLE batch_rule_table;
+
 -- Use partitioning
 CREATE TABLE batch_table ( x int ) PARTITION BY HASH (x);
 
@@ -4291,10 +4337,31 @@ INSERT INTO result_tbl SELECT a, b, 'AAA' || c FROM async_pt WHERE b === 505;
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
 
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt WHERE b % 100 = 0 ORDER BY b, a;
+SELECT * FROM async_pt WHERE b % 100 = 0 ORDER BY b, a;
+
+-- Test that steady-state execution of an async MergeAppend re-fetches from
+-- an async subplan instead of just consuming its initial batch and treating
+-- exhaustion of that batch as end-of-data.  Each partition here has 200
+-- matching rows, more than the FDW's default fetch_size (100), so getting
+-- the right count requires more than one fetch from at least one partition
+-- after the initial heap fill.  The LIMIT keeps the ORDER BY (and therefore
+-- the MergeAppend) from being optimized away in the subquery.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM (SELECT * FROM async_pt ORDER BY b, a LIMIT 100000) ss;
+SELECT count(*) FROM (SELECT * FROM async_pt ORDER BY b, a LIMIT 100000) ss;
+
 -- Test error handling, if accessing one of the foreign partitions errors out
 CREATE FOREIGN TABLE async_p_broken PARTITION OF async_pt FOR VALUES FROM (10000) TO (10001)
   SERVER loopback OPTIONS (table_name 'non_existent_table');
 SELECT * FROM async_pt;
+
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt ORDER BY b, a;
+SELECT * FROM async_pt ORDER BY b, a;
 DROP FOREIGN TABLE async_p_broken;
 
 -- Check case where multiple partitions use the same connection
@@ -4321,11 +4388,22 @@ EXPLAIN (VERBOSE, COSTS OFF)
 SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
 SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
 
--- Test COPY TO when foreign table is partition
-COPY async_pt TO stdout; --error
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt WHERE b === 505 ORDER BY b, a;
+SELECT * FROM async_pt WHERE b === 505 ORDER BY b, a;
+
+-- Test ExecMergeAppendAsyncReset code path that asserts async requests made
+-- for subplans aren't pending anymore at ReScan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT o.x, s.b FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT b FROM async_pt WHERE a = 1505 OR a = o.x ORDER BY b LIMIT 1) s ORDER BY o.x;
+SELECT o.x, s.b FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT b FROM async_pt WHERE a = 1505 OR a = o.x ORDER BY b LIMIT 1) s ORDER BY o.x;
 
 DROP FOREIGN TABLE async_p3;
 DROP TABLE base_tbl3;
+
+-- Test COPY TO when foreign table is partition
+COPY async_pt TO stdout; --error
 
 -- Check case where the partitioned table has local/remote partitions
 CREATE TABLE async_p3 PARTITION OF async_pt FOR VALUES FROM (3000) TO (4000);
@@ -4339,7 +4417,12 @@ INSERT INTO result_tbl SELECT * FROM async_pt WHERE b === 505;
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
 
--- partitionwise joins
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt WHERE b === 505 ORDER BY b, a;
+SELECT * FROM async_pt WHERE b === 505 ORDER BY b, a;
+
+-- Test partitionwise joins
 SET enable_partitionwise_join TO true;
 
 CREATE TABLE join_tbl (a1 int, b1 int, c1 text, a2 int, b2 int, c2 text);
@@ -4360,7 +4443,7 @@ DELETE FROM join_tbl;
 
 RESET enable_partitionwise_join;
 
--- Test rescan of an async Append node with do_exec_prune=false
+-- Test rescan with (no) parameter changes
 SET enable_hashjoin TO false;
 
 EXPLAIN (VERBOSE, COSTS OFF)
@@ -4372,12 +4455,33 @@ DELETE FROM join_tbl;
 
 RESET enable_hashjoin;
 
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT
+	ARRAY(SELECT f.i FROM (SELECT b FROM async_pt ORDER BY b) f(i) ORDER BY f.i LIMIT 10)
+FROM generate_series(1, 3) g(i);
+SELECT
+	ARRAY(SELECT f.i FROM (SELECT b FROM async_pt ORDER BY b) f(i) ORDER BY f.i LIMIT 10)
+FROM generate_series(1, 3) g(i);
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT
+	ARRAY(SELECT f.i FROM (SELECT b + g.i FROM async_pt WHERE a > g.i ORDER BY b) f(i) ORDER BY f.i LIMIT 10)
+FROM generate_series(1, 3) g(i);
+SELECT
+	ARRAY(SELECT f.i FROM (SELECT b + g.i FROM async_pt WHERE a > g.i ORDER BY b) f(i) ORDER BY f.i LIMIT 10)
+FROM generate_series(1, 3) g(i);
+
 -- Test interaction of async execution with plan-time partition pruning
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM async_pt WHERE a < 3000;
 
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM async_pt WHERE a < 2000;
+
+-- MergeAppend cases
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM async_pt WHERE a < 3000 ORDER BY b, a;
 
 -- Test interaction of async execution with run-time partition pruning
 SET plan_cache_mode TO force_generic_plan;
@@ -4398,6 +4502,18 @@ EXECUTE async_pt_query (2000, 505);
 
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
+
+-- MergeAppend cases
+PREPARE async_pt_merge_query (int, int) AS
+  SELECT * FROM async_pt WHERE a < $1 AND b === $2 ORDER BY b, a;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+EXECUTE async_pt_merge_query (3000, 505);
+EXECUTE async_pt_merge_query (3000, 505);
+
+EXPLAIN (VERBOSE, COSTS OFF)
+EXECUTE async_pt_merge_query (2000, 505);
+EXECUTE async_pt_merge_query (2000, 505);
 
 RESET plan_cache_mode;
 
@@ -4576,6 +4692,47 @@ SELECT a FROM base_tbl WHERE (a, random() > 0) IN (SELECT a, random() > 0 FROM f
 -- Clean up
 DROP FOREIGN TABLE foreign_tbl CASCADE;
 DROP TABLE base_tbl;
+
+-- Test partitionwise joins with async MergeAppend
+CREATE TABLE distr1 (i int, j int, k text) PARTITION BY HASH (i);
+CREATE TABLE base1 (i int, j int, k text);
+CREATE TABLE base2 (i int, j int, k text);
+CREATE FOREIGN TABLE distr1_p1 PARTITION OF distr1 FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+  SERVER loopback OPTIONS (table_name 'base1');
+CREATE FOREIGN TABLE distr1_p2 PARTITION OF distr1 FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+  SERVER loopback OPTIONS (table_name 'base2');
+CREATE TABLE distr2 (i int, j int, k text) PARTITION BY HASH (i);
+CREATE TABLE base3 (i int, j int, k text);
+CREATE TABLE base4 (i int, j int, k text);
+CREATE FOREIGN TABLE distr2_p1 PARTITION OF distr2 FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+  SERVER loopback OPTIONS (table_name 'base3');
+CREATE FOREIGN TABLE distr2_p2 PARTITION OF distr2 FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+  SERVER loopback OPTIONS (table_name 'base4');
+INSERT INTO distr1 SELECT i, i*10, 'data_' || i FROM generate_series(1, 1000) i;
+INSERT INTO distr2 SELECT i, i*10, 'data_' || i FROM generate_series(1, 100) i;
+ANALYZE distr1_p1;
+ANALYZE distr1_p2;
+ANALYZE distr2_p1;
+ANALYZE distr2_p2;
+
+SET enable_partitionwise_join TO ON;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM distr1, distr2 WHERE distr1.i=distr2.i AND distr2.j > 90 and distr2.k like 'data%'
+ORDER BY distr2.i LIMIT 10;
+SELECT * FROM distr1, distr2 WHERE distr1.i=distr2.i AND distr2.j > 90 and distr2.k like 'data%'
+ORDER BY distr2.i LIMIT 10;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM distr1 LEFT JOIN distr2 ON distr1.i=distr2.i AND distr2.k like 'data%' WHERE distr1.i > 90
+ORDER BY distr1.i LIMIT 20;
+SELECT * FROM distr1 LEFT JOIN distr2 ON distr1.i=distr2.i AND distr2.k like 'data%' WHERE distr1.i > 90
+ORDER BY distr1.i LIMIT 20;
+
+RESET enable_partitionwise_join;
+
+-- Clean up
+DROP TABLE distr1, distr2, base1, base2, base3, base4;
 
 ALTER SERVER loopback OPTIONS (DROP async_capable);
 ALTER SERVER loopback2 OPTIONS (DROP async_capable);

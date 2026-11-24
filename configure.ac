@@ -610,6 +610,9 @@ if test "$GCC" = yes -a "$ICC" = no; then
   # Disable FP optimizations that cause various errors on gcc 4.5+ or maybe 4.6+
   PGAC_PROG_CC_CFLAGS_OPT([-fexcess-precision=standard])
   PGAC_PROG_CXX_CFLAGS_OPT([-fexcess-precision=standard])
+  # Treat only arrays with [], [0], or [1] as flexible array members.
+  PGAC_PROG_CC_CFLAGS_OPT([-fstrict-flex-arrays=1])
+  PGAC_PROG_CXX_CFLAGS_OPT([-fstrict-flex-arrays=1])
   # Optimization flags for specific files that benefit from loop unrolling
   PGAC_PROG_CC_VAR_OPT(CFLAGS_UNROLL_LOOPS, [-funroll-loops])
   # Optimization flags for specific files that benefit from vectorization
@@ -2354,29 +2357,19 @@ fi
 
 # Select semaphore implementation type.
 if test "$PORTNAME" != "win32"; then
-  if test x"$PREFERRED_SEMAPHORES" = x"NAMED_POSIX" ; then
-    # Need sem_open for this
-    AC_SEARCH_LIBS(sem_open, [rt pthread], [USE_NAMED_POSIX_SEMAPHORES=1])
-  fi
   if test x"$PREFERRED_SEMAPHORES" = x"UNNAMED_POSIX" ; then
     # Need sem_init for this
     AC_SEARCH_LIBS(sem_init, [rt pthread], [USE_UNNAMED_POSIX_SEMAPHORES=1])
   fi
   AC_MSG_CHECKING([which semaphore API to use])
-  if test x"$USE_NAMED_POSIX_SEMAPHORES" = x"1" ; then
-    AC_DEFINE(USE_NAMED_POSIX_SEMAPHORES, 1, [Define to select named POSIX semaphores.])
+  if test x"$USE_UNNAMED_POSIX_SEMAPHORES" = x"1" ; then
+    AC_DEFINE(USE_UNNAMED_POSIX_SEMAPHORES, 1, [Define to select unnamed POSIX semaphores.])
     SEMA_IMPLEMENTATION="src/backend/port/posix_sema.c"
-    sematype="named POSIX"
+    sematype="unnamed POSIX"
   else
-    if test x"$USE_UNNAMED_POSIX_SEMAPHORES" = x"1" ; then
-      AC_DEFINE(USE_UNNAMED_POSIX_SEMAPHORES, 1, [Define to select unnamed POSIX semaphores.])
-      SEMA_IMPLEMENTATION="src/backend/port/posix_sema.c"
-      sematype="unnamed POSIX"
-    else
-      AC_DEFINE(USE_SYSV_SEMAPHORES, 1, [Define to select SysV-style semaphores.])
-      SEMA_IMPLEMENTATION="src/backend/port/sysv_sema.c"
-      sematype="System V"
-    fi
+    AC_DEFINE(USE_SYSV_SEMAPHORES, 1, [Define to select SysV-style semaphores.])
+    SEMA_IMPLEMENTATION="src/backend/port/sysv_sema.c"
+    sematype="System V"
   fi
   AC_MSG_RESULT([$sematype])
 else

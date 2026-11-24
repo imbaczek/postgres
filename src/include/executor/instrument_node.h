@@ -44,7 +44,7 @@ typedef struct AggregateInstrumentation
 typedef struct SharedAggInfo
 {
 	int			num_workers;
-	AggregateInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) AggregateInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedAggInfo;
 
 
@@ -116,7 +116,7 @@ typedef struct IndexScanInstrumentation
 typedef struct SharedIndexScanInstrumentation
 {
 	int			num_workers;
-	IndexScanInstrumentation winstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) IndexScanInstrumentation winstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedIndexScanInstrumentation;
 
 
@@ -140,7 +140,7 @@ typedef struct BitmapHeapScanInstrumentation
 typedef struct SharedBitmapHeapInstrumentation
 {
 	int			num_workers;
-	BitmapHeapScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) BitmapHeapScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedBitmapHeapInstrumentation;
 
 
@@ -169,7 +169,7 @@ typedef struct MemoizeInstrumentation
 typedef struct SharedMemoizeInfo
 {
 	int			num_workers;
-	MemoizeInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) MemoizeInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedMemoizeInfo;
 
 
@@ -190,8 +190,29 @@ typedef struct MaterialInstrumentation
 typedef struct SharedMaterialInfo
 {
 	int			num_workers;
-	MaterialInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) MaterialInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedMaterialInfo;
+
+
+/* ---------------------
+ *	Instrumentation information for FunctionScan
+ * ---------------------
+ */
+typedef struct FunctionScanInstrumentation
+{
+	int64		maxSpaceUsed;	/* peak memory/disk usage in bytes, or 0 if no
+								 * tuplestore was created */
+	bool		usedDisk;		/* did any tuplestore spill to disk? */
+} FunctionScanInstrumentation;
+
+/*
+ * Shared memory container for per-worker function scan information
+ */
+typedef struct SharedFunctionScanInfo
+{
+	int			num_workers;
+	pg_attribute_counted_by(num_workers) FunctionScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+} SharedFunctionScanInfo;
 
 
 /* ---------------------
@@ -236,7 +257,7 @@ typedef struct TuplesortInstrumentation
 typedef struct SharedSortInfo
 {
 	int			num_workers;
-	TuplesortInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) TuplesortInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedSortInfo;
 
 
@@ -259,7 +280,7 @@ typedef struct HashInstrumentation
 typedef struct SharedHashInfo
 {
 	int			num_workers;
-	HashInstrumentation hinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) HashInstrumentation hinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedHashInfo;
 
 
@@ -287,7 +308,7 @@ typedef struct IncrementalSortInfo
 typedef struct SharedIncrementalSortInfo
 {
 	int			num_workers;
-	IncrementalSortInfo sinfo[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) IncrementalSortInfo sinfo[FLEXIBLE_ARRAY_MEMBER];
 } SharedIncrementalSortInfo;
 
 
@@ -306,7 +327,7 @@ typedef struct SeqScanInstrumentation
 typedef struct SharedSeqScanInstrumentation
 {
 	int			num_workers;
-	SeqScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) SeqScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedSeqScanInstrumentation;
 
 
@@ -324,7 +345,7 @@ typedef struct TidRangeScanInstrumentation
 typedef struct SharedTidRangeScanInstrumentation
 {
 	int			num_workers;
-	TidRangeScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+	pg_attribute_counted_by(num_workers) TidRangeScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
 } SharedTidRangeScanInstrumentation;
 
 #endif							/* INSTRUMENT_NODE_H */

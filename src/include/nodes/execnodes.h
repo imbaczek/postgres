@@ -1037,6 +1037,7 @@ typedef struct SubPlanState
 	TupleHashTable hashnulls;	/* hash table for rows with null(s) */
 	bool		havehashrows;	/* true if hashtable is not empty */
 	bool		havenullrows;	/* true if hashnulls is not empty */
+	bool		hashtablestale; /* hash tables must be rebuilt before use */
 	MemoryContext tuplesContext;	/* context containing hash tables' tuples */
 	ExprContext *innerecontext; /* econtext for computing inner tuples */
 	int			numCols;		/* number of columns being hashed */
@@ -1565,6 +1566,12 @@ typedef struct MergeAppendState
 	bool		ms_initialized; /* are subplans started? */
 	struct PartitionPruneState *ms_prune_state;
 	Bitmapset  *ms_valid_subplans;
+	Bitmapset  *ms_asyncplans;	/* asynchronous plans indexes */
+	int			ms_nasyncplans; /* # of asynchronous plans */
+	AsyncRequest **ms_asyncrequests;	/* array of AsyncRequests */
+	Bitmapset  *ms_asyncpending;	/* async plans with an outstanding request */
+	struct WaitEventSet *ms_eventset;	/* WaitEventSet used to configure file
+										 * descriptor wait events */
 } MergeAppendState;
 
 /* ----------------
@@ -1911,6 +1918,20 @@ typedef struct SubqueryScanState
 } SubqueryScanState;
 
 /* ----------------
+ *		Runtime data for each function being scanned by a FunctionScan node.
+ * ----------------
+ */
+typedef struct FunctionScanPerFuncState
+{
+	SetExprState *setexpr;		/* state of the expression being evaluated */
+	TupleDesc	tupdesc;		/* desc of the function result type */
+	int			colcount;		/* expected number of result columns */
+	Tuplestorestate *tstore;	/* holds the function result set */
+	int64		rowcount;		/* # of rows in result set, -1 if not known */
+	TupleTableSlot *func_slot;	/* function result slot (or NULL) */
+} FunctionScanPerFuncState;
+
+/* ----------------
  *	 FunctionScanState information
  *
  *		Function nodes are used to scan the results of a
@@ -1921,13 +1942,12 @@ typedef struct SubqueryScanState
  *		simple				true if we have 1 function and no ordinality
  *		ordinal				current ordinal column value
  *		nfuncs				number of functions being executed
- *		funcstates			per-function execution states (private in
- *							nodeFunctionscan.c)
+ *		funcstates			per-function execution states
  *		argcontext			memory context to evaluate function arguments in
+ *		stats				storage statistics to report in EXPLAIN ANALYZE
+ *		shared_info			storage statistics for parallel workers
  * ----------------
  */
-struct FunctionScanPerFuncState;
-
 typedef struct FunctionScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -1936,8 +1956,10 @@ typedef struct FunctionScanState
 	bool		simple;
 	int64		ordinal;
 	int			nfuncs;
-	struct FunctionScanPerFuncState *funcstates;	/* array of length nfuncs */
+	FunctionScanPerFuncState *funcstates;	/* array of length nfuncs */
 	MemoryContext argcontext;
+	FunctionScanInstrumentation stats;
+	SharedFunctionScanInfo *shared_info;
 } FunctionScanState;
 
 /* ----------------
@@ -2203,7 +2225,8 @@ typedef struct MergeJoinState
  *								outer joins
  *		hj_NullInnerTupleSlot	prepared null tuple for left/full outer joins
  *		hj_NullOuterTupleStore	tuplestore holding outer tuples that have
- *								null join keys (but must be emitted anyway)
+ *								null join keys (but must be emitted anyway);
+ *								used only in multi-batch parallel joins
  *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan
  *		hj_JoinState			current state of ExecHashJoin state machine
  *		hj_KeepNullTuples		true to keep outer tuples with null join keys
@@ -2301,8 +2324,7 @@ typedef struct MemoizeState
 								 * by bit, false when using hash equality ops */
 	MemoizeInstrumentation stats;	/* execution statistics */
 	SharedMemoizeInfo *shared_info; /* statistics for parallel workers */
-	Bitmapset  *keyparamids;	/* Param->paramids of expressions belonging to
-								 * param_exprs */
+	Bitmapset  *keyparamids;	/* copy of Memoize.keyparamids */
 } MemoizeState;
 
 /* ----------------

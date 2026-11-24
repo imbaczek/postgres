@@ -271,6 +271,7 @@ BernoulliSamplerData
 BgWorkerStartTime
 BgwHandleStatus
 BinaryArithmFunc
+BinaryUpgradeAttributeVersions
 BinaryUpgradeClassOidItem
 BindParamCbData
 BipartiteMatchState
@@ -498,6 +499,7 @@ CompareScalarsContext
 CompareType
 CompiledExprState
 CompositeIOData
+CompositeTypeMismatchOptions
 CompositeTypeStmt
 CompoundAffixFlag
 CompressFileHandle
@@ -1038,6 +1040,7 @@ FunctionCallInfoBaseData
 FunctionParameter
 FunctionParameterMode
 FunctionScan
+FunctionScanInstrumentation
 FunctionScanPerFuncState
 FunctionScanState
 FuzzyAttrMatchState
@@ -2060,6 +2063,8 @@ PLyResultObject
 PLySRFState
 PLySavedArgs
 PLyScalarToOb
+PLyStaticsEntry
+PLyStaticsKey
 PLySubtransactionData
 PLySubtransactionObject
 PLyTransformToOb
@@ -2226,6 +2231,7 @@ PatternInfo
 PatternInfoArray
 Pattern_Prefix_Status
 Pattern_Type
+PendingCancelRequest
 PendingFsyncEntry
 PendingListenAction
 PendingListenEntry
@@ -2850,6 +2856,7 @@ SharedDependencyObjectType
 SharedDependencyType
 SharedExecutorInstrumentation
 SharedFileSet
+SharedFunctionScanInfo
 SharedHashInfo
 SharedIncrementalSortInfo
 SharedIndexScanInstrumentation
@@ -3952,12 +3959,9 @@ manifest_wal_range
 manifest_writer
 map_variable_attnos_context
 max_parallel_hazard_context
-mb2wchar_with_len_converter
-mbchar_verifier
 mbcharacter_incrementer
-mbdisplaylen_converter
-mblen_converter
-mbstr_verifier
+mblen_function
+mbverifychar_function
 memoize_hash
 memoize_iterator
 metastring
@@ -4079,6 +4083,7 @@ pgp_armor_headers_state
 pgpa_advice_item
 pgpa_advice_tag_type
 pgpa_advice_target
+pgpa_baserel_state
 pgpa_identifier
 pgpa_index_target
 pgpa_itm_type
@@ -4124,6 +4129,7 @@ pgsql_thing_t
 pgssEntry
 pgssGlobalStats
 pgssHashKey
+pgssQueryState
 pgssSharedState
 pgssStoreKind
 pgssVersion
@@ -4439,7 +4445,6 @@ walrcv_receive_fn
 walrcv_send_fn
 walrcv_server_version_fn
 walrcv_startstreaming_fn
-wchar2mb_with_len_converter
 wchar_t
 win32_deadchild_waitinfo
 wint_t

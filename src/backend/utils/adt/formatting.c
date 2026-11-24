@@ -3789,6 +3789,7 @@ DCH_cache_getnew(const char *str, bool std)
 #endif
 		old->valid = false;
 		strlcpy(old->str, str, DCH_CACHE_SIZE + 1);
+		old->std = std;
 		old->age = (++DCHCounter);
 		/* caller is expected to fill format, then set valid */
 		return old;
@@ -5659,13 +5660,13 @@ NUM_numpart_to_char(NUMProc *Np, int id)
 						NUM_EMITC('0');
 					}
 				}
-				else
+				else if (*Np->input_p)
 				{
 					NUM_EMITC(*Np->input_p);	/* Write DIGIT */
 					Np->num_in = true;
 				}
 			}
-			/* do no exceed string length */
+			/* do not advance past end of string */
 			if (*Np->input_p)
 				++Np->input_p;
 		}

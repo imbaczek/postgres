@@ -73,6 +73,7 @@
 #include "utils/formatting.h"
 #include "utils/json.h"
 #include "utils/jsonpath.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -174,7 +175,21 @@ typedef struct JsonValueList
 	int			maxitems;		/* allocated length of items[] */
 	struct JsonValueList *next; /* => next chunk, if any */
 	struct JsonValueList *last; /* => last chunk (only valid in base chunk) */
-	JsonbValue	items[BASE_JVL_ITEMS];
+	union
+	{
+		/*
+		 * To satisfy -fstrict-flex-arrays=1, we need one union member that
+		 * makes space for the base chunk and one member that is effectively
+		 * declared as a flexible-array member, otherwise you'd get
+		 * -fsanitize=undefined errors.  Note that we can't declare items as
+		 * [FLEXIBLE_ARRAY_MEMBER], because JsonValueList is used in a
+		 * non-last field of JsonTablePlanState, and that's not allowed with
+		 * flexible-array members.  But using [1] works as long as we don't go
+		 * higher than -fstrict-flex-arrays=1.
+		 */
+		JsonbValue	base_items[BASE_JVL_ITEMS];
+		JsonbValue	items[1];
+	};
 } JsonValueList;
 
 /* State data for iterating through a JsonValueList */
@@ -3346,12 +3361,26 @@ JsonItemFromDatum(Datum val, Oid typid, int32 typmod, JsonbValue *res)
 			break;
 		case TEXTOID:
 		case VARCHAROID:
+		case BPCHAROID:
 			{
+				/*
+				 * Note that bpchar values keep their padding, as in
+				 * to_jsonb()
+				 */
 				text	   *txt = DatumGetTextPP(val);
 
 				res->type = jbvString;
 				res->val.string.val = VARDATA_ANY(txt);
 				res->val.string.len = VARSIZE_ANY_EXHDR(txt);
+				break;
+			}
+		case NAMEOID:
+			{
+				char	   *str = NameStr(*DatumGetName(val));
+
+				res->type = jbvString;
+				res->val.string.val = str;
+				res->val.string.len = strlen(str);
 				break;
 			}
 		case DATEOID:
@@ -3395,10 +3424,38 @@ JsonItemFromDatum(Datum val, Oid typid, int32 typmod, JsonbValue *res)
 				break;
 			}
 		default:
-			ereport(ERROR,
-					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					errmsg("could not convert value of type %s to jsonpath",
-						   format_type_be(typid)));
+			{
+				char		typcategory;
+				bool		typispreferred;
+
+				/*
+				 * transformJsonValueExpr() passes values of any type of the
+				 * string category as they are, so handle those not covered
+				 * above (such as extension types) using their output
+				 * function, as to_jsonb() does.
+				 */
+				get_type_category_preferred(typid, &typcategory,
+											&typispreferred);
+				if (typcategory == TYPCATEGORY_STRING)
+				{
+					Oid			typoutput;
+					bool		typisvarlena;
+					char	   *str;
+
+					getTypeOutputInfo(typid, &typoutput, &typisvarlena);
+					str = OidOutputFunctionCall(typoutput, val);
+
+					res->type = jbvString;
+					res->val.string.val = str;
+					res->val.string.len = strlen(str);
+					break;
+				}
+
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("could not convert value of type %s to jsonpath",
+							   format_type_be(typid)));
+			}
 	}
 }
 
