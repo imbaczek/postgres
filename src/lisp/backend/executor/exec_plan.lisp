@@ -826,53 +826,119 @@ if a registered TOAST index is missing."
         finally (return (< (second left) (second right)))))
 
 (defun write-query-sort-run (items order)
-  (with-query-temp-output (pathname output)
-    (dolist (item
-             (stable-sort items
-                          (lambda (left right)
-                            (select-sort-item-less-p left right order))))
-      (query-spill-write-record output item))
-    pathname))
+  "Write a stable sorted run and return its path and leading key bounds.
+Bounds are fixnums when available, so they remain valid after arena reset."
+  (let ((sorted (stable-sort items
+                             (lambda (left right)
+                               (select-sort-item-less-p left right order))))
+        (last-item nil))
+    (with-query-temp-output (pathname output t)
+      (let ((buffer (make-query-sort-spill-buffer)))
+        (dolist (item sorted)
+          (write-query-sort-spill-item output pathname buffer item)
+          (setf last-item item)))
+      ;; Only keep immediate scalar bounds, even when the run lives in an arena.
+      (let ((start (and order sorted (aref (third (first sorted)) 0)))
+            (end (and order last-item (aref (third last-item) 0))))
+        (values pathname (and (typep start 'fixnum) start) (and (typep end 'fixnum) end))))))
 
-(defun merge-query-sort-runs (left-path right-path order)
-  "Merge two runs into an owned output before deleting the inputs."
-  (let ((output-path nil))
-    (with-query-temp-output (pathname output)
-      (setf output-path pathname)
-      (progn
-        (with-query-temp-input (left-input left-path)
-          (with-query-temp-input (right-input right-path)
-            (let ((left (query-spill-read-record left-input))
-                  (right (query-spill-read-record right-input)))
-              (loop until (or (eq left +query-spill-eof+)
-                              (eq right +query-spill-eof+))
-                    do (if (select-sort-item-less-p left right order)
-                           (progn
-                             (query-spill-write-record output left)
-                             (setf left
-                                   (query-spill-read-record left-input)))
-                           (progn
-                             (query-spill-write-record output right)
-                             (setf right
-                                   (query-spill-read-record right-input)))))
-              (loop until (eq left +query-spill-eof+)
-                    do (query-spill-write-record output left)
-                       (setf left
-                             (query-spill-read-record left-input)))
-              (loop until (eq right +query-spill-eof+)
-                    do (query-spill-write-record output right)
-                       (setf right
-                             (query-spill-read-record right-input))))))
-        output-path))
-    (delete-query-temp-file left-path)
-    (delete-query-temp-file right-path)
-    output-path))
+(defun disjoint-query-sort-runs (runs descending-p)
+  "Return runs in key order when their leading integer key ranges are disjoint.
+Strict separation lets the caller stream whole runs without comparing rows
+across runs, while preserving the order of equal keys."
+  (when (every (lambda (run) (and (second run) (third run))) runs)
+    (let* ((less-p (if descending-p #'> #'<))
+           (ordered (stable-sort (copy-list runs) less-p :key #'second)))
+      (when (loop for (run next) on ordered
+                  always (or (null next) (funcall less-p (third run) (second next))))
+        ordered))))
 
-(defun merge-query-sort-run-pass (runs order)
-  (loop for tail on runs by #'cddr
-        collect (if (cdr tail)
-                    (merge-query-sort-runs (car tail) (cadr tail) order)
-                    (car tail))))
+(defun stream-disjoint-query-sort-runs (runs callback)
+  "Drain disjoint runs in sequence with only one open file."
+  (let ((buffer (make-query-sort-spill-buffer)))
+    (dolist (run runs)
+      (with-query-temp-input (input (first run) t)
+        (loop for item = (read-query-sort-spill-item input buffer)
+              until (eq item +query-spill-eof+)
+              do (check-for-interrupts)
+                 (when (eq (funcall callback item) :stop)
+                   (return-from stream-disjoint-query-sort-runs :stop)))))))
+
+;; Bound simultaneously open files and per-run stream buffers. The last merge
+;; streams directly to the consumer instead of writing another temporary run.
+(defconstant +query-sort-merge-fan-in+ 32)
+
+(defun stream-query-sort-runs (runs order callback)
+  "Merge sorted runs, returning :STOP if CALLBACK stops.
+Keep one decoded item and one input buffer per run. The sequence number in each
+item breaks equal-key ties. Input streams remain owned until this call exits."
+  (let ((heap (make-array (length runs)))
+        (count 0))
+    (labels ((less-p (left right)
+               (select-sort-item-less-p (car left) (car right) order))
+             (sift-down (position)
+               (let ((entry (aref heap position)))
+                 (loop for left = (1+ (* 2 position))
+                       while (< left count)
+                       for right = (1+ left)
+                       for child = (if (and (< right count)
+                                            (less-p (aref heap right) (aref heap left)))
+                                       right left)
+                       while (less-p (aref heap child) entry)
+                       do (setf (aref heap position) (aref heap child)
+                                position child))
+                 (setf (aref heap position) entry)))
+             (merge-open-runs ()
+               (loop for position downfrom (1- (floor count 2)) to 0
+                     do (sift-down position))
+               (loop while (plusp count)
+                     for entry = (aref heap 0)
+                     do (check-for-interrupts)
+                        (when (eq (funcall callback (car entry)) :stop)
+                          (return :stop))
+                        (let ((next (read-query-sort-spill-item (second entry) (third entry))))
+                          (if (eq next +query-spill-eof+)
+                              (progn
+                                (decf count)
+                                (setf (aref heap 0) (aref heap count)
+                                      (aref heap count) nil))
+                              (setf (car entry) next)))
+                        (when (plusp count) (sift-down 0))))
+             (open-runs (paths)
+               (if (endp paths)
+                   (merge-open-runs)
+                   (with-query-temp-input (input (car paths) t)
+                     (let* ((buffer (make-query-sort-spill-buffer))
+                            (item (read-query-sort-spill-item input buffer)))
+                       (unless (eq item +query-spill-eof+)
+                         (setf (aref heap count) (list item input buffer))
+                         (incf count)))
+                     (open-runs (cdr paths))))))
+      (open-runs runs))))
+
+(defun merge-query-sort-runs (runs order)
+  "Write one owned merged run before deleting its inputs.
+The surrounding temporary-file scope owns all paths on an error or interrupt."
+  (let ((merged
+          (with-query-temp-output (pathname output t)
+            (let ((buffer (make-query-sort-spill-buffer)))
+              (stream-query-sort-runs
+               runs order
+               (lambda (item)
+                 (write-query-sort-spill-item output pathname buffer item)
+                 nil)))
+            pathname)))
+    (dolist (path runs)
+      (delete-query-temp-file path))
+    merged))
+
+(defun merge-query-sort-run-pass (runs order fan-in)
+  (loop while runs
+        for group = (loop repeat fan-in
+                          while runs collect (pop runs))
+        collect (if (endp (cdr group))
+                    (car group)
+                    (merge-query-sort-runs group order))))
 
 (defun stream-select-sort (streamer order callback &key on-complete limit)
   "Sort a stream with bounded in-memory runs and stable external merges."
@@ -958,6 +1024,7 @@ sorter for spill and origins, and emit each row as (projected . projected)."
   (with-query-temp-files ()
                          (let ((buffer '())
                                (buffer-bytes 0)
+                               (max-item-bytes 1)
                                (sequence 0)
                                (runs '())
                                (memory-limit (max 1 *query-work-memory-bytes*))
@@ -975,10 +1042,13 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                     (flush-run ()
                                       (when buffer
                                         (own-run)
-                                        (push (write-query-sort-run (nreverse buffer) order) runs)
+                                        (multiple-value-bind (path start end)
+                                            (write-query-sort-run (nreverse buffer) order)
+                                          (push (list path start end) runs))
                                         (setf buffer nil buffer-bytes 0)
                                         (reset-query-sort-arena arena)))
                                     (buffer-item (item item-bytes)
+                                      (setf max-item-bytes (max max-item-bytes item-bytes))
                                       (when (and buffer
                                                  (> (+ buffer-bytes item-bytes) memory-limit))
                                         (flush-run))
@@ -997,18 +1067,11 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                               (and *datum-origin-capture*
                                                    (datum-origins-for-spill *query-row-origins*))
                                               *query-row-presence*)))
-                                    (emit-run (pathname)
-                                      (with-query-temp-input (stream pathname)
-                                        (loop for item = (query-spill-read-record stream)
-                                              until (eq item +query-spill-eof+)
-                                              do (check-for-interrupts)
-                                                 (let ((*query-row-origins* (and *datum-origin-capture*
-                                                                                 (datum-origins-from-spill (fifth item))))
-                                                       (*query-row-presence* (if arena
-                                                                                 (copy-query-sort-value (sixth item))
-                                                                                 (sixth item))))
-                                                   (when (eq (funcall callback (fourth item)) :stop)
-                                                     (return-from stream-select-sort-with-arena :stop)))))))
+                                    (emit-item (item)
+                                      (let ((*query-row-origins* (and *datum-origin-capture*
+                                                                      (datum-origins-from-spill (fifth item))))
+                                            (*query-row-presence* (sixth item)))
+                                        (funcall callback (fourth item)))))
                              (unwind-protect
                                   (progn
                                     (funcall
@@ -1056,10 +1119,22 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                                 (return-from stream-select-sort-with-arena :stop)))))
                                         (progn
                                           (flush-run)
-                                          (setf runs (nreverse runs))
-                                          (loop while (cdr runs)
-                                                do (setf runs (merge-query-sort-run-pass runs order)))
-                                          (emit-run (first runs))))
+                                          (let* ((ordered (nreverse runs))
+                                                 (disjoint (disjoint-query-sort-runs ordered (cdar order)))
+                                                 (result
+                                                   (if disjoint
+                                                       (stream-disjoint-query-sort-runs disjoint #'emit-item)
+                                                       (let ((paths (mapcar #'first ordered))
+                                                             ;; Each input retains one decoded row.
+                                                             ;; Allow two inputs even when one row
+                                                             ;; exceeds the memory estimate.
+                                                             (fan-in (min +query-sort-merge-fan-in+
+                                                                          (max 2 (floor memory-limit max-item-bytes)))))
+                                                         (loop while (> (length paths) fan-in)
+                                                               do (setf paths (merge-query-sort-run-pass paths order fan-in)))
+                                                         (stream-query-sort-runs paths order #'emit-item)))))
+                                            (when (eq result :stop)
+                                              (return-from stream-select-sort-with-arena :stop)))))
                                     (when on-complete (funcall on-complete)))
                                ;; This captured cell lives on the heap. Clear it before arena reset
                                ;; or destruction, including cancellation and downstream errors.
@@ -2570,12 +2645,24 @@ Compare the advertised column shape, independently of result format codes."
       (when *select-suppress-description*
         (check-result-column-shape columns *select-expected-result-columns*))
       (flet ((send-row (row)
-               (send-select-row stream row targets)
+               ;; Flush the first row promptly. Complete small frames
+               ;; after it can share the socket buffer.
+               (send-select-row stream row targets (zerop row-count))
                (incf row-count)))
         (call-with-admitted-select-plan
          plan (lambda (registered)
                 (unless *select-suppress-description* (send-row-description stream columns))
                 (execute-query-plan plan registered #'send-row))))
+      ;; The command tag may wait for autocommit outside this executor.
+      ;; If a partial flush fails, the connection cannot carry another frame.
+      (when (> row-count 1)
+        (let ((complete nil))
+          (sb-sys:without-interrupts
+            (unwind-protect
+                 (sb-sys:with-local-interrupts
+                   (force-output stream)
+                   (setf complete t))
+              (unless complete (ignore-errors (close stream :abort t)))))))
       (send-command-complete stream (format nil "SELECT ~a" row-count)))))
 
 (defun copy-write-frame (stream type payload)

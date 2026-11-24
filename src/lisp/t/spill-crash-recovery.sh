@@ -183,40 +183,37 @@ spill_file=$(find "$PGDATA/pgsql_tmp" -type f -name 'pg-query-*.tmp' -print -qui
 [ -z "$spill_file" ] || fail "FULL JOIN quota error left temporary files behind"
 control_eval '(setf pg::*query-temp-file-limit-bytes* nil)' >/dev/null
 
-run -c "create table spill_merge_rows (id int); insert into spill_merge_rows values $(awk 'BEGIN { for (i = 1; i <= 16; i++) printf "%s(%d)", i == 1 ? "" : ",", i; print "" }')" >/dev/null || fail "could not prepare external merge quota input"
+run -c "create table spill_merge_rows (id int, tie int); insert into spill_merge_rows values $(awk 'BEGIN { for (i = 1; i <= 96; i++) printf "%s(%d,%d)", i == 1 ? "" : ",", i % 4, i; print "" }')" >/dev/null || fail "could not prepare external merge quota input"
 control <<'LISP' >/dev/null
 (defparameter pg::*spill_test_merge_count* 0)
-(defparameter pg::*spill_test_merge_high_water* 0)
+(defparameter pg::*spill_test_merge_start_bytes* nil)
 (let ((original (symbol-function 'pg::merge-query-sort-runs)))
   (setf (symbol-function 'pg::merge-query-sort-runs)
-        (lambda (left-path right-path order)
+        (lambda (runs order)
           (incf pg::*spill_test_merge_count*)
-          (funcall original left-path right-path order))))
-(let ((original (symbol-function 'pg::query-temp-account-space)))
-  (setf (symbol-function 'pg::query-temp-account-space)
-        (lambda (pathname bytes &optional stream)
-          (prog1 (funcall original pathname bytes stream)
-            (when (<= 1 pg::*spill_test_merge_count* 12)
-              (setf pg::*spill_test_merge_high_water*
-                    (max pg::*spill_test_merge_high_water*
-                         (pg::query-temp-quota-used-bytes pg::*query-temp-quota*))))))))
+          (unless pg::*spill_test_merge_start_bytes*
+            (setf pg::*spill_test_merge_start_bytes*
+                  (pg::query-temp-quota-used-bytes pg::*query-temp-quota*)))
+          (funcall original runs order))))
 LISP
-run -c "select id from spill_merge_rows order by id" > "$TMP/merge-baseline.out" 2>&1 || fail "unlimited external merge query did not complete"
+run -c "select id, tie from spill_merge_rows order by id, tie desc" > "$TMP/merge-baseline.out" 2>&1 || fail "unlimited external merge query did not complete"
 merge_rows=$(wc -l < "$TMP/merge-baseline.out" | tr -d ' ')
-[ "$merge_rows" = 16 ] || fail "external merge baseline returned $merge_rows rows instead of 16"
+[ "$merge_rows" = 96 ] || fail "external merge baseline returned $merge_rows rows instead of 96"
+awk 'BEGIN { for (id = 0; id < 4; id++) for (i = 96; i > 0; i--) if (i % 4 == id) printf "%d|%d\n", id, i }' > "$TMP/merge-expected.out"
+cmp -s "$TMP/merge-baseline.out" "$TMP/merge-expected.out" || fail "external merge did not honor both sort keys"
 merge_calls=$(control_number MERGE_COUNT '(format nil "MERGE_COUNT=~d" pg::*spill_test_merge_count*)')
-merge_limit=$(control_number MERGE_HIGH_WATER '(format nil "MERGE_HIGH_WATER=~d" pg::*spill_test_merge_high_water*)')
-[ "$merge_calls" = 15 ] && [ "$merge_limit" -gt 0 ] || fail "external merge baseline did not complete the expected 15 merges"
-control_eval "(setf pg::*query-temp-file-limit-bytes* $merge_limit pg::*spill_test_merge_count* 0 pg::*spill_test_merge_high_water* 0)" >/dev/null
-if run -c "select id from spill_merge_rows order by id" > "$TMP/merge-limit.out" 2>&1; then
-    fail "external merge quota did not fail after the calibrated passes"
+merge_limit=$(control_number MERGE_START '(format nil "MERGE_START=~d" pg::*spill_test_merge_start_bytes*)')
+[ "$merge_calls" -gt 1 ] && [ "$merge_limit" -gt 0 ] || fail "external merge baseline did not materialize intermediate runs"
+control_eval "(setf pg::*query-temp-file-limit-bytes* $merge_limit pg::*spill_test_merge_count* 0)" >/dev/null
+if run -c "select id, tie from spill_merge_rows order by id, tie desc" > "$TMP/merge-limit.out" 2>&1; then
+    fail "external merge exceeded no quota"
 fi
 grep -Fq '53400' "$TMP/merge-limit.out" || fail "external merge quota failure did not report SQLSTATE 53400"
 merge_calls=$(control_number MERGE_COUNT '(format nil "MERGE_COUNT=~d" pg::*spill_test_merge_count*)')
-[ "$merge_calls" = 13 ] || fail "external merge quota failed at merge $merge_calls instead of merge 13"
+[ "$merge_calls" = 1 ] || fail "external merge quota failed outside the first materialized merge"
 spill_file=$(find "$PGDATA/pgsql_tmp" -type f -name 'pg-query-*.tmp' -print -quit)
 [ -z "$spill_file" ] || fail "external merge quota error left temporary files behind"
 count_after_merge_limit=$(run -c "select count(*) from spill_merge_rows")
-[ "$count_after_merge_limit" = 16 ] || fail "server stopped serving queries after external merge quota failure"
+[ "$count_after_merge_limit" = 96 ] || fail "server stopped serving queries after external merge quota failure"
 
 echo "spill-crash-recovery: PASS (reclaimed $crashed_spill_file; $count rows survived; sort, FULL JOIN and merge quotas enforced)"

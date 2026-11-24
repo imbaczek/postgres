@@ -78,6 +78,8 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
 
 (defun order-compare (a b)
   (cond
+    ((and (typep a 'fixnum) (typep b 'fixnum))
+     (cond ((< a b) -1) ((> a b) 1) (t 0)))
     ((and (eq a +null+) (eq b +null+)) 0)
     ((eq a +null+) 1)
     ((eq b +null+) -1)
@@ -1846,18 +1848,16 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
                  (write-char (char digits (logand byte 15)) out)))))
 
 (defun select-row-field-writer (value type)
-  "Return a repeatable character writer, or NIL for SQL NULL."
+  "Return text, raw text octets, a repeatable writer, or NIL for SQL NULL."
   (cond ((eq value +null+) nil)
         ((and (eq type :text) (typep value '(vector (unsigned-byte 8)))) value)
         ((eq type :bytea)
          (let ((format (or (session-extra-setting-value "bytea_output") "hex")))
            (lambda (out) (select-write-bytea-text out value format))))
         ((eq type :jsonb) (lambda (out) (sql-jsonb-write value out)))
-        ((and (member type '(:text :varchar :json)) (stringp value))
-         (lambda (out) (write-string value out)))
         (t (let ((text (value->text value type)))
              (unless (stringp text) (error "invalid DataRow field"))
-             (lambda (out) (write-string text out))))))
+             text))))
 
 (defun select-row-utf8-write (writer sink &optional (limit #x7fffffff))
   (multiple-value-bind (counter metrics) (logical-encoding-sink limit)
@@ -1888,9 +1888,11 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (funcall metrics)))
 
 (defun select-row-text-write (writer sink &optional (limit #x7fffffff))
-  (if (typep writer '(vector (unsigned-byte 8)))
-      (select-row-binary-bytea-write writer sink limit)
-      (select-row-utf8-write writer sink limit)))
+  (cond ((stringp writer)
+         (select-row-utf8-write (lambda (out) (write-string writer out)) sink limit))
+        ((typep writer '(vector (unsigned-byte 8)))
+         (select-row-binary-bytea-write writer sink limit))
+        (t (select-row-utf8-write writer sink limit))))
 
 (defun select-row-binary-write (value type sink &optional (limit #x7fffffff))
   "Count, checksum and optionally emit a supported binary field."
@@ -1905,11 +1907,38 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
         (otherwise (error "unsupported binary DataRow type"))))
     (funcall metrics)))
 
-(defun send-select-data-row (stream values targets)
-  "Preflight every field, then write one bounded DataRow."
+(defun make-select-data-row-frame (size width fields)
+  "Build a DataRow from fields fully encoded during preflight.
+SIZE includes the four-byte length word and excludes the message type byte."
+  (declare (type fixnum size))
+  (let ((frame (make-array (1+ size) :element-type '(unsigned-byte 8)))
+        (position 1))
+    (declare (type fixnum position))
+    (flet ((put-integer (value bytes)
+             (declare (type (unsigned-byte 32) value) (type fixnum bytes))
+             (loop for shift from (* 8 (1- bytes)) downto 0 by 8
+                   do (setf (aref frame position) (ldb (byte 8 shift) value))
+                      (incf position))))
+      (setf (aref frame 0) (char-code #\D))
+      (put-integer size 4)
+      (put-integer width 2)
+      (dolist (field fields)
+        (let ((octets (fifth field)))
+          (put-integer (or (second field) #xffffffff) 4)
+          (when octets
+            (replace frame octets :start1 position)
+            (incf position (length octets))))))
+    frame))
+
+(defun send-select-data-row (stream values targets &optional (flush-p t))
+  "Preflight every field, then write a DataRow.
+Small encoded frames may stay in the stream buffer when FLUSH-P is false.
+Large fields are emitted in chunks and checked against their preflight values.
+Close the stream on a failed write, since a partial frame cannot be retried."
   (unless (and (= (length values) (length targets)) (<= (length targets) #xffff))
     (error "invalid DataRow width"))
-  (let ((fields nil) (size (+ 6 (* 4 (length targets)))))
+  (let ((fields nil) (size (+ 6 (* 4 (length targets)))) (cached-bytes 0)
+                     (all-encoded-p t))
     (when (and *select-result-formats* (/= (length *select-result-formats*) (length targets)))
       (error "DataRow result format count mismatch"))
     (loop for value across values for target in targets for index from 0
@@ -1918,17 +1947,28 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
           for type = (getf target :type)
           for writer = (if (and binary (not (eq value +null+))) (cons value type)
                            (select-row-field-writer value type))
-          do (unless (or (= format 0) (and binary (extended-binary-type-p type)))
+          ;; Materialize small, already-rendered fields once. Large fields still
+          ;; stream in bounded chunks and validate the second pass.
+          for encoded = (and (stringp writer) (<= (length writer) 1024)
+                             (<= (+ cached-bytes (* 4 (length writer))) 65536)
+                             (string->bytes writer))
+          do (cond (encoded (incf cached-bytes (length encoded)))
+                   (writer (setf all-encoded-p nil)))
+             (unless (or (= format 0) (and binary (extended-binary-type-p type)))
                (error "unsupported DataRow result format"))
              (multiple-value-bind (length checksum)
                  (cond ((null writer) (values nil nil))
+                       (encoded (length encoded))
                        (binary (select-row-binary-write (car writer) (cdr writer) nil))
                        (t (select-row-text-write writer nil)))
                (when (and length (> length #x7fffffff)) (error "DataRow field too large"))
                (when length (incf size length))
-               (push (list writer length checksum binary) fields)))
+               (push (list writer length checksum binary encoded) fields)))
     (when (> size #x7fffffff) (error "DataRow frame too large"))
-    (let ((complete nil) (last-byte nil))
+    (setf fields (nreverse fields))
+    (let ((complete nil) (last-byte nil)
+                         (frame (and all-encoded-p (<= size 65536)
+                                     (make-select-data-row-frame size (length targets) fields))))
       (labels ((emit (octets)
                  (when (plusp (length octets))
                    (when last-byte (write-byte last-byte stream))
@@ -1938,27 +1978,31 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
         (sb-sys:without-interrupts
           (unwind-protect
                (sb-sys:with-local-interrupts
-                 (emit (vector (char-code #\D)))
-                 (emit (u32-to-bytes size))
-                 (emit (u16-to-bytes (length targets)))
-                 (dolist (field (nreverse fields))
-                   (destructuring-bind (writer length checksum binary) field
-                     (emit (u32-to-bytes (if writer length #xffffffff)))
-                     (when writer
-                       (multiple-value-bind (actual actual-checksum)
-                           (if binary (select-row-binary-write (car writer) (cdr writer) #'emit length)
-                               (select-row-text-write writer #'emit length))
-                         (unless (and (= length actual) (= checksum actual-checksum))
-                           (error "DataRow field changed during output"))))))
-                 (unless last-byte (error "empty DataRow frame"))
-                 (write-byte last-byte stream)
-                 (force-output stream)
+                 (if frame
+                     (write-sequence frame stream)
+                     (progn
+                       (emit (vector (char-code #\D)))
+                       (emit (u32-to-bytes size))
+                       (emit (u16-to-bytes (length targets)))
+                       (dolist (field fields)
+                         (destructuring-bind (writer length checksum binary encoded) field
+                           (emit (u32-to-bytes (if writer length #xffffffff)))
+                           (cond (encoded (emit encoded))
+                                 (writer
+                                  (multiple-value-bind (actual actual-checksum)
+                                      (if binary (select-row-binary-write (car writer) (cdr writer) #'emit length)
+                                          (select-row-text-write writer #'emit length))
+                                    (unless (and (= length actual) (= checksum actual-checksum))
+                                      (error "DataRow field changed during output")))))))
+                       (unless last-byte (error "empty DataRow frame"))
+                       (write-byte last-byte stream)))
+                 (when (or flush-p (null frame)) (force-output stream))
                  (setf complete t))
             (unless complete (ignore-errors (close stream :abort t))))))))
   (values))
 
-(defun send-select-row (stream row targets)
-  (send-select-data-row stream (car row) targets))
+(defun send-select-row (stream row targets &optional (flush-p t))
+  (send-select-data-row stream (car row) targets flush-p))
 
 (defun select-path-description (table path)
   (case (select-scan-path-kind path)

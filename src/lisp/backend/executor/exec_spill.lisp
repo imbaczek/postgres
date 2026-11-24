@@ -1009,15 +1009,16 @@ Publish the actual stream under interrupt masking before fallible registration."
           (abort-query-temp-stream (query-temp-stream-entry-stream entry) pathname)
           (prune-query-temp-stream-entries))))))
 
-(defun open-query-temp-output ()
+(defun open-query-temp-output (&optional bivalent-p)
   (unless *query-temp-file-scope-active-p*
     (error "Query spill files must be created inside WITH-QUERY-TEMP-FILES"))
   (loop repeat 100
         for pathname = (query-temp-file-pathname)
         for stream = (open-and-register-query-temp-file
                       pathname
-                      '(:direction :output :if-exists nil
-                        :if-does-not-exist :create :external-format :utf-8))
+                      (list :direction :output :if-exists nil
+                            :if-does-not-exist :create :external-format :utf-8
+                            :element-type (if bivalent-p :default 'character)))
         when stream
           do (return-from open-query-temp-output (values pathname stream)))
   (error "Could not create a unique query spill file"))
@@ -1035,13 +1036,14 @@ Publish the actual stream under interrupt masking before fallible registration."
           do (return-from open-query-temp-io (values pathname stream)))
   (error "Could not create a unique query spill file"))
 
-(defun open-query-temp-input (pathname)
+(defun open-query-temp-input (pathname &optional bivalent-p)
   "Reserve an entry and publish the input stream before registering its path."
   (ensure-query-temp-acquisition-ready)
   (let ((entry (make-query-temp-stream-entry :pathname pathname)))
     (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
     (sb-sys:without-interrupts
-      (let ((stream (open pathname :direction :input :external-format :utf-8)))
+      (let ((stream (open pathname :direction :input :external-format :utf-8
+                                   :element-type (if bivalent-p :default 'character))))
         (setf (query-temp-stream-entry-stream entry) stream)
         (register-query-temp-stream-path stream pathname)
         stream))))
@@ -1075,7 +1077,7 @@ Normal close errors propagate; a still-open stream remains owned."
              (setf normal-p t))
         (funcall closer normal-p)))))
 
-(defmacro with-query-temp-input ((stream pathname) &body body)
+(defmacro with-query-temp-input ((stream pathname &optional bivalent-p) &body body)
   "Open an owned input stream for BODY and attempt closure on every exit.
 
 The scope retains ownership if closure cannot be confirmed."
@@ -1083,11 +1085,12 @@ The scope retains ownership if closure cannot be confirmed."
     `(let ((,stream nil))
        (call-with-query-temp-stream-cleanup
         (lambda ()
-          (sb-sys:without-interrupts (setf ,stream (open-query-temp-input ,pathname)))
+          (sb-sys:without-interrupts
+            (setf ,stream (open-query-temp-input ,pathname ,@(when bivalent-p (list bivalent-p)))))
           ,@body)
         (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
-(defmacro with-query-temp-output ((pathname stream) &body body)
+(defmacro with-query-temp-output ((pathname stream &optional bivalent-p) &body body)
   "Own an output stream before opening it; the surrounding file scope owns PATHNAME.
 
 Normal close errors propagate; abnormal cleanup preserves the original exit."
@@ -1097,7 +1100,8 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
        (call-with-query-temp-stream-cleanup
         (lambda ()
           (sb-sys:without-interrupts
-            (multiple-value-setq (,pathname ,stream) (open-query-temp-output)))
+            (multiple-value-setq (,pathname ,stream)
+              (open-query-temp-output ,@(when bivalent-p (list bivalent-p)))))
           ,@body)
         (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
@@ -1428,6 +1432,136 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
       (if (eq value +query-spill-eof+)
           +query-spill-eof+
           (query-spill-decode value)))))
+
+;; A sort run uses bivalent streams so compact and readable records can share
+;; a file. A compact record starts with its two-byte big-endian total length.
+;; The leading byte #xff selects a newline-terminated general spill record.
+;; Compact values use one-byte tags, little-endian signed 32-bit integers,
+;; UTF-8 strings, simple vectors, and cons cells. The fixed buffer bounds each
+;; compact record; other values and larger records use the general format.
+(defconstant +query-sort-spill-buffer-size+ 4096)
+
+(defun make-query-sort-spill-buffer ()
+  (make-array +query-sort-spill-buffer-size+ :element-type '(unsigned-byte 8)))
+
+(defun encode-query-sort-spill-item (value buffer)
+  "Encode VALUE into BUFFER and return the frame size.
+Return NIL if the value, nesting depth, or encoded size needs the general format.
+BUFFER is scratch owned by the caller and may be reused after writing."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer))
+  (let ((position 2))
+    (declare (type fixnum position))
+    (labels ((put-byte (byte)
+               (when (= position +query-sort-spill-buffer-size+)
+                 (return-from encode-query-sort-spill-item nil))
+               (setf (aref buffer position) byte)
+               (incf position))
+             (put-size (size)
+               (put-byte (ash size -8))
+               (put-byte (logand size #xff)))
+             (put-value (value depth)
+               (when (> depth 32) (return-from encode-query-sort-spill-item nil))
+               (cond
+                 ((null value) (put-byte 0))
+                 ((eq value +null+) (put-byte 1))
+                 ((eq value :query-sort-item) (put-byte 2))
+                 ((eq value t) (put-byte 3))
+                 ((typep value '(signed-byte 32))
+                  (put-byte 4)
+                  (dotimes (index 4)
+                    (put-byte (ldb (byte 8 (* 8 index)) value))))
+                 ((stringp value)
+                  (when (> (length value) (- +query-sort-spill-buffer-size+ position 3))
+                    (return-from encode-query-sort-spill-item nil))
+                  (let ((octets (string->bytes value)))
+                    (when (> (length octets) (- +query-sort-spill-buffer-size+ position 3))
+                      (return-from encode-query-sort-spill-item nil))
+                    (put-byte 5)
+                    (put-size (length octets))
+                    (replace buffer octets :start1 position)
+                    (incf position (length octets))))
+                 ((simple-vector-p value)
+                  (when (> (length value) (- +query-sort-spill-buffer-size+ position 3))
+                    (return-from encode-query-sort-spill-item nil))
+                  (put-byte 6)
+                  (put-size (length value))
+                  (loop for element across value do (put-value element (1+ depth))))
+                 ((consp value)
+                  (put-byte 7)
+                  (put-value (car value) (1+ depth))
+                  (put-value (cdr value) (1+ depth)))
+                 (t (return-from encode-query-sort-spill-item nil)))))
+      (put-value value 0)
+      (setf (aref buffer 0) (ash position -8)
+            (aref buffer 1) (logand position #xff))
+      position)))
+
+(defun decode-query-sort-spill-item (buffer end)
+  "Decode a compact frame in BUFFER ending at END."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum end))
+  (let ((position 2))
+    (declare (type fixnum position))
+    (labels ((take-byte ()
+               (when (= position end) (error "Truncated sort spill item"))
+               (prog1 (aref buffer position) (incf position)))
+             (take-size ()
+               (logior (ash (take-byte) 8) (take-byte)))
+             (take-value ()
+               (ecase (take-byte)
+                 (0 nil)
+                 (1 +null+)
+                 (2 :query-sort-item)
+                 (3 t)
+                 (4 (let ((value 0))
+                      (dotimes (index 4)
+                        (setf (ldb (byte 8 (* 8 index)) value) (take-byte)))
+                      (if (logbitp 31 value) (- value #x100000000) value)))
+                 (5 (let ((length (take-size)))
+                      (when (> (+ position length) end) (error "Truncated sort spill string"))
+                      (prog1 (bytes->string buffer :start position :end (+ position length))
+                        (incf position length))))
+                 (6 (let* ((length (take-size))
+                           (value (make-array length)))
+                      (dotimes (index length value)
+                        (setf (svref value index) (take-value)))))
+                 (7 (cons (take-value) (take-value))))))
+      (let ((value (take-value)))
+        (unless (= position end) (error "Invalid sort spill item length"))
+        value))))
+
+(defun write-query-sort-spill-item (stream pathname buffer item)
+  "Write ITEM to the owned sort run and account for its temporary-file bytes."
+  (let ((size (encode-query-sort-spill-item item buffer)))
+    (query-temp-check-space pathname (or size 1))
+    (if size
+        (progn
+          (write-sequence buffer stream :end size)
+          (query-temp-account-space pathname size stream))
+        (progn
+          (write-byte #xff stream)
+          (query-temp-account-space pathname 1 stream)
+          (query-spill-write-record stream item)))))
+
+(defun read-query-sort-spill-item (stream buffer)
+  "Read one compact or general sort record, returning the spill EOF marker at end."
+  (let ((header (read-byte stream nil nil)))
+    (cond
+      ((null header) +query-spill-eof+)
+      ((= header #xff)
+       (let ((*read-eval* nil)
+             (*readtable* *query-spill-readtable*)
+             (*package* (find-package '#:pg)))
+         (let ((item (read-preserving-whitespace stream)))
+           (unless (eql (read-char stream nil nil) #\Newline)
+             (error "Invalid sort spill record terminator"))
+           (query-spill-decode item))))
+      (t
+       (let ((size (logior (ash header 8) (read-byte stream))))
+         (unless (and (<= 3 size (length buffer))
+                      (= size (read-sequence buffer stream :start 2 :end size)))
+           (error "Invalid sort spill frame length"))
+         (decode-query-sort-spill-item buffer size))))))
 
 (defstruct (query-row-spool (:constructor %make-query-row-spool))
   (rows nil)

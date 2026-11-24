@@ -338,7 +338,7 @@ is interrupted after publication but before it returns."
          (release-snapshot-registration ,registration)))))
 
 (defun xid-committed-p (xid)
-  (or (member xid (list +bootstrap-xid+ +frozen-xid+) :test #'=)
+  (or (= xid +bootstrap-xid+) (= xid +frozen-xid+)
       (eql (clog-get xid) +clog-committed+)))
 
 (defun xid-aborted-p (xid)
@@ -395,25 +395,34 @@ or perform buffer hint-bit cleanup."
       (and (not (logtest +heap-xmin-invalid+ infomask))
            (/= xmin +invalid-xid+))))
 
-(defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid &optional (infomask 0))
-  "HeapTupleSatisfiesMVCC, retaining the statement's insertion/deletion CID boundary."
-  (let ((curcid (snapshot-curcid snapshot)))
-    (cond
-      ((and my-xid (= xmin my-xid))
-       (multiple-value-bind (cmin cmax)
-           (if (logtest +heap-combo-cid+ infomask)
-               (combo-command-id-values my-xid cid) (values cid cid))
-         (and (< cmin curcid)
-              (or (/= xmax my-xid) (>= cmax curcid)))))
-      ((>= xmin (snapshot-xmax snapshot)) nil)
-      ((member xmin (snapshot-xip snapshot) :test #'=) nil)
-      ((not (xid-committed-p xmin)) nil)
-      ((and my-xid (= xmax my-xid)) (>= cid curcid))
-      ((zerop xmax) t)
-      ((>= xmax (snapshot-xmax snapshot)) t)
-      ((member xmax (snapshot-xip snapshot) :test #'=) t)
-      ((xid-committed-p xmax) nil)
-      (t t))))
+(defun heap-tuple-visible-p (xmin xmax cid snapshot my-xid
+                             &optional (infomask 0) committed-xid-cache)
+  "Check MVCC visibility, including the statement's insertion and deletion CIDs.
+COMMITTED-XID-CACHE, when provided, is private to a heap page visit. It holds
+only a full XID observed committed. Snapshot and command boundaries are checked
+for every tuple before the corresponding cached status is consulted."
+  (flet ((committed-p (xid)
+           (or (and committed-xid-cache (eql xid (car committed-xid-cache)))
+               (when (xid-committed-p xid)
+                 (when committed-xid-cache (setf (car committed-xid-cache) xid))
+                 t))))
+    (let ((curcid (snapshot-curcid snapshot)))
+      (cond
+        ((and my-xid (= xmin my-xid))
+         (multiple-value-bind (cmin cmax)
+             (if (logtest +heap-combo-cid+ infomask)
+                 (combo-command-id-values my-xid cid) (values cid cid))
+           (and (< cmin curcid)
+                (or (/= xmax my-xid) (>= cmax curcid)))))
+        ((>= xmin (snapshot-xmax snapshot)) nil)
+        ((member xmin (snapshot-xip snapshot) :test #'=) nil)
+        ((not (committed-p xmin)) nil)
+        ((and my-xid (= xmax my-xid)) (>= cid curcid))
+        ((zerop xmax) t)
+        ((>= xmax (snapshot-xmax snapshot)) t)
+        ((member xmax (snapshot-xip snapshot) :test #'=) t)
+        ((committed-p xmax) nil)
+        (t t)))))
 
 (defun tuple-prunable-p (xmin xmax oldest-xmin)
   "Return whether tuple XIDs are older than the captured removal horizon."
