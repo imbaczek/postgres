@@ -1855,7 +1855,7 @@ Visit present uppers before lowers and preserve omitted bounds."
       (and (member source '(:date :timestamp :timestamptz))
            (member target '(:date :timestamp :timestamptz)))
       (and (member source '(:timestamp :timestamptz :timetz)) (eq target :time))
-      (and (eq source :time) (eq target :timetz))
+      (and (eq source :time) (member target '(:interval :timetz)))
       (and (eq source :bit) (member target '(:int4 :int8)))
       (and (eq target :bit) (member source '(:int4 :int8)))
       (and (eq source :numeric) (member target '(:int2 :int4 :int8)))
@@ -2373,7 +2373,8 @@ The second value distinguishes a valid NIL result from an unhandled cast."
        (return-from cast-result
          (sql-interval-adjust-typmod
           (if (member source '(:text :varchar :name))
-              (sql-interval-input value (if interval-literal-p typmod -1)) value)
+              (sql-interval-input value (if interval-literal-p typmod -1))
+              (if (eq source :time) (make-sql-interval 0 0 value) value))
           typmod)))
      (when (member target '(:timestamp :timestamptz))
        (return-from cast-result
@@ -2746,6 +2747,14 @@ candidate selection."
   "Resolve temporal arithmetic when either operand has a temporal type."
   (when (or (member (expr-type left) '(:time :timestamp :timestamptz :interval :timetz))
             (member (expr-type right) '(:time :timestamp :timestamptz :interval :timetz)))
+    (when (and (string= operator "+") (eq (expr-type left) :time) (eq (expr-type right) :time))
+      (report-operator-resolution-error operator (list left right) t))
+    (when (and (eq (expr-type left) :time) (member operator '("*" "/") :test #'string=))
+      (setf left (list :cast left :type :interval :typmod -1)))
+    (when (and (eq (expr-type right) :time)
+               (or (string= operator "*")
+                   (and (eq (expr-type left) :interval) (string= operator "-"))))
+      (setf right (list :cast right :type :interval :typmod -1)))
     (when (and (eq (expr-type left) :interval) (member operator '("*" "/") :test #'string=))
       (when (in-unknown-constant-p right) (setf right (coerce-in-constant right :float8)))
       (when (member (expr-type right) '(:int2 :int4 :int8 :numeric :float4))
@@ -4048,7 +4057,7 @@ still requires deferred sort projection."
                 (:int2 :float4) (:int4 :float4) (:int8 :float4) (:numeric :float4)
                 (:int2 :float8) (:int4 :float8) (:int8 :float8) (:numeric :float8)
                 (:float4 :float8)
-                (:date :timestamp) (:date :timestamptz) (:timestamp :timestamptz) (:time :timetz)
+                (:date :timestamp) (:date :timestamptz) (:timestamp :timestamptz) (:time :timetz) (:time :interval)
                 (:name :text) (:text :name) (:text :varchar)
                 (:varchar :text) (:varchar :name)
                 (:char :text) (:pg-node-tree :text))

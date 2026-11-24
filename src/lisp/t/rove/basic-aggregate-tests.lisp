@@ -1643,6 +1643,20 @@
          (long (format nil "~4,'0d-01-02" expanded)))
     (= (sql-date-input short nil :mdy) (sql-date-input long))))
 
+(rove:deftest time-arithmetic-resolves-interval-overloads
+    (dolist (sql '("SELECT (TIME '01:30' * 2)::text"
+                   "SELECT (2 * TIME '01:30')::text"
+                   "SELECT (TIME '06:00' / 2)::text"))
+      (rove:ok (equal '(("03:00:00")) (subquery-test-rows sql)) sql))
+  (rove:ok (equal '(("12:34:56.123456" "03:30:00"))
+                  (subquery-test-rows
+                   "SELECT (TIME '12:34:56.123456'::interval)::text, (TIME '05:00' - TIME '01:30')::text")))
+  (rove:ok (equal '(("01:00:00"))
+                  (subquery-test-rows "SELECT (INTERVAL '2 hours' - TIME '01:00')::text")))
+  (rove:ok (equal "42725"
+                  (handler-case (progn (subquery-test-rows "SELECT TIME '01:00' + TIME '02:00'") nil)
+                    (pg-error (condition) (pg-error-sqlstate condition))))))
+
 (rove:deftest float-expression-casts
     (dolist (case '(("SELECT '1.25'::real::text" "1.25")
                     ("SELECT '-0'::double precision::text" "-0")
