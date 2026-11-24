@@ -726,12 +726,16 @@ Permit overwrite or append without leaving a storage gap."
 (defun wal-page-key (relfilenode block &optional (fork :main))
   (list relfilenode fork block))
 
+(defun wal-prepare-dirty-page (page owned-p)
+  "Clear persisted metadata on the vector WAL will own.
+OWNED-P transfers the caller's private PAGE. Otherwise copy PAGE first."
+  (let ((dirty (if owned-p page (copy-seq page))))
+    (page-set-u64 dirty +pd-lsn-off+ 0)
+    (page-set-u16 dirty +pd-checksum-off+ 0)
+    dirty))
+
 (defun wal-copy-dirty-page (page)
-  "Copy PAGE without its persisted LSN/checksum until it is WAL-logged."
-  (let ((copy (copy-seq page)))
-    (page-set-u64 copy +pd-lsn-off+ 0)
-    (page-set-u16 copy +pd-checksum-off+ 0)
-    copy))
+  (wal-prepare-dirty-page page nil))
 
 (define-condition wal-dirty-store-error (error)
   ((cause :initarg :cause :reader wal-dirty-store-error-cause))
@@ -877,13 +881,16 @@ so a closed spool is retried before a new store can be used."
         (error (condition) (error 'wal-dirty-store-error :cause condition)))))
   (values))
 
+(defun wal-visible-page-reference-under-lock (key)
+  (or (and *wal-page-batch* (gethash key *wal-page-batch*))
+      (gethash key *wal-page-cache*)
+      (wal-pending-page-reference key)))
+
 (defun wal-visible-page-under-lock (relfilenode block fork)
   "Read the newest private, shared or pending page, falling back to disk.
 Caller holds *WAL-LOCK*.  The key includes the exact fork."
   (let* ((key (wal-page-key relfilenode block fork))
-         (reference (or (and *wal-page-batch* (gethash key *wal-page-batch*))
-                        (gethash key *wal-page-cache*)
-                        (wal-pending-page-reference key))))
+         (reference (wal-visible-page-reference-under-lock key)))
     (if reference (wal-dirty-read-reference key reference)
         (smgr-read relfilenode block fork))))
 
@@ -949,13 +956,13 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
                 (wal-visible-page-under-lock relfilenode block fork))))
         (when page (copy-seq page)))))
 
-(defun wal-buffer-write (relfilenode block page &optional (fork :main))
+(defun wal-buffer-write (relfilenode block page &optional (fork :main) owned-p)
   (unless *wal-ready*
     (return-from wal-buffer-write (smgr-write relfilenode block page fork)))
   (let ((key (wal-page-key relfilenode block fork))
-        (copy (wal-copy-dirty-page page)))
+        (dirty (wal-prepare-dirty-page page owned-p)))
     (with-wal-page-state-lock
-      (wal-dirty-install-page key copy)))
+      (wal-dirty-install-page key dirty)))
   (wal-test-pause :after-page-stage)
   (values))
 
@@ -996,14 +1003,14 @@ The zero marker remains sticky for uncertified writes; XIDs are full XIDs."
       (with-wal-page-state-lock
         (wal-visible-nblocks-under-lock relfilenode fork))))
 
-(defun wal-buffer-extend (relfilenode page &optional (fork :main))
+(defun wal-buffer-extend (relfilenode page &optional (fork :main) owned-p)
   (if (not *wal-ready*)
       (smgr-extend relfilenode page fork)
       (with-wal-page-state-lock
         (let* ((block (wal-visible-nblocks-under-lock relfilenode fork))
                (key (wal-page-key relfilenode block fork))
-               (copy (wal-copy-dirty-page page)))
-          (wal-dirty-install-page key copy)
+               (dirty (wal-prepare-dirty-page page owned-p)))
+          (wal-dirty-install-page key dirty)
           (unless *wal-page-batch* (wal-test-pause :after-page-stage))
           block))))
 

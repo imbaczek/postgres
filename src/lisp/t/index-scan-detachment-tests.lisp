@@ -15,7 +15,7 @@
 (defun call-with-multileaf-detachment-test-cursor (function)
   (let* ((key (make-array 1 :element-type '(unsigned-byte 8) :initial-element 7))
          (pages (make-hash-table :test #'eql))
-         (read (symbol-function 'pg::buf-read))
+         (read (symbol-function 'pg::buf-acquire-read-page))
          (cursor
            (pg::make-btree-equal-cursor
             :relfilenode 901 :key key
@@ -32,11 +32,13 @@
                     (list (list key first 1) (list key (1+ first) 1)) nil)))
     (unwind-protect
          (progn
-           (setf (symbol-function 'pg::buf-read)
-                 (lambda (node block)
-                   (if (= node 901) (gethash block pages) (funcall read node block))))
+           (setf (symbol-function 'pg::buf-acquire-read-page)
+                 (lambda (handle node block &optional (fork :main))
+                   (if (= node 901)
+                       (setf (pg::buf-page-handle-page handle) (gethash block pages))
+                       (funcall read handle node block fork))))
            (funcall function cursor pages))
-      (setf (symbol-function 'pg::buf-read) read))))
+      (setf (symbol-function 'pg::buf-acquire-read-page) read))))
 
 (defun call-with-detachment-test-state (function)
   (call-with-parking-test-state

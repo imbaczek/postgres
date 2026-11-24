@@ -114,7 +114,7 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
         (sample (make-array +analyze-sample-size+ :adjustable t :fill-pointer 0)))
     (dotimes (block (buf-nblocks relfilenode))
       (check-for-interrupts)
-      (let ((page (buf-read relfilenode block)))
+      (with-buf-read-page (page relfilenode block)
         (when page
           (do-live-page-items (page offnum off len)
             (let ((xmin (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+))))

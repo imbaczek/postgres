@@ -608,6 +608,104 @@ live plan. Cursor execution, plan execution and DML still share
 `make-select-result-row`, and live join operators retain their streaming
 helpers.
 
+## Shared page cache for pg-lisp workers
+
+SQL workers run as SBCL threads in one process and can share immutable page
+vectors. The owned buffer API copies visible WAL pages and reads clean pages
+from storage. Use a bounded cache of page versions so read-only workers can
+reuse those vectors. Keep owned reads for callers that edit pages.
+
+### 1. Borrow resident WAL pages in heap scans
+
+- Add scoped read-only access in [bufmgr.lisp](backend/storage/bufmgr.lisp)
+  and an explicit handle for cursors that suspend mid-page. Keep the same
+  page version across cursor pulls and keep returned tuple data and TOAST
+  state independent of the handle. Register and release handles without an
+  interrupt window. Release on exhaustion, close, cancellation, and error.
+  Make release idempotent and effectively infallible, or give it an owner
+  that can retry independently of iterator close.
+- Preserve exact-fork lookup precedence. A transaction-private replacement
+  shadows the whole fork, including missing blocks. Otherwise look in the
+  current WAL batch, shared dirty map, and newest pending publication before
+  falling back to storage. Borrow only resident WAL dirty references whose
+  keys match. Keep the owned read path for scratch, compatibility entries,
+  and other ineligible reads. Preserve layout and checksum checks, scratch
+  validation, and WAL fail-stop behavior.
+- Bound borrowed memory separately from WAL dirty-store ownership. Account
+  for each distinct version still held after WAL retires it and fall back to
+  an owned read under pressure. Reader handles must allow WAL to retire its
+  references and close scratch normally. Capture the handle under the WAL
+  page-state lock and release the lock before tuple visibility checks, TOAST
+  reads, or scan callbacks.
+- Existing handles keep their page and release against their original
+  accounting owner through online promotion. New lookups use the current
+  storage domain. Use the suspended cursor in
+  [promotion-readers.py](t/interop/promotion-readers.py) to exercise this.
+
+### 2. Cache validated clean pages
+
+- Key entries by storage incarnation, relfilenode, fork, and block. Admit
+  complete pages after layout and checksum validation. Use bounded eviction
+  that accounts for versions held by readers and allow uncached reads when
+  the cache is full of borrowed pages. Follow the existing WAL-before-smgr
+  lock order.
+- Serialize clean fills and invalidation at the physical mutation boundary.
+  Cover direct and WAL page-image writes, extension, fork reset, relation
+  drop, stream close or reopen, and storage domain changes. Invalidate before
+  a write that could fail partway. A reader holding a retired version can
+  finish with it, and later lookups must resolve the current version. Keep
+  physical verification reads independent of the cache.
+- Audit read-only B-tree, visibility-map, and maintenance callers for page
+  mutation and escaping references before migrating them.
+
+### 3. Transfer write ownership where callers permit it
+
+Let audited writers edit a private version and give up its vector when they
+call WAL staging. Keep the copy-taking API for callers that reuse their
+input. Audit LSN and checksum stamping and page-image construction for
+in-place writes to published vectors. Preserve atomic batch publication,
+contributor tracking, dirty spill ownership, and WAL-before-data ordering.
+
+### Verification
+
+- For the first patch, hold a page in a suspended cursor while a writer
+  publishes its replacement. Verify the cursor keeps its version, a later
+  acquisition gets the new version, and close or cancellation releases the
+  handle. Cover borrow-budget exhaustion, dirty spill, and online promotion.
+- For the clean cache, exercise concurrent scans, tiny-cache eviction,
+  partial write failure, TRUNCATE and DROP, checkpoint, and replay. Compare
+  heap scan pinning and invalidation with
+  [heapam.c](../backend/access/heap/heapam.c) and
+  [bufmgr.c](../backend/storage/buffer/bufmgr.c).
+- Benchmark resident dirty hits, spilled dirty reads, warm clean hits, and
+  large streaming scans separately. Measure full-page copies, physical reads,
+  allocation, retained versions, WAL-lock wait, and writer latency. Require
+  zero full-page copies on eligible resident dirty hits in the first patch
+  and on warm read-only clean-cache hits once the clean cache lands.
+
+### Shared page benchmark
+
+A local SBCL microbenchmark compared the existing owned buffer API with
+scoped reads over the same relation. The warm working set was 32 pages and
+the streaming working set was 2,048 pages. The clean cache held 512 pages.
+The warm clean and resident dirty samples returned the shared vector on
+every scoped read. The suspended scan test separately verifies retirement
+and release of old page versions.
+
+| Workload | Reads | Physical reads, owned → scoped | Bytes allocated per read, owned → scoped |
+| --- | ---: | ---: | ---: |
+| Warm clean | 64,000 | 64,000 → 0 | 16,495 → 96 |
+| Streaming clean | 16,384 | 16,384 → 16,352 | 16,493 → 8,339 |
+| Resident dirty | 16,000 | 0 → 0 | 8,256 → 49 |
+| Spilled dirty | 16,000 | 0 → 0 | 24,767 → 16,560 |
+
+The physical-read column counts relation reads. Each spilled dirty read
+still reads its WAL scratch slot. In a separate run with two clean readers
+and one staging writer, mean WAL mutex wait per acquisition fell from
+6.88 to 0.90 microseconds for readers and from 7.71 to 2.13 microseconds for
+the writer. Writer median staging latency was 2 microseconds in both
+samples, and the 95th percentile fell from 53 to 23 microseconds.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup

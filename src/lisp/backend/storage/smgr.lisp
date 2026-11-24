@@ -5,6 +5,23 @@
 (defvar *relation-streams* (make-hash-table :test #'equal))
 (defvar *smgr-lock* (sb-thread:make-mutex :name "pg smgr lock"))
 
+;; Clean pages are immutable after validation.  The key names a fork and
+;; block within the current storage domain; a change of incarnation, PGDATA,
+;; or stream table clears the lookup table.  A retired vector may still be
+;; held by a reader, but cannot be found by a later lookup.
+;;
+;; *SMGR-LOCK* serializes lookup, fill, and physical mutation.  Where needed,
+;; acquire the WAL page-state lock before it, and the borrow lock after it.
+;; Eviction skips borrowed vectors; if no slot is available, a validated read
+;; is returned without admission.  SMGR-READ remains a physical read.
+(defvar *smgr-clean-pages* (make-hash-table :test #'equal))
+(defvar *smgr-clean-limit-pages* 512)
+(defvar *smgr-clean-slots* #())
+(defvar *smgr-clean-next-slot* 0)
+(defvar *smgr-clean-incarnation* nil)
+(defvar *smgr-clean-pgdata* nil)
+(defvar *smgr-clean-streams* nil)
+
 (defun relation-file-path (relfilenode &optional (fork :main))
   (pgdata-resolve-path
    (format nil "base/~a~a" relfilenode
@@ -55,21 +72,97 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
             ((and (eq fork :visibility) (not (probe-file path))) 0)
             (t (relation-nblocks (smgr-open-locked relfilenode fork)))))))
 
-(defun smgr-read (relfilenode block &optional (fork :main))
+(defun smgr-read-locked (relfilenode block fork)
   (declare (ftype function wal-check-read-page))
+  (let* ((stream (gethash (list relfilenode fork) *relation-streams*))
+         (page (cond (stream (read-page stream block))
+                     ((and (eq fork :visibility)
+                           (not (probe-file (relation-file-path relfilenode fork))))
+                      nil)
+                     (t (read-page (smgr-open-locked relfilenode fork) block)))))
+    (wal-check-read-page page relfilenode block)))
+
+(defun smgr-read (relfilenode block &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
-    (let* ((stream (gethash (list relfilenode fork) *relation-streams*))
-           (page (cond (stream (read-page stream block))
-                       ((and (eq fork :visibility)
-                             (not (probe-file (relation-file-path relfilenode fork))))
-                        nil)
-                       (t (read-page (smgr-open-locked relfilenode fork) block)))))
-      (wal-check-read-page page relfilenode block))))
+    (smgr-read-locked relfilenode block fork)))
+
+(defun smgr-clear-clean-pages-locked (capacity)
+  (let ((slots (make-array capacity :initial-element nil)))
+    (sb-sys:without-interrupts
+      (clrhash *smgr-clean-pages*)
+      (setf *smgr-clean-slots* slots
+            *smgr-clean-next-slot* 0))))
+
+(defun smgr-remove-clean-page-locked (key)
+  (let ((slot (gethash key *smgr-clean-pages*)))
+    (when slot
+      (sb-sys:without-interrupts
+        (remhash key *smgr-clean-pages*)
+        (setf (aref *smgr-clean-slots* slot) nil)))))
+
+(defun smgr-clean-victim-locked (borrow-lock borrowed-pages)
+  (let ((capacity (length *smgr-clean-slots*)))
+    (if (< (hash-table-count *smgr-clean-pages*) capacity)
+        (loop for offset below capacity
+              for slot = (mod (+ *smgr-clean-next-slot* offset) capacity)
+              unless (aref *smgr-clean-slots* slot) return slot)
+        (sb-thread:with-mutex (borrow-lock)
+          (loop for offset below capacity
+                for slot = (mod (+ *smgr-clean-next-slot* offset) capacity)
+                for entry = (aref *smgr-clean-slots* slot)
+                unless (gethash (cdr entry) borrowed-pages) return slot)))))
+
+(defun smgr-read-clean-page-locked (relfilenode block fork incarnation
+                                    verify borrow-lock borrowed-pages)
+  "Return a validated page and whether it is cached. Caller holds *SMGR-LOCK*."
+  (declare (ftype function wal-check-read-page))
+  (unless (and (= *smgr-clean-limit-pages* (length *smgr-clean-slots*))
+               (eq incarnation *smgr-clean-incarnation*)
+               (equal *pgdata* *smgr-clean-pgdata*)
+               (eq *relation-streams* *smgr-clean-streams*))
+    (sb-sys:without-interrupts
+      (smgr-clear-clean-pages-locked *smgr-clean-limit-pages*)
+      (setf *smgr-clean-incarnation* incarnation
+            *smgr-clean-pgdata* *pgdata*
+            *smgr-clean-streams* *relation-streams*)))
+  (let* ((key (list relfilenode fork block))
+         (slot (gethash key *smgr-clean-pages*)))
+    (when slot
+      (return-from smgr-read-clean-page-locked
+        (values (wal-check-read-page (cdr (aref *smgr-clean-slots* slot))
+                                     relfilenode block)
+                t)))
+    (let ((page (funcall verify (smgr-read-locked relfilenode block fork)
+                         relfilenode block fork)))
+      (when page
+        (let ((victim (smgr-clean-victim-locked borrow-lock borrowed-pages)))
+          (when victim
+            (let ((old (aref *smgr-clean-slots* victim))
+                  (entry (cons key page)))
+              (sb-sys:without-interrupts
+                (when old (smgr-remove-clean-page-locked (car old)))
+                (setf (gethash key *smgr-clean-pages*) victim
+                      (aref *smgr-clean-slots* victim) entry
+                      *smgr-clean-next-slot* (mod (1+ victim) *smgr-clean-limit-pages*))))
+            (return-from smgr-read-clean-page-locked (values page t)))))
+      (values page nil))))
+
+(defun smgr-invalidate-clean-relation-locked (relfilenode &optional fork)
+  (maphash (lambda (key page)
+             (declare (ignore page))
+             (when (and (eql relfilenode (first key))
+                        (or (null fork) (eq fork (second key))))
+               (smgr-remove-clean-page-locked key)))
+           *smgr-clean-pages*))
 
 (declaim (ftype function wal-check-persisted-page))
 
 (defun smgr-write-page-locked (stream relfilenode block page fork)
   (wal-check-persisted-page stream relfilenode block page fork)
+  ;; Invalidate before writing: even a failed partial write must not leave a
+  ;; stale page available for a subsequent cache lookup.
+  (when (plusp (hash-table-count *smgr-clean-pages*))
+    (smgr-remove-clean-page-locked (list relfilenode fork block)))
   (write-page stream block page))
 
 (defun smgr-write (relfilenode block page &optional (fork :main))
@@ -93,6 +186,7 @@ under the smgr lock so buffered state cannot survive the truncation."
   (sb-thread:with-mutex (*smgr-lock*)
     (let* ((key (list relfilenode fork))
            (stream (smgr-write-open-locked relfilenode fork)))
+      (smgr-invalidate-clean-relation-locked relfilenode fork)
       (finish-output stream)
       (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 0)
       ;; Reopen after truncation to discard both buffered input and output state.
@@ -120,6 +214,7 @@ under the smgr lock so buffered state cannot survive the truncation."
 (defun smgr-forget (relfilenode &key delete)
   "Close every cached fork for RELFILENODE, optionally deleting each file."
   (sb-thread:with-mutex (*smgr-lock*)
+    (smgr-invalidate-clean-relation-locked relfilenode)
     (let ((keys '()))
       (maphash (lambda (key stream)
                  (declare (ignore stream))
@@ -149,6 +244,10 @@ under the smgr lock so buffered state cannot survive the truncation."
   ;; interrupts.  Individual close errors remain ignored during the traversal.
   (sb-thread:with-mutex (*smgr-lock*)
     (sb-sys:without-interrupts
+      (smgr-clear-clean-pages-locked 0)
+      (setf *smgr-clean-incarnation* nil
+            *smgr-clean-pgdata* nil
+            *smgr-clean-streams* nil)
       (maphash (lambda (k v)
                  (declare (ignore k))
                  (ignore-errors (close v)))

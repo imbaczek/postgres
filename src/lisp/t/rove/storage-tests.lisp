@@ -136,17 +136,17 @@
            (page (page-init (make-page)))
            (broken (form-heap-tuple (vector "bad") columns +frozen-xid+ 0 0 0 0))
            (*current-snapshot* (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
-           (old-read (symbol-function 'buf-read))
+           (old-read (symbol-function 'buf-acquire-read-page))
            (old-count (symbol-function 'buf-nblocks)))
       (setf (aref broken (aref broken +heap-tuple-hoff-off+)) 1)
       (page-add-item page (form-heap-tuple (vector "first") columns +frozen-xid+ 0 0 0 0))
       (page-add-item page broken)
       (unwind-protect
            (progn
-             (setf (symbol-function 'buf-read)
-                   (lambda (relfilenode block &optional (fork :main))
+             (setf (symbol-function 'buf-acquire-read-page)
+                   (lambda (handle relfilenode block &optional (fork :main))
                      (declare (ignore relfilenode block fork))
-                     (copy-seq page))
+                     (setf (buf-page-handle-page handle) (copy-seq page)))
                    (symbol-function 'buf-nblocks)
                    (lambda (relfilenode &optional (fork :main))
                      (declare (ignore relfilenode fork))
@@ -165,7 +165,7 @@
                (unwind-protect
                     (rove:ok (nth-value 1 (sql-iterator-next iterator)))
                  (close-sql-iterator iterator))))
-        (setf (symbol-function 'buf-read) old-read
+        (setf (symbol-function 'buf-acquire-read-page) old-read
               (symbol-function 'buf-nblocks) old-count))))
 
 (rove:deftest test-btree-equal-child-range-with-duplicate-separators
@@ -248,7 +248,7 @@
            (projection (list :project (list (list :expr slice) (list :expr id)) filter))
            (plan (%make-query-plan :physical (list :limit 2 projection)))
            (*current-snapshot* (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
-           (old-read (symbol-function 'buf-read))
+           (old-read (symbol-function 'buf-acquire-read-page))
            (old-count (symbol-function 'buf-nblocks))
            (old-slice (symbol-function 'toast-fetch-value-slice))
            (old-fetch (symbol-function 'toast-fetch-value))
@@ -266,9 +266,10 @@
         (setf (gethash node (query-plan-metadata plan)) (make-plan-node-metadata)))
       (unwind-protect
            (progn
-             (setf (symbol-function 'buf-read)
-                   (lambda (relfilenode block &optional (fork :main))
-                     (declare (ignore relfilenode block fork)) (copy-seq page))
+             (setf (symbol-function 'buf-acquire-read-page)
+                   (lambda (handle relfilenode block &optional (fork :main))
+                     (declare (ignore relfilenode block fork))
+                     (setf (buf-page-handle-page handle) (copy-seq page)))
                    (symbol-function 'buf-nblocks)
                    (lambda (relfilenode &optional (fork :main))
                      (declare (ignore relfilenode fork)) 1)
@@ -362,7 +363,7 @@
                                  (rove:ok (= full-fetches (+ before 2))))
                             (close-sql-iterator iterator)))))
                  (setf (symbol-function 'eval-expr) old-eval))))
-        (setf (symbol-function 'buf-read) old-read
+        (setf (symbol-function 'buf-acquire-read-page) old-read
               (symbol-function 'buf-nblocks) old-count
               (symbol-function 'toast-fetch-value-slice) old-slice
               (symbol-function 'toast-fetch-value) old-fetch))))
@@ -1752,6 +1753,7 @@
   (rove:ok (= (full-xid-from-32 #xFFFFFFFE (+ +xid-cycle+ 3))
               #xFFFFFFFE)
            "tuple XIDs below the new epoch resolve to the prior epoch"))
+
 
 (rove:deftest test-sorted-distinct-iterator-pulls-only-through-next-distinct-row
     (let* ((remaining (list 1 1 2 3))

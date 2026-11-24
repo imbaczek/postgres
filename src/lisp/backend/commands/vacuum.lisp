@@ -265,7 +265,7 @@ implementation's replacement metadata transition atomic as well."
                 (page-set-u32 page (+ offset +heap-tuple-xmax-off+)
                               (xid32-of copy-xmax)))
               (with-wal-page-batch
-                (buf-write target-relfilenode target-block page)
+                (buf-write target-relfilenode target-block page :main :take-ownership)
                 (visibilitymap-clear target-relfilenode target-block))
               (mark-dirty target-relfilenode))))))))
 
@@ -276,7 +276,7 @@ implementation's replacement metadata transition atomic as well."
          (nblocks (buf-nblocks source-relfilenode)))
     (dotimes (block nblocks)
       (check-for-interrupts)
-      (let ((page (buf-read source-relfilenode block)))
+      (with-buf-read-page (page source-relfilenode block)
         (when page
           (loop for offnum from 1 to (page-lp-count page)
                 do (multiple-value-bind (off flags len)

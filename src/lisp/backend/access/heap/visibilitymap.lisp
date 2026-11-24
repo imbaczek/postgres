@@ -22,7 +22,7 @@
   "Return the two-bit visibility status for HEAP-BLOCK, or zero if unset."
   (multiple-value-bind (vm-block byte-offset bit-shift)
       (visibilitymap-location heap-block)
-    (let ((page (buf-read relfilenode vm-block :visibility)))
+    (with-buf-read-page (page relfilenode vm-block :visibility)
       (if page
           (logand (ash (aref page byte-offset) (- bit-shift)) #b11)
           0))))
@@ -38,7 +38,7 @@
             (let ((mask (ash #b11 bit-shift)))
               (setf (aref page byte-offset)
                     (logand (aref page byte-offset) (logxor #xFF mask)))
-              (buf-write relfilenode vm-block page :visibility)))))))
+              (buf-write relfilenode vm-block page :visibility :take-ownership)))))))
   (values))
 
 (defun visibilitymap-set-status (relfilenode heap-block status)
@@ -62,12 +62,12 @@
                     (logior (logand (aref page byte-offset)
                                     (logxor #xFF mask))
                             (ash status bit-shift)))
-              (buf-write relfilenode vm-block page :visibility))
+              (buf-write relfilenode vm-block page :visibility :take-ownership))
             (progn
               (unless (= vm-block nblocks)
                 (error "visibility map pages must be extended in order"))
               (setf (aref page byte-offset) (ash status bit-shift))
-              (unless (= (buf-extend relfilenode page :visibility) vm-block)
+              (unless (= (buf-extend relfilenode page :visibility :take-ownership) vm-block)
                 (error "visibility map fork changed while extending")))))))
   (values))
 

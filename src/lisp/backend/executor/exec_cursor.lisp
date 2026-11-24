@@ -59,7 +59,7 @@
         (values set-node width calls)))))
 
 (defun make-visible-heap-page-iterator (page block columns snapshot)
-  "Visit visible heap tuples from an owned PAGE one at a time.
+  "Visit visible heap tuples from PAGE one at a time.
 
 Check tuple visibility before deforming it, and leave later tuples untouched
 until their next pull.  SNAPSHOT must remain registered for this iterator."
@@ -202,6 +202,9 @@ releases it; closing an active scan discards its unread cursor without a copy."
 (defun make-select-scan-iterator (node relations)
   ;; Capture the parameter environment and statement snapshot for this scan's
   ;; lifetime; later outer rows must not change its index key or visibility.
+  ;; The page handle keeps one immutable version across pulls.  Release it when
+  ;; the page reader is exhausted, or via iterator cleanup on close or error;
+  ;; returned tuples and TOAST context must not depend on the handle's lifetime.
   (let* ((relation (physical-scan-relation node relations))
          (table (getf relation :table))
          (presence (vector (ensure-select-source-identity relation)))
@@ -209,6 +212,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
          (block 0) (nblocks nil) (rows nil) (page-reader nil) (initialized nil)
+         (page-handle (make-buf-page-handle))
          (snapshot *current-snapshot*)
          (capture-p *datum-origin-capture*)
          (demand *select-toast-demand*)
@@ -249,17 +253,21 @@ releases it; closing an active scan discards its unread cursor without a copy."
                      (project-select-scan-row relations relation row origins)
                    (return (values projected-row t projected-origins toast-context presence)))))
              (close-sql-iterator page-reader)
-             (setf page-reader nil)))
+             (setf page-reader nil)
+             (buf-release-page page-handle)))
          (when (or source (>= block nblocks)) (return (values nil nil)))
          (let* ((current block)
-                (page (buf-read (pg-class-relfilenode table) current)))
+                (page (buf-acquire-read-page page-handle
+                                             (pg-class-relfilenode table) current)))
            (incf block)
            (when page
              (setf page-reader (make-visible-heap-page-iterator
                                 page current (pg-class-columns table) snapshot))))))
+     nil
      (lambda ()
        (unwind-protect (close-sql-iterator page-reader)
-         (setf rows nil page-reader nil))))))
+         (setf rows nil page-reader nil)
+         (buf-release-page page-handle))))))
 
 (defun make-append-sql-iterator (arms relations)
   (let ((remaining arms) (input nil) (coercions nil))

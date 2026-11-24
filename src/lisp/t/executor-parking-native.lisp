@@ -97,7 +97,7 @@ A later HUP reload restores the production functions."
   (let ((setting (symbol-function 'sql-setting-value))
         (plan (symbol-function 'run-select-portal))
         (heap (symbol-function 'heapam-scan))
-        (read-page (symbol-function 'buf-read))
+        (read-page (symbol-function 'buf-acquire-read-page))
         (sort-arena (symbol-function 'call-with-query-sort-arena))
         (finish-match (symbol-function 'query-match-map-finish))
         (leases (symbol-function 'call-with-btree-relation-read-leases)))
@@ -156,8 +156,8 @@ A later HUP reload restores the production functions."
               (pushnew node *resource-parking-heap-nodes* :test #'eql))
             (funcall heap node columns snapshot callback))
           *resource-parking-read-wrapper*
-          (lambda (node block &optional (fork :main))
-            (prog1 (funcall read-page node block fork)
+          (lambda (handle node block &optional (fork :main))
+            (prog1 (funcall read-page handle node block fork)
               (when (and (resource-parking-backend-p)
                          (eq fork :main) (member node *resource-parking-heap-nodes* :test #'eql))
                 (pushnew (cons node block) *resource-parking-pages* :test #'equal))))
@@ -181,7 +181,7 @@ A later HUP reload restores the production functions."
           (symbol-function 'sql-setting-value) *parking-native-wrapper*
           (symbol-function 'run-select-portal) *resource-parking-plan-wrapper*
           (symbol-function 'heapam-scan) *resource-parking-heap-wrapper*
-          (symbol-function 'buf-read) *resource-parking-read-wrapper*
+          (symbol-function 'buf-acquire-read-page) *resource-parking-read-wrapper*
           (symbol-function 'call-with-query-sort-arena) *resource-parking-arena-wrapper*
           (symbol-function 'query-match-map-finish) *resource-parking-match-wrapper*
           (symbol-function 'call-with-btree-relation-read-leases) *resource-parking-lease-wrapper*
@@ -196,7 +196,7 @@ A later HUP reload restores the production functions."
 Clear the test hooks after verification."
   (assert (not (eq *resource-parking-plan-wrapper* (symbol-function 'run-select-portal))))
   (assert (not (eq *resource-parking-heap-wrapper* (symbol-function 'heapam-scan))))
-  (assert (not (eq *resource-parking-read-wrapper* (symbol-function 'buf-read))))
+  (assert (not (eq *resource-parking-read-wrapper* (symbol-function 'buf-acquire-read-page))))
   (assert (not (eq *resource-parking-arena-wrapper* (symbol-function 'call-with-query-sort-arena))))
   (assert (not (eq *resource-parking-match-wrapper* (symbol-function 'query-match-map-finish))))
   (assert (not (eq *resource-parking-lease-wrapper* (symbol-function 'call-with-btree-relation-read-leases))))

@@ -611,7 +611,7 @@ visibility predicate to the tuple header before decoding its attributes; return
 NIL if it fails. This is not an MVCC snapshot check: the caller must establish
 visibility and protect the lifetime of the owning parent separately. With the
 option false, no visibility check is performed."
-  (let ((page (buf-read relfilenode block)))
+  (with-buf-read-page (page relfilenode block)
     (when page
       (with-live-page-item (page offnum off len)
         (when (and toast-visibility-p
@@ -644,12 +644,12 @@ option false, no visibility check is performed."
                                    block)
                      (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
                                    offnum))
-                   (with-wal-page-batch
-                     (buf-write relfilenode block page)
-                     (visibilitymap-clear relfilenode block))
-                   (mark-dirty relfilenode)
-                   (heap-fsm-record-page fsm block
-                                         (heap-page-insert-capacity page)))
+                   (let ((capacity (heap-page-insert-capacity page)))
+                     (with-wal-page-batch
+                       (buf-write relfilenode block page :main :take-ownership)
+                       (visibilitymap-clear relfilenode block))
+                     (mark-dirty relfilenode)
+                     (heap-fsm-record-page fsm block capacity)))
                  offnum)))
       (loop for block = (heap-fsm-take-page fsm required)
             while block
@@ -673,16 +673,18 @@ option false, no visibility check is performed."
           (declare (ignore tflags tlen))
           (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) block)
           (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
-        (with-wal-page-batch
-          (buf-write relfilenode block page)
-          (visibilitymap-clear relfilenode block))
-        (mark-dirty relfilenode)
-        (heap-fsm-record-page fsm block
-                              (heap-page-insert-capacity page))
+        (let ((capacity (heap-page-insert-capacity page)))
+          (with-wal-page-batch
+            (buf-write relfilenode block page :main :take-ownership)
+            (visibilitymap-clear relfilenode block))
+          (mark-dirty relfilenode)
+          (heap-fsm-record-page fsm block capacity))
         (values block offnum)))))
 
-(defmacro with-heap-tuple-edit ((page offset relfilenode block offnum) &body body)
-  "Mutate one live tuple and publish its page after a complete edit."
+(defmacro with-heap-tuple-edit ((page offset relfilenode block offnum &optional owned-p)
+                                &body body)
+  "Mutate one live tuple and publish its page after a complete edit.
+With OWNED-P, BODY must keep the private page local to the edit."
   (let ((relfilenode-value (gensym "RELFILENODE-"))
         (block-value (gensym "BLOCK-"))
         (offnum-value (gensym "OFFNUM-"))
@@ -703,14 +705,15 @@ option false, no visibility check is performed."
              (multiple-value-prog1
                  (progn ,@body)
                (with-wal-page-batch
-                 (buf-write ,relfilenode-value ,block-value ,page-value)
+                 (buf-write ,relfilenode-value ,block-value ,page-value
+                            ,@(when owned-p '(:main :take-ownership)))
                  (visibilitymap-clear ,relfilenode-value ,block-value))
                (mark-dirty ,relfilenode-value))))))))
 
 (defun heapam-set-xmax (relfilenode block offnum xmax cid)
   ;; Preserve an own insertion's cmin alongside cmax in the existing CID field.
   ;; The infomask distinguishes the transaction-local combo ID from an ordinary CID.
-  (with-heap-tuple-edit (page offset relfilenode block offnum)
+  (with-heap-tuple-edit (page offset relfilenode block offnum :take-ownership)
     (let* ((mask (page-u16 page (+ offset +heap-tuple-infomask-off+)))
            (own-insert (= (page-u32 page (+ offset +heap-tuple-xmin-off+)) (xid32-of xmax)))
            (old-cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
@@ -727,7 +730,7 @@ option false, no visibility check is performed."
 (defun heapam-set-ctid-unlocked (relfilenode block offnum ctid-block ctid-offnum)
   (unless (sb-thread:holding-mutex-p *write-lock*)
     (error "heap CTID mutation requires the writer lock"))
-  (with-heap-tuple-edit (page offset relfilenode block offnum)
+  (with-heap-tuple-edit (page offset relfilenode block offnum :take-ownership)
     (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) ctid-block)
     (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) ctid-offnum)
     t))
@@ -913,11 +916,13 @@ when supplied, its result is returned as a sixth value."
 
 (defun heapam-scan (relfilenode columns snapshot callback)
   "Call CALLBACK with each visible HTUP. CALLBACK may return :stop."
-  (let ((nblocks (buf-nblocks relfilenode)))
+  (let ((nblocks (buf-nblocks relfilenode))
+        (handle (make-buf-page-handle)))
     (dotimes (block nblocks)
-      (let ((page (buf-read relfilenode block)))
-        (when page
-          (when (eq (heapam-scan-page page block columns snapshot callback)
-                    :stop)
-            (return))))))
+      (unwind-protect
+           (let ((page (buf-acquire-read-page handle relfilenode block)))
+             (when (and page (eq (heapam-scan-page page block columns snapshot callback)
+                                 :stop))
+               (return)))
+        (sb-sys:without-interrupts (buf-release-page handle)))))
   (values))
