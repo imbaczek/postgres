@@ -15,6 +15,8 @@
       (setf expression (coerce-in-constant expression target (if (eq target :interval) typmod -1))
             source target))
     (unless (or (sql-implicit-coercion-p source target)
+                ;; pg_cast marks these explicit temporal conversions as assignment casts.
+                (and (eq target :date) (member source '(:timestamp :timestamptz)))
                 (and (member source '(:json :jsonb))
                      (member target '(:json :jsonb)))
                 (and (member source '(:json-array :jsonb-array))

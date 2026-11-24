@@ -67,6 +67,15 @@
                         (handler-case (progn (cook-check-constraint table raw) nil)
                           (pg-error (e) (pg-error-sqlstate e))))))))
 
+(rove:deftest timestamp-assignment-uses-the-existing-date-cast
+    (let ((column (make-pg-column :name "d" :type :date)))
+      (dolist (source-type '(:timestamp :timestamptz))
+        (let* ((source (list :const 123456789 :type source-type))
+               (assignment (analyze-subquery-assignment source column)))
+          (rove:ok (eql (sql-cast-value 123456789 source-type :date -1)
+                        (eval-subquery-assignment assignment nil)))
+          (rove:ok (not (sql-implicit-coercion-p source-type :date)))))))
+
 (rove:deftest demanded-default-folding-is-statement-local
     (with-joined-dml-test-catalog
         (setf (gethash "default_fold_seq" (database-sequences database))
