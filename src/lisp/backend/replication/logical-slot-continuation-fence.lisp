@@ -26,10 +26,10 @@
       (unwind-protect
            (progn
              (sb-sys:without-interrupts
-               (setf fd (sb-posix:open
+               (setf fd (port-open-file
                          (let ((name (namestring (truename root))))
                            (if (string= name "/") name (string-right-trim "/" name)))
                          (logior sb-posix:o-rdonly sb-posix:o-directory
-                                 sb-posix:o-nofollow +postmaster-o-cloexec+))))
+                                 sb-posix:o-nofollow))))
              (logical-slot-continuation-fd-fenced-p fd))
         (when fd (sb-posix:close fd))))))

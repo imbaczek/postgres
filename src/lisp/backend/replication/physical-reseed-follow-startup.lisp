@@ -136,7 +136,7 @@
                                (equal lock-facts
                                       (physical-reseed-file-facts
                                        (sb-posix:lstat (namestring (merge-pathnames ".pg_lisp.lock" directory)))))
-                               (zerop (physical-store-flock lock-fd 6)))
+                               (port-try-exclusive-file-lock lock-fd))
                     (error "reseed startup observation lost its local lock context"))))
            (check-lock)
            (multiple-value-prog1

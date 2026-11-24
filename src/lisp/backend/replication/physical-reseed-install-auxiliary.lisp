@@ -41,7 +41,7 @@
              (setf fd nil)
              (error "cannot open reseed auxiliary guard: errno ~d" (sb-alien:get-errno)))
            (when (equal name ".pg_lisp.lock")
-             (unless (zerop (physical-store-flock fd 6))
+             (unless (port-try-exclusive-file-lock fd)
                (error "reseed auxiliary startup lock is already owned")))
            (sb-sys:without-interrupts
              (setf stream (sb-sys:make-fd-stream fd :input t :output prepare :element-type '(unsigned-byte 8))))
@@ -149,7 +149,7 @@
          (unwind-protect
               (progn
                 (sb-sys:without-interrupts (setf fd (physical-backup-open-directory directory)))
-                (unless (zerop (physical-store-flock fd 6)) (error "reseed auxiliary directory is already owned"))
+                (unless (port-try-exclusive-file-lock fd) (error "reseed auxiliary directory is already owned"))
                 (let ((base (physical-reseed-install-auxiliary-base-facts owner root-fd directory fd)))
                   (when (and prepare expected (not (equal base expected)))
                     (error "reseed auxiliary differs from its prepared identity")))

@@ -58,7 +58,7 @@
                  (= (getf pid :pid) (sb-posix:getpid))
                  (equal (getf pid :identity)
                         (physical-reseed-file-facts (sb-posix:fstat (sb-sys:fd-stream-fd pid-stream))))
-                 (zerop (physical-store-flock lock-fd 6)))
+                 (port-try-exclusive-file-lock lock-fd))
       (error "retirement startup lost its published postmaster context"))
     (let ((current (physical-reseed-read-pid directory)))
       (unless (and current (= (getf pid :pid) (getf current :pid))

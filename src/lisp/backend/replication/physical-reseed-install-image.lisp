@@ -10,7 +10,7 @@
     (unwind-protect
          (progn
            (sb-sys:without-interrupts (setf fd (physical-backup-open-directory directory)))
-           (unless (zerop (physical-store-flock fd 6)) (error "reseed install stage is already owned"))
+           (unless (port-try-exclusive-file-lock fd) (error "reseed install stage is already owned"))
            (setf active t)
            (flet ((check ()
                     (unless active (error "reseed install stage scope has ended"))

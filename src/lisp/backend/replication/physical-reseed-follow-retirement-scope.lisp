@@ -44,7 +44,7 @@
            (sb-sys:without-interrupts
              (setf fd (physical-backup-open-directory (pathname (getf expected :directory)))))
            (physical-reseed-follow-retirement-directory-check root expected fd)
-           (unless (zerop (physical-store-flock fd 6)) (error "retirement directory is already owned"))
+           (unless (port-try-exclusive-file-lock fd) (error "retirement directory is already owned"))
            (call-with-physical-reseed-install-guard
             fd ".pg_lisp.lock" nil
             (lambda (lock)

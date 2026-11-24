@@ -284,11 +284,10 @@ is independent of the SQL transaction and survives cancellation or disconnect."
         (sb-sys:without-interrupts
           (unwind-protect
                (progn
-                 (setf fd (sb-posix:open (namestring path)
-                                         (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-trunc
-                                                 sb-posix:o-nofollow sb-posix:o-nonblock
-                                                 +postmaster-o-cloexec+)
-                                         #o600))
+                 (setf fd (port-open-file (namestring path)
+                                          (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-trunc
+                                                  sb-posix:o-nofollow sb-posix:o-nonblock)
+                                          #o600))
                  (unless (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd)))
                    (ereport "42809" "promotion signal is not a regular file"))
                  (let ((owned fd))

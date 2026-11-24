@@ -58,7 +58,7 @@ The caller holds the WAL lock and syncs the status directory."
          (flags (logior sb-posix:o-wronly sb-posix:o-creat
                         sb-posix:o-nofollow sb-posix:o-nonblock)))
     (sb-sys:without-interrupts
-      (let ((fd (sb-posix:open marker flags #o600)))
+      (let ((fd (port-open-file marker flags #o600 :inherit)))
         (unwind-protect
              (let ((stat (sb-posix:fstat fd)))
                (unless (and (= sb-posix:s-ifreg
@@ -70,9 +70,9 @@ The caller holds the WAL lock and syncs the status directory."
           (sb-posix:close fd))))))
 
 (defun wal-archive-open-wal-directory ()
-  (sb-posix:open (string-right-trim "/" (namestring (wal-directory)))
-                 (logior sb-posix:o-rdonly sb-posix:o-directory
-                         sb-posix:o-nofollow +postmaster-o-cloexec+)))
+  (port-open-file (string-right-trim "/" (namestring (wal-directory)))
+                  (logior sb-posix:o-rdonly sb-posix:o-directory
+                          sb-posix:o-nofollow)))
 
 (defmacro with-wal-archive-directory ((fd) &body body)
   "Hold the WAL directory descriptor until BODY exits, including on interrupt."

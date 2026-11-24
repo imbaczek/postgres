@@ -90,7 +90,7 @@
        (when lock
          (let ((lock-fd (sb-sys:fd-stream-fd lock)))
            (unless (and (zerop (sb-posix:stat-size (sb-posix:fstat lock-fd)))
-                        (zerop (physical-store-flock lock-fd 6))
+                        (port-try-exclusive-file-lock lock-fd)
                         (equal (physical-image-file-facts lock-fd)
                                (physical-image-file-facts fd ".pg_lisp.lock")))
              (error "logical copy verification scratch lock is still owned or changed"))

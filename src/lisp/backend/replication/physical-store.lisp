@@ -1,9 +1,6 @@
 ;;;; Durable native physical WAL receive spool, independently owned from live storage.
 (in-package #:pg)
 
-(sb-alien:define-alien-routine ("flock" physical-store-flock) sb-alien:int
-  (fd sb-alien:int) (operation sb-alien:int))
-
 (defstruct (physical-store (:constructor %make-physical-store))
   "A locally owned receive spool and its durable progress.
 
@@ -529,10 +526,10 @@ is reported after releasing the mutex."
 
 (defun physical-store-open-lock (store create)
   "Keep a stable regular ownership inode; pending validation never creates it."
-  (let ((fd (sb-posix:open (namestring (physical-store-path store "receive.lock"))
-                           (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+
-                                   (if create sb-posix:o-creat 0))
-                           #o600))
+  (let ((fd (port-open-file (namestring (physical-store-path store "receive.lock"))
+                            (logior sb-posix:o-rdwr sb-posix:o-nofollow
+                                    (if create sb-posix:o-creat 0))
+                            #o600))
         (stream nil))
     (unwind-protect
          (progn
@@ -577,8 +574,7 @@ interrupts briefly. Validation and scanning remain interruptible."
                    (physical-store-open-lock store create-lock)))
            ;; POSIX flock LOCK_EX | LOCK_NB; per-open-description ownership also
            ;; excludes a second receiver in this Lisp process.
-           (unless (zerop (physical-store-flock
-                           (sb-sys:fd-stream-fd (physical-store-lock-stream store)) 6))
+           (unless (port-try-exclusive-file-lock (sb-sys:fd-stream-fd (physical-store-lock-stream store)))
              (error "physical receive store already owned"))
            (if create
                (progn

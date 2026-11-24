@@ -48,7 +48,7 @@ structure layouts need one.
 
 ### Milestones
 
-- [ ] Extract process identity and PGDATA ownership on Linux first. Then route
+- [x] Extract process identity and PGDATA ownership on Linux first. Then route
   shared file opens and numeric parsing through the port. Preserve current
   behavior and add focused coverage for PID reuse, lock revocation, and
   descriptor inheritance where coverage is missing.

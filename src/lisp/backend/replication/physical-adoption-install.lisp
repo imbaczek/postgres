@@ -47,9 +47,9 @@
       (sb-posix:unlink (namestring pending))
       (fsync-directory workspace)
       (physical-adoption-install-test-point :after-attempt-scratch-unlink pending))
-    (let ((fd (sb-posix:open (namestring pending)
-                             (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
-                                     sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
+    (let ((fd (port-open-file (namestring pending)
+                              (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                                      sb-posix:o-nofollow) #o600)))
       (unwind-protect
            (progn
              (sb-posix:fchmod fd #o600)

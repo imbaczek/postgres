@@ -396,9 +396,9 @@ rule signals a fatal error."
           (let ((fd nil) (stream nil))
             (unwind-protect
                  (progn
-                   (setf fd (sb-posix:open (namestring path)
-                                           (logior sb-posix:o-rdonly sb-posix:o-nofollow
-                                                   sb-posix:o-nonblock +postmaster-o-cloexec+))
+                   (setf fd (port-open-file (namestring path)
+                                            (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                                    sb-posix:o-nonblock))
                          stream (sb-sys:make-fd-stream fd :input t :element-type 'character
                                                           :external-format :latin-1))
                    (sb-sys:with-local-interrupts (read-bootstrap-scram-stream stream)))

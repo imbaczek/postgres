@@ -214,7 +214,7 @@ Return the verified plan; signal an error for contradictory artifacts."
   "Open a regular child file for reading and writing, or create it exclusively.
 Return its stream and size. The caller closes the stream. Do not follow a
 symlink or replace an existing special file."
-  (declare (notinline sb-posix:open sb-posix:close))
+  (declare (notinline sb-posix:close))
   (let ((stream nil) (fd nil) (size 0) (complete nil))
     (sb-sys:without-interrupts
       (unwind-protect
@@ -225,9 +225,9 @@ symlink or replace an existing special file."
                    (wal-staging-observe observer :opened-existing :frame path
                                         (sb-sys:fd-stream-fd stream)))
                  (progn
-                   (setf fd (sb-posix:open (namestring path)
-                                           (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
-                                                   sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+                   (setf fd (port-open-file (namestring path)
+                                            (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                                                    sb-posix:o-nofollow) #o600))
                    (wal-staging-observe observer :created :frame path fd)
                    (setf stream (sb-sys:make-fd-stream fd :input t :output t :element-type '(unsigned-byte 8))
                          fd nil)))

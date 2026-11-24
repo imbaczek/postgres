@@ -28,9 +28,9 @@
   (dolist (timeline (timeline-segment-candidates segment history previous-file-timeline))
     (let* ((path (wal-read-segment-path segment timeline namespace))
            (fd (handler-case
-                   (sb-posix:open (namestring path)
-                                  (logior sb-posix:o-rdonly sb-posix:o-nonblock
-                                          sb-posix:o-nofollow +postmaster-o-cloexec+))
+                   (port-open-file (namestring path)
+                                   (logior sb-posix:o-rdonly sb-posix:o-nonblock
+                                           sb-posix:o-nofollow))
                  (sb-posix:syscall-error (condition)
                    (if (= (sb-posix:syscall-errno condition) sb-posix:enoent)
                        nil (error condition)))))

@@ -71,7 +71,7 @@
 (defun call-with-reseed-retirement-test-owned-pid (root function)
   (let ((pg::*postmaster-data-lock* nil) (pg::*postmaster-pid-stream* nil)
                                          (pg::*postmaster-pid-directory* root) (pg::*postmaster-pid-inode* nil)
-                                         (pg::*postmaster-start-time* (pg::postmaster-process-start-time))
+                                         (pg::*postmaster-start-time* (pg::port-current-process-start-time))
                                          (pg::*postmaster-pid-host* "") (pg::*postmaster-pid-port* 55432)
                                          (hooks sb-ext:*exit-hooks*))
     (unwind-protect

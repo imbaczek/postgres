@@ -23,6 +23,8 @@
                   :components ((:file "sockets")
                                (:file "files.hot")
                                (:file "files")
+                               (:file "process")
+                               (:file "numeric")
                                (:file "physical-image")
                                (:file "replication-slot-state")
                                (:file "arm-crc32-support")

@@ -247,9 +247,9 @@ Native ancestry requires the parent history and a forward fork; no role is chang
   "Read an immutable history file without hanging on special files or following growth."
   (let* ((path (timeline-history-path timeline directory))
          (fd (handler-case
-                 (sb-posix:open (namestring path)
-                                (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+
-                                        (if *physical-image-context* sb-posix:o-nofollow 0)))
+                 (port-open-file (namestring path)
+                                 (logior sb-posix:o-rdonly sb-posix:o-nonblock
+                                         (if *physical-image-context* sb-posix:o-nofollow 0)))
                (sb-posix:syscall-error (condition)
                  (ereport (if (= (sb-posix:syscall-errno condition) sb-posix:enoent) "58P01" "58030")
                           "could not open timeline history file ~s" (namestring path)))))

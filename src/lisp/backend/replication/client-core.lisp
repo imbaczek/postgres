@@ -175,10 +175,9 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
                    (unwind-protect
                         (progn
                           (setf fd (handler-case
-                                       (sb-posix:open (namestring path)
-                                                      (logior sb-posix:o-rdwr sb-posix:o-creat
-                                                              sb-posix:o-excl sb-posix:o-nofollow
-                                                              +postmaster-o-cloexec+) #o600)
+                                       (port-open-file (namestring path)
+                                                       (logior sb-posix:o-rdwr sb-posix:o-creat
+                                                               sb-posix:o-excl sb-posix:o-nofollow) #o600)
                                      (sb-posix:syscall-error () nil)))
                           (when fd
                             (sb-posix:unlink (namestring path))

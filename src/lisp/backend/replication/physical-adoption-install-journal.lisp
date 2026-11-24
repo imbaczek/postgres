@@ -48,8 +48,8 @@
                 (physical-adoption-attempt-check-owner owner (getf plan :attempt))))
          (workspace (pathname (getf (getf plan :workspace) :directory)))
          (path (if pending (merge-pathnames "journal.pending" workspace) (physical-adoption-install-path root)))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+))))
+         (fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdwr sb-posix:o-nofollow))))
     (unwind-protect
          (progn
            (unless (and (physical-adoption-install-journal-stat-p

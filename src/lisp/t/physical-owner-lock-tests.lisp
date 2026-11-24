@@ -156,6 +156,19 @@
                (when duplicate (sb-posix:close duplicate)))
              (ok (eq owner (pg::physical-directory-check-owner-common owner)))))))))
 
+(deftest port-file-open-and-data-lock-set-close-on-exec
+    (with-physical-store-directory (root)
+      (let* ((pg::*postmaster-pid-directory* root)
+             (path (merge-pathnames ".pg_lisp.lock" root)))
+        (with-open-stream (lock (pg::postmaster-open-data-lock))
+          (ok (logbitp 0 (sb-posix:fcntl (sb-sys:fd-stream-fd lock) sb-posix:f-getfd))))
+        (dolist (inheritance '(:close-on-exec :inherit))
+          (let ((fd (pg::port-open-file (namestring path) sb-posix:o-rdonly 0 inheritance)))
+            (unwind-protect
+                 (ok (eq (eq inheritance :close-on-exec)
+                         (logbitp 0 (sb-posix:fcntl fd sb-posix:f-getfd))))
+              (sb-posix:close fd)))))))
+
 (deftest offline-owner-flock-inspection-failure-permanently-revokes-ownership
     (dolist (mode '(:missing :error))
       (with-physical-store-directory (root)

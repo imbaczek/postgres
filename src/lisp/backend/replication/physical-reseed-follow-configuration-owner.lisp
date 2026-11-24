@@ -85,7 +85,7 @@
          (progn
            (funcall check)
            (sb-sys:without-interrupts (setf fd (physical-backup-open-directory directory)))
-           (unless (zerop (physical-store-flock fd 6))
+           (unless (port-try-exclusive-file-lock fd)
              (error "configuration workspace is already owned"))
            (let ((facts (physical-reseed-follow-configuration-workspace-facts owner root-fd directory fd)))
              (setf active t)

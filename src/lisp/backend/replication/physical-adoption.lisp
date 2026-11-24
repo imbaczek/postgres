@@ -232,7 +232,7 @@ Construct and check the owner under the lock; its role determines authority."
                (let ((locked (sb-posix:fstat (sb-sys:fd-stream-fd lock))))
                  (unless (and (= 1 (sb-posix:stat-nlink locked))
                               (= (sb-posix:geteuid) (sb-posix:stat-uid locked))
-                              (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6)))
+                              (port-try-exclusive-file-lock (sb-sys:fd-stream-fd lock)))
                    (error "offline adoption could not own the dedicated PGDATA lock"))
                  (setf owner (apply constructor
                                     :directory directory :device (sb-posix:stat-dev stat)

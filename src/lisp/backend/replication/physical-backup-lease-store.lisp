@@ -110,9 +110,9 @@
   (let ((fd nil) (stream nil) (identity nil))
     (unwind-protect
          (progn
-           (setf fd (sb-posix:open (namestring temporary)
-                                   (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
-                                           sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
+           (setf fd (port-open-file (namestring temporary)
+                                    (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                            sb-posix:o-nofollow) #o600))
            (let ((stat (sb-posix:fstat fd)))
              (setf identity (list (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))
              (physical-backup-lease-file-identity stat t maximum))

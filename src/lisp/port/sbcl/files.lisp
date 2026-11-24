@@ -9,6 +9,127 @@
   "Linux bits/fcntl-linux.h O_CLOEXEC, shared by storage and postmaster descriptors.
 SB-POSIX does not export this flag in the supported SBCL.")
 
+(sb-alien:define-alien-routine ("flock" physical-store-flock) sb-alien:int
+  (fd sb-alien:int) (operation sb-alien:int))
+
+(defun port-try-exclusive-file-lock (fd)
+  "Try to take a nonblocking exclusive lock on the open file description."
+  ;; LOCK_EX | LOCK_NB.
+  (zerop (physical-store-flock fd 6)))
+
+(defun port-open-file (path flags &optional (mode 0) (inheritance :close-on-exec))
+  "Open PATH with native flags and return a caller-owned descriptor.
+Set close-on-exec atomically by default. :INHERIT passes FLAGS through unchanged."
+  (sb-posix:open path (ecase inheritance
+                        (:close-on-exec (logior flags +postmaster-o-cloexec+))
+                        (:inherit flags))
+                 mode))
+
+(defstruct (port-file-lock-identity (:constructor %make-port-file-lock-identity)
+                                    (:copier nil))
+  (fd nil :read-only t)
+  (device nil :read-only t)
+  (inode nil :read-only t))
+
+(defun port-capture-file-lock-identity (stream)
+  (let* ((fd (sb-sys:fd-stream-fd stream))
+         (stat (sb-posix:fstat fd)))
+    (%make-port-file-lock-identity :fd fd :device (sb-posix:stat-dev stat)
+                                   :inode (sb-posix:stat-ino stat))))
+
+(defun port-private-file-identity-p (stat device inode)
+  (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+       (= 1 (sb-posix:stat-nlink stat))
+       (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+       (zerop (logand #o077 (sb-posix:stat-mode stat)))
+       (= device (sb-posix:stat-dev stat))
+       (= inode (sb-posix:stat-ino stat))))
+
+(defun port-file-lock-identity-matches-p (identity stream path)
+  (let ((fd (port-file-lock-identity-fd identity))
+        (device (port-file-lock-identity-device identity))
+        (inode (port-file-lock-identity-inode identity)))
+    (and (open-stream-p stream)
+         (= fd (sb-sys:fd-stream-fd stream))
+         (port-private-file-identity-p (sb-posix:lstat (namestring path)) device inode)
+         (port-private-file-identity-p (sb-posix:fstat fd) device inode))))
+
+(defstruct (port-data-directory-identity (:constructor %make-port-data-directory-identity)
+                                         (:copier nil))
+  (device nil :read-only t)
+  (inode nil :read-only t)
+  (lock nil :read-only t)
+  (pid nil :read-only t))
+
+(defun port-capture-data-directory-identity (directory lock pid-stream)
+  "Save the root identity and the open lock and PID file identities for revalidation.
+The caller retains both streams and closes them."
+  (let ((root (sb-posix:lstat (namestring directory))))
+    (%make-port-data-directory-identity
+     :device (sb-posix:stat-dev root) :inode (sb-posix:stat-ino root)
+     :lock (port-capture-file-lock-identity lock)
+     :pid (port-capture-file-lock-identity pid-stream))))
+
+(defun port-owned-data-directory-p (stat)
+  (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
+       (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
+       (member (logand #o777 (sb-posix:stat-mode stat)) '(#o700 #o750))))
+
+(defun port-validate-data-directory (directory)
+  "Check the resolved PGDATA directory's type, owner, and permissions."
+  (unless (port-owned-data-directory-p (sb-posix:stat directory))
+    (error "data directory has wrong type, ownership or permissions; require 0700 or 0750")))
+
+(defun port-check-data-directory-identity (identity directory lock pid-stream)
+  "Verify the root and both named bindings against the borrowed open files.
+The root must retain its owner, accepted mode and identity. Each open file
+and its named entry must identify the captured private regular file.
+The caller checks the exclusive lock separately."
+  (let ((root (sb-posix:lstat (namestring directory))))
+    (unless (and (port-owned-data-directory-p root)
+                 (= (port-data-directory-identity-device identity) (sb-posix:stat-dev root))
+                 (= (port-data-directory-identity-inode identity) (sb-posix:stat-ino root)))
+      (error "postmaster data directory identity changed")))
+  (flet ((check (file stream name)
+           (let ((path (merge-pathnames name directory)))
+             (unless (port-file-lock-identity-matches-p file stream path)
+               (error "postmaster ownership file identity changed: ~a" path)))))
+    (check (port-data-directory-identity-lock identity) lock ".pg_lisp.lock")
+    (check (port-data-directory-identity-pid identity) pid-stream "postmaster.pid")))
+
+(defun port-data-directory-lock-key (identity)
+  "Return the device and inode expected by the existing physical owner scopes."
+  (let ((lock (port-data-directory-identity-lock identity)))
+    (values (port-file-lock-identity-device lock) (port-file-lock-identity-inode lock))))
+
+(defun port-open-private-lock-file (path &key existing-only)
+  "Open a dedicated regular lock file. The caller owns the returned stream.
+EXISTING-ONLY requires an existing private file and leaves its mode unchanged."
+  (let* ((fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdwr (if existing-only 0 sb-posix:o-creat)
+                                     sb-posix:o-nonblock sb-posix:o-nofollow) #o600))
+         (success nil))
+    (unwind-protect
+         (let ((stat (sb-posix:fstat fd)))
+           (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+                        (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
+                        (= (sb-posix:stat-nlink stat) 1))
+             (error "data ownership lock is not a dedicated regular file"))
+           (unless (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
+             (when existing-only (error "offline recovery requires a private data lock"))
+             (sb-posix:fchmod fd #o600))
+           (prog1 (sb-sys:make-fd-stream fd :input t :output t
+                                            :element-type '(unsigned-byte 8) :auto-close t)
+             (setf success t)))
+      (unless success (sb-posix:close fd)))))
+
+(defun port-acquire-data-directory-lock (stream)
+  "Try a nonblocking exclusive lock on STREAM and return it, or signal failure.
+The caller must keep STREAM open while the lock is needed and close it on exit."
+  (unless (port-try-exclusive-file-lock (sb-sys:fd-stream-fd stream))
+    (error "data directory is already owned by another pg-lisp process"))
+  stream)
+
 (sb-alien:define-alien-routine ("mkostemp" port-mkostemp) sb-alien:int
   (template (* (sb-alien:unsigned 8))) (flags sb-alien:int))
 
@@ -56,9 +177,9 @@ an incomplete return closes the descriptor and removes any known temporary path.
   "Open PATH as a bounded regular file and return its stream and byte size.
 Check the opened descriptor before allocating a buffer. Do not follow a final
 symlink or block opening a FIFO. The caller owns and must close the stream."
-  (let ((fd (sb-posix:open (namestring path)
-                           (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
-                                   sb-posix:o-nofollow sb-posix:o-nonblock +postmaster-o-cloexec+)))
+  (let ((fd (port-open-file (namestring path)
+                            (logior (if writable sb-posix:o-rdwr sb-posix:o-rdonly)
+                                    sb-posix:o-nofollow sb-posix:o-nonblock)))
         (stream nil))
     (unwind-protect
          (let* ((stat (sb-posix:fstat fd)) (size (sb-posix:stat-size stat)))
@@ -159,9 +280,9 @@ callers needing a coherent view across publications must compare control images.
     (unwind-protect
          (progn
            (sb-sys:without-interrupts
-             (setf fd (sb-posix:open (format nil "/proc/self/fdinfo/~d" borrowed-fd)
-                                     (logior sb-posix:o-rdonly sb-posix:o-nofollow
-                                             sb-posix:o-nonblock +postmaster-o-cloexec+))
+             (setf fd (port-open-file (format nil "/proc/self/fdinfo/~d" borrowed-fd)
+                                      (logior sb-posix:o-rdonly sb-posix:o-nofollow
+                                              sb-posix:o-nonblock))
                    stream (sb-sys:make-fd-stream fd :input t :element-type '(unsigned-byte 8))))
            (let ((length (read-sequence buffer stream))
                  (after (sb-posix:fstat borrowed-fd)))
@@ -259,7 +380,7 @@ callers needing a coherent view across publications must compare control images.
                            (char= (char name (1- (length name))) #\/))
                       (subseq name 0 (1- (length name)))
                       name))
-         (fd (sb-posix:open trimmed sb-posix:o-rdonly)))
+         (fd (port-open-file trimmed sb-posix:o-rdonly 0 :inherit)))
     (unwind-protect
          (sb-posix:fsync fd)
       (sb-posix:close fd))))

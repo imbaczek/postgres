@@ -75,10 +75,10 @@
              (progn
                (setf fd (if borrowed-fd
                             (sb-posix:fcntl borrowed-fd 1030 0)
-                            (sb-posix:open
+                            (port-open-file
                              (string-right-trim "/" (namestring path))
                              (logior sb-posix:o-rdonly sb-posix:o-directory
-                                     sb-posix:o-nofollow +postmaster-o-cloexec+))))
+                                     sb-posix:o-nofollow))))
                (let ((stat (sb-posix:fstat fd)))
                  (unless (sb-posix:s-isdir (sb-posix:stat-mode stat))
                    (error "replication slot parent descriptor is not a directory"))

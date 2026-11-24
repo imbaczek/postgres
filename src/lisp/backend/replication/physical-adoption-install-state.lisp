@@ -230,9 +230,9 @@
 (defun physical-adoption-allocate-private (directory name)
   "Create a private scratch inode without replacing or following an entry."
   (let* ((path (physical-adoption-install-entry-path directory name))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
-                                    sb-posix:o-nofollow +postmaster-o-cloexec+) #o600)))
+         (fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
+                                     sb-posix:o-nofollow) #o600)))
     (unwind-protect
          (progn
            (sb-posix:fchmod fd #o600)
@@ -246,8 +246,8 @@
                                                                     (after-sync :after-private-file-fsync))
   (let* ((row (list (file-namestring path) :file #o600 (getf identity :device)
                     (getf identity :inode) 0 #xCBF29CE484222325))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+))))
+         (fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdwr sb-posix:o-nofollow))))
     (unwind-protect
          (let ((stat (sb-posix:fstat fd)))
            (unless (and (physical-adoption-install-row-identity-p row stat)

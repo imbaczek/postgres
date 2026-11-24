@@ -20,13 +20,14 @@
 
 (defun logical-slot-copy-owner-arguments (ownership)
   "Capture the postmaster identity for a thread-owned input scope."
-  (list :directory (postmaster-ownership-directory ownership)
-        :device (postmaster-ownership-device ownership)
-        :inode (postmaster-ownership-inode ownership)
-        :lock (postmaster-ownership-lock ownership)
-        :lock-device (postmaster-ownership-lock-device ownership)
-        :lock-inode (postmaster-ownership-lock-inode ownership)
-        :thread sb-thread:*current-thread* :active-p t :ownership ownership))
+  (multiple-value-bind (lock-device lock-inode)
+      (port-data-directory-lock-key (postmaster-ownership-identity ownership))
+    (list :directory (postmaster-ownership-directory ownership)
+          :device (postmaster-ownership-device ownership)
+          :inode (postmaster-ownership-inode ownership)
+          :lock (postmaster-ownership-lock ownership)
+          :lock-device lock-device :lock-inode lock-inode
+          :thread sb-thread:*current-thread* :active-p t :ownership ownership)))
 
 (defmethod physical-adoption-check-owner-role ((owner logical-slot-copy-startup-owner))
   (physical-adoption-check-startup-quiescence)

@@ -65,7 +65,7 @@ this capability on exit without closing the postmaster's borrowed streams."
                  :pid-inode (sb-posix:stat-ino pid))))
     (unwind-protect
          (progn
-           (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd *postmaster-data-lock*) 6))
+           (unless (port-try-exclusive-file-lock (sb-sys:fd-stream-fd *postmaster-data-lock*))
              (error "adoption startup cannot verify exclusive data ownership"))
            (physical-adoption-check-owner owner)
            (funcall function owner))

@@ -23,28 +23,6 @@
 
 (defvar *postmaster-pid-inode* nil)
 
-(sb-alien:define-alien-routine ("sysconf" postmaster-sysconf) sb-alien:long
-  (name sb-alien:int))
-
-(defun postmaster-process-start-time ()
-  "Linux process creation time, not Lisp main-entry time after ASDF compilation."
-  #+linux
-  (let* ((line (with-open-file (stream "/proc/self/stat") (read-line stream)))
-         (tail (subseq line (+ 2 (position #\) line :from-end t))))
-         (fields (remove "" (uiop:split-string tail :separator '(#\Space)) :test #'equal))
-         ;; Linux /proc stat field 22, after the pid and parenthesized comm fields.
-         (ticks (parse-integer (nth 19 fields)))
-         ;; glibc bits/confname.h: _SC_CLK_TCK is enum value 2.
-         (frequency (postmaster-sysconf 2))
-         (boot (with-open-file (stream "/proc/stat")
-                 (loop for row = (read-line stream nil nil) while row
-                       when (uiop:string-prefix-p "btime " row)
-                         return (parse-integer row :start 6)))))
-    (unless (and boot (plusp frequency)) (error "cannot determine process creation time"))
-    (+ boot (floor ticks frequency)))
-  #-linux
-  (error "accurate postmaster process start metadata is not implemented on this platform"))
-
 (defun postmaster-data-path (name)
   (merge-pathnames name *postmaster-pid-directory*))
 
@@ -67,9 +45,8 @@
 (defun postmaster-existing-pid ()
   "Read bounded regular PID metadata without following links or blocking on a FIFO."
   (let* ((path (postmaster-data-path "postmaster.pid"))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdonly sb-posix:o-nonblock sb-posix:o-nofollow
-                                    +postmaster-o-cloexec+)))
+         (fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdonly sb-posix:o-nonblock sb-posix:o-nofollow)))
          (stream nil))
     (unwind-protect
          (progn
@@ -88,10 +65,7 @@
   "Follow C's ancestor exceptions; do not infer PID reuse from elapsed time."
   (let ((grandparent (ignore-errors (parse-integer (or (uiop:getenv "PG_GRANDPARENT_PID") "")))))
     (unless (member pid (list (sb-posix:getpid) (sb-posix:getppid) grandparent))
-      (handler-case (progn (sb-posix:kill pid 0) t)
-        (sb-posix:syscall-error (condition)
-          (unless (member (sb-posix:syscall-errno condition) (list sb-posix:esrch sb-posix:eperm))
-            (error condition)))))))
+      (port-process-signalable-p pid))))
 
 (defun postmaster-pid-owned-p ()
   (and *postmaster-pid-stream*
@@ -106,58 +80,34 @@
   nil)
 
 (defstruct (postmaster-ownership (:constructor %make-postmaster-ownership))
-  ;; This object borrows the published streams; it neither acquires the lock
-  ;; nor closes either stream.  Save the canonical root and descriptor identities
-  ;; so later checks can detect replacement.  A copy is not an active scope.
   (directory nil :read-only t)
-  (device nil :read-only t) (inode nil :read-only t)
-  (lock nil :read-only t) (lock-fd nil :read-only t)
-  (lock-device nil :read-only t) (lock-inode nil :read-only t)
-  (pid-stream nil :read-only t) (pid-fd nil :read-only t)
-  (pid-device nil :read-only t) (pid-inode nil :read-only t)
+  (identity nil :read-only t)
+  (lock nil :read-only t)
+  (pid-stream nil :read-only t)
+  (pid-inode nil :read-only t)
   (thread nil :read-only t) active-p)
+
+(defun postmaster-ownership-device (owner)
+  (port-data-directory-identity-device (postmaster-ownership-identity owner)))
+
+(defun postmaster-ownership-inode (owner)
+  (port-data-directory-identity-inode (postmaster-ownership-identity owner)))
 
 (defmethod print-object ((owner postmaster-ownership) stream)
   (print-unreadable-object (owner stream :type t :identity t)))
 
-(defun postmaster-ownership-file-p (stat device inode)
-  ;; Both the name and descriptor must still identify the private regular file.
-  (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
-       (= 1 (sb-posix:stat-nlink stat))
-       (= (sb-posix:geteuid) (sb-posix:stat-uid stat))
-       (zerop (logand #o077 (sb-posix:stat-mode stat)))
-       (= device (sb-posix:stat-dev stat))
-       (= inode (sb-posix:stat-ino stat))))
-
 (defun postmaster-check-ownership-identities (owner)
-  ;; Check the published streams, root and both names against the saved
-  ;; identities.  The root must remain owned by us with mode 0700 or 0750.
   (let ((directory (postmaster-ownership-directory owner))
         (lock (postmaster-ownership-lock owner))
         (pid-stream (postmaster-ownership-pid-stream owner)))
-    (unless (and (eq lock *postmaster-data-lock*) (open-stream-p lock)
-                 (= (postmaster-ownership-lock-fd owner) (sb-sys:fd-stream-fd lock))
-                 (eq pid-stream *postmaster-pid-stream*) (open-stream-p pid-stream)
-                 (= (postmaster-ownership-pid-fd owner) (sb-sys:fd-stream-fd pid-stream))
+    (unless (and (eq lock *postmaster-data-lock*)
+                 (eq pid-stream *postmaster-pid-stream*)
                  (equal directory *postmaster-pid-directory*)
                  (equal directory (uiop:ensure-directory-pathname (truename *pgdata*)))
                  (eql (postmaster-ownership-pid-inode owner) *postmaster-pid-inode*))
       (error "postmaster ownership lost its published context"))
-    (let ((root (sb-posix:lstat (namestring directory))))
-      (unless (and (sb-posix:s-isdir (sb-posix:stat-mode root))
-                   (= (sb-posix:geteuid) (sb-posix:stat-uid root))
-                   (member (logand #o777 (sb-posix:stat-mode root)) '(#o700 #o750))
-                   (= (postmaster-ownership-device owner) (sb-posix:stat-dev root))
-                   (= (postmaster-ownership-inode owner) (sb-posix:stat-ino root)))
-        (error "postmaster data directory identity changed")))
-    (flet ((check-file (path fd device inode)
-             (unless (and (postmaster-ownership-file-p (sb-posix:lstat (namestring path)) device inode)
-                          (postmaster-ownership-file-p (sb-posix:fstat fd) device inode))
-               (error "postmaster ownership file identity changed: ~a" path))))
-      (check-file (merge-pathnames ".pg_lisp.lock" directory) (postmaster-ownership-lock-fd owner)
-                  (postmaster-ownership-lock-device owner) (postmaster-ownership-lock-inode owner))
-      (check-file (merge-pathnames "postmaster.pid" directory) (postmaster-ownership-pid-fd owner)
-                  (postmaster-ownership-pid-device owner) (postmaster-ownership-pid-inode owner)))
+    (port-check-data-directory-identity (postmaster-ownership-identity owner)
+                                        directory lock pid-stream)
     (unless (and (postmaster-pid-owned-p) (eql (sb-posix:getpid) (postmaster-existing-pid)))
       (error "postmaster PID no longer identifies this process")))
   owner)
@@ -197,16 +147,11 @@
                (postmaster-pid-owned-p))
     (error "postmaster ownership requires published lock and PID streams"))
   (let* ((directory (uiop:ensure-directory-pathname (truename *pgdata*)))
-         (root (sb-posix:lstat (namestring directory)))
-         (lock-fd (sb-sys:fd-stream-fd *postmaster-data-lock*))
-         (pid-fd (sb-sys:fd-stream-fd *postmaster-pid-stream*))
-         (lock (sb-posix:fstat lock-fd)) (pid (sb-posix:fstat pid-fd))
+         (identity (port-capture-data-directory-identity directory *postmaster-data-lock*
+                                                         *postmaster-pid-stream*))
          (owner (%make-postmaster-ownership
-                 :directory directory :device (sb-posix:stat-dev root) :inode (sb-posix:stat-ino root)
-                 :lock *postmaster-data-lock* :lock-fd lock-fd
-                 :lock-device (sb-posix:stat-dev lock) :lock-inode (sb-posix:stat-ino lock)
-                 :pid-stream *postmaster-pid-stream* :pid-fd pid-fd
-                 :pid-device (sb-posix:stat-dev pid) :pid-inode (sb-posix:stat-ino pid)
+                 :directory directory :identity identity :lock *postmaster-data-lock*
+                 :pid-stream *postmaster-pid-stream* :pid-inode *postmaster-pid-inode*
                  :thread sb-thread:*current-thread* :active-p t)))
     (let ((*postmaster-ownership-contexts* (cons owner *postmaster-ownership-contexts*)))
       (unwind-protect
@@ -261,9 +206,8 @@ leaves the separate data ownership lock to its owner."
           (error "postmaster.pid changed during stale owner inspection"))
         (delete-file path)
         (fsync-directory *postmaster-pid-directory*)))
-    (let ((fd (sb-posix:open (namestring path)
-                             (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl
-                                     +postmaster-o-cloexec+) #o600)))
+    (let ((fd (port-open-file (namestring path)
+                              (logior sb-posix:o-rdwr sb-posix:o-creat sb-posix:o-excl) #o600)))
       (setf *postmaster-pid-stream*
             (sb-sys:make-fd-stream fd :input t :output t :element-type 'character
                                       :external-format :utf-8 :buffering :full :auto-close t)
@@ -284,34 +228,12 @@ EXISTING-ONLY requires the directory to be present."
       (sb-posix:syscall-error (condition)
         (unless (= (sb-posix:syscall-errno condition) sb-posix:eexist)
           (error condition)))))
-  (let ((stat (sb-posix:stat *pgdata*)))
-    (unless (and (sb-posix:s-isdir (sb-posix:stat-mode stat))
-                 (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
-                 (member (logand (sb-posix:stat-mode stat) #o777) '(#o700 #o750)))
-      (error "data directory has wrong type, ownership or permissions; require 0700 or 0750")))
+  (port-validate-data-directory *pgdata*)
   (truename *pgdata*))
 
 (defun postmaster-open-data-lock (&key existing-only)
-  "Open a dedicated regular ownership inode without following links.
-EXISTING-ONLY requires an existing private lock and leaves its mode unchanged."
-  (let* ((fd (sb-posix:open (namestring (postmaster-data-path ".pg_lisp.lock"))
-                            (logior sb-posix:o-rdwr (if existing-only 0 sb-posix:o-creat)
-                                    sb-posix:o-nonblock sb-posix:o-nofollow +postmaster-o-cloexec+) #o600))
-         (success nil))
-    (unwind-protect
-         (let ((stat (sb-posix:fstat fd)))
-           (unless (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
-                        (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
-                        (= (sb-posix:stat-nlink stat) 1))
-             (error "data ownership lock is not a dedicated regular file"))
-           ;; Keep an already-private lock's metadata unchanged on a failed startup.
-           (unless (= #o600 (logand #o7777 (sb-posix:stat-mode stat)))
-             (when existing-only (error "offline recovery requires a private data lock"))
-             (sb-posix:fchmod fd #o600))
-           (prog1 (sb-sys:make-fd-stream fd :input t :output t
-                                            :element-type '(unsigned-byte 8) :auto-close t)
-             (setf success t)))
-      (unless success (sb-posix:close fd)))))
+  (port-open-private-lock-file (postmaster-data-path ".pg_lisp.lock")
+                               :existing-only existing-only))
 
 (defun postmaster-own-data-directory (host port &key startup-before-pid startup-check startup-reconcile startup-observer existing-only)
   "Own PGDATA before any database storage initialization or recovery mutation.
@@ -337,10 +259,10 @@ remove the owned PID, and close the lock even if PID cleanup fails."
          (progn
            (setf *postmaster-pid-directory* (truename *pgdata*)
                  *postmaster-pid-host* "" *postmaster-pid-port* port
-                 *postmaster-start-time* (postmaster-process-start-time)
-                 lock (postmaster-open-data-lock :existing-only existing-only))
-           (unless (zerop (physical-store-flock (sb-sys:fd-stream-fd lock) 6))
-             (error "data directory is already owned by another pg-lisp process"))
+                 *postmaster-start-time* (port-current-process-start-time))
+           (sb-sys:without-interrupts
+             (setf lock (postmaster-open-data-lock :existing-only existing-only)))
+           (port-acquire-data-directory-lock lock)
            (if startup-observer
                (progn
                  (funcall startup-observer lock :before-pid)

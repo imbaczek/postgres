@@ -15,8 +15,8 @@
          (identity (getf (getf state :plan) :journal))
          (row (list "physical-adoption.follow" :file #o600 (getf identity :device)
                     (getf identity :inode) 0 0))
-         (fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdwr sb-posix:o-nofollow +postmaster-o-cloexec+))))
+         (fd (port-open-file (namestring path)
+                             (logior sb-posix:o-rdwr sb-posix:o-nofollow))))
     (unwind-protect
          (let ((stat (sb-posix:fstat fd)))
            (unless (and (physical-adoption-install-row-identity-p row stat)

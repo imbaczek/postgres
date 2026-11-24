@@ -279,96 +279,18 @@ synchronous configuration plan against the same source and generation."
 (defun find-startup-setting (name)
   (find name *startup-setting-specs* :key #'startup-setting-descriptor-name :test #'string=))
 
-(sb-alien:define-alien-routine ("strtol" startup-strtol) sb-alien:long
-  (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
-
-(sb-alien:define-alien-routine ("strtod" startup-strtod) sb-alien:double
-  (text (* sb-alien:char)) (end (* (* sb-alien:char))))
-
-(sb-alien:define-alien-routine ("__errno_location" startup-errno-location) (* sb-alien:int))
-
-(sb-alien:define-alien-routine ("strtoull" startup-strtoull) sb-alien:unsigned-long-long
-  (text (* sb-alien:char)) (end (* (* sb-alien:char))) (base sb-alien:int))
-
-(defun startup-recovery-timeline-number (begin end)
-  "Parse an unsigned base-zero value with the libc behavior used by C.
-Use the C23 entry point when available, otherwise the older strtoull."
-  (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtoull")))
-    (setf (sb-alien:deref (startup-errno-location)) 0)
-    (if address
-        (sb-alien:alien-funcall
-         (sb-alien:sap-alien
-          (sb-sys:int-sap address)
-          (function sb-alien:unsigned-long-long
-                    (* sb-alien:char) (* (* sb-alien:char)) sb-alien:int))
-         begin end 0)
-        (startup-strtoull begin end 0))))
-
 (defun startup-parse-recovery-timeline (text)
-  "Parse exact current or latest, or a complete nonzero 32-bit timeline ID.
-Numeric input uses unsigned base-zero libc parsing; units and integer GUC
-rounding do not apply."
+  "Parse exact current or latest, or a complete nonzero 32-bit timeline ID."
   (when (find (code-char 0) text) (error "NUL in recovery_target_timeline"))
   (cond ((string= text "current") :current)
         ((string= text "latest") :latest)
-        (t
-         (let ((bytes (concatenate '(vector (unsigned-byte 8)) (string->bytes text) #(0))))
-           (sb-sys:with-pinned-objects (bytes)
-             (sb-alien:with-alien ((end (* sb-alien:char)))
-               (let* ((begin (sb-alien:sap-alien (sb-sys:vector-sap bytes) (* sb-alien:char)))
-                      (errno (startup-errno-location)))
-                 (let* ((timeline (startup-recovery-timeline-number begin (sb-alien:addr end)))
-                        (offset (- (sb-sys:sap-int (sb-alien:alien-sap end))
-                                   (sb-sys:sap-int (sb-sys:vector-sap bytes)))))
-                   (unless (and (zerop (sb-alien:deref errno))
-                                (zerop (aref bytes offset))
-                                (<= 1 timeline 4294967295))
-                     (error "invalid recovery_target_timeline ~s" text))
-                   timeline))))))))
-
-(defun startup-integer-number (begin end)
-  "Parse a signed base-zero integer using C23 strtol when available, otherwise strtol.
-Clear errno after symbol lookup so lookup errors do not contaminate conversion.
-Recovery timeline parsing uses its separate unsigned conversion."
-  (let ((address (sb-sys:find-foreign-symbol-address "__isoc23_strtol")))
-    (setf (sb-alien:deref (startup-errno-location)) 0)
-    (if address
-        (sb-alien:alien-funcall
-         (sb-alien:sap-alien
-          (sb-sys:int-sap address)
-          (function sb-alien:long (* sb-alien:char) (* (* sb-alien:char)) sb-alien:int))
-         begin end 0)
-        (startup-strtol begin end 0))))
+        (t (let ((timeline (port-parse-unsigned-base-zero text)))
+             (unless (and timeline (<= 1 timeline 4294967295))
+               (error "invalid recovery_target_timeline ~s" text))
+             timeline))))
 
 (defun startup-numeric-prefix (text)
-  "Use C numeric conversions as in guc.c:parse_int, without Lisp READ.
-Try the signed integer path first; overflow or a fractional or exponent suffix
-uses strtod. Return the remaining unit for the caller's conversion and rounding."
-  (when (find (code-char 0) text) (error "NUL in configuration value"))
-  (let ((bytes (concatenate '(vector (unsigned-byte 8)) (string->bytes text) #(0))))
-    (sb-sys:with-pinned-objects (bytes)
-      (sb-alien:with-alien ((end (* sb-alien:char)))
-        (let* ((begin (sb-alien:sap-alien (sb-sys:vector-sap bytes) (* sb-alien:char)))
-               (errno (startup-errno-location))
-               (number nil)
-               (offset nil))
-          (setf (sb-alien:deref errno) 0
-                number (startup-integer-number begin (sb-alien:addr end))
-                offset (- (sb-sys:sap-int (sb-alien:alien-sap end))
-                          (sb-sys:sap-int (sb-sys:vector-sap bytes))))
-          (when (or (= (sb-alien:deref errno) sb-posix:erange)
-                    (find (code-char (aref bytes offset)) ".eE"))
-            (setf (sb-alien:deref errno) 0
-                  number (startup-strtod begin (sb-alien:addr end))
-                  offset (- (sb-sys:sap-int (sb-alien:alien-sap end))
-                            (sb-sys:sap-int (sb-sys:vector-sap bytes)))))
-          (unless (and (plusp offset) (zerop (sb-alien:deref errno)))
-            (error "invalid numeric configuration value ~s" text))
-          (setf number (coerce number 'double-float))
-          (when (or (sb-ext:float-nan-p number) (sb-ext:float-infinity-p number))
-            (error "nonfinite configuration value"))
-          (values number (string-trim '(#\Space #\Tab #\Newline #\Return #\Page)
-                                      (bytes->string bytes :start offset :end (1- (length bytes))))))))))
+  (port-numeric-prefix text))
 
 (defun startup-parse-integer-setting (name text minimum maximum base-unit)
   "Match parse_int rounding, including conversion via the next smaller unit."
@@ -627,8 +549,7 @@ as in a C string. Do not reencode the byte view as UTF-8."
 (defun startup-open-config (path &optional (maximum (* 16 1024 1024)))
   "Open a bounded regular config file as a Latin-1 byte view.
 Follow symlinks, but reject special files without blocking the reload gate."
-  (let* ((fd (sb-posix:open (namestring path)
-                            (logior sb-posix:o-rdonly sb-posix:o-nonblock +postmaster-o-cloexec+)))
+  (let* ((fd (port-open-file (namestring path) (logior sb-posix:o-rdonly sb-posix:o-nonblock)))
          (success nil))
     (unwind-protect
          (let ((stat (sb-posix:fstat fd)))

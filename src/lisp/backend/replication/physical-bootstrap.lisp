@@ -22,9 +22,8 @@ does not cancel the request. Open nonblocking and fsync only regular files."
     (handler-case (sb-posix:stat path)
       (sb-posix:syscall-error () (return-from physical-recovery-signal-found-p nil)))
     (handler-case
-        (let ((fd (sb-posix:open path
-                                 (logior sb-posix:o-rdwr sb-posix:o-nonblock
-                                         +postmaster-o-cloexec+))))
+        (let ((fd (port-open-file path
+                                  (logior sb-posix:o-rdwr sb-posix:o-nonblock))))
           (unwind-protect
                (when (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd)))
                  (sb-posix:fsync fd))
@@ -118,9 +117,9 @@ active timeline goal before recovery preparation or redo."
                            (catalog-system-identifier catalog) (namestring data)))))
 
 (defun physical-backup-open-directory (path)
-  (sb-posix:open (string-right-trim "/" (namestring path))
-                 (logior sb-posix:o-rdonly sb-posix:o-directory
-                         sb-posix:o-nofollow +postmaster-o-cloexec+)))
+  (port-open-file (string-right-trim "/" (namestring path))
+                  (logior sb-posix:o-rdonly sb-posix:o-directory
+                          sb-posix:o-nofollow)))
 
 (defun physical-backup-check-stage-directory (fd)
   (let ((stat (sb-posix:fstat fd)))
@@ -701,10 +700,10 @@ The slot is dropped on every exit; a verified origin remains after cancellation.
     (sb-sys:without-interrupts
       (unwind-protect
            (progn
-             (setf fd (sb-posix:open
+             (setf fd (port-open-file
                        (string-right-trim "/" (namestring *pgdata*))
                        (logior sb-posix:o-rdonly sb-posix:o-directory
-                               sb-posix:o-nofollow +postmaster-o-cloexec+)))
+                               sb-posix:o-nofollow)))
              (sb-sys:with-local-interrupts
                (call-with-physical-image-directory fd function :primary)))
         (when fd (sb-posix:close fd))))))
@@ -1034,10 +1033,10 @@ bytes against the sealed file digest. The caller checks the header and owns outp
     (let ((fd nil) (stream nil))
       (unwind-protect
            (progn
-             (setf fd (sb-posix:open (namestring path)
-                                     (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
-                                             sb-posix:o-nofollow +postmaster-o-cloexec+)
-                                     #o600))
+             (setf fd (port-open-file (namestring path)
+                                      (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl
+                                              sb-posix:o-nofollow)
+                                      #o600))
              (sb-posix:fchmod fd #o600)
              (setf stream (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8)))
              (sb-sys:with-local-interrupts (funcall function stream)))

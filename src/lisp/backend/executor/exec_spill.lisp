@@ -329,42 +329,11 @@ on exit unless cleanup has resolved the owner."
                                                (1+ namespace-separator)))))
         (values pid start-token pid-namespace-token)))))
 
-(defun query-temp-whitespace-p (character)
-  (find character '(#\Space #\Tab #\Newline #\Return)))
-
-(defun query-temp-whitespace-token (string token-index)
-  (let ((cursor 0)
-        (length (length string)))
-    (dotimes (index (1+ token-index))
-      (setf cursor (position-if-not #'query-temp-whitespace-p
-                                    string :start cursor))
-      (unless cursor
-        (return-from query-temp-whitespace-token nil))
-      (let ((end (position-if #'query-temp-whitespace-p string :start cursor)))
-        (when (= index token-index)
-          (return-from query-temp-whitespace-token
-            (subseq string cursor end)))
-        (setf cursor (or end length))))))
-
 (defun query-temp-process-start-token (pid)
-  "Return Linux /proc's process start-time ticks for PID."
-  (ignore-errors
-   (with-open-file (stream (format nil "/proc/~d/stat" pid))
-     (let* ((stat (read-line stream nil))
-            ;; The command name is parenthesized and may itself contain spaces
-            ;; and parentheses, so fields after it start at the final ')'.
-            (command-end (and stat (position #\) stat :from-end t)))
-            (fields (and command-end (subseq stat (1+ command-end))))
-            ;; starttime is field 22; fields starts at field 3.
-            (starttime (and fields (query-temp-whitespace-token fields 19))))
-       (and starttime (parse-integer starttime))))))
+  (port-process-start-token pid))
 
 (defun query-temp-pid-namespace-token ()
-  (ignore-errors
-   (let* ((target (sb-posix:readlink "/proc/self/ns/pid"))
-          (start (position #\[ target))
-          (end (and start (position #\] target :start (1+ start)))))
-     (and start end (parse-integer target :start (1+ start) :end end)))))
+  (port-current-pid-namespace-token))
 
 (defun query-temp-valid-pid-p (pid)
   (and (integerp pid) (<= 1 pid #x7fffffff)))
@@ -441,7 +410,7 @@ on exit unless cleanup has resolved the owner."
          (flags (logior sb-posix:o-rdonly sb-posix:o-directory
                         sb-posix:o-nofollow)))
     (ignore-errors
-     (sb-posix:open (if (plusp (length name)) name "/") flags))))
+     (port-open-file (if (plusp (length name)) name "/") flags 0 :inherit))))
 
 (defun query-temp-fd-path (fd)
   (format nil "/proc/self/fd/~d" fd))
@@ -452,16 +421,16 @@ on exit unless cleanup has resolved the owner."
 (defun query-temp-open-child-directory (fd name)
   "Open NAME below pinned directory FD without following a symlink."
   (ignore-errors
-   (sb-posix:open
-    (query-temp-fd-child-path fd name)
-    (logior sb-posix:o-rdonly sb-posix:o-directory sb-posix:o-nofollow))))
+   (port-open-file (query-temp-fd-child-path fd name)
+                   (logior sb-posix:o-rdonly sb-posix:o-directory sb-posix:o-nofollow)
+                   0 :inherit)))
 
 (defun query-temp-open-child-file (fd name)
   "Open a regular-file candidate below pinned directory FD without blocking."
   (ignore-errors
-   (sb-posix:open
-    (query-temp-fd-child-path fd name)
-    (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock))))
+   (port-open-file (query-temp-fd-child-path fd name)
+                   (logior sb-posix:o-rdonly sb-posix:o-nofollow sb-posix:o-nonblock)
+                   0 :inherit)))
 
 (defun query-temp-directory-entry-names (fd)
   "List immediate names from pinned directory FD; report unreadable handles."
