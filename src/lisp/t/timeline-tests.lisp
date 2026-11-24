@@ -21,6 +21,12 @@
     (ok (intake-fails-p (lambda () (pg::timeline-check-lineage history)))))
   (ok (= 1 (pg::timeline-at-point 0 (pg::timeline-parse-history 1 "")))))
 
+(deftest timeline-history-requires-a-complete-switchpoint
+    (dolist (line '("1 000000000/1" "1 0/000000010" "1 0/40suffix" "1+0/40"))
+      (ok (intake-fails-p (lambda () (pg::timeline-parse-history 2 line))) line))
+  (let ((history (pg::timeline-parse-history 2 (format nil "1~c0/ffffffff  reason λ" #\Tab))))
+    (ok (= #xffffffff (pg::timeline-history-entry-begin (first history))))))
+
 (deftest timeline-history-read-is-bounded-and-does-not-create-missing-files
     (with-physical-store-directory (root)
       (let ((path (merge-pathnames "pg_wal/00000002.history" root)))

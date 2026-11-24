@@ -78,7 +78,7 @@ Missing, duplicate or unknown options fail before a sender is acquired."
         (ereport "0A000" "native physical stream requires native_format, proof_pin, system_id, timeline, base_lsn, prefix_digest and optional manifest_digest and mode"))
       (let ((command (make-logical-replication-command
                       :type :physical-start :slot-name name :options options
-                      :requested-lsn (parse-replication-lsn (nth lsn-position words)))))
+                      :requested-lsn (parse-replication-start-lsn (nth lsn-position words)))))
         (unless (equal +physical-native-format+ (physical-stream-option command "native_format"))
           (ereport "0A000" "unsupported native physical WAL format"))
         (unless (wal-valid-replication-slot-name-p (physical-stream-proof-pin command))

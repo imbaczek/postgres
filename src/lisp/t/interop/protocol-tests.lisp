@@ -55,6 +55,18 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
   `(handler-case (progn ,@body nil)
      (pg::pg-error (condition) (pg::pg-error-sqlstate condition))))
 
+(deftest logical-start-requires-a-bounded-lsn
+    (dolist (lsn '("000000000/1" "0/000000001" "+1/1" "1/+1" "1/1extra"))
+      (ok (equal "42601"
+                 (sqlstate-of
+                  (pg::parse-replication-command
+                   (format nil "START_REPLICATION SLOT test_slot LOGICAL ~a" lsn))))
+          lsn))
+  (ok (= #xffffffffffffffff
+         (pg::logical-replication-command-requested-lsn
+          (pg::parse-replication-command
+           "START_REPLICATION SLOT test_slot LOGICAL FFFFFFFF/ffffffff")))))
+
 (deftest sqlstate-observation-keeps-error-boundary
     (let ((calls 0))
       (ok (null (sqlstate-of (incf calls))))

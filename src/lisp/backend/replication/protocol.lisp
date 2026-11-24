@@ -170,21 +170,14 @@
          :options (when binary-bytea (list (cons "binary_bytea" t))))))))
 
 (defun parse-replication-lsn (text)
-  (let ((slash (position #\/ text)))
-    (unless (and slash
-                 (plusp slash)
-                 (< slash (1- (length text)))
-                 (not (position #\/ text :start (1+ slash))))
-      (ereport "22P02" "invalid replication LSN \"~a\"" text))
-    (handler-case
-        (let ((high (parse-integer text :end slash :radix 16 :junk-allowed nil))
-              (low (parse-integer text :start (1+ slash) :radix 16
-                                       :junk-allowed nil)))
-          (unless (and (<= 0 high #xFFFFFFFF) (<= 0 low #xFFFFFFFF))
-            (ereport "22P02" "replication LSN is out of range"))
-          (+ (ash high 32) low))
-      (error ()
-        (ereport "22P02" "invalid replication LSN \"~a\"" text)))))
+  "Parse an LSN value, reporting invalid text as a data error."
+  (or (parse-wal-lsn text)
+      (ereport "22P02" "invalid replication LSN ~s" text)))
+
+(defun parse-replication-start-lsn (text)
+  "Parse a START_REPLICATION location, reporting invalid syntax as a command error."
+  (or (parse-wal-lsn text)
+      (ereport "42601" "invalid streaming start location")))
 
 (declaim (ftype function parse-native-physical-start start-native-physical-replication))
 
@@ -271,7 +264,7 @@
              (parse-start-replication-options (nthcdr 5 words))
            (make-logical-replication-command
             :type :start :slot-name name
-            :requested-lsn (parse-replication-lsn (fifth words))
+            :requested-lsn (parse-replication-start-lsn (fifth words))
             :protocol-version version :options options))))
       (t (ereport "42601" "unsupported replication command")))))
 

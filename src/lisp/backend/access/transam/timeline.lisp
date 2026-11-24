@@ -4,20 +4,27 @@
 
 (defstruct timeline-history-entry timeline begin end)
 
-(sb-alien:define-alien-routine ("sscanf" timeline-scanf-history-line) sb-alien:int
+(sb-alien:define-alien-routine ("sscanf" timeline-scanf-history-id) sb-alien:int
   (line sb-alien:c-string) (format sb-alien:c-string)
-  (timeline (* sb-alien:unsigned-int)) (high (* sb-alien:unsigned-int))
-  (low (* sb-alien:unsigned-int)))
+  (timeline (* sb-alien:unsigned-int)) (consumed (* sb-alien:int)))
 
 (defun timeline-history-fields (line)
-  "Use the same scanf conversion and low-word width as timeline.c."
+  "Read a decimal timeline ID and a complete WAL switchpoint; ignore the reason."
   (sb-alien:with-alien ((timeline sb-alien:unsigned-int 0)
-                        (high sb-alien:unsigned-int 0) (low sb-alien:unsigned-int 0))
-    (unless (= 3 (timeline-scanf-history-line
-                  line (format nil "%u~c%X/%08X" #\Tab)
-                  (sb-alien:addr timeline) (sb-alien:addr high) (sb-alien:addr low)))
+                        (consumed sb-alien:int 0))
+    (unless (= 1 (timeline-scanf-history-id line "%u%n"
+                                            (sb-alien:addr timeline)
+                                            (sb-alien:addr consumed)))
       (error "syntax error in timeline history: ~s" line))
-    (values timeline (logior (ash high 32) low))))
+    (let* ((start (when (and (< consumed (length line))
+                             (sql-array-space-p (char line consumed)))
+                    (position-if-not #'sql-array-space-p line :start consumed)))
+           (switchpoint (when start
+                          (parse-wal-lsn
+                           (subseq line start (position-if #'sql-array-space-p line :start start))))))
+      (unless switchpoint
+        (error "syntax error in timeline history: ~s" line))
+      (values timeline switchpoint))))
 
 (defun timeline-parse-history (child text)
   "readTimeLineHistory's newest-first intervals; reasons are deliberately ignored."

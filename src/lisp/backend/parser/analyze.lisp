@@ -1965,16 +1965,19 @@ syntax is checked before the final signed-width range check for TYPE."
          (format nil "~a/~d" (value->text value source) (* 8 (length value))))
         (t (value->text value source))))
 
-(defun sql-pg-lsn-input (text)
-  "Follow pg_parse_lsn: exactly two components of one to eight ASCII hex digits."
+(defun parse-wal-lsn (text)
+  "Parse an LSN as two groups of one to eight ASCII hex digits, or return NIL."
   (let ((slash (position #\/ text)))
-    (unless (and slash (<= 1 slash 8) (<= 1 (- (length text) slash 1) 8)
-                 (loop for character across text for position from 0
-                       always (or (= position slash)
-                                  (find character "0123456789abcdefABCDEF"))))
-      (ereport "22P02" "invalid input syntax for type pg_lsn: ~s" text))
-    (logior (ash (parse-integer text :end slash :radix 16) 32)
-            (parse-integer text :start (1+ slash) :radix 16))))
+    (when (and slash (<= 1 slash 8) (<= 1 (- (length text) slash 1) 8)
+               (loop for character across text for position from 0
+                     always (or (= position slash)
+                                (find character "0123456789abcdefABCDEF"))))
+      (logior (ash (parse-integer text :end slash :radix 16) 32)
+              (parse-integer text :start (1+ slash) :radix 16)))))
+
+(defun sql-pg-lsn-input (text)
+  (or (parse-wal-lsn text)
+      (ereport "22P02" "invalid input syntax for type pg_lsn: ~s" text)))
 
 (defun sql-oid-input (text &optional (type :oid))
   "Read oid or oid8 through C's unsigned base-zero input rules."
