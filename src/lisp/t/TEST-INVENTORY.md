@@ -351,10 +351,12 @@ ASDF or installed under the active Quicklisp local-projects directory; see the
 [dependency setup](../README.md#testing), including `CL_SOURCE_REGISTRY` for an
 external checkout. The runner invokes the `pg-unit-tests/all` ASDF test
 operation. Rove reports its results first. On success, the legacy harness runs
-its registered cases and inline wait-helper assertion and prints its check and
-failure counts. Either suite can signal an error, which produces a nonzero shell
-exit status. The combined success line appears after both suites pass. Loading
-`pg-unit-tests` defines tests for direct Rove discovery and selection.
+its registered cases, including the wait-helper case. Each `TEST-OUTCOME`
+line reports a package-qualified case name and the result `PASSED`, `FAILED`,
+or `ABORTED`. The summary reports executed and skipped cases, checks, and
+failures. A suite error produces a nonzero shell exit status. The combined
+success line appears after both suites pass. Loading `pg-unit-tests` defines
+tests for direct Rove discovery and selection.
 
 Run `./t/run-unit-tests.sh --list` to print both inventories without running
 tests. Each `TEST-CASE` line identifies the harness and package-qualified case
