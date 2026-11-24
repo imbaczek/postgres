@@ -142,7 +142,7 @@
             (*query-row-origins* nil)
             (*query-row-presence* nil))
         (unwind-protect
-             (execute-query-plan
+             (map-query-plan-rows
               plan registered
               (lambda (row)
                 (check-for-interrupts)

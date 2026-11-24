@@ -235,30 +235,20 @@
       (rove:ok (zerop (aggregate-input-owner-depth (list :whole-row 0 (list outer)))))))
 
 (rove:deftest subquery-consumer-stop-crosses-limit
-    (let ((visited 0))
-      (execute-physical-plan-node
-       '(:limit 10 (:result)) nil nil
-       (lambda (row) (declare (ignore row)) :stop)
-       (lambda (node emit)
-         (declare (ignore node))
-         (loop for value below 20
-               do (incf visited)
-               when (eq (funcall emit value) :stop) do (return :stop)))
-       (lambda (&rest arguments) (declare (ignore arguments))))
+    (let* ((visited 0)
+           (input (make-sql-iterator (lambda () (values (incf visited) t))))
+           (limited (make-limit-sql-iterator 10 input)))
+      (unwind-protect
+           (rove:ok (eq :stop (map-sql-iterator limited (constantly :stop))))
+        (close-sql-iterator limited))
       (rove:ok (= visited 1) "the consumer stops LIMIT before its own bound")))
 
 (rove:deftest subquery-consumer-stop-crosses-append
-    (let ((opened 0) (visited 0))
-      (stream-union-all
-       '((() first) (() second))
-       (lambda (row) (declare (ignore row)) :stop)
-       (lambda (node emit)
-         (declare (ignore node))
-         (incf opened)
-         (incf visited)
-         (funcall emit (cons #() #()))))
-      (rove:ok (= opened 1) "consumer stop prevents opening the next arm")
-      (rove:ok (= visited 1))))
+    (let ((input (make-append-sql-iterator '((nil (:project nil (:result))) (nil (:unreachable))) nil)))
+      (unwind-protect
+           (rove:ok (eq :stop (map-sql-iterator input (constantly :stop)))
+                    "consumer stop prevents opening the next arm")
+        (close-sql-iterator input))))
 
 (rove:deftest buffered-plan-clears-toast-demand-for-consumer
     (let ((original (symbol-function 'simple-select-toast-demand))
@@ -276,10 +266,10 @@
                       (node (if (eq kind :sort) (list :sort order project)
                                 (list :top-n order 1 project)))
                       (plan (%make-query-plan :physical node)))
-                 (interpret-query-plan plan nil
-                                       (lambda (row)
-                                         (declare (ignore row))
-                                         (setf seen *select-toast-demand*)))
+                 (map-query-plan-rows plan nil
+                                      (lambda (row)
+                                        (declare (ignore row))
+                                        (setf seen *select-toast-demand*)))
                  (rove:ok (null seen) (format nil "~a consumer sees no scan demand" kind)))))
         (setf (symbol-function 'simple-select-toast-demand) original))))
 
@@ -404,8 +394,8 @@
   (let* ((plan (plan-select-query (first (parse-statements sql))))
          (relations (getf (query-plan-prepared plan) :relations))
          (rows nil))
-    (execute-query-plan plan relations
-                        (lambda (row) (push (coerce (car row) 'list) rows)))
+    (map-query-plan-rows plan relations
+                         (lambda (row) (push (coerce (car row) 'list) rows)))
     (nreverse rows)))
 
 (defun subquery-test-expected (value)
@@ -622,7 +612,7 @@
                     (relations (getf (query-plan-prepared plan) :relations))
                     (rows nil))
                (rove:ok (zerop allocations))
-               (execute-query-plan plan relations (lambda (row) (push (car row) rows)))
+               (map-query-plan-rows plan relations (lambda (row) (push (car row) rows)))
                (rove:ok (= allocations 1) "one allocation for repeated calls")
                (rove:ok (equalp rows (list (vector (+ (ash 1 32) 3) (+ (ash 1 32) 3))))))
              (setf (backend-xid *backend*) nil)
@@ -711,9 +701,9 @@
                   (first (parse-statements "SELECT f.v,f FROM abs($1) f(v)"))))
            (relations (getf (query-plan-prepared plan) :relations))
            (rows nil))
-      (execute-query-plan plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
+      (map-query-plan-rows plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
       (setf *query-parameter-values* #(-8))
-      (execute-query-plan plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
+      (map-query-plan-rows plan relations (lambda (row) (push (coerce (car row) 'list) rows)))
       (rove:ok (equal '((3 3) (8 8)) (nreverse rows)))))
 
 (rove:deftest subquery-execution-results
@@ -873,34 +863,16 @@
            (descriptor (first (getf (query-plan-prepared plan) :sublinks)))
            (child (sql-subplan-plan descriptor))
            (*query-plan-instrumentation-p* t))
-      (execute-query-plan plan relations (lambda (row) (declare (ignore row))))
+      (map-query-plan-rows plan relations (lambda (row) (declare (ignore row))))
       (rove:ok (= 3 (plan-node-metadata-actual-loops
                      (gethash (query-plan-physical child) (query-plan-metadata child)))))
       (rove:ok (search "SubPlan" (format-query-plan plan relations t)))
-      (execute-query-plan plan relations (lambda (row) (declare (ignore row))))
+      (map-query-plan-rows plan relations (lambda (row) (declare (ignore row))))
       (rove:ok (= 3 (plan-node-metadata-actual-loops
                      (gethash (query-plan-physical child) (query-plan-metadata child))))
                "a new execution resets, while rescans accumulate"))
   (let ((plan (plan-select-query (first (parse-statements "SELECT (SELECT 1)")))))
     (rove:ok (search "InitPlan" (format-query-plan plan)))))
-
-(rove:deftest subquery-inherits-compiler-hook
-    (let ((compilations 0))
-      (unwind-protect
-           (progn
-             (register-query-plan-backend
-              :subquery-test-compiler
-              :compiler (lambda (plan)
-                          (incf compilations)
-                          (lambda (relations callback)
-                            (interpret-query-plan plan relations callback))))
-             (let* ((plan (plan-select-query (first (parse-statements "SELECT (SELECT 1)"))))
-                    (relations (getf (query-plan-prepared plan) :relations)))
-               (execute-query-plan plan relations (lambda (row) (declare (ignore row)))
-                                   :backend :subquery-test-compiler)
-               (rove:ok (= compilations 2) "root and child inherit the compiler entry")))
-        (sb-thread:with-mutex (*query-plan-backend-lock*)
-          (remhash :subquery-test-compiler *query-plan-backends*)))))
 
 (rove:deftest subquery-mixed-registration-is-atomic
     (let ((*relation-writers* (make-hash-table :test #'eql))

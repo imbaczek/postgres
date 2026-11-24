@@ -21,7 +21,6 @@
 
 (defvar *subquery-output-value* nil)
 
-(defvar *subquery-backend-entry* nil)
 
 (defvar *subquery-instrumentation-depth* 0)
 

@@ -12,10 +12,14 @@
   ;; Additional values are optional datum origins, TOAST slice context, and
   ;; source presence.  Presence NIL is unknown; #() is known empty.  Borrowed
   ;; carriers are immutable and must be copied when retained.
-  next-function close-function closed-p)
+  next-function close-function release-function closed-p)
 
-(defun make-sql-iterator (next &optional close)
-  (let ((iterator (%make-sql-iterator :next-function next :close-function close)))
+(defun make-sql-iterator (next &optional close release)
+  ;; RELEASE is for short ownership cleanup that must survive an interrupted
+  ;; CLOSE.  It runs in the protected cleanup even if CLOSE signals an error;
+  ;; page-handle release therefore belongs here rather than in CLOSE alone.
+  (let ((iterator (%make-sql-iterator :next-function next :close-function close
+                                      :release-function release)))
     (when *sql-open-iterators* (setf (gethash iterator *sql-open-iterators*) t))
     iterator))
 
@@ -32,9 +36,13 @@
            (sb-sys:with-local-interrupts
              (when (sql-iterator-close-function iterator)
                (funcall (sql-iterator-close-function iterator))))
-        (when *sql-open-iterators* (remhash iterator *sql-open-iterators*))
-        (setf (sql-iterator-next-function iterator) nil
-              (sql-iterator-close-function iterator) nil))))
+        (unwind-protect
+             (when (sql-iterator-release-function iterator)
+               (funcall (sql-iterator-release-function iterator)))
+          (when *sql-open-iterators* (remhash iterator *sql-open-iterators*))
+          (setf (sql-iterator-next-function iterator) nil
+                (sql-iterator-close-function iterator) nil
+                (sql-iterator-release-function iterator) nil)))))
   (values))
 
 (defun map-sql-iterator (iterator callback)

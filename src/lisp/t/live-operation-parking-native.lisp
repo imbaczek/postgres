@@ -39,23 +39,22 @@ an extensionless destination."
     (assert (eql virtual (backend-virtual-reader-xid backend)))
     (assert (eq query-token (gethash backend *live-operation-backend-query-tokens*)))
     (assert (every #'eq runtime (list *catalog* *clog-stream* *relation-streams*)))
-    (assert (eq *parking-native-wrapper* (symbol-function 'eval-setting-function)))
+    (assert (eq *parking-native-wrapper* (symbol-function 'sql-setting-value)))
     (assert (eq :active (live-operation-token-state *live-operation-current-token*)))
     (assert (backend-read-only backend))
     (assert (not (recovery-in-progress-p))))
   "resumed")
 
 (defun parking-native-install (root)
-  (let ((original (symbol-function 'eval-setting-function)))
+  (let ((original (symbol-function 'sql-setting-value)))
     (setf *parking-native-root* root
           *parking-native-calls* 0
           *parking-native-wrapper*
-          (lambda (name arguments)
-            (if (and (string= name "current_setting")
-                     (equal (first arguments) "pg_lisp_test_park"))
+          (lambda (name &optional missing-ok)
+            (if (equal name "pg_lisp_test_park")
                 (parking-native-wait)
-                (funcall original name arguments)))
-          (symbol-function 'eval-setting-function) *parking-native-wrapper*
+                (funcall original name missing-ok)))
+          (symbol-function 'sql-setting-value) *parking-native-wrapper*
           *live-operation-before-open-hook*
           (lambda ()
             (when (and (string= (sb-thread:thread-name sb-thread:*current-thread*) "pg code reloader")
@@ -65,7 +64,7 @@ an extensionless destination."
   t)
 
 (defun parking-native-reloaded-p ()
-  (not (eq *parking-native-wrapper* (symbol-function 'eval-setting-function))))
+  (not (eq *parking-native-wrapper* (symbol-function 'sql-setting-value))))
 
 (defun parking-native-verify ()
   (assert (= 1 *parking-native-calls*))

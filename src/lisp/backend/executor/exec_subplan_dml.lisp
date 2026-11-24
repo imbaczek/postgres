@@ -341,7 +341,8 @@
           (*subquery-result-cache* (make-hash-table :test #'eq))
           (*subquery-registered-relations* relations)
           (*subquery-outer-frames* nil)
-          (*subquery-backend-entry* (query-plan-backend-entry :interpreter)))
+          (*iterator-index-scan-domain-p* t)
+          (*select-index-scans* *select-index-scans*))
       (call-with-query-cte-execution
        (null *query-execution-owner*)
        (lambda ()
@@ -493,7 +494,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
              (if source
                  (let ((*datum-origin-capture* (simple-datum-origin-plan-p (query-plan-physical source) (subquery-registered-relations source)))
                        (*query-row-origins* nil))
-                   (execute-query-plan
+                   (map-query-plan-rows
                     source (subquery-registered-relations source)
                     (lambda (row)
                       (insert-row (mapcar (lambda (target) (getf target :expr))

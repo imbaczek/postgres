@@ -50,8 +50,8 @@
     (setf (gethash "view_slot" *wal-replication-slots*) slot)
     (unwind-protect
          (with-registered-select-relations (registered relations)
-           (execute-query-plan plan registered
-                               (lambda (row) (push row rows))))
+           (map-query-plan-rows plan registered
+                                (lambda (row) (push row rows))))
       (reset-backend-transaction *backend*))
     (setf rows (nreverse rows))
     (check (= (length rows) 1)
@@ -203,28 +203,25 @@
                   (list :type :inner)
                   (list :index-scan 0 93011 93021 '(:bool t :type :bool) #(1))
                   (list :index-scan 1 93012 93022 '(:bool t :type :bool) #(1)))))
-         (original-backend-entry (symbol-function 'query-plan-backend-entry))
+         (original-iterator (symbol-function 'make-resumable-query-plan-iterator))
          (expected-locks (mapcar #'btree-relation-lock '(202 101)))
          (executor-ran-under-locks-p nil))
     (unwind-protect
          (progn
            (check (equal (query-plan-index-relfilenodes plan relations) '(101 202))
                   "nested IndexScans resolve to sorted, deduplicated relation IDs")
-           (setf (symbol-function 'query-plan-backend-entry)
-                 (lambda (backend)
-                   (declare (ignore backend))
-                   (make-query-plan-backend
-                    :executor
-                    (lambda (query registered callback)
-                      (declare (ignore query registered callback))
-                      (setf executor-ran-under-locks-p
-                            (and (every #'btree-read-lease-active-p *btree-read-leases*)
-                                 (equal (mapcar #'btree-read-lease-lock-state *btree-read-leases*)
-                                        expected-locks)))))))
-           (execute-query-plan plan relations nil :backend :lock-order-test)
+           (setf (symbol-function 'make-resumable-query-plan-iterator)
+                 (lambda (query registered)
+                   (declare (ignore query registered))
+                   (setf executor-ran-under-locks-p
+                         (and (every #'btree-read-lease-active-p *btree-read-leases*)
+                              (equal (mapcar #'btree-read-lease-lock-state *btree-read-leases*)
+                                     expected-locks)))
+                   (make-sql-iterator (lambda () (values nil nil)))))
+           (map-query-plan-rows plan relations #'identity)
            (check executor-ran-under-locks-p
                   "executor starts only after the full sorted index read-lock set"))
-      (setf (symbol-function 'query-plan-backend-entry) original-backend-entry))))
+      (setf (symbol-function 'make-resumable-query-plan-iterator) original-iterator))))
 
 (defun test-select-toast-reader-domain ()
   (let* ((toast (make-pg-toast :oid 100 :relfilenode 104 :index-relfilenode 102))
@@ -282,7 +279,7 @@
                                       (list :filter '(:bool t :type :bool)
                                             scan-node)))))
          (registered (list (list :table table :path path)))
-         (original-btree-scan (symbol-function 'call-with-btree-equal-cursor))
+         (original-btree-scan (symbol-function 'open-btree-equal-cursor-unlocked))
          (original-next-tid (symbol-function 'btree-cursor-next-tid))
          (original-get-tuple (symbol-function 'heapam-get-tuple))
          (original-visible (symbol-function 'htup-visible-p))
@@ -292,20 +289,15 @@
          (seen 0))
     (unwind-protect
          (progn
-           (setf (symbol-function 'call-with-btree-equal-cursor)
-                 (lambda (relfilenode key function)
+           (setf (symbol-function 'open-btree-equal-cursor-unlocked)
+                 (lambda (relfilenode key)
                    (incf scan-calls)
-                   (call-with-btree-relation-read-lease
-                    relfilenode
-                    (lambda (lease)
-                      (funcall function
-                               (make-btree-equal-cursor
-                                :relfilenode relfilenode :key key
-                                :stack (list (make-btree-equal-cursor-frame
-                                              :level 0 :end 2
-                                              :entries (loop for offset from 1 to 3
-                                                             collect (list key 0 offset)))))
-                               lease))))
+                   (make-btree-equal-cursor
+                    :relfilenode relfilenode :key key
+                    :stack (list (make-btree-equal-cursor-frame
+                                  :level 0 :end 2
+                                  :entries (loop for offset from 1 to 3
+                                                 collect (list key 0 offset))))))
                  (symbol-function 'btree-cursor-next-tid)
                  (lambda (cursor)
                    (incf candidate-visits)
@@ -319,13 +311,13 @@
                  (lambda (tuple snapshot)
                    (declare (ignore tuple snapshot))
                    t))
-           (interpret-query-plan
+           (map-query-plan-rows
             plan registered
             (lambda (row) (declare (ignore row)) (incf seen)))
            (check (and (= seen 1) (= heap-visits 1)
                        (= candidate-visits 1) (= scan-calls 1))
                   "LIMIT stops a duplicate-key cursor after its first candidate"))
-      (setf (symbol-function 'call-with-btree-equal-cursor) original-btree-scan
+      (setf (symbol-function 'open-btree-equal-cursor-unlocked) original-btree-scan
             (symbol-function 'btree-cursor-next-tid) original-next-tid
             (symbol-function 'heapam-get-tuple) original-get-tuple
             (symbol-function 'htup-visible-p) original-visible))
@@ -383,139 +375,6 @@
       (check (eq (plan-node-metadata-selection-rule metadata)
                  :sequential-fallback)
              "plan metadata records a stale-index fallback"))))
-
-(defun test-query-plan-compiler-backend-hook ()
-  (let ((original (query-plan-backend-entry :unit-test-compiler))
-        (compiled 0)
-        (rows '())
-        (plan (plan-select-query
-               (first (parse-statements "select 42")))))
-    (unwind-protect
-         (progn
-           (register-query-plan-backend
-            :unit-test-compiler
-            :compiler (lambda (received-plan)
-                        (check (eq received-plan plan)
-                               "compiler receives the physical query plan")
-                        (incf compiled)
-                        (lambda (relations callback)
-                          (declare (ignore relations))
-                          (interpret-query-plan received-plan nil callback))))
-           (execute-query-plan
-            plan nil (lambda (row) (push (aref (car row) 0) rows))
-            :backend :unit-test-compiler)
-           (check (= compiled 1) "compiler backend hook is invoked once")
-           (check (equal rows '(42))
-                  "compiled backend can route execution through an alternate function"))
-      (sb-thread:with-mutex (*query-plan-backend-lock*)
-        (if original
-            (setf (gethash :unit-test-compiler *query-plan-backends*) original)
-            (remhash :unit-test-compiler *query-plan-backends*))))))
-
-(defun test-query-plan-compiler-dispatch-uses-registry-snapshot ()
-  (let* ((name :unit-test-compiler-snapshot)
-         (original (query-plan-backend-entry name))
-         (original-entry-reader (symbol-function 'query-plan-backend-entry))
-         (plan (plan-select-query
-                (first (parse-statements "select 42"))))
-         (rows '())
-         (lookups 0)
-         (caught nil)
-         (replacement
-           (lambda (received-plan relations callback)
-             (declare (ignore received-plan relations))
-             (funcall callback (cons #(99) nil)))))
-    (unwind-protect
-         (progn
-           (register-query-plan-backend
-            name
-            :compiler (lambda (received-plan)
-                        (declare (ignore received-plan))
-                        (lambda (relations callback)
-                          (declare (ignore relations))
-                          (funcall callback (cons #(42) nil)))))
-           (setf (symbol-function 'query-plan-backend-entry)
-                 (lambda (backend)
-                   (if (eq backend name)
-                       (progn
-                         (incf lookups)
-                         (if (= lookups 1)
-                             (prog1 (funcall original-entry-reader backend)
-                               ;; Model replacement after dispatch captured the
-                               ;; compiler entry but before a second lookup.
-                               (register-query-plan-backend
-                                name :executor replacement))
-                             (funcall original-entry-reader backend)))
-                       (funcall original-entry-reader backend))))
-           (handler-case
-               (execute-query-plan
-                plan nil (lambda (row) (push (aref (car row) 0) rows))
-                :backend name)
-             (error (condition) (setf caught condition)))
-           (check (null caught)
-                  "compiler dispatch keeps the backend entry captured at lookup")
-           (check (= lookups 1)
-                  "compiler dispatch reads the backend registry only once")
-           (check (equal rows '(42))
-                  "a concurrent backend replacement does not change active dispatch"))
-      (setf (symbol-function 'query-plan-backend-entry) original-entry-reader)
-      (sb-thread:with-mutex (*query-plan-backend-lock*)
-        (if original
-            (setf (gethash name *query-plan-backends*) original)
-            (remhash name *query-plan-backends*))))))
-
-(defun test-query-plan-backend-registry-synchronization ()
-  (let* ((name :unit-test-backend-registry)
-         (original (query-plan-backend-entry name))
-         (plan (plan-select-query
-                (first (parse-statements "select 42"))))
-         (failures '())
-         (failure-lock (sb-thread:make-mutex :name "backend registry test")))
-    (labels ((executor-for (value)
-               (lambda (received-plan relations callback)
-                 (declare (ignore received-plan relations))
-                 (funcall callback
-                          (cons (vector value
-                                        (sb-thread:holding-mutex-p
-                                         *query-plan-backend-lock*))
-                                nil))))
-             (record-failure (failure)
-               (sb-thread:with-mutex (failure-lock)
-                 (push failure failures))))
-      (unwind-protect
-           (progn
-             (register-query-plan-backend name :executor (executor-for 1))
-             (let ((writer
-                     (sb-thread:make-thread
-                      (lambda ()
-                        (dotimes (iteration 300)
-                          (register-query-plan-backend
-                           name :executor (executor-for
-                                           (if (evenp iteration) 1 2)))))))
-                   (reader
-                     (sb-thread:make-thread
-                      (lambda ()
-                        (loop repeat 300
-                              do
-                                 (handler-case
-                                     (let ((row nil))
-                                       (execute-query-plan
-                                        plan nil (lambda (result) (setf row result))
-                                        :backend name)
-                                       (unless (and row
-                                                    (member (aref (car row) 0) '(1 2))
-                                                    (not (aref (car row) 1)))
-                                         (record-failure row)))
-                                   (error (condition)
-                                     (record-failure condition))))))))
-               (sb-thread:join-thread writer)
-               (sb-thread:join-thread reader))
-             (check (null failures)
-                    "concurrent backend registration and dispatch use synchronized snapshots"))
-        (sb-thread:with-mutex (*query-plan-backend-lock*)
-          (if original
-              (setf (gethash name *query-plan-backends*) original)
-              (remhash name *query-plan-backends*)))))))
 
 (defun test-relation-build-own-xid ()
   (let ((relfilenode 987653)

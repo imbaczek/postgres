@@ -14,7 +14,7 @@
 
 (defun index-parking-install (root expected)
   (parking-native-install root)
-  (let ((original (symbol-function 'eval-setting-function))
+  (let ((original (symbol-function 'sql-setting-value))
         (push-node (symbol-function 'btree-cursor-push-node)))
     (setf *index-parking-visits* 0
           *index-parking-paths* nil
@@ -29,9 +29,8 @@
             (funcall push-node cursor level block))
           (symbol-function 'btree-cursor-push-node) *index-parking-push-wrapper*
           *parking-native-wrapper*
-          (lambda (name arguments)
-            (if (and (string= name "current_setting")
-                     (equal (first arguments) "pg_lisp_test_index_park"))
+          (lambda (name &optional missing-ok)
+            (if (equal name "pg_lisp_test_index_park")
                 (progn
                   (incf *index-parking-visits*)
                   (if (= 1 *index-parking-visits*)
@@ -42,8 +41,8 @@
                                (select-index-scan-cursor (first *select-index-scans*))))
                         (parking-native-wait))
                       "visited"))
-                (funcall original name arguments)))
-          (symbol-function 'eval-setting-function) *parking-native-wrapper*
+                (funcall original name missing-ok)))
+          (symbol-function 'sql-setting-value) *parking-native-wrapper*
           *live-operation-parking-test-hook*
           (lambda (point token)
             (declare (ignore token))

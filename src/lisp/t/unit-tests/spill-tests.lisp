@@ -5,6 +5,13 @@
 (declaim (ftype function make-query-spill-test-directory
                 query-spill-test-directory-empty-p))
 
+(defun map-unit-hash-aggregate (rows keys count function)
+  (with-query-temp-files ()
+                         (let* ((input (make-sql-iterator (lambda () (when rows (values (pop rows) t)))))
+                                (iterator (make-hash-aggregate-iterator input keys count)))
+                           (unwind-protect (map-sql-iterator iterator function)
+                             (close-sql-iterator iterator)))))
+
 (defun test-hash-aggregate-partitioned-spill ()
   (let* ((directory (make-query-spill-test-directory))
          (rows (loop for index below 120
@@ -18,12 +25,11 @@
     (unwind-protect
          (let ((*query-temp-directory* directory)
                (*query-work-memory-bytes* 180))
-           (stream-hash-aggregate
-            (lambda (callback) (dolist (row rows) (funcall callback row)))
-            (list group-key) 1
-            (lambda (row)
-              (setf (gethash (sql-group-value-key (aref row 0) :int4) actual)
-                    (aref row 1))))
+           (map-unit-hash-aggregate rows
+                                    (list group-key) 1
+                                    (lambda (row)
+                                      (setf (gethash (sql-group-value-key (aref row 0) :int4) actual)
+                                            (aref row 1))))
            (check (and (= (hash-table-count actual) (hash-table-count expected))
                        (loop for key being the hash-keys of expected
                              always (= (gethash key actual -1)
@@ -44,11 +50,10 @@
          (let ((*query-temp-directory* directory)
                (*query-work-memory-bytes* 1)
                (+hash-aggregate-partition-count+ 1))
-           (stream-hash-aggregate
-            (lambda (callback) (dolist (row rows) (funcall callback row)))
-            (list group-key) 1
-            (lambda (row)
-              (setf (gethash (aref row 0) actual) (aref row 1))))
+           (map-unit-hash-aggregate rows
+                                    (list group-key) 1
+                                    (lambda (row)
+                                      (setf (gethash (aref row 0) actual) (aref row 1))))
            (check (and (= (hash-table-count actual) (length rows))
                        (loop for value below (length rows)
                              always (= (gethash value actual -1) 1)))
@@ -56,10 +61,8 @@
            (check (query-spill-test-directory-empty-p directory)
                   "sort fallback removes spill and merge files")
            (let ((scalar-rows nil))
-             (stream-hash-aggregate (lambda (callback)
-                                      (declare (ignore callback)))
-                                    nil 1
-                                    (lambda (row) (push (aref row 0) scalar-rows)))
+             (map-unit-hash-aggregate nil nil 1
+                                      (lambda (row) (push (aref row 0) scalar-rows)))
              (check (equal scalar-rows '(0))
                     "empty scalar COUNT(*) emits one zero-count row")))
       (ignore-errors
@@ -571,15 +574,10 @@
                    (if (eq expr :spill-join-equal)
                        (= (aref environment 0) (aref environment 1))
                        (funcall original-eval expr environment))))
-           (stream-select-join-environments
-            (lambda (visit-left) (funcall visit-left #(1)))
-            (lambda (visit-right)
-              (dolist (row (list (vector 1 bytea-a)
-                                 (vector 2 bytea-b)))
-                (when (eq (funcall visit-right row) :stop)
-                  (return :stop))))
-            (list :type :full :qual :spill-join-equal
-                  :left-width 1 :right-width 2)
+           (map-unit-join
+            (make-unit-row-iterator (list #(1)))
+            (make-unit-row-iterator (list (vector 1 bytea-a) (vector 2 bytea-b)))
+            (list :type :full :qual :spill-join-equal :left-width 1 :right-width 2)
             (lambda (row) (push row emitted)))
            (setf emitted (nreverse emitted))
            (check (= (length emitted) 2)
@@ -720,23 +718,13 @@
          (plan (%make-query-plan
                 :physical (list :sort order
                                 (list :project (list target) scan))))
-         (registered (list (list :table table :path path)))
-         (original-scan (symbol-function 'scan-select-path))
          (input (list #(2 "A") #(1 "B") #(2 "C") #(1 "D")))
+         (registered (list (list :table table :path path :row-source (lambda () input))))
          (labels '()))
     (unwind-protect
          (let ((*query-work-memory-bytes* 1)
                (*query-temp-directory* directory))
-           (setf (symbol-function 'scan-select-path)
-                 (lambda (received-table relfilenode received-path snapshot callback
-                          &optional environment)
-                   (declare (ignore relfilenode received-path snapshot environment))
-                   (check (eq received-table table)
-                          "external sort reads its registered scan relation")
-                   (dolist (values input)
-                     (when (eq (funcall callback (make-htup :values values)) :stop)
-                       (return :stop)))))
-           (interpret-query-plan
+           (map-query-plan-rows
             plan registered
             (lambda (row) (push (aref (car row) 0) labels)))
            (setf labels (nreverse labels))
@@ -746,7 +734,7 @@
                   "external sort removes run files after completion")
            (setf labels nil)
            (let ((delivered 0))
-             (interpret-query-plan
+             (map-query-plan-rows
               plan registered
               (lambda (row)
                 (incf delivered)
@@ -758,7 +746,6 @@
                     "external sort stop returns the first stable sorted row"))
            (check (query-spill-test-directory-empty-p directory)
                   "external sort removes merged run files after early stop"))
-      (setf (symbol-function 'scan-select-path) original-scan)
       (ignore-errors
        (uiop:delete-directory-tree directory :validate t
                                              :if-does-not-exist :ignore)))))

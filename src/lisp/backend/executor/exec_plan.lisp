@@ -1,4 +1,4 @@
-;;;; exec_plan.lisp -- S-expression query plans and their reference interpreter.
+;;;; exec_plan.lisp -- S-expression query plans and executor support.
 
 (in-package #:pg)
 
@@ -19,65 +19,10 @@
   prepared
   (metadata (make-hash-table :test #'eq)))
 
-(defstruct query-plan-backend
-  executor
-  compiler)
-
-(defvar *query-plan-backends* (make-hash-table :test #'eq))
 (defvar *query-plan-instrumentation-p* nil)
-(defvar *query-plan-backend-lock*
-  (sb-thread:make-mutex :name "pg query-plan backend registry"))
 
 (defun internal-time-ticks->milliseconds (ticks)
   (* 1000.0d0 (/ ticks internal-time-units-per-second)))
-
-(defun query-plan-backend-entry (name)
-  (sb-thread:with-mutex (*query-plan-backend-lock*)
-    (gethash name *query-plan-backends*)))
-
-(defun register-query-plan-backend (name &key executor compiler)
-  "Register an executor and/or compiler for physical query plans.
-
-An executor accepts PLAN, REGISTERED-RELATIONS and ROW-CALLBACK. A compiler
-accepts PLAN and returns a function accepting REGISTERED-RELATIONS and
-ROW-CALLBACK."
-  (unless (or executor compiler)
-    (error "A query-plan backend needs an executor or compiler"))
-  (let ((entry (make-query-plan-backend :executor executor :compiler compiler)))
-    (sb-thread:with-mutex (*query-plan-backend-lock*)
-      (setf (gethash name *query-plan-backends*) entry)))
-  name)
-
-(defun compile-query-plan (plan &optional (backend :sbcl-compiled))
-  "Compile PLAN through BACKEND's compiler hook, if one is installed."
-  (let* ((entry (query-plan-backend-entry backend))
-         (compiler (and entry (query-plan-backend-compiler entry))))
-    (unless compiler
-      (ereport "0A000" "query-plan compiler backend ~a is not installed"
-               backend))
-    (funcall compiler plan)))
-
-(defun execute-query-plan (plan registered-relations row-callback &key (backend :interpreter))
-  "Execute a plan and its subqueries in one registered statement domain."
-  (let* ((root-p (not *subquery-execution-active-p*))
-         (*subquery-result-cache* (if root-p (make-hash-table :test #'eq) *subquery-result-cache*))
-         (*subquery-registered-relations* (if root-p registered-relations *subquery-registered-relations*))
-         (*subquery-outer-frames* (if root-p nil *subquery-outer-frames*))
-         (*subquery-backend-entry* (if root-p (query-plan-backend-entry backend) *subquery-backend-entry*))
-         (*subquery-execution-active-p* t)
-         (entry *subquery-backend-entry*)
-         (executor (and entry (query-plan-backend-executor entry))))
-    (call-with-query-cte-execution
-     root-p
-     (lambda ()
-       (call-with-select-index-lease-domain
-        (query-plan-index-relfilenodes plan registered-relations)
-        (lambda ()
-          (cond
-            (executor (funcall executor plan registered-relations row-callback))
-            ((and entry (query-plan-backend-compiler entry))
-             (funcall (funcall (query-plan-backend-compiler entry) plan) registered-relations row-callback))
-            (t (ereport "0A000" "query-plan backend ~a is not installed" backend)))))))))
 
 (defun query-plan-sexp (plan)
   "Return the inspectable logical/physical plan artifact."
@@ -877,27 +822,16 @@ across runs, while preserving the order of equal keys."
                   always (or (null next) (funcall less-p (third run) (second next))))
         ordered))))
 
-(defun stream-disjoint-query-sort-runs (runs callback)
-  "Drain disjoint runs in sequence with only one open file."
-  (let ((buffer (make-query-sort-spill-buffer)))
-    (dolist (run runs)
-      (with-query-temp-input (input (first run) t)
-        (loop for item = (read-query-sort-spill-item input buffer)
-              until (eq item +query-spill-eof+)
-              do (check-for-interrupts)
-                 (when (eq (funcall callback item) :stop)
-                   (return-from stream-disjoint-query-sort-runs :stop)))))))
-
-;; Bound simultaneously open files and per-run stream buffers. The last merge
-;; streams directly to the consumer instead of writing another temporary run.
 (defconstant +query-sort-merge-fan-in+ 32)
 
-(defun stream-query-sort-runs (runs order callback)
-  "Merge sorted runs, returning :STOP if CALLBACK stops.
-Keep one decoded item and one input buffer per run. The sequence number in each
-item breaks equal-key ties. Input streams remain owned until this call exits."
+(defun make-query-sort-merge-iterator (runs order &key delete-runs-p)
+  "Pull stable sort items from runs, keeping one decoded item per input.
+The iterator closes its input streams. DELETE-RUNS-P also removes the run files
+when the reader closes, including after an early stop."
   (let ((heap (make-array (length runs)))
-        (count 0))
+        (streams nil)
+        (count 0)
+        (initialized nil))
     (labels ((less-p (left right)
                (select-sort-item-less-p (car left) (car right) order))
              (sift-down (position)
@@ -912,33 +846,71 @@ item breaks equal-key ties. Input streams remain owned until this call exits."
                        do (setf (aref heap position) (aref heap child)
                                 position child))
                  (setf (aref heap position) entry)))
-             (merge-open-runs ()
+             (initialize ()
+               (dolist (path runs)
+                 (let ((input (sb-sys:without-interrupts
+                                (let ((stream (open-query-temp-input path t)))
+                                  (push stream streams)
+                                  stream)))
+                       (buffer (make-query-sort-spill-buffer)))
+                   (let ((item (read-query-sort-spill-item input buffer)))
+                     (unless (eq item +query-spill-eof+)
+                       (setf (aref heap count) (list item input buffer))
+                       (incf count)))))
                (loop for position downfrom (1- (floor count 2)) to 0
                      do (sift-down position))
-               (loop while (plusp count)
-                     for entry = (aref heap 0)
-                     do (check-for-interrupts)
-                        (when (eq (funcall callback (car entry)) :stop)
-                          (return :stop))
-                        (let ((next (read-query-sort-spill-item (second entry) (third entry))))
-                          (if (eq next +query-spill-eof+)
-                              (progn
-                                (decf count)
-                                (setf (aref heap 0) (aref heap count)
-                                      (aref heap count) nil))
-                              (setf (car entry) next)))
-                        (when (plusp count) (sift-down 0))))
-             (open-runs (paths)
-               (if (endp paths)
-                   (merge-open-runs)
-                   (with-query-temp-input (input (car paths) t)
-                     (let* ((buffer (make-query-sort-spill-buffer))
-                            (item (read-query-sort-spill-item input buffer)))
-                       (unless (eq item +query-spill-eof+)
-                         (setf (aref heap count) (list item input buffer))
-                         (incf count)))
-                     (open-runs (cdr paths))))))
-      (open-runs runs))))
+               (setf initialized t))
+             (advance ()
+               (when (plusp count)
+                 (let* ((entry (aref heap 0))
+                        (next (read-query-sort-spill-item (second entry) (third entry))))
+                   (if (eq next +query-spill-eof+)
+                       (progn
+                         (decf count)
+                         (setf (aref heap 0) (aref heap count)
+                               (aref heap count) nil))
+                       (setf (car entry) next))
+                   (when (plusp count) (sift-down 0))))))
+      (make-sql-iterator
+       (lambda ()
+         ;; Refill only when the consumer requests another item.
+         (if initialized (advance) (initialize))
+         (when (plusp count)
+           (values (car (aref heap 0)) t)))
+       (lambda ()
+         (dolist (stream streams)
+           (finish-query-temp-stream stream nil))
+         (when delete-runs-p
+           (dolist (path runs) (delete-query-temp-file path))))))))
+
+(defun make-disjoint-query-sort-iterator (runs)
+  "Pull strictly ordered runs, reclaiming each file before opening the next."
+  (let ((input nil)
+        (path nil)
+        (buffer (make-query-sort-spill-buffer)))
+    (make-sql-iterator
+     (lambda ()
+       (loop
+         (unless input
+           (unless runs (return))
+           (sb-sys:without-interrupts
+             (setf path (first (pop runs))
+                   input (open-query-temp-input path t))))
+         (let ((item (read-query-sort-spill-item input buffer)))
+           (unless (eq item +query-spill-eof+)
+             (return (values item t))))
+         (finish-query-temp-stream input t)
+         (delete-query-temp-file path)
+         (setf input nil path nil)))
+     (lambda ()
+       (unwind-protect (finish-query-temp-stream input nil)
+         (when path (delete-query-temp-file path))
+         (dolist (run runs) (delete-query-temp-file (first run))))))))
+
+(defun stream-query-sort-runs (runs order callback)
+  (let ((iterator (make-query-sort-merge-iterator runs order)))
+    (unwind-protect (map-sql-iterator iterator callback)
+      (close-sql-iterator iterator))))
 
 (defun merge-query-sort-runs (runs order)
   "Write one owned merged run before deleting its inputs.
@@ -964,28 +936,6 @@ The surrounding temporary-file scope owns all paths on an error or interrupt."
                     (car group)
                     (merge-query-sort-runs group order))))
 
-(defun stream-select-sort (streamer order callback &key on-complete limit projected-only-p)
-  "Sort a stream with bounded in-memory runs and stable external merges."
-  (when (and limit (zerop (check-select-limit limit)))
-    (return-from stream-select-sort (when on-complete (funcall on-complete))))
-  (unless limit
-    (return-from stream-select-sort
-      (call-with-query-sort-arena
-       (lambda (arena)
-         (stream-select-sort-with-arena streamer order callback arena on-complete nil projected-only-p)))))
-  (let ((remaining limit)
-        (stopped nil))
-    (call-with-query-sort-arena
-     (lambda (arena)
-       (stream-select-sort-with-arena
-        streamer order
-        (lambda (row)
-          (setf stopped (eq (funcall callback row) :stop))
-          (when (or stopped (zerop (decf remaining))) :stop))
-        arena nil limit)))
-    (cond (stopped :stop)
-          (on-complete (funcall on-complete)))))
-
 (defun grouping-rows-equal-p (keys left right)
   "Compare grouping keys in LEFT and RIGHT using SQL not-distinct semantics.
 Two NULLs match, and one NULL does not. As in C ExecBuildGroupingEqual, visit
@@ -997,21 +947,6 @@ is raised only if comparison reaches it."
         for b = (eval-expr key right)
         always (if (eq a +null+) (eq b +null+)
                    (and (not (eq b +null+)) (sql-compare "=" a b)))))
-
-(defun stream-sorted-distinct (source keys callback)
-  "Sort DISTINCT inputs and compare adjacent rows when records cannot be hashed.
-Sorting visits keys in priority order; adjacent equality visits them in reverse
-order, as ExecBuildGroupingEqual does. Hashing would inspect unused fields even
-for singleton input or records decided by earlier fields. Reuse the bounded
-sorter for spill and origins, and emit each row as (projected . projected)."
-  (let ((previous nil))
-    (stream-select-sort
-     source (mapcar (lambda (key) (list (list :sort-output (second key)))) keys)
-     (lambda (row)
-       (unless (and previous
-                    (grouping-rows-equal-p keys previous (car row)))
-         (setf previous (copy-query-sort-value (car row)))
-         (funcall callback (cons (car row) (car row))))))))
 
 (defun datum-origins-for-spill (origins)
   "Represent detached origins with ordinary vectors and lists for sort/spill."
@@ -1043,138 +978,101 @@ sorter for spill and origins, and emit each row as (projected . projected)."
                                       (datum-origins-for-spill (select-top-n-item-origins item))
                                       (select-top-n-item-presence item)))
 
-(defun stream-select-sort-with-arena (streamer order callback arena
-                                      &optional on-complete limit projected-only-p)
-  "Sort streamed rows in memory or owned temporary runs and pass them to CALLBACK.
-PROJECTED-ONLY-P is for a terminal consumer that needs only projected values.
-When all keys refer to output slots, those values also supply the sort keys."
-  (with-query-temp-files ()
-                         (let ((buffer '())
-                               (buffer-bytes 0)
-                               (max-item-bytes 1)
-                               (sequence 0)
-                               (single-order-key (and (null (cdr order)) (caar order)))
-                               (projected-keys-p (and projected-only-p
-                                                      (every (lambda (entry)
-                                                               (eq (caar entry) :sort-output))
-                                                             order)))
-                               (runs '())
-                               (memory-limit (max 1 *query-work-memory-bytes*))
-                               (top-n (when limit
-                                        (make-select-top-n-collector
-                                         limit order (lambda (item)
-                                                       (query-spill-record-size (top-n-spill-item item)))))))
-                           (labels ((own-run ()
-                                      ;; Batch region switches: SBCL discards unused TLAB space on
-                                      ;; every exit. Staging and the arena copy briefly coexist.
-                                      (when arena
-                                        (setf buffer
-                                              (call-in-query-sort-arena
-                                               arena (lambda () (copy-query-sort-value buffer))))))
-                                    (flush-run ()
-                                      (when buffer
-                                        (own-run)
-                                        (multiple-value-bind (path start end)
-                                            (write-query-sort-run (nreverse buffer) order)
-                                          (push (list path start end) runs))
-                                        (setf buffer nil buffer-bytes 0)
-                                        (reset-query-sort-arena arena)))
-                                    (buffer-item (item item-bytes)
-                                      (setf max-item-bytes (max max-item-bytes item-bytes))
-                                      (when (and buffer
-                                                 (> (+ buffer-bytes item-bytes) memory-limit))
-                                        (flush-run))
-                                      (push item buffer)
-                                      (incf buffer-bytes item-bytes)
-                                      (when (>= buffer-bytes memory-limit)
-                                        (flush-run)))
-                                    (make-item (row)
-                                      (let ((sequence-number sequence)
-                                            (keys (unless projected-keys-p
-                                                    (if single-order-key
-                                                        (vector (select-order-value single-order-key row))
-                                                        (map 'vector
-                                                             (lambda (entry) (select-order-value (car entry) row))
-                                                             order)))))
-                                        (incf sequence)
-                                        (if projected-only-p
-                                            (make-query-sort-item sequence-number keys (car row))
-                                            (make-query-sort-item-with-metadata
-                                             sequence-number keys row
-                                             (and *datum-origin-capture*
-                                                  (datum-origins-for-spill *query-row-origins*))
-                                             *query-row-presence*))))
-                                    (emit-item (item &optional copy-p)
-                                      (let* ((row (query-sort-item-row item))
-                                             (row (if copy-p (copy-query-sort-value row) row))
-                                             (presence (unless projected-only-p
-                                                         (query-sort-item-with-metadata-presence item)))
-                                             (*query-row-origins* (and *datum-origin-capture*
-                                                                       (not projected-only-p)
-                                                                       (datum-origins-from-spill
-                                                                        (query-sort-item-with-metadata-origins item))))
-                                             (*query-row-presence* (if copy-p
-                                                                       (copy-query-sort-value presence)
-                                                                       presence)))
-                                        (funcall callback (if projected-only-p (cons row nil) row)))))
-                             (unwind-protect
-                                  (progn
-                                    (funcall
-                                     streamer
-                                     (lambda (row)
-                                       (check-for-interrupts)
-                                       (cond
-                                         (top-n
-                                          (offer-select-top-n-row top-n row)
-                                          (when (>= (select-top-n-collector-bytes top-n) memory-limit)
-                                            ;; Discarded rows already rank below LIMIT candidates.
-                                            ;; Transfer the evaluated keys and original tie breakers.
-                                            (let ((heap (select-top-n-collector-heap top-n)))
-                                              (setf sequence (select-top-n-collector-next-sequence top-n)
-                                                    top-n nil)
-                                              (loop for item across heap
-                                                    do (buffer-item (top-n-spill-item item)
-                                                                    (select-top-n-item-bytes item))))))
-                                         (t
-                                          (let ((item (make-item row)))
-                                            (buffer-item item (query-spill-record-size item)))))))
-                                    (when top-n
-                                      (setf buffer (map 'list #'top-n-spill-item
-                                                        (select-top-n-collector-heap top-n))))
-                                    (if (null runs)
-                                        (progn
-                                          (unless top-n (own-run))
-                                          (dolist (item
-                                                   (stable-sort
-                                                    (nreverse buffer)
-                                                    (lambda (left right)
-                                                      (select-sort-item-less-p left right order))))
-                                            (check-for-interrupts)
-                                            ;; Consumers, including instrumentation, can retain rows.
-                                            (when (eq (emit-item item arena) :stop)
-                                              (return-from stream-select-sort-with-arena :stop))))
-                                        (progn
-                                          (flush-run)
-                                          (let* ((ordered (nreverse runs))
-                                                 (disjoint (disjoint-query-sort-runs ordered (cdar order)))
-                                                 (result
-                                                   (if disjoint
-                                                       (stream-disjoint-query-sort-runs disjoint #'emit-item)
-                                                       (let ((paths (mapcar #'first ordered))
-                                                             ;; Each input retains one decoded row.
-                                                             ;; Allow two inputs even when one row
-                                                             ;; exceeds the memory estimate.
-                                                             (fan-in (min +query-sort-merge-fan-in+
-                                                                          (max 2 (floor memory-limit max-item-bytes)))))
-                                                         (loop while (> (length paths) fan-in)
-                                                               do (setf paths (merge-query-sort-run-pass paths order fan-in)))
-                                                         (stream-query-sort-runs paths order #'emit-item)))))
-                                            (when (eq result :stop)
-                                              (return-from stream-select-sort-with-arena :stop)))))
-                                    (when on-complete (funcall on-complete)))
-                               ;; This captured cell lives on the heap. Clear it before arena reset
-                               ;; or destruction, including cancellation and downstream errors.
-                               (setf buffer nil))))))
+(defun prepare-select-sort (input order arena limit projected-only-p)
+  "Consume INPUT and return an iterator over sorted items.
+LIMIT bounds the initial top-N collector. If it exceeds the memory budget,
+its retained items become sorted runs and the reader enforces the final limit.
+PROJECTED-ONLY-P stores projected values without row metadata. The caller owns
+the temporary-file scope for the lifetime of the result and must close the
+iterator. In-memory arena items are copied out before the arena is destroyed."
+  (let* ((buffer nil)
+         (buffer-bytes 0)
+         (max-item-bytes 1)
+         (sequence 0)
+         (single-order-key (and (null (cdr order)) (caar order)))
+         (projected-keys-p (and projected-only-p
+                                (every (lambda (entry) (eq (caar entry) :sort-output)) order)))
+         (runs nil)
+         (memory-limit (max 1 *query-work-memory-bytes*))
+         (top-n (when limit
+                  (make-select-top-n-collector
+                   limit order (lambda (item) (query-spill-record-size (top-n-spill-item item)))))))
+    (labels ((own-run ()
+               ;; Batch allocations in the sort arena to avoid switching per item.
+               (when arena
+                 (setf buffer (call-in-query-sort-arena
+                               arena (lambda () (copy-query-sort-value buffer))))))
+             (flush-run ()
+               (when buffer
+                 (own-run)
+                 (multiple-value-bind (path start end)
+                     (write-query-sort-run (nreverse buffer) order)
+                   (push (list path start end) runs))
+                 (setf buffer nil buffer-bytes 0)
+                 (reset-query-sort-arena arena)))
+             (buffer-item (item item-bytes)
+               (setf max-item-bytes (max max-item-bytes item-bytes))
+               (when (and buffer (> (+ buffer-bytes item-bytes) memory-limit))
+                 (flush-run))
+               (push item buffer)
+               (incf buffer-bytes item-bytes)
+               (when (>= buffer-bytes memory-limit)
+                 (flush-run)))
+             (make-item (row)
+               (let ((sequence-number sequence)
+                     (keys (unless projected-keys-p
+                             (if single-order-key
+                                 (vector (select-order-value single-order-key row))
+                                 (map 'vector (lambda (entry) (select-order-value (car entry) row)) order)))))
+                 (incf sequence)
+                 (if projected-only-p
+                     (make-query-sort-item sequence-number keys (car row))
+                     (make-query-sort-item-with-metadata
+                      sequence-number keys row
+                      (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*))
+                      *query-row-presence*))))
+             (consume (row)
+               (if top-n
+                   (progn
+                     (offer-select-top-n-row top-n row)
+                     (when (>= (select-top-n-collector-bytes top-n) memory-limit)
+                       ;; Transfer evaluated keys and tie breakers for the surviving rows.
+                       (let ((heap (select-top-n-collector-heap top-n)))
+                         (setf sequence (select-top-n-collector-next-sequence top-n)
+                               top-n nil)
+                         (loop for item across heap
+                               do (buffer-item (top-n-spill-item item)
+                                               (select-top-n-item-bytes item))))))
+                   (let ((item (make-item row)))
+                     (buffer-item item (query-spill-record-size item))))
+               nil))
+      (unwind-protect
+           (progn
+             (map-sql-iterator input #'consume)
+             (when top-n
+               (setf buffer (map 'list #'top-n-spill-item (select-top-n-collector-heap top-n))))
+             (if (null runs)
+                 (progn
+                   (unless top-n (own-run))
+                   (let ((items (stable-sort (nreverse buffer)
+                                             (lambda (left right)
+                                               (select-sort-item-less-p left right order)))))
+                     (when arena (setf items (copy-query-sort-value items)))
+                     (make-sql-iterator (lambda () (when items (values (pop items) t))))))
+                 (progn
+                   (flush-run)
+                   (let* ((ordered (nreverse runs))
+                          (disjoint (disjoint-query-sort-runs ordered (cdar order))))
+                     (if disjoint
+                         (make-disjoint-query-sort-iterator disjoint)
+                         (let ((paths (mapcar #'first ordered))
+                               ;; Allow two inputs even if a single row exceeds work_mem.
+                               (fan-in (min +query-sort-merge-fan-in+
+                                            (max 2 (floor memory-limit max-item-bytes)))))
+                           (loop while (> (length paths) fan-in)
+                                 do (setf paths (merge-query-sort-run-pass paths order fan-in)))
+                           (make-query-sort-merge-iterator paths order :delete-runs-p t)))))))
+        (setf buffer nil)))))
 
 (defparameter +hash-aggregate-partition-count+ 16)
 (defparameter +hash-aggregate-entry-overhead-bytes+ 128)
@@ -1251,45 +1149,10 @@ When all keys refer to output slots, those values also supply the sort keys."
     (delete-query-temp-file (cdr partition)))
   (values))
 
-(defun hash-aggregate-sort-spill (pathname group-keys aggregate-count callback)
-  "Sort one non-shrinking spill batch and reduce adjacent equal groups."
-  (let ((order (mapcar (lambda (expr) (cons expr nil)) group-keys))
-        (current-key nil) (current-state nil) (current-origins nil) (saw-row nil))
-    (labels ((emit-current ()
-               (when current-state
-                 (let ((*query-row-origins*
-                         (and *datum-origin-capture*
-                              (concatenate 'vector (or current-origins #())
-                                           (make-array aggregate-count :initial-element nil)))))
-                   (prog1 (funcall callback (hash-aggregate-state-row current-state))
-                     (setf current-state nil current-origins nil)))))
-             (consume (environment)
-               (multiple-value-bind (values key origins)
-                   (hash-aggregate-group group-keys (cdr environment))
-                 (when (and saw-row (not (equal key current-key)))
-                   (when (eq (emit-current) :stop) (return-from consume :stop)))
-                 (unless current-state
-                   (setf current-state (cons (coerce values 'vector)
-                                             (make-array aggregate-count :initial-element 0))
-                         current-origins origins))
-                 (setf saw-row t current-key key)
-                 (dotimes (index aggregate-count) (incf (aref (cdr current-state) index)))))
-             (source (row-callback)
-               (hash-aggregate-spill-file
-                pathname (lambda (row) (funcall row-callback (cons nil row))))))
-      (let ((result (stream-select-sort #'source order #'consume)))
-        (when (eq result :stop)
-          (return-from hash-aggregate-sort-spill :stop)))
-      (when (and (not saw-row) (null group-keys))
-        (setf current-state (cons #() (make-array aggregate-count :initial-element 0))))
-      (emit-current))))
-
-(defun hash-aggregate-process-rows
-    (source group-keys aggregate-count callback memory-limit depth)
-  "Aggregate a row stream, spilling unseen groups and recursively partitioning them.
-
-The spill stream closes normally after the source returns and is abort-cleaned
-on an abnormal exit."
+(defun prepare-hash-aggregate-batch (source group-keys aggregate-count memory-limit)
+  "Consume one batch and return its in-memory groups, origins and overflow file.
+SOURCE is exhausted before the first group can be returned. The caller owns any
+returned overflow file and processes it after the in-memory groups."
   (let ((groups (make-hash-table :test #'equal))
         (group-order nil)
         (state-origins (make-hash-table :test #'eq))
@@ -1340,68 +1203,18 @@ on an abnormal exit."
       (call-with-query-temp-stream-cleanup
        (lambda () (funcall source #'consume))
        (lambda (normal-p) (finish-query-temp-stream spill-stream normal-p)))
-      (dolist (state (nreverse group-order))
-        (when (eq (let ((*query-row-origins*
-                          (and *datum-origin-capture*
-                               (concatenate 'vector (or (gethash state state-origins) #())
-                                            (make-array aggregate-count :initial-element nil)))))
-                    (funcall callback (hash-aggregate-state-row state))) :stop)
-          (return-from hash-aggregate-process-rows :stop)))
-      (when spill-path
-        ;; Drop this batch's keys and states before processing child batches.
-        ;; PostgreSQL resets its hash table between batches for the same reason.
-        (setf groups (make-hash-table :test #'equal)
-              group-order nil
-              state-origins (make-hash-table :test #'eq)
-              memory-used 0)
-        (when (and (> spill-count 0)
-                   (>= depth +hash-aggregate-max-partition-depth+))
-          (unwind-protect
-               (return-from hash-aggregate-process-rows
-                 (hash-aggregate-sort-spill spill-path group-keys
-                                            aggregate-count callback))
-            (delete-query-temp-file spill-path)))
-        (let ((partitions
-                (hash-aggregate-partition-spill spill-path group-keys (1+ depth))))
-          (when (and (> spill-count 0)
-                     (some (lambda (partition)
-                             (>= (car partition) spill-count))
-                           partitions))
-            (hash-aggregate-delete-partitions partitions)
-            (unwind-protect
-                 (return-from hash-aggregate-process-rows
-                   (hash-aggregate-sort-spill spill-path group-keys
-                                              aggregate-count callback))
-              (delete-query-temp-file spill-path)))
-          (delete-query-temp-file spill-path)
-          (dolist (partition partitions)
-            (let* ((path (cdr partition))
-                   (result
-                     (hash-aggregate-process-rows
-                      (lambda (row-callback)
-                        (hash-aggregate-spill-file path row-callback))
-                      group-keys aggregate-count callback memory-limit
-                      (1+ depth))))
-              (delete-query-temp-file path)
-              (when (eq result :stop)
-                (return-from hash-aggregate-process-rows :stop))))))
-      (values))))
+      (values (nreverse group-order) state-origins spill-path spill-count))))
 
-(defun stream-hash-aggregate (source group-keys aggregate-count callback)
-  "Run bounded hash aggregation with partitioned spill and sort fallback."
-  (let ((keys (loop for key in group-keys for slot from 1
-                    collect (list :col slot :type (expr-type key) :typmod (expr-typmod key)))))
-    (with-query-temp-files ()
-                           (hash-aggregate-process-rows
-                            (lambda (emit)
-                              (funcall source
-                                       (lambda (environment)
-                                         (multiple-value-bind (values key origins)
-                                             (hash-aggregate-group group-keys environment)
-                                           (declare (ignore key))
-                                           (let ((*query-row-origins* origins))
-                                             (funcall emit (coerce values 'vector)))))))
-                            keys aggregate-count callback (max 1 *query-work-memory-bytes*) 0))))
+(defun partition-hash-aggregate-overflow (path row-count group-keys depth)
+  "Return shrinking partitions or indicate that this file needs a sort fallback."
+  (when (>= depth +hash-aggregate-max-partition-depth+)
+    (return-from partition-hash-aggregate-overflow (values nil t)))
+  (let ((partitions (hash-aggregate-partition-spill path group-keys (1+ depth))))
+    (if (some (lambda (partition) (>= (car partition) row-count)) partitions)
+        (progn
+          (hash-aggregate-delete-partitions partitions)
+          (values nil t))
+        (values partitions nil))))
 
 (defstruct average-transition (sum 0) (count 0))
 
@@ -1695,73 +1508,6 @@ on an abnormal exit."
                  (when origins (setf (aref origins i) origin))))
     (values values origins)))
 
-(defun stream-sorted-aggregates (source group-keys descriptors callback)
-  "Sort grouped input and stream one group's aggregate transitions at a time.
-Evaluate keys and aggregate inputs before sorting, so spill replay does not
-repeat scalar evaluation. Compare adjacent keys with SQL equality: a singleton
-needs no equality comparison, and record equality can stop before an unsupported
-later field. With no group keys, emit one aggregate even for empty input.
-
-The current group owns its transition states until emission; close them on
-normal completion, consumer stop, or error. The surrounding temporary-file
-scope owns sort spills. A consumer's :STOP ends further group consumption."
-  (with-query-temp-files ()
-                         (let* ((width (length group-keys))
-                                (keys (loop for key in group-keys for position from 1
-                                            collect (list :col position :type (expr-type key) :typmod (expr-typmod key))))
-                                (states nil) (current-values nil)
-                                (group-origins nil) (transition-origins nil))
-                           (labels ((emit-current ()
-                                      (when states
-                                        (unwind-protect
-                                             (let ((*query-row-origins*
-                                                     (and *datum-origin-capture*
-                                                          (concatenate 'vector group-origins transition-origins))))
-                                               (funcall callback
-                                                        (concatenate 'vector current-values
-                                                                     (aggregate-transition-results states descriptors))))
-                                          (close-aggregate-transition-states states)
-                                          (setf states nil))))
-                                    (consume (row)
-                                      (let ((environment (cdr row)))
-                                        (when (and states (not (grouping-rows-equal-p keys current-values environment)))
-                                          (when (eq (emit-current) :stop) (return-from consume :stop)))
-                                        (unless states
-                                          (setf states (make-aggregate-transition-states descriptors)
-                                                current-values (subseq environment 0 width)
-                                                group-origins (make-array width :initial-element nil)
-                                                transition-origins (make-array (length descriptors) :initial-element nil))
-                                          (when (and *datum-origin-capture* *query-row-origins*)
-                                            (dotimes (i width)
-                                              (setf (aref group-origins i) (aref *query-row-origins* i)))))
-                                        (step-aggregate-transition-origins states descriptors environment
-                                                                           *query-row-origins* transition-origins width)
-                                        (step-aggregate-transition-states states descriptors environment width)))
-                                    (finish ()
-                                      (when (and (null states) (null group-keys))
-                                        (setf states (make-aggregate-transition-states descriptors)
-                                              current-values #() group-origins #()
-                                              transition-origins (make-array (length descriptors) :initial-element nil)))
-                                      (emit-current))
-                                    (input (row-callback)
-                                      (funcall source
-                                               (lambda (environment)
-                                                 (multiple-value-bind (values origins)
-                                                     (aggregate-input-row environment group-keys descriptors)
-                                                   (let ((*query-row-origins* origins))
-                                                     (funcall row-callback (cons nil values))))))))
-                             (unwind-protect
-                                  (if group-keys
-                                      (stream-select-sort #'input (mapcar (lambda (key) (cons key nil)) keys)
-                                                          #'consume :on-complete #'finish)
-                                      (progn (input #'consume) (finish)))
-                               (close-aggregate-transition-states states))))))
-
-(defun stream-select-aggregates (source group-keys specification callback)
-  (if (integerp specification)
-      (stream-hash-aggregate source group-keys specification callback)
-      (stream-sorted-aggregates source group-keys specification callback)))
-
 (defun make-sql-set-function-iterator (call environment)
   (let* ((arguments (mapcar (lambda (argument) (eval-expr argument environment)) (third call)))
          (iterator
@@ -1809,16 +1555,6 @@ ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
       (dotimes (index width) (step-set index)))
     (when any-row-p values)))
 
-(defun stream-project-set (environment calls sets callback)
-  (replace sets calls)
-  (let ((width (length sets)))
-    (loop for values = (project-set-next-values environment sets)
-          while values
-          do (let ((*query-row-origins*
-                     (project-set-row-origins *query-row-origins* (length environment) width)))
-               (when (eq (funcall callback (concatenate 'vector environment values)) :stop)
-                 (return :stop))))))
-
 (defun project-append-row (coercions environment input-origins)
   "Apply one UNION ALL arm's coercions and return its owned output row and origins."
   (let* ((width (length coercions))
@@ -1832,20 +1568,6 @@ ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
                (setf (aref values i) value)
                (when origins (setf (aref origins i) origin))))
     (values (cons values values) origins)))
-
-(defun stream-union-all (arms emit run-child)
-  "An arm's LIMIT ends that arm; only a consumer stop ends the Append."
-  (let ((stopped-p nil))
-    (dolist (arm arms)
-      (funcall run-child (second arm)
-               (lambda (row)
-                 (multiple-value-bind (projected origins)
-                     (project-append-row (first arm) (car row) *query-row-origins*)
-                   (let ((*query-row-origins* origins))
-                     (when (eq (funcall emit projected) :stop)
-                       (setf stopped-p t)
-                       :stop)))))
-      (when stopped-p (return :stop)))))
 
 (defun simple-datum-origin-plan-p (node &optional relations iterator-p worktable seen)
   "Recognize plans whose execution retains detached row origins."
@@ -2015,24 +1737,6 @@ ROW's source environment.  Only final target origins leave this projection."
                  (when origins (setf (aref origins i) origin))))
     (values (cons values environment) origins)))
 
-(defun execute-physical-scan-node (node registered-relations outer-environment emit)
-  (let* ((relation (physical-scan-relation node registered-relations))
-         (path (physical-scan-path node relation))
-         (source (getf relation :row-source))
-         (presence (vector (ensure-select-source-identity relation))))
-    (scan-select-relation
-     relation path *current-snapshot*
-     (lambda (row)
-       (check-for-interrupts)
-       (multiple-value-bind (environment origins)
-           (project-select-scan-row registered-relations relation
-                                    (if source row (htup-values row))
-                                    (and *datum-origin-capture* (not source) (htup-origins row)))
-         (let ((*query-row-presence* presence)
-               (*query-row-origins* origins))
-           (funcall emit environment))))
-     outer-environment)))
-
 (defun make-physical-subquery-scan-frame (node relations outer-environment)
   "Capture this scan's outer frame and the source identity of its output rows."
   (let* ((relation (physical-scan-relation node relations))
@@ -2041,19 +1745,6 @@ ROW's source environment.  Only final target origins leave this projection."
     (values (make-subquery-parameter-frame
              (if lateral-p outer-environment #()) :capture-p lateral-p)
             presence)))
-
-(defun execute-physical-subquery-scan (node registered-relations outer-environment emit run-child)
-  (multiple-value-bind (frame presence)
-      (make-physical-subquery-scan-frame node registered-relations outer-environment)
-    (let* ((parent-frames *subquery-outer-frames*)
-           (*subquery-outer-frames* (cons frame parent-frames)))
-      (unwind-protect
-           (funcall run-child (fourth node)
-                    (lambda (row)
-                      (let ((*subquery-outer-frames* parent-frames)
-                            (*query-row-presence* presence))
-                        (funcall emit (car row)))))
-        (close-cte-frame-cache (cdr frame))))))
 
 (defun project-physical-row (environment targets deferred set-node)
   "Return the projected row and its origins for either execution driver."
@@ -2070,24 +1761,6 @@ ROW's source environment.  Only final target origins leave this projection."
        (values (cons values environment) origins)))
     (t (values (make-select-result-row environment nil targets) nil))))
 
-(defun execute-physical-projection (node emit run-child)
-  (let* ((targets (second node))
-         (deferred (and *query-sort-project*
-                        (eq node (car *query-sort-project*))
-                        (cdr *query-sort-project*)))
-         (set-node (and (null deferred) (project-set-projection-node node)))
-         (*query-project-set* (and set-node (cons set-node targets))))
-    (funcall run-child
-             (third node)
-             (lambda (environment)
-               (multiple-value-bind (row origins)
-                   (project-physical-row environment targets deferred set-node)
-                 (when (or set-node row)
-                   (if (and (not set-node) (or deferred *datum-origin-capture*))
-                       (let ((*query-row-origins* origins))
-                         (funcall emit row))
-                       (funcall emit row))))))))
-
 (defun physical-buffered-node-child (node)
   "Read the child after a sort bound or aggregate specification, when present."
   (if (member (first node) '(:top-n :hash-aggregate :sorted-aggregate))
@@ -2098,160 +1771,11 @@ ROW's source environment.  Only final target origins leave this projection."
   "The root node of a wire SELECT that only consumes projected values.
 Only this node can discard source rows and their metadata during sorting.")
 
-(defun execute-physical-order (node emit run-child)
-  (let* ((child (physical-buffered-node-child node))
-         (deferred (sort-projection-deferred-slots node child))
-         (*query-sort-project* (and deferred (cons child deferred))))
-    (stream-physical-buffered-node
-     node (lambda (sort-callback) (funcall run-child child sort-callback))
-     (lambda (row)
-       (if deferred
-           (multiple-value-bind (projected origins)
-               (finish-sort-project-row row (second child) deferred)
-             (let ((*query-row-origins* origins))
-               (funcall emit projected)))
-           (funcall emit row)))
-     (and (eq node *select-terminal-sort-node*)
-          (eq (first node) :sort)
-          (null deferred)
-          (not *datum-origin-capture*)))))
-
 (defun physical-join-rescans-inner-p (join right)
   "Recognize LATERAL and parameterized IndexScan inputs from the physical plan."
   (or (getf join :lateral-dependent)
       (and (eq (first right) :index-scan)
            (physical-index-scan-parameter right))))
-
-(defun execute-physical-join (node emit run-child run-node)
-  (let* ((join (second node))
-         (left (third node))
-         (right (fourth node)))
-    (if (physical-join-rescans-inner-p join right)
-        (stream-select-indexed-join-environments
-         (lambda (left-callback)
-           (funcall run-child left left-callback))
-         (lambda (outer-environment right-callback)
-           (funcall run-node right right-callback outer-environment))
-         join emit)
-        (stream-select-join-environments
-         (lambda (left-callback)
-           (funcall run-child left left-callback))
-         (lambda (right-callback)
-           (funcall run-child right right-callback))
-         join emit))))
-
-(defun stream-physical-buffered-node (node source emit &optional projected-only-p)
-  "Run sorting, DISTINCT or aggregation over a driver-owned row source."
-  (ecase (first node)
-    ((:sort :top-n)
-     (stream-select-sort source (second node) emit
-                         :limit (and (eq (first node) :top-n) (third node))
-                         :projected-only-p projected-only-p))
-    (:sorted-distinct
-     (stream-sorted-distinct source (second node) emit))
-    (:hash-distinct
-     (stream-hash-aggregate
-      (lambda (callback)
-        (funcall source (lambda (row) (funcall callback (car row)))))
-      (second node) 0
-      (lambda (values) (funcall emit (cons values values)))))
-    ((:hash-aggregate :sorted-aggregate)
-     (stream-select-aggregates source (second node) (third node) emit))))
-
-(defun execute-physical-plan-node (node registered-relations outer-environment
-                                   emit run-child run-node)
-  "Execute one physical node using the instrumented callbacks from RUN-NODE."
-  (when (member (first node) '(:sort :top-n))
-    (let ((child (physical-buffered-node-child node)))
-      (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
-        (when set-node
-          (let ((input (make-sorted-project-set-iterator
-                        node child set-node width calls registered-relations
-                        :source-streamer
-                        (lambda (callback) (funcall run-child (third set-node) callback)))))
-            (return-from execute-physical-plan-node
-              (unwind-protect (map-sql-iterator input emit)
-                (close-sql-iterator input))))))))
-  (case (first node)
-    (:result
-     (let ((*query-row-origins* nil) (*query-row-presence* #())) (funcall emit #())))
-    (:with-ctes
-        (call-with-cte-definitions (second node) (lambda () (funcall run-child (third node) emit))))
-    (:cte-scan
-     (let ((reader (make-cte-scan-iterator (physical-scan-relation node registered-relations))))
-       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
-    (:worktable-scan
-     (let ((reader (make-cte-worktable-iterator (physical-scan-relation node registered-relations))))
-       (unwind-protect (map-sql-iterator reader emit) (close-sql-iterator reader))))
-    (:recursive-union
-     (let ((input (make-recursive-union-iterator node registered-relations)))
-       (unwind-protect (map-sql-iterator input emit) (close-sql-iterator input))))
-    (:append (stream-union-all (second node) emit run-child))
-    ((:seq-scan :index-scan)
-     (execute-physical-scan-node node registered-relations outer-environment emit))
-    (:subquery-scan
-     (execute-physical-subquery-scan node registered-relations outer-environment emit run-child))
-    (:filter
-     (let ((qual (second node)))
-       (funcall run-child
-                (third node)
-                (lambda (environment)
-                  (when (true-p (eval-expr qual environment))
-                    (funcall emit environment))))))
-    (:nested-loop-join (execute-physical-join node emit run-child run-node))
-    (:window-input
-     (funcall run-child (third node)
-              (lambda (environment)
-                (multiple-value-bind (values origins)
-                    (window-input-with-origins environment (second node) *query-row-origins*)
-                  (let ((*query-row-origins* origins))
-                    (funcall emit values))))))
-    (:window
-     (stream-window-stage (lambda (callback) (funcall run-child (third node) callback))
-                          (second node) emit))
-    (:project-set
-     (let* ((targets (and *query-project-set*
-                          (eq node (car *query-project-set*))
-                          (cdr *query-project-set*)))
-            (calls (second node))
-            (sets (unless targets (make-array (length calls)))))
-       (funcall run-child (third node)
-                (lambda (environment)
-                  (if targets
-                      (let* ((pending t)
-                             (origins *query-row-origins*)
-                             (presence *query-row-presence*)
-                             (input (make-sql-iterator
-                                     (lambda ()
-                                       (when pending
-                                         (setf pending nil)
-                                         (values environment t origins nil presence)))))
-                             (projected
-                               (make-project-set-projection-iterator
-                                input (second node) targets (fourth node))))
-                        (unwind-protect (map-sql-iterator projected emit)
-                          (close-sql-iterator projected)))
-                      (stream-project-set environment calls sets emit))))))
-    (:project (execute-physical-projection node emit run-child))
-    ((:sorted-distinct :hash-distinct :hash-aggregate :sorted-aggregate)
-     (let ((child (physical-buffered-node-child node)))
-       (flet ((source (callback) (funcall run-child child callback)))
-         (declare (dynamic-extent #'source))
-         (stream-physical-buffered-node node #'source emit))))
-    ((:sort :top-n) (execute-physical-order node emit run-child))
-    (:limit
-     (let ((limit (check-select-limit (second node)))
-           (count 0))
-       (unless (zerop limit)
-         (funcall run-child
-                  (third node)
-                  (lambda (row)
-                    (incf count)
-                    (when (or (eq (funcall emit row) :stop)
-                              (>= count limit))
-                      :stop))))))
-    (otherwise
-     (error "Unknown physical query-plan node ~s" node))))
 
 (defun reset-query-plan-instrumentation (metadata-map)
   (maphash (lambda (node metadata)
@@ -2262,22 +1786,6 @@ Only this node can discard source rows and their metadata during sorting.")
                    (plan-node-metadata-actual-startup-time-ticks metadata) 0
                    (plan-node-metadata-actual-total-time-ticks metadata) 0))
            metadata-map)
-  (values))
-
-(defun record-query-plan-node-instrumentation (metadata started emitted startup-time
-                                               callback-time child-total-time)
-  (when (and started metadata)
-    (incf (plan-node-metadata-actual-loops metadata))
-    (incf (plan-node-metadata-actual-row-count metadata) emitted)
-    (setf (plan-node-metadata-actual-rows metadata)
-          (/ (plan-node-metadata-actual-row-count metadata)
-             (plan-node-metadata-actual-loops metadata)))
-    (let* ((elapsed (- (get-internal-real-time) started))
-           (self-time (max 0 (- elapsed callback-time child-total-time))))
-      (incf (plan-node-metadata-actual-startup-time-ticks metadata)
-            (or startup-time elapsed))
-      (incf (plan-node-metadata-actual-total-time-ticks metadata)
-            (+ self-time child-total-time))))
   (values))
 
 (defun aggregate-toast-demand (node relations)
@@ -2424,69 +1932,6 @@ projection or filter forms fall back to ordinary full materialization."
                       (set-difference (cdr demand) (mapcar #'cdr (cdr slice-plan))))
                 demand)
             slice-plan)))
-
-(defun interpret-query-plan (plan registered-relations row-callback)
-  "Reference interpreter for physical S-expression plans."
-  (multiple-value-bind (demand slice-plan)
-      (select-plan-toast-access (query-plan-physical plan) registered-relations)
-    (let* ((*cte-active-plan* plan)
-           (metadata-map (query-plan-metadata plan))
-           (*select-toast-demand* demand)
-           (*select-toast-slice-plan* slice-plan)
-           (*toast-slice-current* nil)
-           (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*)))
-      (when (and *query-plan-instrumentation-p* (= *subquery-instrumentation-depth* 1))
-        (reset-query-plan-tree-instrumentation plan))
-      (labels ((run-node (node callback &optional outer-environment)
-                 (let ((metadata (gethash node metadata-map))
-                       (emitted 0)
-                       (started (when *query-plan-instrumentation-p*
-                                  (get-internal-real-time)))
-                       (startup-time nil)
-                       (callback-time 0)
-                       (child-total-time 0))
-                   (labels ((emit (row)
-                              (incf emitted)
-                              (when (and started (null startup-time))
-                                (setf startup-time
-                                      (- (get-internal-real-time) started)))
-                              (if started
-                                  (let ((callback-start (get-internal-real-time)))
-                                    (unwind-protect
-                                         (funcall callback row)
-                                      (incf callback-time
-                                            (- (get-internal-real-time)
-                                               callback-start))))
-                                  (funcall callback row)))
-                            (run-child (child child-callback &optional environment)
-                              (let* ((child-metadata (gethash child metadata-map))
-                                     (old-total-time
-                                       (if child-metadata
-                                           (plan-node-metadata-actual-total-time-ticks
-                                            child-metadata)
-                                           0)))
-                                (unwind-protect
-                                     (run-node child child-callback environment)
-                                  (when (and started child-metadata)
-                                    (incf child-total-time
-                                          (- (plan-node-metadata-actual-total-time-ticks
-                                              child-metadata)
-                                             old-total-time)))))))
-                     (unwind-protect
-                          (execute-physical-plan-node
-                           node registered-relations outer-environment
-                           #'emit #'run-child #'run-node)
-                       (record-query-plan-node-instrumentation
-                        metadata started emitted startup-time callback-time
-                        child-total-time))))))
-        (run-node (query-plan-physical plan)
-                  (lambda (row)
-                    (let ((*select-toast-demand* nil)
-                          (*select-toast-slice-plan* nil)
-                          (*toast-slice-current* nil))
-                      (funcall row-callback row))))))))
-
-(register-query-plan-backend :interpreter :executor #'interpret-query-plan)
 
 (defun physical-plan-node-children (node)
   (let ((children nil))
@@ -2681,38 +2126,8 @@ Compare the advertised column shape, independently of result format codes."
              (setf found-p t)))
       (call-with-admitted-select-plan
        plan (lambda (registered)
-              (execute-query-plan plan registered #'discard-row))))
+              (map-query-plan-rows plan registered #'discard-row))))
     found-p))
-
-(defun exec-select (stream ast)
-  (multiple-value-bind (plan targets columns) (prepare-select-result ast)
-    (let ((row-count 0)
-          (frame-buffer nil)
-          (*select-terminal-sort-node* (query-plan-physical plan)))
-      (when *select-suppress-description*
-        (check-result-column-shape columns *select-expected-result-columns*))
-      (flet ((send-row (row)
-               ;; Flush the first row promptly. Complete small frames
-               ;; after it can share the socket buffer.
-               (when (= row-count 1)
-                 (setf frame-buffer (make-array +select-data-row-buffer-size+ :element-type '(unsigned-byte 8))))
-               (send-select-row stream row targets (zerop row-count) frame-buffer)
-               (incf row-count)))
-        (call-with-admitted-select-plan
-         plan (lambda (registered)
-                (unless *select-suppress-description* (send-row-description stream columns))
-                (execute-query-plan plan registered #'send-row))))
-      ;; The command tag may wait for autocommit outside this executor.
-      ;; If a partial flush fails, the connection cannot carry another frame.
-      (when (> row-count 1)
-        (let ((complete nil))
-          (sb-sys:without-interrupts
-            (unwind-protect
-                 (sb-sys:with-local-interrupts
-                   (force-output stream)
-                   (setf complete t))
-              (unless complete (ignore-errors (close stream :abort t)))))))
-      (send-command-complete stream (format nil "SELECT ~a" row-count)))))
 
 (defun copy-write-frame (stream type payload)
   "A partially transmitted COPY frame must close rather than interleave an error."
@@ -2770,7 +2185,7 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                  (logical-test-failpoint
                   :after-copy-out-response
                   (when (sql-relation-name-p source) (sql-relation-name-name source))))
-               (execute-query-plan plan registered #'send-row)))
+               (map-query-plan-rows plan registered #'send-row)))
       (call-with-admitted-select-plan plan #'copy-plan)
       (copy-write-frame stream #\c #())
       count)))
@@ -2784,7 +2199,7 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                (when analyze-p
                  (let ((started (get-internal-real-time)))
                    (let ((*query-plan-instrumentation-p* t))
-                     (execute-query-plan
+                     (map-query-plan-rows
                       plan registered
                       (lambda (row)
                         (declare (ignore row))

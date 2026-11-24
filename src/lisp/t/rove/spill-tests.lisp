@@ -1,14 +1,24 @@
 ;;;; spill-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(defun make-rove-row-iterator (rows)
+  (make-sql-iterator (lambda () (when rows (values (pop rows) t)))))
+
+(defun map-rove-sorted-aggregate (rows keys descriptors function)
+  (with-query-temp-files ()
+                         (let ((iterator (make-sorted-aggregate-iterator (make-rove-row-iterator rows) keys descriptors)))
+                           (unwind-protect (map-sql-iterator iterator function)
+                             (close-sql-iterator iterator)))))
+
 (rove:deftest test-hash-aggregate-skew-does-not-spill-unnecessarily
     (let ((actual nil))
       (let ((*query-work-memory-bytes* 1))
-        (stream-hash-aggregate
-         (lambda (callback)
-           (dotimes (index 100) (funcall callback #(7))))
-         '((:col 1 :type :int4)) 1
-         (lambda (row) (push (list (aref row 0) (aref row 1)) actual))))
+        (let ((iterator (make-hash-aggregate-iterator
+                         (make-rove-row-iterator (make-list 100 :initial-element #(7)))
+                         '((:col 1 :type :int4)) 1)))
+          (unwind-protect
+               (map-sql-iterator iterator (lambda (row) (push (coerce row 'list) actual)))
+            (close-sql-iterator iterator))))
       (rove:ok (equal actual '((7 100)))
                "a single heavily skewed group stays in one bounded hash state")))
 
@@ -317,14 +327,15 @@
       (rove:ok
        (handler-case
            (progn
-             (stream-sorted-aggregates
-              (lambda (callback)
-                (incf visited)
-                (funcall callback #("oversized"))
-                (incf visited)
-                (error "later input must not be evaluated"))
-              nil '((:kind :json-agg :input (:col 1 :type :text) :type :json))
-              (lambda (row) (declare (ignore row)) nil))
+             (let* ((input (make-sql-iterator
+                            (lambda ()
+                              (unless (= 1 (incf visited))
+                                (error "later input must not be evaluated"))
+                              (values #("oversized") t))))
+                    (iterator (make-sorted-aggregate-iterator
+                               input nil '((:kind :json-agg :input (:col 1 :type :text) :type :json)))))
+               (unwind-protect (sql-iterator-next iterator)
+                 (close-sql-iterator iterator)))
              nil)
          (pg-error (condition) (equal (pg-error-sqlstate condition) "54000"))))
       (rove:ok (= visited 1))))
@@ -406,19 +417,17 @@
            (input '(#(1 "a") #(2 "b") #(1 "c") #(2 "d"))))
       (ensure-directories-exist directory)
       (unwind-protect
-           (flet ((source (callback) (dolist (row input) (funcall callback row))))
+           (progn
              (let ((count 0))
-               (stream-sorted-aggregates
-                #'source '((:col 1 :type :int4)) descriptors
-                (lambda (row) (declare (ignore row)) (incf count) :stop))
+               (map-rove-sorted-aggregate input '((:col 1 :type :int4)) descriptors
+                                          (lambda (row) (declare (ignore row)) (incf count) :stop))
                (rove:ok (= count 1)))
              (rove:ok (null (uiop:directory-files directory)))
              (rove:ok
               (handler-case
                   (progn
-                    (stream-sorted-aggregates
-                     #'source '((:col 1 :type :int4)) descriptors
-                     (lambda (row) (declare (ignore row)) (ereport "57014" "cancelled")))
+                    (map-rove-sorted-aggregate input '((:col 1 :type :int4)) descriptors
+                                               (lambda (row) (declare (ignore row)) (ereport "57014" "cancelled")))
                     nil)
                 (pg-error (condition) (equal (pg-error-sqlstate condition) "57014"))))
              (rove:ok (null (uiop:directory-files directory)))
@@ -426,9 +435,8 @@
                (rove:ok
                 (handler-case
                     (progn
-                      (stream-sorted-aggregates
-                       #'source '((:col 1 :type :int4)) descriptors
-                       (lambda (row) (declare (ignore row)) nil))
+                      (map-rove-sorted-aggregate input '((:col 1 :type :int4)) descriptors
+                                                 (lambda (row) (declare (ignore row)) nil))
                       nil)
                   (pg-error (condition) (equal (pg-error-sqlstate condition) "54000")))))
              (rove:ok (null (uiop:directory-files directory))))
@@ -514,8 +522,8 @@
                        (let ((input (make-physical-plan-iterator node (list source))))
                          (unwind-protect (map-sql-iterator input #'emit)
                            (close-sql-iterator input)))
-                       (interpret-query-plan (%make-query-plan :physical node)
-                                             (list source) #'emit)))
+                       (map-query-plan-rows (%make-query-plan :physical node)
+                                            (list source) #'emit)))
                  (rove:ok (equalp (nreverse rows)
                                   '(#("{\"id\":null}" 1) #("{\"id\":null}" 2)))))))
         (setf (symbol-function 'make-sql-set-function-iterator) original))))

@@ -17,14 +17,10 @@
                          (values (cons (map 'vector (lambda (key) (eval-expr key row)) keys) padded) t
                                  (window-pad-origins *query-row-origins* (length padded)))))))
          (source (if (and keys (getf stage :sort-required t))
-                     (make-buffered-sql-iterator
-                      (lambda (emit)
-                        (stream-select-sort
-                         (lambda (callback) (map-sql-iterator decorated callback))
-                         (loop for direction in directions for position from 1
-                               collect (cons (list :sort-output position) direction))
-                         emit))
-                      decorated)
+                     (make-select-sort-iterator
+                      decorated
+                      (loop for direction in directions for position from 1
+                            collect (cons (list :sort-output position) direction)))
                      decorated))
          (functions (getf stage :functions))
          (aggregates (remove-if (lambda (function)

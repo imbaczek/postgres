@@ -14,12 +14,17 @@
                 '("NEW-ARENA" "ARENA-P" "SWITCH-TO-ARENA"
                   "REWIND-ARENA" "DESTROY-ARENA")))))
 
-(defun sort-arena-test-stream (rows callback)
-  (stream-select-sort
-   (lambda (visit)
-     (dolist (values rows)
-       (funcall visit (cons values values))))
-   '(((:col 1 :type :int4) . nil)) callback))
+(defun sort-arena-test-consume (input function)
+  (let ((iterator (make-select-sort-iterator input '(((:col 1 :type :int4) . nil)))))
+    (unwind-protect (map-sql-iterator iterator function)
+      (close-sql-iterator iterator))))
+
+(defun sort-arena-test-stream (rows function)
+  (sort-arena-test-consume
+   (make-sql-iterator
+    (lambda ()
+      (when rows (let ((row (pop rows))) (values (cons row row) t)))))
+   function))
 
 (defun test-sort-arena-option-parsing ()
   (check (= (nth-value 8 (parse-args '("--sort-arena-limit-bytes" "65536")))
@@ -113,14 +118,16 @@
     (unwind-protect
          (progn
            (handler-case
-               (stream-select-sort
-                (lambda (visit)
-                  (dotimes (index 32) (funcall visit (cons (vector index) #(0))))
-                  (setf saw-spill (not (query-spill-test-directory-empty-p directory)))
-                  (funcall visit (cons (vector (make-string 131072 :initial-element #\x))
-                                       #(0))))
-                '(((:col 1 :type :int4) . nil))
-                (lambda (row) (declare (ignore row))))
+               (let ((index 0))
+                 (sort-arena-test-consume
+                  (make-sql-iterator
+                   (lambda ()
+                     (cond ((< index 32) (values (cons (vector (1- (incf index))) #(0)) t))
+                           ((= index 32)
+                            (incf index)
+                            (setf saw-spill (not (query-spill-test-directory-empty-p directory)))
+                            (values (cons (vector (make-string 131072 :initial-element #\x)) #(0)) t)))))
+                  (lambda (row) (declare (ignore row)))))
              (pg-error (caught) (setf condition caught)))
            (check saw-spill "arena capacity test fails after a spill already exists")
            (check (and condition (string= (pg-error-sqlstate condition) "53200"))
@@ -140,17 +147,17 @@
   (let ((*query-sort-arena-limit-bytes* 65536)
         (*query-work-memory-bytes* 1048576)
         (output nil))
-    (stream-select-sort
-     (lambda (visit)
-       ;; No input collection survives the streamer. After the batch is copied,
-       ;; future rows' bignums have no live heap holder outside the arena.
-       (loop for index from 32 downto 1
-             do (let ((values (vector index (+ (expt 2 200) index))))
-                  (funcall visit (cons values values)))))
-     '(((:col 1 :type :int4) . nil))
-     (lambda (row)
-       (push (car row) output)
-       (sb-ext:gc :full t)))
+    (let ((index 32))
+      (sort-arena-test-consume
+       (make-sql-iterator
+        (lambda ()
+          (when (plusp index)
+            (let ((row (vector index (+ (expt 2 200) index))))
+              (decf index)
+              (values (cons row row) t)))))
+       (lambda (row)
+         (push (car row) output)
+         (sb-ext:gc :full t))))
     (sb-ext:gc :full t)
     (check (and (= (length output) 32)
                 (every (lambda (row)

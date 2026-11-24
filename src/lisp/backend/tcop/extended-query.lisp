@@ -221,55 +221,74 @@
             (progn
               (sb-thread:with-mutex (*extended-portal-executions-lock*)
                 (setf (gethash ,actual-portal ,registry) ,execution))
-              ,@body
-              (setf ,complete t)
-              ,actual-portal)
+              (multiple-value-prog1 (progn ,@body)
+                (setf ,complete t)))
          (unless ,complete (extended-close-portal ,actual-portal))))))
 
-(defun extended-initialize-select-portal (portal)
+(defun extended-initialize-select-portal (portal &key snapshot)
+  "Prepare a SELECT portal and return its result columns.
+The owner retains the plan, relations and snapshot until the portal closes.
+SNAPSHOT is the active simple-query snapshot. Otherwise start the snapshot
+for an extended-protocol portal and check its bound result descriptor."
   (let* ((statement (extended-portal-statement portal))
          (owner (make-extended-portal-execution-owner portal :suppress-datum-origins t))
          (execution (make-extended-select-execution :owner owner)))
     (with-extended-portal-initialization (portal execution *extended-select-executions*)
-      (recovery-check-statement (extended-statement-ast statement))
-      (query-execution-owner-acquire-snapshot
-       owner (lambda (registration) (statement-start registration nil)))
+      (if snapshot
+          (query-execution-owner-pin-snapshot owner snapshot)
+          (progn
+            (recovery-check-statement (extended-statement-ast statement))
+            (query-execution-owner-acquire-snapshot
+             owner (lambda (registration) (statement-start registration nil)))))
       (call-with-query-execution-owner
        owner
        (lambda ()
          (multiple-value-bind (plan targets columns)
              (prepare-select-result (extended-statement-ast statement))
-           (check-result-column-shape columns *select-expected-result-columns*)
+           (unless snapshot
+             (check-result-column-shape columns *select-expected-result-columns*))
            (setf (extended-select-execution-plan execution) plan
                  (extended-select-execution-targets execution) targets)
-           (flet ((initialize (relations)
-                    (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
-                          relations)
-                    ;; Retain scans, including lazy children, for the portal's executor.
-                    (retain-query-plan-executor-tables plan relations)
-                    (call-with-select-index-lease-domain
-                     (query-plan-index-relfilenodes plan relations)
-                     (lambda ()
-                       (setf (extended-select-execution-iterator execution)
-                             (make-resumable-query-plan-iterator plan relations))))))
-             (call-with-admitted-select-plan plan #'initialize))))))))
+           (call-with-admitted-select-plan
+            plan (lambda (relations)
+                   (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
+                         relations)
+                   (retain-query-plan-executor-tables plan relations)))
+           columns))))))
 
-(defun extended-send-portal-rows (stream iterator targets limit &optional values-only-p)
+(defun extended-send-portal-rows (stream iterator targets limit &key values-only-p batch-p)
   ;; Observe EOF only through a pull allowed by LIMIT, even for a sealed store.
-  ;; The caller supplies its owner, snapshot and any lease domain around this loop.
-  (let ((count 0))
+  (let ((count 0)
+        (frame-buffer nil))
     (loop while (or (<= limit 0) (< count limit))
-          do (check-for-interrupts)
-             (multiple-value-bind (row present) (sql-iterator-next iterator)
-               (unless present (return-from extended-send-portal-rows (values count t)))
+          do (multiple-value-bind (row present) (sql-iterator-next iterator)
+               (unless present
+                 (when (and batch-p (> count 1))
+                   (let ((complete nil))
+                     (sb-sys:without-interrupts
+                       (unwind-protect
+                            (sb-sys:with-local-interrupts
+                              (force-output stream)
+                              (setf complete t))
+                         (unless complete (ignore-errors (close stream :abort t)))))))
+                 (return-from extended-send-portal-rows (values count t)))
+               (when (and batch-p (= count 1))
+                 (setf frame-buffer (make-array +select-data-row-buffer-size+
+                                                :element-type '(unsigned-byte 8))))
                (let ((*select-toast-demand* nil)
                      (*select-toast-slice-plan* nil)
                      (*toast-slice-current* nil))
-                 (send-select-row stream (if values-only-p (cons row row) row) targets))
+                 (send-select-row stream (if values-only-p (cons row row) row) targets
+                                  (or (not batch-p) (zerop count)) frame-buffer))
                (incf count)))
     (values count nil)))
 
-(defun extended-execute-select-portal (stream portal limit)
+(defun run-select-portal (stream portal limit)
+  "Send SELECT rows and return the count and whether the portal reached the end.
+A nonpositive LIMIT requests all remaining rows. Keep the iterator in the
+portal owner so a bounded Execute can resume the same plan and snapshot.
+Detach active index scans before a suspended execution releases its leases.
+On completion or error, close the iterators while those leases are still held."
   (let ((execution (extended-select-execution-for portal))
         (count 0))
     (unless execution (ereport "55000" "portal has no initialized SELECT execution"))
@@ -280,17 +299,46 @@
        (extended-select-execution-owner execution)
        (lambda ()
          (let ((plan (extended-select-execution-plan execution))
-               (relations *subquery-registered-relations*))
+               (relations *subquery-registered-relations*)
+               (targets (extended-select-execution-targets execution))
+               (iterator (extended-select-execution-iterator execution)))
            (call-with-select-index-lease-domain
             (query-plan-index-relfilenodes plan relations)
             (lambda ()
-              (multiple-value-bind (delivered at-end)
-                  (extended-send-portal-rows
-                   stream (extended-select-execution-iterator execution)
-                   (extended-select-execution-targets execution) limit)
-                (setf count delivered
-                      (extended-select-execution-at-end-p execution) at-end))))))))
-    (if (extended-select-execution-at-end-p execution)
+              (let ((batch-p (and (<= limit 0) (null iterator)))
+                    (*iterator-index-scan-domain-p* t)
+                    (suspend-p nil))
+                (unwind-protect
+                     (progn
+                       (unless iterator
+                         (setf iterator (make-resumable-query-plan-iterator plan relations :projected-only-p t)
+                               (extended-select-execution-iterator execution) iterator))
+                       (multiple-value-bind (delivered at-end)
+                           (extended-send-portal-rows stream iterator targets limit :batch-p batch-p)
+                         (setf count delivered
+                               (extended-select-execution-at-end-p execution) at-end)
+                         (unless at-end
+                           (detach-select-index-scans)
+                           (setf suspend-p t))))
+                  (unless suspend-p
+                    (sb-sys:without-interrupts
+                      (unwind-protect
+                           (sb-sys:with-local-interrupts
+                             (unwind-protect (close-sql-iterator iterator)
+                               ;; A shared CTE producer can outlive its last result reader.
+                               (dolist (open (loop for open being the hash-keys of *sql-open-iterators*
+                                                   collect open))
+                                 (close-sql-iterator open))))
+                        ;; Never try to spool a cursor after its group has unwound.
+                        ;; The iterator and temp owners still own any unfinished cleanup.
+                        (setf *select-index-scans*
+                              (delete-if #'select-index-scan-borrowed-lease-p *select-index-scans*))))
+                    (setf (extended-select-execution-iterator execution) nil))))))))))
+    (values count (extended-select-execution-at-end-p execution))))
+
+(defun execute-select-portal (stream portal limit)
+  (multiple-value-bind (count at-end) (run-select-portal stream portal limit)
+    (if at-end
         (progn
           (send-command-complete stream (format nil "SELECT ~d" count))
           t)
@@ -298,6 +346,28 @@
           (setf *extended-execute-suspended-p* t)
           (write-message stream #\s #())
           nil))))
+
+(defun exec-select (stream ast)
+  "Run a simple-query SELECT through a transient portal.
+Send its row description before execution and close it before reporting completion."
+  (let ((portal (make-extended-portal :statement (make-extended-statement :ast ast)))
+        (count nil)
+        (original-fatal nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (send-row-description stream
+                                     (extended-initialize-select-portal portal :snapshot *current-snapshot*))
+               (setf count (run-select-portal stream portal 0)))
+           (pg-error (condition)
+             (when (fatal-error-p condition) (setf original-fatal condition))
+             (error condition)))
+      (handler-case
+          (unless (or (extended-close-portal portal) (null count))
+            (ereport "58030" "portal cleanup remains incomplete"))
+        (error (condition)
+          (error (or original-fatal condition)))))
+    (send-command-complete stream (format nil "SELECT ~d" count))))
 
 (defun extended-initialize-dml-portal (portal)
   (let* ((statement (extended-portal-statement portal))
@@ -411,7 +481,7 @@
          (multiple-value-bind (delivered at-end)
              (extended-send-portal-rows
               stream (extended-dml-execution-iterator execution)
-              (extended-dml-execution-targets execution) limit t)
+              (extended-dml-execution-targets execution) limit :values-only-p t)
            (setf count delivered
                  (extended-dml-execution-at-end-p execution) at-end)))))
     (if (extended-dml-execution-at-end-p execution)
@@ -802,7 +872,7 @@
       (let ((completed
               (cond
                 ((extended-portal-select-p portal)
-                 (extended-execute-select-portal stream portal limit))
+                 (execute-select-portal stream portal limit))
                 ((extended-portal-returns-rows-p portal)
                  (extended-execute-dml-portal stream portal limit))
                 (t

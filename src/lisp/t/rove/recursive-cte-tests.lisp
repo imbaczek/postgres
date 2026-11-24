@@ -173,8 +173,8 @@
       (rove:ok (search "Recursive Union" (format-query-plan plan)))
       (dotimes (run 2)
         (let ((*query-plan-instrumentation-p* t) (rows nil))
-          (execute-query-plan plan (getf (query-plan-prepared plan) :relations)
-                              (lambda (row) (push (coerce (car row) 'list) rows)))
+          (map-query-plan-rows plan (getf (query-plan-prepared plan) :relations)
+                               (lambda (row) (push (coerce (car row) 'list) rows)))
           (rove:ok (equal (nreverse rows) '((1) (2) (3) (4))))
           (rove:ok (= 1 (plan-node-metadata-actual-loops
                          (gethash recursive (query-plan-metadata producer)))))

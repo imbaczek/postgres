@@ -336,10 +336,12 @@
     (check-interrupted-spill-open-cleanup
      'pg::open-query-temp-output
      (lambda ()
-       (pg::stream-hash-aggregate
-        (lambda (callback) (funcall callback #(1)) (funcall callback #(2)))
-        '((:col 1 :type :int4 :typmod nil)) 1
-        (lambda (row) (declare (ignore row)) nil)))))
+       (let* ((rows (list #(1) #(2)))
+              (input (pg::make-sql-iterator
+                      (lambda () (when rows (values (pop rows) t)))))
+              (iterator (pg::make-hash-aggregate-iterator input '((:col 1 :type :int4)) 1)))
+         (unwind-protect (pg::sql-iterator-next iterator)
+           (pg::close-sql-iterator iterator))))))
 
 (deftest aggregate-partition-open-interruption-retains-scope-cleanup-ownership
     (check-interrupted-spill-open-cleanup
@@ -393,16 +395,22 @@
                      :left-width 1 :right-width 1))
              (seen nil) (parks 0))
          (pg::with-live-operation
-           (pg::stream-select-join-environments
-            (lambda (callback)
-              (dolist (row '(#(1) #(2))) (funcall callback row)))
-            (lambda (callback)
-              (dolist (row '(#(10) #(20) #(30))) (funcall callback row)))
-            join
-            (lambda (row)
-              (push (coerce row 'list) seen)
-              (pg::call-with-live-operation-parked (lambda () (incf parks)))
-              nil)))
+           (pg::with-query-temp-files ()
+                                      (let* ((left (list #(1) #(2)))
+                                             (right (list #(10) #(20) #(30)))
+                                             (iterator
+                                               (pg::make-nested-loop-iterator
+                                                join
+                                                (pg::make-sql-iterator (lambda () (when left (values (pop left) t))))
+                                                (pg::make-sql-iterator (lambda () (when right (values (pop right) t)))))))
+                                        (unwind-protect
+                                             (pg::map-sql-iterator
+                                              iterator
+                                              (lambda (row)
+                                                (push (coerce row 'list) seen)
+                                                (pg::call-with-live-operation-parked (lambda () (incf parks)))
+                                                nil))
+                                          (pg::close-sql-iterator iterator)))))
          (ok (= 6 parks))
          (ok (equal (nreverse seen) '((1 10) (1 20) (1 30) (2 10) (2 20) (2 30))))
          (ok (null (uiop:directory-files root)))))))
@@ -413,19 +421,26 @@
        (let ((pg::*query-work-memory-bytes* 1)
              (visits 0) (parks 0) (result nil))
          (pg::with-live-operation
-           (pg::stream-select-aggregates
-            (lambda (callback)
-              (dolist (row '(#(3) #(1) #(2)))
-                (incf visits)
-                (funcall callback row)
-                (pg::call-with-live-operation-parked (lambda () (incf parks)))))
-            nil
-            '((:kind :count)
-              (:kind :sum :input (:col 1 :type :int4) :type :int8)
-              (:kind :array-agg :input (:col 1 :type :int4)))
-            (lambda (row)
-              (pg::call-with-live-operation-parked (lambda () (incf parks)))
-              (setf result row))))
+           (pg::with-query-temp-files ()
+                                      (let* ((rows (list #(3) #(1) #(2)))
+                                             (input
+                                               (pg::make-sql-iterator
+                                                (lambda ()
+                                                  (when rows
+                                                    (incf visits)
+                                                    (pg::call-with-live-operation-parked (lambda () (incf parks)))
+                                                    (values (pop rows) t)))))
+                                             (iterator
+                                               (pg::make-sorted-aggregate-iterator
+                                                input nil
+                                                '((:kind :count)
+                                                  (:kind :sum :input (:col 1 :type :int4) :type :int8)
+                                                  (:kind :array-agg :input (:col 1 :type :int4))))))
+                                        (unwind-protect
+                                             (progn
+                                               (setf result (pg::sql-iterator-next iterator))
+                                               (pg::call-with-live-operation-parked (lambda () (incf parks))))
+                                          (pg::close-sql-iterator iterator)))))
          (ok (= 3 visits))
          (ok (= 4 parks))
          (ok (= (length result) 3))
@@ -434,6 +449,12 @@
          (ok (equalp (pg::sql-array-elements (aref result 2)) #(3 1 2)))
          (ok (null (uiop:directory-files root)))))))
 
+(defun map-resource-sort-rows (next function)
+  (let ((iterator (pg::make-select-sort-iterator
+                   (pg::make-sql-iterator next) '(((:col 1 :type :int4) . nil)))))
+    (unwind-protect (pg::map-sql-iterator iterator function)
+      (pg::close-sql-iterator iterator))))
+
 (deftest sorted-output-retains-spill-reader-position-across-parks
     (dolist (budget '(1 100000))
       (call-with-detachment-test-state
@@ -441,17 +462,17 @@
          (let ((pg::*query-work-memory-bytes* budget)
                (visits 0) (parks 0) (seen nil))
            (pg::with-live-operation
-             (pg::stream-select-sort
-              (lambda (callback)
-                (dolist (row '(#(3) #(1) #(2)))
-                  (incf visits)
-                  (funcall callback (cons row row))
-                  (pg::call-with-live-operation-parked (lambda () (incf parks)))))
-              '(((:col 1 :type :int4) . nil))
-              (lambda (row)
-                (push (aref (car row) 0) seen)
-                (pg::call-with-live-operation-parked (lambda () (incf parks)))
-                nil)))
+             (let ((rows (list #(3) #(1) #(2))))
+               (map-resource-sort-rows
+                (lambda ()
+                  (when rows
+                    (incf visits)
+                    (pg::call-with-live-operation-parked (lambda () (incf parks)))
+                    (let ((row (pop rows))) (values (cons row row) t))))
+                (lambda (row)
+                  (push (aref (car row) 0) seen)
+                  (pg::call-with-live-operation-parked (lambda () (incf parks)))
+                  nil))))
            (ok (= 3 visits))
            (ok (= 6 parks))
            (ok (equal (nreverse seen) '(1 2 3)))
@@ -462,27 +483,32 @@
      (lambda (root)
        (let ((pg::*query-work-memory-bytes* 1)
              (retained-after-input 0) (retained-during-output 0)
-             (entries-during-output 0) (seen nil))
+             (excess-entries 0) (seen nil))
          (pg::with-query-temp-files
-           (pg::stream-select-sort
-            (lambda (callback)
-              (loop for value downfrom 150 to 1
-                    for row = (vector value)
-                    do (funcall callback (cons row row))
-                       (setf retained-after-input
-                             (max retained-after-input
-                                  (count-if #'pg::query-temp-stream-entry-stream
-                                            (pg::query-temp-cleanup-owner-entries pg::*query-temp-cleanup-owner*))))))
-            '(((:col 1 :type :int4) . nil))
-            (lambda (row)
-              (let ((entries (pg::query-temp-cleanup-owner-entries pg::*query-temp-cleanup-owner*)))
-                (setf retained-during-output (max retained-during-output
-                                                  (count-if #'pg::query-temp-stream-entry-stream entries))
-                      entries-during-output (max entries-during-output (length entries))))
-              (push (aref (car row) 0) seen)))
+           (let ((value 150))
+             (map-resource-sort-rows
+              (lambda ()
+                (setf retained-after-input
+                      (max retained-after-input
+                           (count-if #'pg::query-temp-stream-entry-stream
+                                     (pg::query-temp-cleanup-owner-entries pg::*query-temp-cleanup-owner*))))
+                (when (plusp value)
+                  (let ((row (vector value)))
+                    (decf value)
+                    (values (cons row row) t))))
+              (lambda (row)
+                (let ((entries (pg::query-temp-cleanup-owner-entries pg::*query-temp-cleanup-owner*)))
+                  (setf retained-during-output (max retained-during-output
+                                                    (count-if #'pg::query-temp-stream-entry-stream entries))
+                        ;; With one item per run, unopened runs and the active
+                        ;; file each need a pathname entry, plus one live reader.
+                        excess-entries (max excess-entries
+                                            (- (length entries) (1+ (- 150 (length seen)))))))
+                (push (aref (car row) 0) seen))))
            (ok (zerop retained-after-input))
            (ok (<= retained-during-output 1))
-           (ok (<= entries-during-output 2))
+           (ok (zerop excess-entries))
+           (ok (null (pg::query-temp-cleanup-owner-entries pg::*query-temp-cleanup-owner*)))
            (ok (equal (nreverse seen) (loop for value from 1 to 150 collect value))))
          (ok (null (uiop:directory-files root)))))))
 

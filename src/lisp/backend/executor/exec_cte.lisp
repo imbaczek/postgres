@@ -273,6 +273,9 @@
 
 (defun make-cte-producer-state (definition frames context cache &optional reference-plan)
   (let* ((capture-p *datum-origin-capture*)
+         ;; A cached producer can outlive a reader and be pulled under another
+         ;; lease group. Buffer its index TIDs within the producing scan's scope.
+         (lazy-index-p (and (null cache) *iterator-index-scan-domain-p*))
          (own-frame (cons #() (make-hash-table :test #'eq)))
          (producer-frames (cons own-frame frames))
          (worktables *recursive-cte-worktables*)
@@ -281,6 +284,7 @@
          (relations (subquery-registered-relations plan))
          (input
            (let ((*datum-origin-capture* capture-p)
+                 (*iterator-index-scan-domain-p* lazy-index-p)
                  (*subquery-outer-frames* producer-frames)
                  (*cte-execution-context* context)
                  (*recursive-cte-worktables* worktables)
@@ -291,6 +295,7 @@
            (make-sql-iterator
             (lambda ()
               (let ((*datum-origin-capture* capture-p)
+                    (*iterator-index-scan-domain-p* lazy-index-p)
                     (*subquery-outer-frames* producer-frames)
                     (*cte-execution-context* context)
                     (*recursive-cte-worktables* worktables)

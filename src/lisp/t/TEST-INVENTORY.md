@@ -420,7 +420,7 @@ limitation of Rove: concurrent and stateful tests can use Rove once isolated.
 | --- | ---: | ---: | ---: |
 | `primitives-tests.lisp` | 6 | 5 | 1 |
 | `storage-tests.lisp` | 8 | 5 | 3 |
-| `sql-tests.lisp` | 19 | 8 | 11 |
+| `sql-tests.lisp` | 16 | 8 | 8 |
 | `transaction-tests.lisp` | 10 | 1 | 9 |
 | `catalog-tests.lisp` | 16 | 7 | 9 |
 | `protocol-tests.lisp` | 7 | 2 | 5 |
@@ -472,9 +472,6 @@ limitation of Rove: concurrent and stateful tests can use Rove once isolated.
 | `test-parameterized-join-streaming-and-reordered-slots` | [Rove](rove/sql-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |
 | `test-query-plan-index-lock-order` | [Legacy](unit-tests/sql-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
 | `test-index-scan-limit-stops-duplicate-candidates` | [Legacy](unit-tests/sql-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
-| `test-query-plan-compiler-backend-hook` | [Legacy](unit-tests/sql-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
-| `test-query-plan-compiler-dispatch-uses-registry-snapshot` | [Legacy](unit-tests/sql-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
-| `test-query-plan-backend-registry-synchronization` | [Legacy](unit-tests/sql-tests.lisp) | T: threads/interrupts at shared registry, snapshot or locking boundaries |
 | `test-insert-index-catalog-snapshot-lock` | [Legacy](unit-tests/sql-tests.lisp) | H: global scan/executor/compiler hook or publication-failure injection |
 | `test-select-top-n-collector` | [Both](rove/sql-tests.lisp) | stable-sort differential |
 | `test-using-join-output-metadata` | [Rove](rove/sql-tests.lisp) | Fixed examples; retain specific results/errors/evaluation order |

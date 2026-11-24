@@ -67,7 +67,7 @@ table.  With no query owner there is no persistent executor to record."
 (defparameter *query-execution-owner-context-symbols*
   '(*query-parameter-types* *query-parameter-values*
     *subquery-execution-active-p* *subquery-result-cache* *subquery-registered-relations*
-    *subquery-outer-frames* *subquery-output-value* *subquery-backend-entry*
+    *subquery-outer-frames* *subquery-output-value*
     *subquery-instrumentation-depth* *cte-execution-context* *cte-open-states*
     *cte-active-plan* *sql-open-iterators* *query-executor-tables* *recursive-cte-worktables*
     *recursive-cte-generation-caches* *lateral-outer-environment*
@@ -158,8 +158,7 @@ Without CHECK-CANCEL, use the ordinary untimed condition wait."
     (dolist (symbol '(*subquery-result-cache* *cte-open-states* *sql-open-iterators*))
       (setf (cdr (assoc symbol context)) (make-hash-table :test #'eq)))
     (setf (cdr (assoc '*subquery-execution-active-p* context)) t
-          (cdr (assoc '*subquery-instrumentation-depth* context)) 0
-          (cdr (assoc '*subquery-backend-entry* context)) (query-plan-backend-entry :interpreter))
+          (cdr (assoc '*subquery-instrumentation-depth* context)) 0)
     (sb-sys:without-interrupts
       (with-query-execution-owner-registry-update
         (setf (gethash owner *query-execution-owners*) t))

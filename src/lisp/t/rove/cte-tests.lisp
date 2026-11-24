@@ -240,12 +240,18 @@
            (*query-plan-instrumentation-p* t)
            (counts nil))
       (dotimes (execution 2)
-        (execute-query-plan plan (getf (query-plan-prepared plan) :relations)
-                            (lambda (row)
-                              (declare (ignore row))
-                              (push (list (hash-table-count *cte-open-states*)
-                                          (hash-table-count *sql-open-iterators*)) counts))))
-      (rove:ok (every (lambda (counts) (equal counts '(0 0))) counts))
+        (map-query-plan-rows plan (getf (query-plan-prepared plan) :relations)
+                             (lambda (row)
+                               (declare (ignore row))
+                               (push (list (hash-table-count *cte-open-states*)
+                                           (hash-table-count *sql-open-iterators*)) counts))))
+      (rove:ok (= 60 (length counts)))
+      ;; The outer iterator and its active arm remain open while they deliver a row.
+      ;; Correlated CTE state and iterators must not accumulate across rows.
+      (rove:ok (every (lambda (entry)
+                        (and (zerop (first entry))
+                             (<= (second entry) (+ 1 (* 2 (hash-table-count (query-plan-metadata plan)))))))
+                      counts))
       (rove:ok (= nodes (hash-table-count (query-plan-metadata reference))))
       (rove:ok (= 30 (plan-node-metadata-actual-loops
                       (gethash (query-plan-physical reference) (query-plan-metadata reference)))))
@@ -257,8 +263,8 @@
                           "WITH q AS MATERIALIZED(SELECT 1 AS x UNION ALL SELECT 2) SELECT a.x,b.x FROM q a CROSS JOIN q b"))))
            (producer (sql-cte-plan (first (getf (query-plan-prepared plan) :ctes))))
            (*query-plan-instrumentation-p* t))
-      (execute-query-plan plan (getf (query-plan-prepared plan) :relations)
-                          (lambda (row) (declare (ignore row))))
+      (map-query-plan-rows plan (getf (query-plan-prepared plan) :relations)
+                           (lambda (row) (declare (ignore row))))
       (rove:ok (= 1 (plan-node-metadata-actual-loops
                      (gethash (query-plan-physical producer) (query-plan-metadata producer)))))
       (rove:ok (= 2 (plan-node-metadata-actual-row-count

@@ -47,10 +47,9 @@
            (dolist (memory '(1048576 1))
              (let ((pg::*query-temp-directory* directory)
                    (pg::*query-work-memory-bytes* memory) (output nil))
-               (pg::stream-sorted-aggregates
-                (lambda (callback) (dolist (row input) (funcall callback row)))
-                '((:col 1 :type :int4)) descriptors
-                (lambda (row) (push row output)))
+               (map-test-sorted-aggregate input
+                                          '((:col 1 :type :int4)) descriptors
+                                          (lambda (row) (push row output)))
                (ok (equalp (list (vector 1 2 18446744073709551614 (text-array '("a" "b")))
                                  (vector 2 2 pg::+null+ (text-array '("x" "y"))))
                            (nreverse output)))

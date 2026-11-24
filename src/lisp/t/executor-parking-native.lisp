@@ -94,8 +94,8 @@ Verify that index scans are detached and record paths for later cleanup checks."
 Record executor resources and replace the setting call used to park the query.
 A later HUP reload restores the production functions."
   (parking-native-install root)
-  (let ((setting (symbol-function 'eval-setting-function))
-        (plan (symbol-function 'execute-query-plan))
+  (let ((setting (symbol-function 'sql-setting-value))
+        (plan (symbol-function 'run-select-portal))
         (heap (symbol-function 'heapam-scan))
         (read-page (symbol-function 'buf-read))
         (sort-arena (symbol-function 'call-with-query-sort-arena))
@@ -125,10 +125,16 @@ A later HUP reload restores the production functions."
                 (assert (query-match-map-finished-p map))
                 (setf *resource-parking-match-finished* t))))
           *resource-parking-plan-wrapper*
-          (lambda (query relations callback &rest options)
+          (lambda (stream portal limit)
             (if (resource-parking-backend-p)
-                (let ((*query-work-memory-bytes* budget)
-                      (*query-sort-arena-limit-bytes* arena))
+                (let* ((*query-work-memory-bytes* budget)
+                       (*query-sort-arena-limit-bytes* arena)
+                       (owner (extended-select-execution-owner (extended-select-execution-for portal)))
+                       (relations (query-execution-owner-binding owner '*subquery-registered-relations*)))
+                  (dolist (relation relations)
+                    (let* ((table (getf relation :table))
+                           (node (and table (pg-class-relfilenode table))))
+                      (when node (pushnew node *resource-parking-heap-nodes* :test #'eql))))
                   (when (and (plusp (sixth minima)) (null *resource-parking-index-node*))
                     (let* ((inner (find "resource_inner_indexed" relations
                                         :key (lambda (relation)
@@ -142,8 +148,8 @@ A later HUP reload restores the production functions."
                       (assert (eq :col (first parameter)))
                       (assert (= 1 (second parameter)))
                       (setf *resource-parking-index-node* (pg-index-relfilenode index))))
-                  (apply plan query relations callback options))
-                (apply plan query relations callback options)))
+                  (funcall plan stream portal limit))
+                (funcall plan stream portal limit)))
           *resource-parking-heap-wrapper*
           (lambda (node columns snapshot callback)
             (when (resource-parking-backend-p)
@@ -163,18 +169,17 @@ A later HUP reload restores the production functions."
                          (incf *resource-parking-arenas*))
                        (funcall function region))))
           *parking-native-wrapper*
-          (lambda (name arguments)
-            (if (and (string= name "current_setting")
-                     (equal (first arguments) "pg_lisp_test_resource_park"))
+          (lambda (name &optional missing-ok)
+            (if (equal name "pg_lisp_test_resource_park")
                 (progn
                   (incf *resource-parking-visits*)
                   (if (= *resource-parking-after* *resource-parking-visits*)
                       (progn
                         (prog1 (parking-native-wait) (setf *resource-parking-resumed* t)))
                       "visited"))
-                (funcall setting name arguments)))
-          (symbol-function 'eval-setting-function) *parking-native-wrapper*
-          (symbol-function 'execute-query-plan) *resource-parking-plan-wrapper*
+                (funcall setting name missing-ok)))
+          (symbol-function 'sql-setting-value) *parking-native-wrapper*
+          (symbol-function 'run-select-portal) *resource-parking-plan-wrapper*
           (symbol-function 'heapam-scan) *resource-parking-heap-wrapper*
           (symbol-function 'buf-read) *resource-parking-read-wrapper*
           (symbol-function 'call-with-query-sort-arena) *resource-parking-arena-wrapper*
@@ -189,7 +194,7 @@ A later HUP reload restores the production functions."
 (defun resource-parking-verify-cleanup ()
   "Check that reload replaced the wrappers and that owned temporary resources were released.
 Clear the test hooks after verification."
-  (assert (not (eq *resource-parking-plan-wrapper* (symbol-function 'execute-query-plan))))
+  (assert (not (eq *resource-parking-plan-wrapper* (symbol-function 'run-select-portal))))
   (assert (not (eq *resource-parking-heap-wrapper* (symbol-function 'heapam-scan))))
   (assert (not (eq *resource-parking-read-wrapper* (symbol-function 'buf-read))))
   (assert (not (eq *resource-parking-arena-wrapper* (symbol-function 'call-with-query-sort-arena))))
@@ -247,7 +252,7 @@ Clear the test hooks after verification."
 (defun resource-parking-install-sql-promotion (root backend-pid)
   (let ((capture *live-operation-parking-test-hook*)
         (open *live-operation-before-open-hook*)
-        (setting (symbol-function 'eval-setting-function))
+        (setting (symbol-function 'sql-setting-value))
         (wait (symbol-function 'physical-promotion-wait-for-sql)))
     (sql-promotion-test-install root backend-pid :normal)
     (let ((park *live-operation-parking-test-hook*))
@@ -263,14 +268,13 @@ Clear the test hooks after verification."
                 (parking-native-marker "parked")))
             *live-operation-before-open-hook* open))
     (setf *parking-native-wrapper*
-          (lambda (name arguments)
-            (if (and (string= name "current_setting")
-                     (equal (first arguments) "pg_lisp_test_resource_park"))
+          (lambda (name &optional missing-ok)
+            (if (equal name "pg_lisp_test_resource_park")
                 (progn
                   (incf *resource-parking-visits*)
                   (if (= *resource-parking-after* *resource-parking-visits*) "promote" "visited"))
-                (funcall setting name arguments)))
-          (symbol-function 'eval-setting-function) *parking-native-wrapper*
+                (funcall setting name missing-ok)))
+          (symbol-function 'sql-setting-value) *parking-native-wrapper*
           (symbol-function 'physical-promotion-wait-for-sql)
           (lambda (deadline)
             (let ((result (funcall wait deadline)))

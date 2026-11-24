@@ -1752,3 +1752,47 @@
   (rove:ok (= (full-xid-from-32 #xFFFFFFFE (+ +xid-cycle+ 3))
               #xFFFFFFFE)
            "tuple XIDs below the new epoch resolve to the prior epoch"))
+
+(rove:deftest test-sorted-distinct-iterator-pulls-only-through-next-distinct-row
+    (let* ((remaining (list 1 1 2 3))
+           (pulls 0)
+           (closed nil)
+           (input (make-sql-iterator
+                   (lambda ()
+                     (incf pulls)
+                     (when remaining
+                       (let ((row (vector (pop remaining))))
+                         (values (cons row row) t))))
+                   (lambda () (setf closed t))))
+           (distinct (make-sorted-distinct-iterator input '((:col 1 :type :int4)))))
+      (unwind-protect
+           (progn
+             (rove:ok (equalp (car (sql-iterator-next distinct)) #(1)))
+             (rove:ok (= pulls 1))
+             (rove:ok (equalp (car (sql-iterator-next distinct)) #(2)))
+             (rove:ok (= pulls 3)))
+        (close-sql-iterator distinct))
+      (rove:ok closed)
+      (rove:ok (equal remaining '(3)))))
+
+
+(rove:deftest test-hash-distinct-limit-defers-overflow
+    (let ((*query-work-memory-bytes* 1)
+          (*query-temp-directory* (uiop:temporary-directory))
+          (rows (list 1 2 3)))
+      (with-query-temp-files ()
+                             (let* ((input (make-sql-iterator
+                                            (lambda ()
+                                              (when rows
+                                                (let ((values (vector (pop rows))))
+                                                  (values (cons values values) t))))))
+                                    (distinct (make-hash-distinct-iterator input '((:col 1 :type :int4))))
+                                    (output nil))
+                               (unwind-protect
+                                    (progn
+                                      (map-sql-iterator distinct (lambda (row) (setf output (car row)) :stop))
+                                      (rove:ok (equalp output #(1)))
+                                      (rove:ok (null rows) "Hash aggregation reads its initial input before emitting")
+                                      (rove:ok (= 1 (length *query-temp-files*)) "Only the input overflow file is written"))
+                                 (close-sql-iterator distinct))
+                               (rove:ok (null *query-temp-files*))))))

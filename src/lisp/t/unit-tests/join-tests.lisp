@@ -2,6 +2,15 @@
 
 (in-package #:pg)
 
+(defun make-unit-row-iterator (rows)
+  (make-sql-iterator (lambda () (when rows (values (pop rows) t)))))
+
+(defun map-unit-join (left right join function)
+  (with-query-temp-files ()
+                         (let ((iterator (make-nested-loop-iterator join left right)))
+                           (unwind-protect (map-sql-iterator iterator function)
+                             (close-sql-iterator iterator)))))
+
 (defun test-streamed-join-stop-and-outer-matches ()
   (let ((original-eval (symbol-function 'eval-expr))
         (qual-evaluations 0)
@@ -14,19 +23,11 @@
                    (when (equal expr '(:bool t))
                      (incf qual-evaluations))
                    (funcall original-eval expr env)))
-           (stream-select-join-environments
-            (lambda (visit-left)
-              (loop for value from 1 to 1000
-                    until (eq (funcall visit-left (vector value)) :stop)))
-            (lambda (visit-right)
-              (loop for value from 1 to 1000
-                    do (incf right-visits)
-                    until (eq (funcall visit-right (vector value)) :stop)))
-            (list :type :cross :qual '(:bool t)
-                  :left-width 1 :right-width 1)
-            (lambda (environment)
-              (push environment emitted)
-              :stop))
+           (map-unit-join
+            (make-unit-row-iterator (list #(1) #(2)))
+            (make-sql-iterator (lambda () (values (vector (incf right-visits)) t)))
+            (list :type :cross :qual '(:bool t) :left-width 1 :right-width 1)
+            (lambda (environment) (push environment emitted) :stop))
            (check (= qual-evaluations 1)
                   "streamed nested loop stops after the first accepted pair")
            (check (= right-visits 1)
@@ -36,19 +37,11 @@
                        (= (aref (first emitted) 1) 1))
                   "streamed nested loop emits its first pair before stopping")
            (setf emitted '())
-           (stream-select-join-environments
-            (lambda (visit-left)
-              (dolist (row (list (vector 1) (vector 2)))
-                (when (eq (funcall visit-left row) :stop)
-                  (return :stop))))
-            (lambda (visit-right)
-              (dolist (row (list (vector 9) (vector 10)))
-                (when (eq (funcall visit-right row) :stop)
-                  (return :stop))))
-            (list :type :full :qual '(:bool nil)
-                  :left-width 1 :right-width 1)
-            (lambda (environment)
-              (push environment emitted)))
+           (map-unit-join
+            (make-unit-row-iterator (list #(1) #(2)))
+            (make-unit-row-iterator (list #(9) #(10)))
+            (list :type :full :qual '(:bool nil) :left-width 1 :right-width 1)
+            (lambda (environment) (push environment emitted)))
            (setf emitted (nreverse emitted))
            (check (= (length emitted) 4)
                   "FULL JOIN emits unmatched rows from both inputs")
@@ -77,29 +70,27 @@
                       (list :seq-scan index (pg-class-oid table))))
          (registered (list (list :table left-table :path left-path)
                            (list :table right-table :path right-path)))
-         (original-scan (symbol-function 'scan-select-path))
+         (original-scan (symbol-function 'make-select-scan-iterator))
          (right-visits 0)
          (left-empty-p nil)
          (rows 0))
     (unwind-protect
          (progn
-           (setf (symbol-function 'scan-select-path)
-                 (lambda (table relfilenode path snapshot callback
-                          &optional environment)
-                   (declare (ignore relfilenode path snapshot environment))
-                   (cond
-                     ((eq table left-table)
-                      (unless left-empty-p
-                        (funcall callback
-                                 (make-htup :values #(1)))))
-                     ((eq table right-table)
-                      (loop for value from 1 to 1000
-                            do (incf right-visits)
-                            until (eq (funcall callback
-                                               (make-htup
-                                                :values (vector value)))
-                                      :stop))))))
-           (interpret-query-plan
+           (setf (symbol-function 'make-select-scan-iterator)
+                 (lambda (node relations)
+                   (let ((table (getf (physical-scan-relation node relations) :table))
+                         (value 0))
+                     (make-sql-iterator
+                      (lambda ()
+                        (cond
+                          ((eq table left-table)
+                           (unless (or left-empty-p (plusp value))
+                             (incf value)
+                             (values #(1) t)))
+                          ((< value 1000)
+                           (incf right-visits)
+                           (values (vector (incf value)) t))))))))
+           (map-query-plan-rows
             (%make-query-plan
              :physical
              (list :limit 1
@@ -109,12 +100,12 @@
             registered
             (lambda (row) (declare (ignore row)) (incf rows)))
            (check (= rows 1)
-                  "plan interpreter returns the first joined row under LIMIT")
+                  "plan iterator returns the first joined row under LIMIT")
            (check (= right-visits 1)
-                  "plan interpreter does not consume the full inner scan for LIMIT 1")
+                  "plan iterator does not consume the full inner scan for LIMIT 1")
            (setf right-visits 0)
            (setf left-empty-p t)
-           (interpret-query-plan
+           (map-query-plan-rows
             (%make-query-plan
              :physical
              (list :nested-loop-join join
@@ -124,8 +115,8 @@
                   (list :table right-table :path right-path))
             (lambda (row) (declare (ignore row)) (incf rows)))
            (check (zerop right-visits)
-                  "plan interpreter skips the inner scan when the outer is empty"))
-      (setf (symbol-function 'scan-select-path) original-scan))))
+                  "plan iterator skips the inner scan when the outer is empty"))
+      (setf (symbol-function 'make-select-scan-iterator) original-scan))))
 
 (defun test-streamed-join-on-matches-survive-where-and-stop ()
   (let ((original-eval (symbol-function 'eval-expr))
@@ -144,17 +135,12 @@
            ;; The (1, 1) pair matches ON but fails WHERE. Its right row must
            ;; remain matched so FULL JOIN does not emit it a second time as an
            ;; unmatched right row. Only right value 2 survives as unmatched.
-           (stream-select-join-environments
-            (lambda (visit-left) (funcall visit-left #(1)))
-            (lambda (visit-right)
-              (dolist (row (list #(1) #(2)))
-                (when (eq (funcall visit-right row) :stop)
-                  (return :stop))))
-            (list :type :full :qual :join-equal
-                  :left-width 1 :right-width 1)
+           (map-unit-join
+            (make-unit-row-iterator (list #(1)))
+            (make-unit-row-iterator (list #(1) #(2)))
+            (list :type :full :qual :join-equal :left-width 1 :right-width 1)
             (lambda (environment)
-              (when (true-p
-                     (eval-expr :where-null-left-or-right-two environment))
+              (when (true-p (eval-expr :where-null-left-or-right-two environment))
                 (push environment where-rejected-match))))
            (check (and (= (length where-rejected-match) 1)
                        (eq (aref (first where-rejected-match) 0) +null+)
@@ -164,19 +150,11 @@
            ;; A consumer that reaches LIMIT on an unmatched left row must stop
            ;; the remaining outer-join work as well.
            (let ((status
-                   (stream-select-join-environments
-                    (lambda (visit-left)
-                      (dolist (row (list #(3) #(4)))
-                        (when (eq (funcall visit-left row) :stop)
-                          (return :stop))))
-                    (lambda (visit-right)
-                      (declare (ignore visit-right))
-                      (values))
-                    (list :type :left :qual '(:bool t)
-                          :left-width 1 :right-width 1)
-                    (lambda (environment)
-                      (push environment emitted)
-                      :stop))))
+                   (map-unit-join
+                    (make-unit-row-iterator (list #(3) #(4)))
+                    (make-unit-row-iterator nil)
+                    (list :type :left :qual '(:bool t) :left-width 1 :right-width 1)
+                    (lambda (environment) (push environment emitted) :stop))))
              (check (eq status :stop)
                     "outer-join stop propagates from unmatched-row emission"))
            (check (and (= (length emitted) 1)

@@ -90,14 +90,14 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                                   t))))))))
      (lambda () (setf page nil)))))
 
-(defun make-select-index-tid-iterator (table path environment)
+(defun make-buffered-select-index-tid-iterator (table path environment &optional (key nil key-p))
   ;; Buffer matching TIDs under the index lease, then release the lease before
   ;; fetching heap tuples. The buffer may spill and is owned by the iterator.
   (let ((*datum-origin-capture* nil))
     (make-buffered-sql-iterator
      (lambda (emit)
        (let* ((index (select-scan-path-index path))
-              (key (select-scan-index-key table path environment)))
+              (key (if key-p key (select-scan-index-key table path environment))))
          (when key
            (call-with-current-select-index-domain
             (pg-index-relfilenode index)
@@ -112,9 +112,74 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                     (funcall emit (vector (car tid) (cdr tid)))))))))))
        (detach-select-index-scans)))))
 
+(defun make-select-index-tid-iterator (table path environment)
+  "Pull TIDs under the active index group, or read a detached scan's sealed tail.
+The group owns the borrowed lease. A pause copies unread TIDs before the group
+releases it; closing an active scan discards its unread cursor without a copy."
+  (unless *iterator-index-scan-domain-p*
+    (return-from make-select-index-tid-iterator
+      (make-buffered-select-index-tid-iterator table path environment)))
+  (let ((node (pg-index-relfilenode (select-scan-path-index path)))
+        (scan nil)
+        (buffered nil)
+        (store nil)
+        (reader nil)
+        (started-p nil))
+    (make-sql-iterator
+     (lambda ()
+       (block next
+         (unless started-p
+           (setf started-p t)
+           (let ((key (select-scan-index-key table path environment)))
+             (when key
+               (if (select-index-domain-covered-p *select-index-lease-domain*)
+                   (call-with-current-select-index-domain
+                    node
+                    (lambda ()
+                      (let ((lease
+                              (loop for group in *select-index-lease-groups*
+                                    for lease = (cdr (assoc node (select-index-lease-group-leases group)))
+                                    when (and lease (btree-read-lease-active-p lease)) return lease)))
+                        (unless lease (error "iterator index scan requires an active group lease"))
+                        (setf scan (make-select-index-scan
+                                    :cursor (open-btree-equal-cursor-unlocked node key)
+                                    :lease lease :borrowed-lease-p t))
+                        (push scan *select-index-scans*))))
+                   ;; A prior park may have released the surrounding group.
+                   ;; A temporary repair group cannot lend a cursor across pulls.
+                   (setf buffered (make-buffered-select-index-tid-iterator table path environment key))))))
+         (when buffered (return-from next (sql-iterator-next buffered)))
+         (when scan
+           (let ((spool (select-index-scan-spool scan)))
+             (if spool
+                 (progn
+                   (unless reader
+                     (setf store (adopt-sealed-query-row-spool spool)
+                           reader (make-query-replay-reader store)))
+                   (sql-iterator-next reader))
+                 (progn
+                   (unless (btree-read-lease-active-p (select-index-scan-lease scan))
+                     (error "iterator index scan outlived its group lease"))
+                   (let ((tid (btree-cursor-next-tid (select-index-scan-cursor scan))))
+                     (if tid
+                         (values (vector (car tid) (cdr tid)) t)
+                         (progn
+                           (setf *select-index-scans* (remove scan *select-index-scans* :test #'eq)
+                                 scan nil)
+                           (values nil nil))))))))))
+     (lambda ()
+       (unwind-protect (close-sql-iterator buffered)
+         (when scan
+           (if store
+               (close-query-replay-store store)
+               (when (select-index-scan-spool scan)
+                 (close-query-row-spool (select-index-scan-spool scan)))))))
+     (lambda ()
+       (setf *select-index-scans* (remove scan *select-index-scans* :test #'eq))))))
+
 (defun make-select-index-scan-iterator (table path snapshot relation relations environment capture-p demand)
-  ;; Fetch and check one buffered TID at a time against the scan snapshot.
-  ;; Closing this iterator also closes the TID buffer.
+  ;; Fetch and check one TID at a time against the scan snapshot. Closing this
+  ;; iterator releases its cursor or detached TID store.
   (let ((tids (make-select-index-tid-iterator table path environment))
         (presence (vector (ensure-select-source-identity relation))))
     (make-sql-iterator
@@ -311,15 +376,13 @@ existing input needs no lazy-child captures or branch."
                                (cdr entry)))))
      (nreverse extra))))
 
-(defun make-sorted-project-set-iterator (node project set-node width calls relations &key source-streamer)
+(defun make-sorted-project-set-iterator (node project set-node width calls relations)
   "Sort source rows before expansion when no sort key depends on a set result.
 
 Cache ordinary targets and their origins per source row.  Source origins travel
 through the sort after the target origins, then accompany each expanded input.
 Bare set targets use target-list attempt order; wrapped set results remain a
-separate projection.  SOURCE-STREAMER, when supplied, passes each source row to
-its callback with that row's origins bound.  Otherwise the iterator reads the
-source itself.  Closing the result closes the sort and its source."
+separate projection. Closing the result closes the sort and its source."
   (let* ((targets (second project))
          (target-count (length targets))
          (capture-p *datum-origin-capture*)
@@ -345,26 +408,9 @@ source itself.  Closing the result closes the sort and its source."
                                     extra)))
                      (setf (car row) (concatenate 'vector (car row) keys))
                      (values row t origins)))))
-             (source
-               (unless source-streamer
-                 (make-mapping-sql-iterator
-                  (make-physical-plan-iterator (third set-node) relations) transform)))
-             (sorted
-               (make-buffered-sql-iterator
-                (lambda (emit)
-                  (stream-select-sort
-                   (lambda (callback)
-                     (if source-streamer
-                         (funcall source-streamer
-                                  (lambda (environment)
-                                    (multiple-value-bind (row keep origins)
-                                        (funcall transform environment)
-                                      (declare (ignore keep))
-                                      (let ((*query-row-origins* origins))
-                                        (funcall callback row)))))
-                         (map-sql-iterator source callback)))
-                   order emit))
-                source))
+             (source (make-mapping-sql-iterator
+                      (make-physical-plan-iterator (third set-node) relations) transform))
+             (sorted (make-select-sort-iterator source order))
              (input
                (make-mapping-sql-iterator
                 sorted
@@ -566,7 +612,7 @@ source itself.  Closing the result closes the sort and its source."
 (defun make-physical-plan-iterator (node relations)
   (instrument-physical-plan-iterator node (%make-physical-plan-iterator node relations)))
 
-(defun make-resumable-query-plan-iterator (plan relations)
+(defun make-resumable-query-plan-iterator (plan relations &key projected-only-p)
   ;; Restore the plan's TOAST demand and instrumentation context for each pull;
   ;; the caller owns the returned iterator and closes it when the plan ends.
   (multiple-value-bind (demand slice-plan)
@@ -575,6 +621,7 @@ source itself.  Closing the result closes the sort and its source."
            (*select-toast-slice-plan* slice-plan)
            (*toast-slice-current* nil)
            (*cte-active-plan* plan)
+           (*select-terminal-sort-node* (and projected-only-p (query-plan-physical plan)))
            (input (make-physical-plan-iterator (query-plan-physical plan) relations)))
       (make-sql-iterator
        (lambda ()
@@ -586,6 +633,39 @@ source itself.  Closing the result closes the sort and its source."
              (declare (ignore toast-context))
              (values row present origins nil presence))))
        (lambda () (close-sql-iterator input))))))
+
+(defun map-query-plan-rows (plan relations function)
+  "Consume a plan in the current statement domain, closing it even on early stop."
+  (let* ((root-p (not *subquery-execution-active-p*))
+         (*subquery-result-cache* (if root-p (make-hash-table :test #'eq) *subquery-result-cache*))
+         (*subquery-registered-relations* (if root-p relations *subquery-registered-relations*))
+         (*subquery-outer-frames* (if root-p nil *subquery-outer-frames*))
+         (*subquery-execution-active-p* t)
+         (*subquery-instrumentation-depth* (1+ *subquery-instrumentation-depth*))
+         (new-scan-scope-p (not *iterator-index-scan-domain-p*))
+         (*iterator-index-scan-domain-p* t))
+    (when (and *query-plan-instrumentation-p* (= *subquery-instrumentation-depth* 1))
+      (reset-query-plan-tree-instrumentation plan))
+    ;; Nested consumers can open a shared CTE producer that outlives their
+    ;; reader. Register those cursors in the enclosing execution's scan scope.
+    (progv (when new-scan-scope-p '(*select-index-scans*))
+        (when new-scan-scope-p (list *select-index-scans*))
+      (call-with-query-cte-execution
+       root-p
+       (lambda ()
+         (call-with-select-index-lease-domain
+          (query-plan-index-relfilenodes plan relations)
+          (lambda ()
+            (let ((iterator (make-resumable-query-plan-iterator plan relations)))
+              (unwind-protect
+                   (map-sql-iterator
+                    iterator
+                    (lambda (row)
+                      (let ((*select-toast-demand* nil)
+                            (*select-toast-slice-plan* nil)
+                            (*toast-slice-current* nil))
+                        (funcall function row))))
+                (close-sql-iterator iterator))))))))))
 
 (defun make-subquery-scan-iterator (node relations)
   (multiple-value-bind (frame presence)
@@ -623,6 +703,252 @@ source itself.  Closing the result closes the sort and its source."
       (make-nested-loop-iterator
        (second node) (make-physical-plan-iterator (third node) relations)
        (make-physical-plan-iterator (fourth node) relations))))
+
+(defun make-select-sort-iterator (input order &key limit projected-only-p)
+  "Prepare the sort on the first pull and return one sorted row per call.
+The reader retains its runs until close. If there is no enclosing temporary
+owner, the iterator creates one and closes it after the reader and input."
+  (let ((reader nil)
+        (owner nil)
+        (private-owner-p nil)
+        (remaining limit)
+        (limit-checked nil)
+        (capture-p *datum-origin-capture*))
+    (make-sql-iterator
+     (lambda ()
+       (unless limit-checked
+         (when limit (check-select-limit limit))
+         (setf limit-checked t))
+       (unless (eql remaining 0)
+         (unless owner
+           (setf owner *query-temp-cleanup-owner*)
+           (unless owner
+             (setf owner (make-query-temp-scope-owner
+                          (or *query-temp-quota* (backend-query-temp-quota *backend*)))
+                   private-owner-p t
+                   (query-temp-cleanup-owner-temporary-directory owner) *query-temp-directory*)))
+         (call-with-query-temp-owner
+          owner
+          (lambda ()
+            (let ((*datum-origin-capture* capture-p))
+              (unless reader
+                (setf reader
+                      (call-with-query-sort-arena
+                       (lambda (arena)
+                         (prepare-select-sort input order arena limit projected-only-p))))
+                (close-sql-iterator input))
+              (multiple-value-bind (item present) (sql-iterator-next reader)
+                (when present
+                  (when remaining (decf remaining))
+                  (values (if projected-only-p
+                              (cons (query-sort-item-row item) nil)
+                              (query-sort-item-row item))
+                          t (and capture-p (not projected-only-p) (datum-origins-from-spill
+                                                                   (query-sort-item-with-metadata-origins item)))
+                          nil (unless projected-only-p
+                                (query-sort-item-with-metadata-presence item))))))))))
+     (lambda ()
+       (unwind-protect
+            (when owner
+              (unwind-protect
+                   (call-with-query-temp-owner owner (lambda () (close-sql-iterator reader)) nil)
+                (when private-owner-p (close-query-temp-owner owner))))
+         (close-sql-iterator input))))))
+
+(defun make-sorted-distinct-iterator (input keys)
+  "Yield the first row of each group from a sorted input.
+Copy the previous projected values before the input advances again."
+  (let ((previous nil))
+    (make-mapping-sql-iterator
+     input
+     (lambda (row)
+       (let ((values (car row)))
+         (unless (and previous (grouping-rows-equal-p keys previous values))
+           (setf previous (copy-query-sort-value values))
+           (values (cons values values) t *query-row-origins*)))))))
+
+(defun make-sorted-aggregate-iterator (input group-keys descriptors)
+  "Finalize one group per pull, preserving the first row of the next group.
+The current group's transition states are closed before the row is returned,
+including when finalization or input evaluation fails."
+  (let* ((width (length group-keys))
+         (keys (loop for key in group-keys for position from 1
+                     collect (list :col position :type (expr-type key) :typmod (expr-typmod key))))
+         (evaluated (make-mapping-sql-iterator
+                     input
+                     (lambda (row)
+                       (multiple-value-bind (values origins)
+                           (aggregate-input-row row group-keys descriptors)
+                         (values (cons nil values) t origins)))))
+         (ordered (if keys
+                      (make-select-sort-iterator evaluated (mapcar (lambda (key) (cons key nil)) keys))
+                      evaluated))
+         (pending nil)
+         (pending-origins nil)
+         (done nil))
+    (make-sql-iterator
+     (lambda ()
+       (unless done
+         (unless pending
+           (multiple-value-bind (row present origins) (sql-iterator-next ordered)
+             (when present (setf pending (cdr row) pending-origins origins))))
+         (if (and keys (null pending))
+             (progn (setf done t) (values nil nil))
+             (with-query-temp-files ()
+                                    (let ((states nil)
+                                          (group (if pending (subseq pending 0 width) #()))
+                                          (group-origins (and pending-origins (subseq pending-origins 0 width)))
+                                          (transition-origins (make-array (length descriptors) :initial-element nil)))
+                                      (unwind-protect
+                                           (progn
+                                             (setf states (make-aggregate-transition-states descriptors))
+                                             (loop while pending
+                                                   do (step-aggregate-transition-origins
+                                                       states descriptors pending pending-origins transition-origins width)
+                                                      (step-aggregate-transition-states states descriptors pending width)
+                                                      (multiple-value-bind (row present origins) (sql-iterator-next ordered)
+                                                        (setf pending (and present (cdr row)) pending-origins origins))
+                                                   until (and pending keys (not (grouping-rows-equal-p keys group pending))))
+                                             (setf done (null pending))
+                                             (values (concatenate 'vector group (aggregate-transition-results states descriptors))
+                                                     t (and *datum-origin-capture*
+                                                            (concatenate 'vector
+                                                                         (or group-origins (make-array width :initial-element nil))
+                                                                         transition-origins))))
+                                        (close-aggregate-transition-states states)))))))
+     (lambda () (close-sql-iterator ordered)))))
+
+(defun make-hash-aggregate-sort-fallback-iterator (path keys count)
+  "Reduce adjacent canonical keys from one non-shrinking overflow batch.
+The parent owns PATH. This iterator closes its sort and input stream on exit."
+  (let* ((stream nil)
+         (capture-p *datum-origin-capture*)
+         (input
+           (make-sql-iterator
+            (lambda ()
+              (unless stream
+                (sb-sys:without-interrupts
+                  (setf stream (open-query-temp-input path))))
+              (let ((record (query-spill-read-record stream)))
+                (unless (eq record +query-spill-eof+)
+                  (if capture-p
+                      (values (cons nil (first record)) t (datum-origins-from-spill (second record)))
+                      (values (cons nil record) t)))))
+            (lambda () (finish-query-temp-stream stream nil))))
+         (sorted (make-select-sort-iterator input (mapcar (lambda (key) (cons key nil)) keys)))
+         (pending nil)
+         (pending-key nil)
+         (pending-origins nil)
+         (done nil))
+    (labels ((advance ()
+               (multiple-value-bind (row present origins) (sql-iterator-next sorted)
+                 (if present
+                     (let ((*query-row-origins* origins))
+                       (multiple-value-setq (pending pending-key pending-origins)
+                         (hash-aggregate-group keys (cdr row))))
+                     (setf pending nil done t)))))
+      (make-sql-iterator
+       (lambda ()
+         (unless done
+           (unless pending (advance))
+           (unless done
+             (let ((key pending-key)
+                   (group pending)
+                   (origins pending-origins)
+                   (rows 0))
+               (loop do (incf rows) (advance)
+                     until (or done (not (equal key pending-key))))
+               (values (concatenate 'vector group (make-array count :initial-element rows))
+                       t (and capture-p
+                              (concatenate 'vector (or origins #())
+                                           (make-array count :initial-element nil))))))))
+       (lambda () (close-sql-iterator sorted))))))
+
+(defun make-hash-aggregate-batch-iterator (source keys count memory-limit depth &key input)
+  "Yield in-memory states before processing overflow partitions one at a time.
+The iterator owns the overflow and pending partition files. Closing it early
+also closes the active child and input, then removes its remaining files."
+  (let ((groups nil)
+        (origins nil)
+        (spill nil)
+        (spill-count 0)
+        (partitions nil)
+        (child-path nil)
+        (child nil)
+        (started-p nil))
+    (labels ((close-child ()
+               (unwind-protect (close-sql-iterator child)
+                 (setf child nil)
+                 (when child-path
+                   (delete-query-temp-file child-path)
+                   (setf child-path nil)))))
+      (make-sql-iterator
+       (lambda ()
+         (block next-group
+           (unless started-p
+             (multiple-value-setq (groups origins spill spill-count)
+               (prepare-hash-aggregate-batch source keys count memory-limit))
+             (setf started-p t)
+             (close-sql-iterator input))
+           (when groups
+             (let* ((state (pop groups))
+                    (group-origins (gethash state origins)))
+               (remhash state origins)
+               (return-from next-group
+                 (values (hash-aggregate-state-row state) t
+                         (and *datum-origin-capture*
+                              (concatenate 'vector (or group-origins #())
+                                           (make-array count :initial-element nil)))))))
+           (when spill
+             (multiple-value-bind (batch-paths sort-p)
+                 (partition-hash-aggregate-overflow spill spill-count keys depth)
+               (if sort-p
+                   (setf child (make-hash-aggregate-sort-fallback-iterator spill keys count)
+                         child-path spill)
+                   (progn
+                     (setf partitions batch-paths)
+                     (delete-query-temp-file spill)))
+               (setf spill nil)))
+           (loop
+             (unless child
+               (unless partitions (return))
+               (let ((path (cdr (pop partitions))))
+                 (setf child-path path
+                       child (make-hash-aggregate-batch-iterator
+                              (lambda (emit) (hash-aggregate-spill-file path emit))
+                              keys count memory-limit (1+ depth)))))
+             (multiple-value-bind (row present row-origins) (sql-iterator-next child)
+               (when present (return (values row t row-origins))))
+             (close-child))))
+       (lambda ()
+         (unwind-protect
+              (unwind-protect (close-child)
+                (when spill (delete-query-temp-file spill))
+                (hash-aggregate-delete-partitions partitions))
+           (close-sql-iterator input)))))))
+
+(defun make-hash-aggregate-iterator (input group-keys aggregate-count &key distinct-p)
+  "Consume INPUT into hash batches and return one aggregate group per pull."
+  (let* ((keys (loop for key in group-keys for slot from 1
+                     collect (list :col slot :type (expr-type key) :typmod (expr-typmod key))))
+         (source
+           (lambda (emit)
+             (map-sql-iterator
+              input
+              (lambda (row)
+                (multiple-value-bind (values key origins)
+                    (hash-aggregate-group group-keys (if distinct-p (car row) row))
+                  (declare (ignore key))
+                  (let ((*query-row-origins* origins))
+                    (funcall emit (coerce values 'vector))))))))
+         (batch (make-hash-aggregate-batch-iterator
+                 source keys aggregate-count (max 1 *query-work-memory-bytes*) 0 :input input)))
+    (if distinct-p
+        (make-mapping-sql-iterator batch (lambda (row) (values (cons row row) t *query-row-origins*)))
+        batch)))
+
+(defun make-hash-distinct-iterator (input keys)
+  (make-hash-aggregate-iterator input keys 0 :distinct-p t))
 
 (defun %make-physical-plan-iterator (node relations)
   (case (first node)
@@ -673,7 +999,21 @@ source itself.  Closing the result closes the sort and its source."
      (make-limit-sql-iterator (second node)
                               (make-physical-plan-iterator (third node) relations) :lazy t))
     (:nested-loop-join (make-physical-join-iterator node relations))
-    ((:sort :top-n :hash-aggregate :sorted-aggregate :hash-distinct :sorted-distinct)
+    (:sorted-distinct
+     (let* ((keys (second node))
+            (input (make-physical-plan-iterator (third node) relations))
+            (order (mapcar (lambda (key) (list (list :sort-output (second key)))) keys))
+            (sorted (make-select-sort-iterator input order)))
+       (make-sorted-distinct-iterator sorted keys)))
+    (:sorted-aggregate
+     (make-sorted-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
+                                     (second node) (third node)))
+    (:hash-distinct
+     (make-hash-distinct-iterator (make-physical-plan-iterator (third node) relations) (second node)))
+    (:hash-aggregate
+     (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
+                                   (second node) (third node)))
+    ((:sort :top-n)
      (let ((child (physical-buffered-node-child node)))
        ;; If a key needs an SRF value, keep expansion below sort instead of
        ;; moving it above the sort and changing the key's evaluation point.
@@ -685,12 +1025,13 @@ source itself.  Closing the result closes the sort and its source."
             (deferred (sort-projection-deferred-slots node child))
             (*query-sort-project* (and deferred (cons child deferred)))
             (input (make-physical-plan-iterator child relations))
-            (buffer
-              (make-buffered-sql-iterator
-               (lambda (emit)
-                 (flet ((source (callback) (map-sql-iterator input callback)))
-                   (stream-physical-buffered-node node #'source emit)))
-               input)))
+            (buffer (make-select-sort-iterator
+                     input (second node)
+                     :limit (and (eq (first node) :top-n) (third node))
+                     :projected-only-p (and (eq node *select-terminal-sort-node*)
+                                            (eq (first node) :sort)
+                                            (null deferred)
+                                            (not *datum-origin-capture*)))))
        (if deferred
            (make-mapping-sql-iterator
             buffer

@@ -154,12 +154,11 @@
                                :input '(:const 7 :type :int4 :typmod -1) :type :int8 :slot 0))
              (stage (list :partition nil :order nil :frame '(:rows :current)
                           :width 1 :functions (list descriptor))))
-        (stream-window-stage
-         (lambda (callback)
-           (loop repeat 20
-                 do (incf visited)
-                 when (eq (funcall callback #()) :stop) do (return :stop)))
-         stage (lambda (row) (declare (ignore row)) :stop))
+        (let ((iterator (make-window-plan-iterator
+                         (make-sql-iterator (lambda () (incf visited) (values #() t)))
+                         stage)))
+          (unwind-protect (map-sql-iterator iterator (constantly :stop))
+            (close-sql-iterator iterator)))
         (rove:ok (= visited 1) "a prefix/ranking consumer stops its source"))))
 
 (rove:deftest window-spilled-array-prefix
@@ -181,7 +180,7 @@
 
 (cl-spec:defproperty window-generated-prefix-totals
     ((size (range integer 1 12)) (delta (range integer -10 10)) (range-p boolean))
-  (:about stream-window-stage)
+  (:about make-window-plan-iterator)
   (:trials (:normal 150))
   (let* ((source (format nil "~{~a~^ UNION ALL ~}"
                          (loop for index from 1 to size

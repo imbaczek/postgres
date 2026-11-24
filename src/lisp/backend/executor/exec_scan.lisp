@@ -434,7 +434,7 @@ approximates tuple spool size from relation pages and path selectivity."
   "Estimate an inner path using its parameterization and replay strategy.
 
 Unparameterized SeqScan and IndexScan inputs are cached by
-stream-select-join-environments, like nodeMaterial.c, so their access cost is
+the nested-loop iterator, like nodeMaterial.c, so their access cost is
 paid once and later passes pay tuple replay plus possible spill reads. A
 parameterized IndexScan is rescanned per outer row, as in nodeIndexscan.c."
   (let* ((scan-cost (select-scan-path-cost table path))
@@ -1207,10 +1207,12 @@ registration-to-DDL handoff free of a lock-order inversion."
             (encode-index-key (list value) types))))))
 
 (defstruct select-index-scan
-  "A scoped cursor and lease, or a sealed spool of its unread TIDs."
-  cursor lease spool)
+  "A cursor and lease, or a sealed spool of its unread TIDs.
+A borrowed lease belongs to the enclosing group and is released by that group."
+  cursor lease spool borrowed-lease-p)
 
 (defvar *select-index-scans* nil)
+(defvar *iterator-index-scan-domain-p* nil)
 
 (defstruct select-index-lease-domain
   "The fixed, sorted index nodes available to a query and its nested plans."
@@ -1226,7 +1228,9 @@ registration-to-DDL handoff free of a lock-order inversion."
 
 (defun select-index-lease-owner-count (lease)
   "Count supported scan and group owners of LEASE."
-  (+ (count lease *select-index-scans* :key #'select-index-scan-lease :test #'eq)
+  (+ (count-if (lambda (scan) (and (not (select-index-scan-borrowed-lease-p scan))
+                                   (eq lease (select-index-scan-lease scan))))
+               *select-index-scans*)
      (loop for group in *select-index-lease-groups*
            sum (count lease (select-index-lease-group-leases group) :key #'cdr :test #'eq))))
 
@@ -1377,25 +1381,28 @@ spool delivery without invoking the callback for the remaining tail."
   (dolist (scan *select-index-scans*)
     (let ((lease (select-index-scan-lease scan))
           (spool (select-index-scan-spool scan)))
-      (unless (and (member lease *btree-read-leases* :test #'eq)
-                   (= 1 (select-index-lease-owner-count lease))
-                   (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
-                   (if spool
-                       (and (null (select-index-scan-cursor scan))
-                            (not (btree-read-lease-active-p lease))
-                            (query-row-spool-sealed-p spool))
-                       (and (select-index-scan-cursor scan)
-                            (btree-read-lease-active-p lease))))
+      (unless (if (and spool (select-index-scan-borrowed-lease-p scan))
+                  (and (null lease) (null (select-index-scan-cursor scan))
+                       (query-row-spool-sealed-p spool))
+                  (and (member lease *btree-read-leases* :test #'eq)
+                       (= 1 (select-index-lease-owner-count lease))
+                       (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
+                       (if spool
+                           (and (null (select-index-scan-cursor scan))
+                                (not (btree-read-lease-active-p lease))
+                                (query-row-spool-sealed-p spool))
+                           (and (select-index-scan-cursor scan)
+                                (btree-read-lease-active-p lease)))))
         (error "index scan ownership mismatch"))))
   (values))
 
 (defun detach-select-index-scan (scan)
-  "Save unread TIDs before releasing SCAN's lease.
+  "Save unread TIDs before releasing SCAN's cursor.
 
 Read a cursor copy without fetching or evaluating tuples.  Publish the sealed
-spool and clear the cursor before release, which can report a deadline after
-discharging the lease.  On failure before publication, close the partial spool
-and retain the original cursor and lease.  An existing spool keeps its position."
+spool and clear the cursor before releasing an owned lease. A borrowed lease is
+left to its group. On failure before publication, close the partial spool and
+retain the original cursor and lease. An existing spool keeps its position."
   (unless (select-index-scan-spool scan)
     (let ((cursor (clone-btree-equal-cursor (select-index-scan-cursor scan)))
           (spool (make-query-row-spool 1))
@@ -1411,7 +1418,9 @@ and retain the original cursor and lease.  An existing spool keeps its position.
                (setf (select-index-scan-spool scan) spool
                      (select-index-scan-cursor scan) nil
                      installed t)
-               (release-btree-read-lease (select-index-scan-lease scan))))
+               (if (select-index-scan-borrowed-lease-p scan)
+                   (setf (select-index-scan-lease scan) nil)
+                   (release-btree-read-lease (select-index-scan-lease scan)))))
         (sb-sys:without-interrupts
           (unless installed (close-query-row-spool spool))))))
   (values))
@@ -1697,137 +1706,6 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
 (defun nested-loop-match-memory (spool-memory)
   "Use the remaining work memory for the match map, with a one-byte minimum."
   (max 1 (- *query-work-memory-bytes* spool-memory)))
-
-(defun stream-select-join-environments (left-stream right-stream join callback)
-  (let* ((join-type (getf join :type))
-         (qual (getf join :qual))
-         (left-width (getf join :left-width))
-         (right-width (getf join :right-width))
-         (null-left (make-array left-width :initial-element +null+))
-         (null-right (make-array right-width :initial-element +null+))
-         (right/full-p (member join-type '(:right :full)))
-         (capture-p *datum-origin-capture*)
-         (spool-memory (nested-loop-spool-memory right/full-p))
-         (match-memory (nested-loop-match-memory spool-memory)))
-    (with-query-temp-files ()
-                           (with-query-row-spool (right-spool spool-memory)
-                             (labels ((run-join (matched-right)
-                                        (let ((right-loaded nil) (outer-seen nil) (stopped nil) (matched-left nil))
-                                          (labels
-                                              ((emit (environment origins presence)
-                                                 (let ((*query-row-origins* origins) (*query-row-presence* presence))
-                                                   (when (eq (funcall callback environment) :stop)
-                                                     (setf stopped t)
-                                                     :stop)))
-                                               (stored-row (right)
-                                                 (list right
-                                                       (and capture-p (datum-origins-for-spill *query-row-origins*))
-                                                       *query-row-presence*))
-                                               (stored-origins (stored)
-                                                 (when capture-p (datum-origins-from-spill (second stored))))
-                                               (process-right (left left-origins left-presence right right-origins
-                                                               right-presence right-index)
-                                                 (check-for-interrupts)
-                                                 (multiple-value-bind (joined origins presence)
-                                                     (qualify-select-join-pair join qual left right left-origins right-origins
-                                                                               left-presence right-presence t)
-                                                   (when joined
-                                                     (setf matched-left t)
-                                                     (when matched-right (query-match-map-mark matched-right right-index))
-                                                     (emit joined origins presence))))
-                                               (load-right-for-left (left left-origins left-presence)
-                                                 (setf right-loaded t)
-                                                 (funcall right-stream
-                                                          (lambda (right)
-                                                            (let* ((right-origins *query-row-origins*)
-                                                                   (right-presence *query-row-presence*)
-                                                                   (index (query-row-spool-append right-spool (stored-row right))))
-                                                              (when matched-right
-                                                                (unless (= index (query-match-map-append matched-right))
-                                                                  (error "Join spool and match map lost row alignment")))
-                                                              (process-right left left-origins left-presence right right-origins
-                                                                             right-presence index))))
-                                                 (unless stopped (query-row-spool-seal right-spool)))
-                                               (visit-left (left)
-                                                 (unless stopped
-                                                   (check-for-interrupts)
-                                                   (setf outer-seen t matched-left nil)
-                                                   (let ((left-origins *query-row-origins*)
-                                                         (left-presence *query-row-presence*))
-                                                     (if right-loaded
-                                                         (map-query-row-spool
-                                                          right-spool
-                                                          (lambda (stored index)
-                                                            (process-right left left-origins left-presence
-                                                                           (first stored) (stored-origins stored)
-                                                                           (third stored) index)))
-                                                         (load-right-for-left left left-origins left-presence))
-                                                     (when (and (not stopped) (not matched-left)
-                                                                (member join-type '(:left :full)))
-                                                       (multiple-value-bind (row origins)
-                                                           (null-extend-select-join-row left left-origins null-right nil left-origins)
-                                                         (emit row origins left-presence))))
-                                                   (when stopped :stop)))
-                                               (emit-unmatched-right (right origins presence)
-                                                 (multiple-value-bind (row padded-origins)
-                                                     (null-extend-select-join-row right origins null-left t origins)
-                                                   (emit row padded-origins presence)))
-                                               (emit-unmatched-rights ()
-                                                 (if outer-seen
-                                                     (progn
-                                                       (query-match-map-finish matched-right)
-                                                       (map-query-row-spool
-                                                        right-spool
-                                                        (lambda (stored index)
-                                                          (unless (query-match-map-matched-p matched-right index)
-                                                            (emit-unmatched-right (first stored) (stored-origins stored)
-                                                                                  (third stored))))))
-                                                     (funcall right-stream
-                                                              (lambda (right)
-                                                                (emit-unmatched-right right *query-row-origins*
-                                                                                      *query-row-presence*))))))
-                                            (funcall left-stream #'visit-left)
-                                            (unless stopped (when right/full-p (emit-unmatched-rights)))
-                                            (when stopped :stop)))))
-                               (if right/full-p
-                                   (with-query-match-map (matched-right match-memory) (run-join matched-right))
-                                   (run-join nil)))))))
-
-(defun stream-select-indexed-join-environments
-    (left-stream parameterized-right-stream join callback)
-  "Rescan a parameterized inner input for each left row, retaining origins."
-  (let* ((join-type (getf join :type))
-         (qual (getf join :qual))
-         (right-width (getf join :right-width))
-         (null-right (make-array right-width :initial-element +null+))
-         (stopped nil))
-    (unless (member join-type '(:inner :cross :left))
-      (error "Parameterized join does not support ~a joins" join-type))
-    (labels ((emit (environment origins presence)
-               (let ((*query-row-origins* origins) (*query-row-presence* presence))
-                 (when (eq (funcall callback environment) :stop)
-                   (setf stopped t)
-                   :stop)))
-             (visit-left (left)
-               (unless stopped
-                 (check-for-interrupts)
-                 (let ((matched nil) (left-origins *query-row-origins*)
-                                     (left-presence *query-row-presence*))
-                   (funcall parameterized-right-stream left
-                            (lambda (right)
-                              (multiple-value-bind (joined origins presence)
-                                  (qualify-select-join-pair join qual left right left-origins *query-row-origins*
-                                                            left-presence *query-row-presence* t)
-                                (when joined
-                                  (setf matched t)
-                                  (emit joined origins presence)))))
-                   (when (and (not stopped) (not matched) (eq join-type :left))
-                     (multiple-value-bind (row origins)
-                         (null-extend-select-join-row left left-origins null-right nil left-origins)
-                       (emit row origins left-presence))))
-                 (when stopped :stop))))
-      (funcall left-stream #'visit-left)
-      (if stopped :stop (values)))))
 
 (defun select-write-bytea-text (out bytes format)
   "Write PostgreSQL bytea text without building a value-sized string."

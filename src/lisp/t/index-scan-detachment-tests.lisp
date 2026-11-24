@@ -48,9 +48,8 @@
              (pg::*query-temp-quota* nil))
          (funcall function root))))))
 
-(defun call-with-detachment-test-plan (nodes function &key compiler-hook)
-  (let* ((pg::*query-plan-backends* (make-hash-table :test #'eq))
-         (relations
+(defun call-with-detachment-test-plan (nodes function &key before-scan)
+  (let* ((relations
            (loop for node in nodes
                  collect
                  (list :table (pg::make-pg-class :oid (+ 100000 node) :relfilenode (+ 300000 node)
@@ -68,19 +67,11 @@
                            scans)
                    '(:result nil)))
          (plan (pg::%make-query-plan :physical tree)))
-    (pg::register-query-plan-backend
-     :detachment-test
-     :executor (unless compiler-hook
-                 (lambda (query registered callback)
-                   (declare (ignore query registered callback))
-                   (funcall function)))
-     :compiler (when compiler-hook
-                 (lambda (query)
-                   (funcall compiler-hook query)
-                   (lambda (registered callback)
-                     (declare (ignore registered callback))
-                     (funcall function)))))
-    (pg::execute-query-plan plan relations nil :backend :detachment-test)))
+    (pg::call-with-select-index-lease-domain
+     (pg::query-plan-index-relfilenodes plan relations)
+     (lambda ()
+       (when before-scan (funcall before-scan plan))
+       (funcall function)))))
 
 (defun detachment-test-domain-scan (node count callback)
   (pg::call-with-current-select-index-domain
@@ -390,25 +381,25 @@
                  (ok (not entered))))
            (setf (symbol-function 'pg::acquire-btree-read-lease) acquire))))))
 
-(deftest compiler-hook-can-park-before-opening-its-first-index-cursor
+(deftest before-scan-can-park-before-opening-its-first-index-cursor
     (call-with-detachment-test-state
      (lambda (root)
-       (let ((compiles 0) (seen nil))
+       (let ((setups 0) (seen nil))
          (pg::with-live-operation
            (call-with-detachment-test-plan
             '(901)
             (lambda ()
               (detachment-test-domain-scan
                901 3 (lambda (tid) (push tid seen) nil)))
-            :compiler-hook
+            :before-scan
             (lambda (plan)
               (declare (ignore plan))
-              (incf compiles)
+              (incf setups)
               (ok (pg::select-index-domain-covered-p pg::*select-index-lease-domain*))
               (pg::call-with-live-operation-parked
                (lambda ()
                  (ok (notany #'pg::btree-read-lease-active-p pg::*btree-read-leases*)))))))
-         (ok (= 1 compiles))
+         (ok (= 1 setups))
          (ok (equal (nreverse seen) '((1 . 1) (2 . 1) (3 . 1))))
          (ok (null (uiop:directory-files root)))))))
 

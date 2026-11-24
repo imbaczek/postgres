@@ -108,16 +108,15 @@
 
 (cl-spec:defproperty record-grouping-prefix-determines-groups
     ((prefix (range integer -10000 10000)) (delta (range integer 1 100)))
-  (:about stream-sorted-aggregates grouping-rows-equal-p)
+  (:about make-sorted-aggregate-iterator grouping-rows-equal-p)
   (:trials (:normal 100))
   (let* ((fields '(("id" :int4) ("j" :json)))
          (rows (list (vector (make-sql-record :fields fields :values (vector prefix "{}")))
                      (vector (make-sql-record :fields fields :values (vector (+ prefix delta) +null+)))))
          (result nil))
-    (stream-sorted-aggregates
-     (lambda (visit) (dolist (row (reverse rows)) (funcall visit row)))
-     '((:col 1 :type :record)) '((:kind :count :input nil))
-     (lambda (row) (push (list (aref (sql-record-values (aref row 0)) 0) (aref row 1)) result)))
+    (map-rove-sorted-aggregate (reverse rows)
+                               '((:col 1 :type :record)) '((:kind :count :input nil))
+                               (lambda (row) (push (list (aref (sql-record-values (aref row 0)) 0) (aref row 1)) result)))
     (equal (reverse result) (list (list prefix 1) (list (+ prefix delta) 1)))))
 
 (rove:deftest generated-record-grouping-prefix
@@ -154,6 +153,14 @@
       (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))
       (rove:ok (= 200 (getf result :trials)))))
 
+(defun map-rove-sorted-distinct (rows keys function)
+  (with-query-temp-files ()
+                         (let* ((order (mapcar (lambda (key) (list (list :sort-output (second key)))) keys))
+                                (sorted (make-select-sort-iterator (make-rove-row-iterator rows) order))
+                                (iterator (make-sorted-distinct-iterator sorted keys)))
+                           (unwind-protect (map-sql-iterator iterator function)
+                             (close-sql-iterator iterator)))))
+
 (rove:deftest record-distinct-sorts-with-bounded-memory
     (dolist (memory '(1 100000))
       (let ((*query-work-memory-bytes* memory)
@@ -166,11 +173,8 @@
                               (list (list (record 1 :jsonb (sql-jsonb-input "{}"))
                                           (record 1 :jsonb (sql-jsonb-input "{}"))) '(1))))
             (let ((result nil))
-              (stream-sorted-distinct
-               (lambda (visit)
-                 (dolist (record (first case))
-                   (let ((values (vector record)))
-                     (funcall visit (cons values values)))))
+              (map-rove-sorted-distinct
+               (mapcar (lambda (record) (let ((row (vector record))) (cons row row))) (first case))
                '((:col 1 :type :record))
                (lambda (row) (push (aref (sql-record-values (aref (car row) 0)) 0) result)))
               (rove:ok (equal (reverse result) (second case)))))
@@ -179,10 +183,8 @@
             (rove:ok
              (equal "42883"
                     (handler-case
-                        (stream-sorted-distinct
-                         (lambda (visit)
-                           (funcall visit (cons values values))
-                           (funcall visit (cons values values)))
+                        (map-rove-sorted-distinct
+                         (list (cons values values) (cons values values))
                          '((:col 1 :type :record)) (lambda (row) (declare (ignore row))))
                       (pg-error (condition) (pg-error-sqlstate condition))))))))))
 
@@ -496,13 +498,13 @@
              "logical plan uses an abstract aggregate operator")
     (rove:ok (eq (first (third physical)) :hash-aggregate)
              "physical plan selects HashAggregate")
-    (execute-query-plan plan nil (lambda (row) (declare (ignore row))))
+    (map-query-plan-rows plan nil (lambda (row) (declare (ignore row))))
     (rove:ok (zerop (plan-node-metadata-actual-loops
                      (gethash aggregate-node (query-plan-metadata plan))))
              "ordinary execution leaves EXPLAIN ANALYZE counters untouched")
     (let ((*query-plan-instrumentation-p* t))
-      (execute-query-plan plan nil
-                          (lambda (row) (push (aref (car row) 0) rows))))
+      (map-query-plan-rows plan nil
+                           (lambda (row) (push (aref (car row) 0) rows))))
     (rove:ok (equal (nreverse rows) '(1))
              "interpreter executes a plain COUNT(*) over its input")
     (rove:ok (= (plan-node-metadata-actual-rows
@@ -536,7 +538,7 @@
                    (plan-node-metadata-actual-total-time-ticks source-metadata))
                "EXPLAIN ANALYZE aggregate timing includes its input exactly once"))
     (let ((*query-plan-instrumentation-p* t))
-      (execute-query-plan plan nil (lambda (row) (declare (ignore row)))))
+      (map-query-plan-rows plan nil (lambda (row) (declare (ignore row)))))
     (rove:ok (= (plan-node-metadata-actual-loops
                  (gethash aggregate-node (query-plan-metadata plan)))
                 1)
@@ -544,13 +546,13 @@
   (let* ((plan (plan-select-query
                 (first (parse-statements "select 7, count(*) where 1 = 0"))))
          (rows '()))
-    (execute-query-plan plan nil (lambda (row) (push (car row) rows)))
+    (map-query-plan-rows plan nil (lambda (row) (push (car row) rows)))
     (rove:ok (equalp (nreverse rows) (list #(7 0)))
              "global COUNT(*) emits one zero row for empty input and permits constants"))
   (let* ((plan (plan-select-query
                 (first (parse-statements "select true, count(*) where 1 = 0"))))
          (rows '()))
-    (execute-query-plan plan nil (lambda (row) (push (car row) rows)))
+    (map-query-plan-rows plan nil (lambda (row) (push (car row) rows)))
     (rove:ok (equalp (nreverse rows) (list #(t 0)))
              "global COUNT(*) permits row-independent boolean projections"))
   (let* ((group-ref (aggregate-output-ref 1 :int4))
@@ -564,15 +566,15 @@
 
 (rove:deftest test-parameterized-join-streaming-and-reordered-slots
     (let ((rows '()))
-      (stream-select-indexed-join-environments
-       (lambda (callback)
-         (dolist (left (list #(10) #(20)))
-           (funcall callback left)))
-       (lambda (outer callback)
-         (when (= (aref outer 0) 10)
-           (funcall callback #(100))))
-       (list :type :left :qual '(:bool t) :left-width 1 :right-width 1)
-       (lambda (environment) (push environment rows)))
+      (let ((iterator
+              (make-lateral-join-iterator
+               (list :type :left :qual '(:bool t) :left-width 1 :right-width 1)
+               (make-rove-row-iterator (list #(10) #(20)))
+               (lambda (outer origins presence)
+                 (declare (ignore origins presence))
+                 (make-rove-row-iterator (when (= (aref outer 0) 10) (list #(100))))))))
+        (unwind-protect (map-sql-iterator iterator (lambda (row) (push row rows)))
+          (close-sql-iterator iterator)))
       (rove:ok (equalp (nreverse rows) (list #(10 100) (vector 20 +null+)))
                "parameterized LEFT join emits matches and null-extends misses"))
   (rove:ok (equalp

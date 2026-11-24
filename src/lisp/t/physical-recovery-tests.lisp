@@ -970,7 +970,7 @@
                         (let* ((ast (first (pg::parse-statements
                                             "SELECT substring(v,1996,3), octet_length(v), v FROM text_slice")))
                                (plan (pg::plan-select-query ast)))
-                          (pg::interpret-query-plan
+                          (pg::map-query-plan-rows
                            plan (getf (pg::query-plan-prepared plan) :relations)
                            (lambda (row) (push (car row) rows))))
                         (ok (= calls 1))
@@ -989,7 +989,7 @@
                                (ast (first (pg::parse-statements "SELECT substring(v,1996,3) FROM text_slice")))
                                (plan (pg::plan-select-query ast))
                                (rows nil))
-                          (pg::interpret-query-plan
+                          (pg::map-query-plan-rows
                            plan (getf (pg::query-plan-prepared plan) :relations)
                            (lambda (row) (push (car row) rows)))
                           (ok (and (= (length rows) 1)
@@ -998,7 +998,7 @@
                                (ast (first (pg::parse-statements
                                             "SELECT octet_length(v), length(v), char_length(v), character_length(v) FROM text_slice")))
                                (plan (pg::plan-select-query ast)) (rows nil))
-                          (pg::interpret-query-plan
+                          (pg::map-query-plan-rows
                            plan (getf (pg::query-plan-prepared plan) :relations)
                            (lambda (row) (push (car row) rows)))
                           (ok (and (= (length rows) 1)
@@ -1014,7 +1014,7 @@
                                  (let* ((pg::*current-snapshot* snapshot)
                                         (ast (first (pg::parse-statements "SELECT octet_length(v), length(b), octet_length(b) FROM text_slice")))
                                         (plan (pg::plan-select-query ast)) (rows nil))
-                                   (pg::interpret-query-plan
+                                   (pg::map-query-plan-rows
                                     plan (getf (pg::query-plan-prepared plan) :relations)
                                     (lambda (row) (push (car row) rows)))
                                    (ok (every (lambda (i) (= (aref (first rows) i) (length raw))) '(0 1 2)))))
@@ -1262,7 +1262,7 @@
                           (let* ((plan (pg::plan-select-query
                                         (first (pg::parse-statements "SELECT payload FROM whole_target"))))
                                  (result nil))
-                            (pg::execute-query-plan
+                            (pg::map-query-plan-rows
                              plan (getf (pg::query-plan-prepared plan) :relations)
                              (lambda (row) (push (car row) result) nil))
                             result))

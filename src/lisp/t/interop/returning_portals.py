@@ -71,14 +71,16 @@ def expect_kinds(result, expected):
 
 
 def select_plan_cases(peers):
+    padding = "x" * 256
     for peer in peers:
         peer.query('CREATE TABLE portal_plans (id int PRIMARY KEY, grp int, v text)')
         peer.query("INSERT INTO portal_plans VALUES (1,1,'a'),(2,1,'b'),(3,2,'c'),(4,2,'d')")
         peer.query('CREATE INDEX portal_plans_grp ON portal_plans(grp)')
         peer.query('ANALYZE portal_plans')
-        peer.query('CREATE TABLE portal_index_plan (id int PRIMARY KEY, v int)')
+        peer.query('CREATE TABLE portal_index_plan (id int PRIMARY KEY, v int, pad text)')
         peer.query('INSERT INTO portal_index_plan VALUES ' +
-                   ','.join(f'({i},{i})' for i in range(1000)))
+                   ','.join(f'({i},{i // 3})' for i in range(1000)))
+        peer.query('CREATE INDEX portal_index_plan_v ON portal_index_plan(v)')
         peer.query('ANALYZE portal_index_plan')
         peer.query('CREATE PUBLICATION portal_plan_pub FOR TABLE portal_plans')
         peer.query('CREATE PUBLICATION portal_empty_pub FOR TABLE portal_plans')
@@ -449,6 +451,8 @@ def select_plan_cases(peers):
 
     cases = (
         ('index', 'SELECT v FROM portal_index_plan WHERE id=500'),
+        ('index_duplicates', 'SELECT v FROM portal_index_plan WHERE v=167'),
+        ('materialized_cte_limit', 'WITH q AS MATERIALIZED (SELECT v FROM portal_index_plan WHERE v=167) SELECT v FROM q LIMIT 2'),
         ('join', 'SELECT a.id,b.id FROM portal_plans a JOIN portal_plans b ON a.id=b.id WHERE a.id<4'),
         ('right_join', 'SELECT a.id,b.id FROM portal_plans a RIGHT JOIN portal_plans b ON a.id=b.id+2 ORDER BY b.id'),
         ('full_join', 'SELECT a.id,b.id FROM portal_plans a FULL JOIN portal_plans b ON a.id=b.id+2 ORDER BY a.id,b.id'),
@@ -465,11 +469,18 @@ def select_plan_cases(peers):
         ('slice', 'SELECT substr(v,1,1) FROM portal_plans ORDER BY id'),
     )
     for name, sql in cases:
+        if name == 'index_duplicates':
+            plan = peers[-1].query('EXPLAIN ' + sql)
+            assert any('Index Scan' in row[0] for row in plan), (name, plan)
         portal = name.encode()
         result = compare(peers, [parse(sql, name=portal), bind((), portal=portal, statement=portal),
                                  execute(1, portal)], (name, 'first'))
         expect_kinds(result, [b'1', b'2', b'D', b's', b'Z'])
         result = compare(peers, [execute(0, portal)], (name, 'rest'))
+        if name in ('index_duplicates', 'materialized_cte_limit'):
+            remaining = 2 if name == 'index_duplicates' else 1
+            expect_kinds(result, [b'D'] * remaining + [b'C', b'Z'])
+            assert all(peers[0].data_row(body) == ['167'] for kind, body in result if kind == b'D')
         assert result[-2][0] == b'C' and result[-1][0] == b'Z', (name, result)
         compare(peers, [close_portal(portal)], (name, 'close'))
 

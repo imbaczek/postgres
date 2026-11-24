@@ -1894,9 +1894,9 @@
            (*query-parameter-values* (vector 3 "one"))
            (plan (plan-select-query (first (parse-statements "select $1, $2"))))
            (rows nil))
-      (execute-query-plan plan nil (lambda (row) (push (copy-seq (car row)) rows)))
+      (map-query-plan-rows plan nil (lambda (row) (push (copy-seq (car row)) rows)))
       (setf *query-parameter-values* (vector 8 +null+))
-      (execute-query-plan plan nil (lambda (row) (push (copy-seq (car row)) rows)))
+      (map-query-plan-rows plan nil (lambda (row) (push (copy-seq (car row)) rows)))
       (rove:ok (equalp (nreverse rows) (list (vector 3 "one") (vector 8 +null+)))))
   (rove:ok (handler-case (progn (tokenize "$1junk") nil) (error () t)))
   (rove:ok (handler-case (progn (analyze-expr '(:parameter 0) nil) nil)
@@ -2502,7 +2502,7 @@
     (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
            (old-plan (symbol-function 'plan-select-query))
            (old-column (symbol-function 'target->result-column))
-           (old-run (symbol-function 'execute-query-plan))
+           (old-run (symbol-function 'map-query-plan-rows))
            (*select-suppress-description* t)
            (*select-expected-result-columns* (list (make-result-column :name "old" :type-oid 17)))
            (calls 0))
@@ -2513,14 +2513,14 @@
                      (%make-query-plan :prepared '(:relations nil :targets ((:type :bytea)))))
                    (symbol-function 'target->result-column)
                    (lambda (target) (declare (ignore target)) (make-result-column :name "new" :type-oid 17))
-                   (symbol-function 'execute-query-plan)
+                   (symbol-function 'map-query-plan-rows)
                    (lambda (&rest args) (declare (ignore args)) (incf calls)))
              (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
                (rove:ok (handler-case (progn (exec-select out nil) nil) (error () t)))
                (rove:ok (zerop calls)) (rove:ok (zerop (file-position out)))))
         (setf (symbol-function 'plan-select-query) old-plan
               (symbol-function 'target->result-column) old-column
-              (symbol-function 'execute-query-plan) old-run)
+              (symbol-function 'map-query-plan-rows) old-run)
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-empty-copy-row-description-validation

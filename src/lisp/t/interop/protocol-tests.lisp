@@ -716,27 +716,24 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
              (let ((pg::*query-temp-directory* directory)
                    (pg::*query-work-memory-bytes* memory)
                    (output nil))
-               (pg::stream-sorted-aggregates
-                (lambda (callback) (dolist (row input) (funcall callback row)))
-                '((:col 1 :type :int4)) descriptors
-                (lambda (row) (push row output)))
+               (map-test-sorted-aggregate input
+                                          '((:col 1 :type :int4)) descriptors
+                                          (lambda (row) (push row output)))
                (ok (equalp (list (vector 1 3 (text-array (list "a" pg::+null+ "b")))
                                  (vector 2 2 (text-array '("x" "y"))))
                            (nreverse output)))
                (ok (null (uiop:directory-files directory)))
                (let ((count 0))
-                 (pg::stream-sorted-aggregates
-                  (lambda (callback) (dolist (row input) (funcall callback row)))
-                  '((:col 1 :type :int4)) descriptors
-                  (lambda (row) (declare (ignore row)) (incf count) :stop))
+                 (map-test-sorted-aggregate input
+                                            '((:col 1 :type :int4)) descriptors
+                                            (lambda (row) (declare (ignore row)) (incf count) :stop))
                  (ok (= 1 count)))
                (ok (null (uiop:directory-files directory)))
                (ok (handler-case
                        (progn
-                         (pg::stream-sorted-aggregates
-                          (lambda (callback) (dolist (row input) (funcall callback row)))
-                          '((:col 1 :type :int4)) descriptors
-                          (lambda (row) (declare (ignore row)) (error "consumer failed")))
+                         (map-test-sorted-aggregate input
+                                                    '((:col 1 :type :int4)) descriptors
+                                                    (lambda (row) (declare (ignore row)) (error "consumer failed")))
                          nil)
                      (error () t)))
                (ok (null (uiop:directory-files directory)))))
@@ -887,31 +884,24 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                (pg::sql-char-output (pg::sql-char-input "é"))))
   (ok (string= "" (pg::sql-char-output (pg::sql-char-input "")))))
 
+(defun map-test-sorted-aggregate (rows keys descriptors function)
+  (pg::with-query-temp-files ()
+                             (let* ((input (pg::make-sql-iterator
+                                            (lambda () (when rows (values (pop rows) t)))))
+                                    (iterator (pg::make-sorted-aggregate-iterator input keys descriptors)))
+                               (unwind-protect (pg::map-sql-iterator iterator function)
+                                 (pg::close-sql-iterator iterator)))))
+
 (defun derived-query-rows (sql)
   (let* ((plan (pg::plan-select-query (first (pg::parse-statements sql))))
          (rows nil))
-    (pg::interpret-query-plan
+    (pg::map-query-plan-rows
      plan (getf (pg::query-plan-prepared plan) :relations)
      (lambda (row) (push (car row) rows)))
     (nreverse rows)))
 
-(defun whole-row-query-rows (sql &optional iterator-p)
-  (let* ((plan (pg::plan-select-query (first (pg::parse-statements sql))))
-         (relations (getf (pg::query-plan-prepared plan) :relations))
-         (rows nil))
-    (flet ((emit (row) (push (car row) rows) nil))
-      (if iterator-p
-          (let ((pg::*query-plan-backends* (make-hash-table :test #'eq)))
-            (pg::register-query-plan-backend
-             :whole-row-test
-             :executor
-             (lambda (query registered callback)
-               (let ((input (pg::make-resumable-query-plan-iterator query registered)))
-                 (unwind-protect (pg::map-sql-iterator input callback)
-                   (pg::close-sql-iterator input)))))
-            (pg::execute-query-plan plan relations #'emit :backend :whole-row-test))
-          (pg::execute-query-plan plan relations #'emit)))
-    (nreverse rows)))
+(defun whole-row-query-rows (sql)
+  (derived-query-rows sql))
 
 (deftest whole-row-json-distinguishes-present-null-fields
     (ok (test-row-equal-p
@@ -927,60 +917,57 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
        (derived-query-rows "SELECT r.* FROM (SELECT 1 AS id, 'x'::text AS label) r"))))
 
 (deftest whole-row-json-survives-correlated-and-lateral-execution
-    (dolist (iterator-p '(nil t))
-      (dolist (sql '("SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) r"
-                     "SELECT (SELECT to_json(r.*)) FROM (SELECT NULL::integer AS id) r"
-                     "SELECT (SELECT (SELECT to_json(r.*))) FROM (SELECT NULL::integer AS id) r"
-                     "SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) l LEFT JOIN LATERAL (SELECT l.id) r ON true"))
-        (ok (test-row-equal-p '(#("{\"id\":null}")) (whole-row-query-rows sql iterator-p))))
-      (dolist (sql '("SELECT (SELECT to_json(r.*)) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
-                     "SELECT to_json(r.*) FROM (SELECT 1 AS id) l LEFT JOIN LATERAL (SELECT l.id WHERE false) r ON true"))
-        (ok (test-row-equal-p (list (vector pg::+null+)) (whole-row-query-rows sql iterator-p))))))
+    (dolist (sql '("SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) r"
+                   "SELECT (SELECT to_json(r.*)) FROM (SELECT NULL::integer AS id) r"
+                   "SELECT (SELECT (SELECT to_json(r.*))) FROM (SELECT NULL::integer AS id) r"
+                   "SELECT to_json(r.*) FROM (SELECT NULL::integer AS id) l LEFT JOIN LATERAL (SELECT l.id) r ON true"))
+      (ok (test-row-equal-p '(#("{\"id\":null}")) (whole-row-query-rows sql))))
+  (dolist (sql '("SELECT (SELECT to_json(r.*)) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                 "SELECT to_json(r.*) FROM (SELECT 1 AS id) l LEFT JOIN LATERAL (SELECT l.id WHERE false) r ON true"))
+    (ok (test-row-equal-p (list (vector pg::+null+)) (whole-row-query-rows sql)))))
 
 (deftest json-aggregate-preserves-null-and-whole-row-values
-    (dolist (iterator-p '(nil t))
-      (dolist (memory '(1 100000))
-        (let ((pg::*query-work-memory-bytes* memory)
-              (pg::*query-temp-directory* (uiop:temporary-directory)))
-          (dolist (case
-                      (list
-                       (list "SELECT json_agg(r.id) FROM (SELECT 1 AS id WHERE false) r"
-                             (list (vector pg::+null+)))
-                       (list "SELECT json_agg(r.id) FROM (SELECT NULL::integer AS id) r"
-                             '(#("[null]")))
-                       (list "SELECT pg_catalog.json_agg(r.id) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
-                             '(#("[1, 2]")))
-                       (list "SELECT json_agg(r.*) FROM (SELECT NULL::integer AS id) r"
-                             '(#("[{\"id\":null}]")))
-                       (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
-                             '(#("[null]")))
-                       (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
-                             (list (vector (format nil "[{\"id\":1}, ~% {\"id\":2}]"))))
-                       (list "SELECT json_agg(r.x) FROM (SELECT false AS x UNION ALL SELECT true UNION ALL SELECT NULL::boolean) r"
-                             '(#("[false, true, null]")))
-                       (list "SELECT json_agg(r.x) FROM (SELECT ARRAY[1,2] AS x UNION ALL SELECT ARRAY[3,4]) r"
-                             (list (vector (format nil "[[1,2], ~% [3,4]]"))))
-                       (list "SELECT json_agg(r.j) FROM (SELECT '{ \"raw\" : 1 }'::json AS j) r"
-                             '(#("[{ \"raw\" : 1 }]")))))
-            (ok (test-row-equal-p (second case)
-                                  (whole-row-query-rows (first case) iterator-p))))))))
+    (dolist (memory '(1 100000))
+      (let ((pg::*query-work-memory-bytes* memory)
+            (pg::*query-temp-directory* (uiop:temporary-directory)))
+        (dolist (case
+                    (list
+                     (list "SELECT json_agg(r.id) FROM (SELECT 1 AS id WHERE false) r"
+                           (list (vector pg::+null+)))
+                     (list "SELECT json_agg(r.id) FROM (SELECT NULL::integer AS id) r"
+                           '(#("[null]")))
+                     (list "SELECT pg_catalog.json_agg(r.id) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
+                           '(#("[1, 2]")))
+                     (list "SELECT json_agg(r.*) FROM (SELECT NULL::integer AS id) r"
+                           '(#("[{\"id\":null}]")))
+                     (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                           '(#("[null]")))
+                     (list "SELECT json_agg(r.*) FROM (SELECT 1 AS id UNION ALL SELECT 2) r"
+                           (list (vector (format nil "[{\"id\":1}, ~% {\"id\":2}]"))))
+                     (list "SELECT json_agg(r.x) FROM (SELECT false AS x UNION ALL SELECT true UNION ALL SELECT NULL::boolean) r"
+                           '(#("[false, true, null]")))
+                     (list "SELECT json_agg(r.x) FROM (SELECT ARRAY[1,2] AS x UNION ALL SELECT ARRAY[3,4]) r"
+                           (list (vector (format nil "[[1,2], ~% [3,4]]"))))
+                     (list "SELECT json_agg(r.j) FROM (SELECT '{ \"raw\" : 1 }'::json AS j) r"
+                           '(#("[{ \"raw\" : 1 }]")))))
+          (ok (test-row-equal-p (second case)
+                                (whole-row-query-rows (first case))))))))
 
 (deftest json-aggregate-group-and-window-snapshots
-    (dolist (iterator-p '(nil t))
-      (dolist (memory '(1 100000))
-        (let ((pg::*query-work-memory-bytes* memory)
-              (pg::*query-temp-directory* (uiop:temporary-directory)))
-          (dolist (case
-                      '(("SELECT k,json_agg(v) FROM (SELECT 1 AS k,'a'::text AS v UNION ALL SELECT 2,'b'::text UNION ALL SELECT 1,'c'::text) r GROUP BY k ORDER BY k"
-                         (#(1 "[\"a\", \"c\"]") #(2 "[\"b\"]")))
-                        ("SELECT v,json_agg(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) r ORDER BY v"
-                         (#(1 "[1]") #(2 "[1, 2]") #(3 "[1, 2, 3]")))
-                        ("SELECT v,json_agg(v) OVER (ORDER BY v) FROM (SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 2) r ORDER BY v"
-                         (#(1 "[1, 1]") #(1 "[1, 1]") #(2 "[1, 1, 2]")))
-                        ("SELECT v,json_agg(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS v UNION ALL SELECT 2) r ORDER BY v"
-                         (#(1 "[1, 2]") #(2 "[1, 2]")))))
-            (ok (test-row-equal-p (second case)
-                                  (whole-row-query-rows (first case) iterator-p))))))))
+    (dolist (memory '(1 100000))
+      (let ((pg::*query-work-memory-bytes* memory)
+            (pg::*query-temp-directory* (uiop:temporary-directory)))
+        (dolist (case
+                    '(("SELECT k,json_agg(v) FROM (SELECT 1 AS k,'a'::text AS v UNION ALL SELECT 2,'b'::text UNION ALL SELECT 1,'c'::text) r GROUP BY k ORDER BY k"
+                       (#(1 "[\"a\", \"c\"]") #(2 "[\"b\"]")))
+                      ("SELECT v,json_agg(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) r ORDER BY v"
+                       (#(1 "[1]") #(2 "[1, 2]") #(3 "[1, 2, 3]")))
+                      ("SELECT v,json_agg(v) OVER (ORDER BY v) FROM (SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 2) r ORDER BY v"
+                       (#(1 "[1, 1]") #(1 "[1, 1]") #(2 "[1, 1, 2]")))
+                      ("SELECT v,json_agg(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS v UNION ALL SELECT 2) r ORDER BY v"
+                       (#(1 "[1, 2]") #(2 "[1, 2]")))))
+          (ok (test-row-equal-p (second case)
+                                (whole-row-query-rows (first case))))))))
 
 (deftest json-aggregate-rejects-unknown-and-unsupported-call-decorations
     (dolist (case '(("SELECT json_agg('x')" . "42804")
@@ -992,21 +979,20 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                    (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))
 
 (deftest whole-row-analysis-retains-column-precedence-and-slot-identity
-    (dolist (iterator-p '(nil t))
-      (dolist (case
-                  '(("SELECT to_json(r) FROM (SELECT 1 AS id, 'x'::text AS label) r"
-                     (#("{\"id\":1,\"label\":\"x\"}")))
-                    ("SELECT r FROM (SELECT 7 AS r) r" (#(7)))
-                    ("SELECT (SELECT r FROM (SELECT 1 AS id) r) FROM (SELECT 7 AS r) o"
-                     (#(7)))
-                    ("SELECT r.* FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
-                    ("SELECT (r.*) FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
-                    ("SELECT to_json((r.*)) FROM (SELECT 1 AS x, 2 AS x) r"
-                     (#("{\"x\":1,\"x\":2}")))
-                    ("SELECT count(r.*) FROM (SELECT NULL::integer AS id) r" (#(1)))
-                    ("SELECT count(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
-                     (#(0)))))
-        (ok (test-row-equal-p (second case) (whole-row-query-rows (first case) iterator-p)))))
+    (dolist (case
+                '(("SELECT to_json(r) FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                   (#("{\"id\":1,\"label\":\"x\"}")))
+                  ("SELECT r FROM (SELECT 7 AS r) r" (#(7)))
+                  ("SELECT (SELECT r FROM (SELECT 1 AS id) r) FROM (SELECT 7 AS r) o"
+                   (#(7)))
+                  ("SELECT r.* FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
+                  ("SELECT (r.*) FROM (SELECT 1 AS x, 2 AS x) r" (#(1 2)))
+                  ("SELECT to_json((r.*)) FROM (SELECT 1 AS x, 2 AS x) r"
+                   (#("{\"x\":1,\"x\":2}")))
+                  ("SELECT count(r.*) FROM (SELECT NULL::integer AS id) r" (#(1)))
+                  ("SELECT count(r.*) FROM (SELECT 1 AS id) l LEFT JOIN (SELECT NULL::integer AS id) r ON false"
+                   (#(0)))))
+      (ok (test-row-equal-p (second case) (whole-row-query-rows (first case)))))
   (dolist (sql '("SELECT to_json(r.*) FROM (SELECT 1 AS id) r GROUP BY r.id"
                  "SELECT (SELECT to_json(r.*)) FROM (SELECT 1 AS id) r GROUP BY r.id"))
     (ok (equal "42803"
@@ -1014,50 +1000,46 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                  (pg::pg-error (condition) (pg::pg-error-sqlstate condition)))))))
 
 (deftest whole-row-origin-capture-restores-correlated-presence
-    (dolist (iterator-p '(nil t))
-      (let ((pg::*datum-origin-capture* t))
-        (ok (test-row-equal-p
-             '(#("{\"id\":null}"))
-             (whole-row-query-rows
-              "SELECT to_json((SELECT COALESCE(r.*))) FROM (SELECT NULL::integer AS id) r"
-              iterator-p))))))
+    (let ((pg::*datum-origin-capture* t))
+      (ok (test-row-equal-p
+           '(#("{\"id\":null}"))
+           (whole-row-query-rows
+            "SELECT to_json((SELECT COALESCE(r.*))) FROM (SELECT NULL::integer AS id) r")))))
 
 (deftest whole-row-null-tests-use-composite-semantics
-    (dolist (iterator-p '(nil t))
-      (dolist (case
-                  '(("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT NULL::integer AS id, NULL::text AS label) r"
-                     (#(t nil)))
-                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, NULL::text AS label) r"
-                     (#(nil nil)))
-                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, 'x'::text AS label) r"
-                     (#(nil t)))
-                    ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id) l LEFT JOIN (SELECT 2 AS id) r ON false"
-                     (#(t nil)))
-                    ("SELECT (r.*) FROM (SELECT 1 AS id, 'x'::text AS label) r"
-                     (#(1 "x")))))
-        (ok (test-row-equal-p (second case)
-                              (whole-row-query-rows (first case) iterator-p))))))
+    (dolist (case
+                '(("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT NULL::integer AS id, NULL::text AS label) r"
+                   (#(t nil)))
+                  ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, NULL::text AS label) r"
+                   (#(nil nil)))
+                  ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                   (#(nil t)))
+                  ("SELECT (r.*) IS NULL, (r.*) IS NOT NULL FROM (SELECT 1 AS id) l LEFT JOIN (SELECT 2 AS id) r ON false"
+                   (#(t nil)))
+                  ("SELECT (r.*) FROM (SELECT 1 AS id, 'x'::text AS label) r"
+                   (#(1 "x")))))
+      (ok (test-row-equal-p (second case)
+                            (whole-row-query-rows (first case))))))
 
 (deftest whole-row-json-survives-materialization-and-set-expansion
-    (dolist (iterator-p '(nil t))
-      (dolist (memory '(1 100000))
-        (let ((pg::*query-work-memory-bytes* memory)
-              (pg::*query-temp-directory* (uiop:temporary-directory)))
-          (dolist (case
-                      '(("SELECT CASE WHEN random() < 0.5 THEN to_json(r.*) ELSE to_json(r.*) END FROM (SELECT 2 AS id UNION ALL SELECT 1) r ORDER BY id LIMIT 1"
-                         (#("{\"id\":1}")))
-                        ("WITH r AS MATERIALIZED (SELECT NULL::integer AS id) SELECT to_json(r.*) FROM r"
-                         (#("{\"id\":null}")))
-                        ("WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM r WHERE id < 2) SELECT to_json(r.*) FROM r ORDER BY id"
-                         (#("{\"id\":1}") #("{\"id\":2}")))
-                        ("SELECT to_json(r.*) FROM (SELECT 1 AS id) r UNION ALL SELECT to_json(r.*) FROM (SELECT 2 AS id) r"
-                         (#("{\"id\":1}") #("{\"id\":2}")))
-                        ("SELECT to_json(r.*), row_number() OVER () FROM (SELECT NULL::integer AS id) r"
-                         (#("{\"id\":null}" 1)))
-                        ("SELECT to_json(r.*), sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS id UNION ALL SELECT 2) r ORDER BY id"
-                         (#("{\"id\":1}" 3) #("{\"id\":2}" 3)))))
-            (ok (test-row-equal-p (second case)
-                                  (whole-row-query-rows (first case) iterator-p))))))))
+    (dolist (memory '(1 100000))
+      (let ((pg::*query-work-memory-bytes* memory)
+            (pg::*query-temp-directory* (uiop:temporary-directory)))
+        (dolist (case
+                    '(("SELECT CASE WHEN random() < 0.5 THEN to_json(r.*) ELSE to_json(r.*) END FROM (SELECT 2 AS id UNION ALL SELECT 1) r ORDER BY id LIMIT 1"
+                       (#("{\"id\":1}")))
+                      ("WITH r AS MATERIALIZED (SELECT NULL::integer AS id) SELECT to_json(r.*) FROM r"
+                       (#("{\"id\":null}")))
+                      ("WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM r WHERE id < 2) SELECT to_json(r.*) FROM r ORDER BY id"
+                       (#("{\"id\":1}") #("{\"id\":2}")))
+                      ("SELECT to_json(r.*) FROM (SELECT 1 AS id) r UNION ALL SELECT to_json(r.*) FROM (SELECT 2 AS id) r"
+                       (#("{\"id\":1}") #("{\"id\":2}")))
+                      ("SELECT to_json(r.*), row_number() OVER () FROM (SELECT NULL::integer AS id) r"
+                       (#("{\"id\":null}" 1)))
+                      ("SELECT to_json(r.*), sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT 1 AS id UNION ALL SELECT 2) r ORDER BY id"
+                       (#("{\"id\":1}" 3) #("{\"id\":2}" 3)))))
+          (ok (test-row-equal-p (second case)
+                                (whole-row-query-rows (first case))))))))
 
 (deftest whole-row-json-preserves-null-extension-through-outer-joins
     (dolist (sql '("SELECT to_json(r.*) FROM (SELECT 1 AS id) l
@@ -1096,18 +1078,16 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                       FROM pg_catalog.pg_stat_get_wal_senders() w,
                            pg_catalog.pg_stat_get_activity(w.pid)
                       WHERE w.state = 'streaming'")))
-               (dolist (iterator-p '(nil t))
-                 (ok (test-row-equal-p
-                      '(#("[{\"pid\":2354,\"application_name\":\"status_join\",\"sync_state\":\"async\",\"write_lsn\":80,\"flush_lsn\":64,\"replay_lsn\":32}]"))
-                      (whole-row-query-rows
-                       "SELECT json_agg(r.*) FROM (
+               (ok (test-row-equal-p
+                    '(#("[{\"pid\":2354,\"application_name\":\"status_join\",\"sync_state\":\"async\",\"write_lsn\":80,\"flush_lsn\":64,\"replay_lsn\":32}]"))
+                    (whole-row-query-rows
+                     "SELECT json_agg(r.*) FROM (
                           SELECT w.pid AS pid, application_name, sync_state,
                                  pg_wal_lsn_diff(write_lsn,'0/0')::bigint AS write_lsn,
                                  pg_wal_lsn_diff(flush_lsn,'0/0')::bigint AS flush_lsn,
                                  pg_wal_lsn_diff(replay_lsn,'0/0')::bigint AS replay_lsn
                           FROM pg_stat_get_wal_senders() w, pg_stat_get_activity(w.pid)
-                          WHERE w.state='streaming') r"
-                       iterator-p))))
+                          WHERE w.state='streaming') r")))
                (ok (test-row-equal-p
                     '(#(2354 "status_join") #(2355 "sql_only"))
                     (derived-query-rows
@@ -1252,22 +1232,26 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                 :key #'first)))
   (ok (equal "0A000" (sqlstate-of (pg::parse-statements "SELECT DISTINCT ON (1) 1")))))
 
+(defun map-test-hash-distinct (rows keys function)
+  (pg::with-query-temp-files ()
+                             (let* ((input (pg::make-sql-iterator
+                                            (lambda ()
+                                              (when rows (values (cons (pop rows) #(:irrelevant)) t)))))
+                                    (iterator (pg::make-hash-distinct-iterator input keys)))
+                               (unwind-protect (pg::map-sql-iterator iterator function)
+                                 (pg::close-sql-iterator iterator)))))
+
 (deftest distinct-executor-projected-values
     (let* ((keys '((:col 1 :type :int4) (:col 2 :type :text)))
            (null pg::+null+)
            (input (list (vector 1 "a") (vector 1 "a")
                         (vector 1 null) (vector 1 null) (vector 2 "a")))
            (output nil))
-      (pg::execute-physical-plan-node
-       (list :hash-distinct keys :test-input) nil nil
+      (map-test-hash-distinct
+       input keys
        (lambda (row)
-         (ok (eq (car row) (cdr row)))
-         (push (coerce (car row) 'list) output))
-       (lambda (node callback)
-         (declare (ignore node))
-         (dolist (values input)
-           (funcall callback (cons values #(:irrelevant)))))
-       nil)
+         (ok (equalp (car row) (cdr row)))
+         (push (coerce (car row) 'list) output)))
       (ok (= 3 (length output)))
       (ok (member (list 1 null) output :test #'equal))
       (ok (member '(1 "a") output :test #'equal))
@@ -1275,10 +1259,8 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
 
 (deftest distinct-empty-input
     (let ((count 0))
-      (pg::execute-physical-plan-node
-       '(:hash-distinct ((:col 1 :type :int4)) :test-input) nil nil
-       (lambda (row) (declare (ignore row)) (incf count))
-       (lambda (node callback) (declare (ignore node callback))) nil)
+      (map-test-hash-distinct nil '((:col 1 :type :int4))
+                              (lambda (row) (declare (ignore row)) (incf count)))
       (ok (zerop count))))
 
 (deftest distinct-spill-and-sort-fallback
@@ -1294,13 +1276,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                    (pg::*query-work-memory-bytes* 1)
                    (pg::+hash-aggregate-partition-count+ partitions)
                    (output nil))
-               (pg::execute-physical-plan-node
-                (list :hash-distinct keys :test-input) nil nil
-                (lambda (row) (push (aref (car row) 0) output))
-                (lambda (node callback)
-                  (declare (ignore node))
-                  (dolist (values input) (funcall callback (cons values #()))))
-                nil)
+               (map-test-hash-distinct input keys (lambda (row) (push (aref (car row) 0) output)))
                (ok (= 24 (length output)))
                (ok (equal (sort (remove pg::+null+ output) #'<)
                           (loop for i below 23 collect i)))
@@ -1319,14 +1295,11 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                    (pg::*query-work-memory-bytes* memory)
                    (pg::+hash-aggregate-partition-count+ 1)
                    (output nil))
-               (pg::execute-physical-plan-node
-                '(:hash-distinct ((:col 1 :type :int2vector)) :test-input) nil nil
-                (lambda (row) (push (aref (car row) 0) output))
-                (lambda (node callback)
-                  (declare (ignore node))
-                  (dolist (contents '((1 2) (1 2) (1) (1 3) (1 2) (1)))
-                    (funcall callback (cons (vector (coerce contents 'vector)) #()))))
-                nil)
+               (map-test-hash-distinct
+                (mapcar (lambda (contents) (vector (coerce contents 'vector)))
+                        '((1 2) (1 2) (1) (1 3) (1 2) (1)))
+                '((:col 1 :type :int2vector))
+                (lambda (row) (push (aref (car row) 0) output)))
                (ok (= 3 (length output)))
                (ok (every (lambda (expected) (member expected output :test #'equalp))
                           '(#(1) #(1 2) #(1 3))))
@@ -1338,7 +1311,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
                    "SELECT DISTINCT 1 ORDER BY 1"))
       (let ((rows nil)
             (plan (pg::plan-select-query (first (pg::parse-statements sql)))))
-        (pg::interpret-query-plan plan nil (lambda (row) (push (car row) rows)))
+        (pg::map-query-plan-rows plan nil (lambda (row) (push (car row) rows)))
         (ok (equalp rows '(#(1)))))))
 
 (deftest distinct-repeated-aggregate-alias
@@ -1346,7 +1319,7 @@ Preserve EQUALP's numeric comparison while descending into SQL value wrappers."
           (plan (pg::plan-select-query
                  (first (pg::parse-statements
                          "SELECT DISTINCT COUNT(*) AS x, COUNT(*) AS x ORDER BY x")))))
-      (pg::interpret-query-plan plan nil (lambda (row) (push (car row) rows)))
+      (pg::map-query-plan-rows plan nil (lambda (row) (push (car row) rows)))
       (ok (equalp rows '(#(1 1))))))
 
 (deftest distinct-order-must-be-selected
