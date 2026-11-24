@@ -1271,6 +1271,23 @@ in 103.13 seconds after the WAL archive polish. Comparing the two archived
 logs with the 30 components confirmed that each of their 745 test heads
 passed once across the two selections.
 
+The strict physical baseline at `124fb5350b0` covered all 3,239 registered
+heads. The original process exited during the reseed interruption test
+after 2,475 passes. A fresh strict run on that revision covered the
+remaining 764 heads. Comparing the ordered results with the registered
+inventory found 3,223 passes and 16 failures.
+
+A strict rerun on the current branch passed all 16 failed cases. Thirteen
+index lease checks had called a helper removed when index creation moved
+out of the read path. The fixtures now exercise live lease acquisition.
+The malformed source full-page-write batch check recognizes the explicit
+outside-batch rejection and still checks that replay state stays intact.
+The two cold recovery checks passed with the existing restartpoint fixture
+fix. A checkpoint review checked the revised assertions, and a fresh
+strict run of both edited components passed all 32 heads. The inventory,
+raw logs, compiler receipts, rerun patch and checksums
+are under `architecture-full-physical-124fb535` in the evidence archive.
+
 ### A9 follow-up evidence
 
 Joined UPDATE and DELETE classify one-time qualifications with the local

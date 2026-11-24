@@ -50,7 +50,6 @@
 
 (defun call-with-detachment-test-plan (nodes function &key compiler-hook)
   (let* ((pg::*query-plan-backends* (make-hash-table :test #'eq))
-         (ensure (symbol-function 'pg::btree-ensure-init-before-read))
          (relations
            (loop for node in nodes
                  collect
@@ -81,12 +80,7 @@
                    (lambda (registered callback)
                      (declare (ignore registered callback))
                      (funcall function)))))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'pg::btree-ensure-init-before-read)
-                 (lambda (node) (declare (ignore node)) nil))
-           (pg::execute-query-plan plan relations nil :backend :detachment-test))
-      (setf (symbol-function 'pg::btree-ensure-init-before-read) ensure))))
+    (pg::execute-query-plan plan relations nil :backend :detachment-test)))
 
 (defun detachment-test-domain-scan (node count callback)
   (pg::call-with-current-select-index-domain
@@ -347,54 +341,54 @@
          (ok entered)
          (ok (null (uiop:directory-files root)))))))
 
-(deftest nested-plan-domain-expansion-rejects-before-index-initialization
+(deftest nested-plan-domain-expansion-rejects-before-lease-acquisition
     (call-with-detachment-test-state
      (lambda (root)
        (pg::with-live-operation
          (call-with-detachment-test-plan
           '(902 901)
           (lambda ()
-            (let ((ensure (symbol-function 'pg::btree-ensure-init-before-read))
-                  (initialized nil) (entered nil) (domain pg::*select-index-lease-domain*))
+            (let ((acquire (symbol-function 'pg::acquire-btree-read-lease))
+                  (acquisitions nil) (entered nil) (domain pg::*select-index-lease-domain*))
               (unwind-protect
                    (progn
-                     (setf (symbol-function 'pg::btree-ensure-init-before-read)
-                           (lambda (node) (push node initialized)))
+                     (setf (symbol-function 'pg::acquire-btree-read-lease)
+                           (lambda (lease) (push lease acquisitions) (funcall acquire lease)))
                      (ok (intake-fails-p
                           (lambda ()
                             (pg::call-with-select-index-lease-domain '(900 901) (lambda () :unexpected)))))
-                     (ok (null initialized))
+                     (ok (null acquisitions))
                      (pg::call-with-select-index-lease-domain
                       '(901)
                       (lambda ()
                         (setf entered t)
                         (ok (eq domain pg::*select-index-lease-domain*))))
                      (ok entered)
-                     (ok (null initialized)))
-                (setf (symbol-function 'pg::btree-ensure-init-before-read) ensure))))))
+                     (ok (null acquisitions)))
+                (setf (symbol-function 'pg::acquire-btree-read-lease) acquire))))))
        (ok (null (uiop:directory-files root))))))
 
-(deftest root-plan-domain-rejects-raw-leases-before-index-initialization
+(deftest root-plan-domain-rejects-raw-leases-before-lease-acquisition
     (call-with-detachment-test-state
      (lambda (root)
        (declare (ignore root))
-       (let ((ensure (symbol-function 'pg::btree-ensure-init-before-read))
-             (initialized nil)
+       (let ((acquire (symbol-function 'pg::acquire-btree-read-lease))
+             (acquisitions nil)
              (entered nil))
          (unwind-protect
               (pg::call-with-btree-relation-read-lease
                902
                (lambda (lease)
                  (declare (ignore lease))
-                 (setf (symbol-function 'pg::btree-ensure-init-before-read)
-                       (lambda (node) (push node initialized)))
+                 (setf (symbol-function 'pg::acquire-btree-read-lease)
+                       (lambda (lease) (push lease acquisitions) (funcall acquire lease)))
                  (ok (intake-fails-p
                       (lambda ()
                         (pg::call-with-select-index-lease-domain
                          '(901) (lambda () (setf entered t))))))
-                 (ok (null initialized))
+                 (ok (null acquisitions))
                  (ok (not entered))))
-           (setf (symbol-function 'pg::btree-ensure-init-before-read) ensure))))))
+           (setf (symbol-function 'pg::acquire-btree-read-lease) acquire))))))
 
 (deftest compiler-hook-can-park-before-opening-its-first-index-cursor
     (call-with-detachment-test-state

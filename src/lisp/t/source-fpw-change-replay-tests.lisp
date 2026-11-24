@@ -103,7 +103,11 @@
                    (pg::physical-store-flush store)
                    (ok (handler-case (progn (replay-source-fpw-change mode) nil)
                          (error (condition)
-                           (search "metadata terminal" (princ-to-string condition)))))
+                           (let ((diagnostic (princ-to-string condition)))
+                             (or (search "metadata terminal" diagnostic)
+                                 (and (eq framing :outside)
+                                      (search "WAL terminal record appears outside a batch"
+                                              diagnostic)))))))
                    (ok (= 96 pg::*last-replay-lsn*))
                    (ok (equal before pg::*physical-recovery-state*))
                    (ok (eq writer pg::*wal-fpw-state*))
