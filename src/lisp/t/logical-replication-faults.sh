@@ -3,6 +3,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+. "$BASE/t/test-support.sh"
 PORT_BASE=${PORT_BASE:-5620}
 SOURCE_PORT=$PORT_BASE
 TARGET_ONE_PORT=$((PORT_BASE + 1))
@@ -25,60 +26,36 @@ start_server() {
     SERVER_PORT=$1
     SERVER_DATA=$2
     SERVER_LOG=$3
+    : >"$SERVER_LOG"
     shift 3
+    # The crash matrix retains successful slots through subsequent restarts.
+    # Reserve capacity for all publisher and subscriber fault scenarios.
     if [ "$#" -eq 2 ]; then
         FAULT_POINT=$1
         FAULT_MARKER=$2
         PG_LISP_TEST_FAILPOINT=$FAULT_POINT \
         PG_LISP_TEST_FAILPOINT_ACTION=crash \
         PG_LISP_TEST_FAILPOINT_ONCE_FILE=$FAULT_MARKER \
-            "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+            test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG" \
+                -c max_replication_slots=32
     else
-        "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+        test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG" \
+            -c max_replication_slots=32
     fi
     SERVER_PID=$!
-    i=0
-    while [ "$i" -lt 200 ]; do
-        if psql -X -h 127.0.0.1 -p "$SERVER_PORT" -U postgres -d postgres \
-                -c '' >/dev/null 2>&1; then
-            return 0
-        fi
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "logical-replication-faults: server exited during startup: $SERVER_LOG" >&2
-            return 1
-        fi
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-replication-faults: server did not start on port $SERVER_PORT" >&2
-    return 1
+    case "$SERVER_PORT" in
+        "$SOURCE_PORT") SOURCE_PID=$SERVER_PID ;;
+        "$TARGET_ONE_PORT") TARGET_ONE_PID=$SERVER_PID ;;
+        "$TARGET_TWO_PORT") TARGET_TWO_PID=$SERVER_PID ;;
+    esac
+    test_wait_owned_sql_server "$SERVER_PID" "$SERVER_PORT" || {
+        echo "logical-replication-faults: see $SERVER_LOG" >&2
+        return 1
+    }
 }
 
 wait_for_file() {
-    FILE_PATH=$1
-    i=0
-    while [ "$i" -lt 300 ]; do
-        [ -f "$FILE_PATH" ] && return 0
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-replication-faults: timed out waiting for $FILE_PATH" >&2
-    return 1
-}
-
-wait_for_log() {
-    LOG_FILE=$1
-    LOG_TEXT=$2
-    i=0
-    while [ "$i" -lt 300 ]; do
-        grep -F "$LOG_TEXT" "$LOG_FILE" >/dev/null 2>&1 && return 0
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-replication-faults: timed out waiting for '$LOG_TEXT' in $LOG_FILE" >&2
-    return 1
+    test_wait_for_marker "$1" 300
 }
 
 wait_for_state() {
@@ -327,10 +304,7 @@ on_exit() {
     trap - EXIT
     if [ "$status" -ne 0 ]; then
         echo "logical-replication-faults: failure; logs follow" >&2
-        for log in "$TMP/source.log" "$TMP/source-restart.log" \
-                   "$TMP/target-one.log" "$TMP/target-two.log" \
-                   "$TMP/worker-one.log" "$TMP/worker-one-restart.log" \
-                   "$TMP/worker-two.log" "$TMP/worker-two-restart.log"; do
+        for log in "$TMP"/*.log; do
             if [ -f "$log" ]; then
                 echo "--- $log" >&2
                 cat "$log" >&2
@@ -392,7 +366,7 @@ SOURCE_PID=$SERVER_PID
     --source-port "$SOURCE_PORT" --target-port "$TARGET_ONE_PORT" \
     --table fault_rows > "$TMP/worker-one-restart.log" 2>&1 &
 WORKER_ONE_PID=$!
-wait_for_log "$TMP/worker-one-restart.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-one-restart.log" "streaming from"
 source_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 wait_for_lsn "$TARGET_ONE_PORT" fault_before_release "$source_barrier"
 sql "$SOURCE_PORT" "INSERT INTO fault_rows VALUES (3, 'after-restart')" >/dev/null
@@ -437,7 +411,7 @@ SOURCE_PID=$SERVER_PID
     exit 1
 }
 start_copy_worker fault_before_finalize "$TMP/worker-before-finalize-retry.log"
-wait_for_log "$TMP/worker-before-finalize-retry.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-before-finalize-retry.log" "streaming from"
 wait_for_slot_confirmation "$SOURCE_PORT" fault_before_finalize "$pre_finalize_marker"
 [ "$(sql "$SOURCE_PORT" \
         "SELECT confirmed_flush_lsn IS NOT NULL FROM pg_replication_slots WHERE slot_name = 'fault_before_finalize'")" = t ] || {
@@ -513,7 +487,7 @@ SOURCE_PID=$SERVER_PID
     --source-port "$SOURCE_PORT" --target-port "$TARGET_TWO_PORT" \
     --table fault_rows > "$TMP/worker-two-restart.log" 2>&1 &
 WORKER_TWO_PID=$!
-wait_for_log "$TMP/worker-two-restart.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-two-restart.log" "streaming from"
 source_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 wait_for_lsn "$TARGET_TWO_PORT" fault_after_release "$source_barrier"
 if [ "$(rows "$TARGET_TWO_PORT")" != "$(rows "$SOURCE_PORT")" ]; then
@@ -651,7 +625,7 @@ wait_for_state "$TARGET_ONE_PORT" fault_after_import copying
 start_server "$SOURCE_PORT" "$TMP/source-data" "$TMP/source-import-restart.log"
 SOURCE_PID=$SERVER_PID
 start_copy_worker fault_after_import "$TMP/fault-after-import-retry.log"
-wait_for_log "$TMP/fault-after-import-retry.log" "exported snapshot expired; reseeding"
+test_wait_for_log_text "$TMP/fault-after-import-retry.log" "exported snapshot expired; reseeding"
 wait_for_state "$TARGET_ONE_PORT" fault_after_import ready
 source_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 wait_for_lsn "$TARGET_ONE_PORT" fault_after_import "$source_barrier"

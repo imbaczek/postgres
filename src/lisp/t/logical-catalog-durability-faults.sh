@@ -3,6 +3,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+. "$BASE/t/test-support.sh"
 PORT=${PORT_BASE:-5630}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pg-catalog-faults.XXXXXX")
 DATA=$TMP/data
@@ -16,32 +17,22 @@ sql() {
 
 start_server() {
     SERVER_LOG=$1
+    : >"$SERVER_LOG"
     if [ "$#" -eq 3 ]; then
         FAULT_ACTION=$2
         FAULT_MARKER=$3
         PG_LISP_TEST_FAILPOINT=after-catalog-event-wal-terminal \
         PG_LISP_TEST_FAILPOINT_ACTION=$FAULT_ACTION \
         PG_LISP_TEST_FAILPOINT_ONCE_FILE=$FAULT_MARKER \
-            "$BASE/pg-lisp.sh" -p "$PORT" -D "$DATA" > "$SERVER_LOG" 2>&1 &
+            test_launch_lisp_server "$PORT" "$DATA" "" "$SERVER_LOG"
     else
-        "$BASE/pg-lisp.sh" -p "$PORT" -D "$DATA" > "$SERVER_LOG" 2>&1 &
+        test_launch_lisp_server "$PORT" "$DATA" "" "$SERVER_LOG"
     fi
     SERVER_PID=$!
-    i=0
-    while [ "$i" -lt 200 ]; do
-        if psql -X -h 127.0.0.1 -p "$PORT" -U postgres -d postgres \
-                -c '' >/dev/null 2>&1; then
-            return 0
-        fi
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "logical-catalog-durability-faults: server exited: $SERVER_LOG" >&2
-            return 1
-        fi
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-catalog-durability-faults: server did not start" >&2
-    return 1
+    test_wait_owned_sql_server "$SERVER_PID" "$PORT" || {
+        echo "logical-catalog-durability-faults: see $SERVER_LOG" >&2
+        return 1
+    }
 }
 
 stop_server() {
@@ -52,15 +43,7 @@ stop_server() {
 }
 
 wait_for_file() {
-    FILE_PATH=$1
-    i=0
-    while [ "$i" -lt 100 ]; do
-        [ -f "$FILE_PATH" ] && return 0
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-catalog-durability-faults: missing marker $FILE_PATH" >&2
-    return 1
+    test_wait_for_marker "$1" 100
 }
 
 cleanup() {

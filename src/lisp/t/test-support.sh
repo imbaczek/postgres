@@ -39,14 +39,42 @@ test_wait_owned_sql_server() {
     return 1
 }
 
+test_wait_for_marker() (
+    marker=$1
+    attempts=$2
+    while [ "$attempts" -gt 0 ]; do
+        [ -f "$marker" ] && return 0
+        attempts=$((attempts - 1))
+        sleep 0.1
+    done
+    echo "Timed out waiting for marker $marker" >&2
+    return 1
+)
+
+test_wait_for_log_text() (
+    log=$1
+    pattern=$2
+    attempts=${3:-300}
+    while [ "$attempts" -gt 0 ]; do
+        grep -F -e "$pattern" "$log" >/dev/null 2>&1 && return 0
+        attempts=$((attempts - 1))
+        sleep 0.1
+    done
+    echo "Timed out waiting for '$pattern' in $log" >&2
+    return 1
+)
+
 # Launch within the caller's private fixture directory. The caller records
 # $! before waiting for readiness so its cleanup trap also covers startup failure.
 test_launch_lisp_server() {
     TEST_LAUNCH_PORT=$1 TEST_LAUNCH_DATA=$2 TEST_LAUNCH_SOCKET=$3 TEST_LAUNCH_LOG=$4
     shift 4
-    rm -f "$TEST_LAUNCH_SOCKET" || return
+    if [ -n "$TEST_LAUNCH_SOCKET" ]; then
+        rm -f "$TEST_LAUNCH_SOCKET" || return
+        set -- --control-socket "$TEST_LAUNCH_SOCKET" "$@"
+    fi
     "$BASE/pg-lisp.sh" -p "$TEST_LAUNCH_PORT" -D "$TEST_LAUNCH_DATA" \
-        --control-socket "$TEST_LAUNCH_SOCKET" "$@" >>"$TEST_LAUNCH_LOG" 2>&1 &
+        "$@" >>"$TEST_LAUNCH_LOG" 2>&1 &
 }
 
 test_lisp_control() {

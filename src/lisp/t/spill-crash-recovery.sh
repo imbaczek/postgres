@@ -76,18 +76,8 @@ start_server() {
             --control-port "$CONTROL_PORT" >> "$LOG" 2>&1 &
     fi
     SRV=$!
-    i=0
-    while [ "$i" -lt 150 ]; do
-        if run -c '' >/dev/null 2>&1; then
-            return 0
-        fi
-        if ! kill -0 "$SRV" 2>/dev/null; then
-            fail "server exited during startup"
-        fi
-        i=$((i + 1))
-        sleep 0.2
-    done
-    fail "server did not start"
+    PGPASSWORD=x test_wait_owned_sql_server "$SRV" "$PORT" psql 300 ||
+        fail "server did not become ready"
 }
 
 wait_for_spill() {

@@ -3,6 +3,7 @@
 set -eu
 
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+. "$BASE/t/test-support.sh"
 PORT_BASE=${PORT_BASE:-5660}
 SOURCE_PORT=$PORT_BASE
 TARGET_PORT=$((PORT_BASE + 1))
@@ -26,6 +27,7 @@ start_server() {
     SERVER_PORT=$1
     SERVER_DATA=$2
     SERVER_LOG=$3
+    : >"$SERVER_LOG"
       if [ "$#" -eq 8 ]; then
           FAULT_POINT=$4
           FAULT_MARKER=$5
@@ -38,8 +40,7 @@ start_server() {
           PG_LISP_TEST_FAILPOINT_HIT=$FAULT_HIT \
           PG_LISP_TEST_FAILPOINT_LSN_AFTER=$FAULT_LSN_AFTER \
           PG_LISP_TEST_FAILPOINT_GUARD_FILE=$FAULT_GUARD_FILE \
-              "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-              > "$SERVER_LOG" 2>&1 &
+              test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
       elif [ "$#" -eq 7 ]; then
         FAULT_POINT=$4
         FAULT_MARKER=$5
@@ -50,8 +51,7 @@ start_server() {
         PG_LISP_TEST_FAILPOINT_ONCE_FILE=$FAULT_MARKER \
         PG_LISP_TEST_FAILPOINT_HIT=$FAULT_HIT \
         PG_LISP_TEST_FAILPOINT_LSN_AFTER=$FAULT_LSN_AFTER \
-            "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+            test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
     elif [ "$#" -eq 6 ]; then
         FAULT_POINT=$4
         FAULT_MARKER=$5
@@ -60,43 +60,32 @@ start_server() {
         PG_LISP_TEST_FAILPOINT_ACTION=crash \
         PG_LISP_TEST_FAILPOINT_ONCE_FILE=$FAULT_MARKER \
         PG_LISP_TEST_FAILPOINT_HIT=$FAULT_HIT \
-            "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+            test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
     elif [ "$#" -eq 5 ]; then
         FAULT_POINT=$4
         FAULT_MARKER=$5
         PG_LISP_TEST_FAILPOINT=$FAULT_POINT \
         PG_LISP_TEST_FAILPOINT_ACTION=crash \
         PG_LISP_TEST_FAILPOINT_ONCE_FILE=$FAULT_MARKER \
-            "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+            test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
       elif [ "$#" -eq 4 ]; then
           SCAN_BUDGET_BYTES=$4
           PG_LISP_TEST_LOGICAL_SCAN_BYTES=$SCAN_BUDGET_BYTES \
           PG_LISP_TEST_FAILPOINT=after-scan-progress-before-feedback \
           PG_LISP_TEST_FAILPOINT_ACTION=crash \
-              "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-              > "$SERVER_LOG" 2>&1 &
+              test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
       else
-        "$BASE/pg-lisp.sh" -p "$SERVER_PORT" -D "$SERVER_DATA" \
-            > "$SERVER_LOG" 2>&1 &
+        test_launch_lisp_server "$SERVER_PORT" "$SERVER_DATA" "" "$SERVER_LOG"
     fi
     SERVER_PID=$!
-    i=0
-    while [ "$i" -lt 200 ]; do
-        if psql -X -h 127.0.0.1 -p "$SERVER_PORT" -U postgres -d postgres \
-                -c '' >/dev/null 2>&1; then
-            return 0
-        fi
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "logical-standalone-event-faults: server exited during startup: $SERVER_LOG" >&2
-            return 1
-        fi
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-standalone-event-faults: server did not start on port $SERVER_PORT" >&2
-    return 1
+    case "$SERVER_PORT" in
+        "$SOURCE_PORT") SOURCE_PID=$SERVER_PID ;;
+        "$TARGET_PORT") TARGET_PID=$SERVER_PID ;;
+    esac
+    test_wait_owned_sql_server "$SERVER_PID" "$SERVER_PORT" || {
+        echo "logical-standalone-event-faults: see $SERVER_LOG" >&2
+        return 1
+    }
 }
 
 restart_target() {
@@ -160,28 +149,7 @@ restart_source() {
   }
 
 wait_for_file() {
-    FILE_PATH=$1
-    i=0
-    while [ "$i" -lt 300 ]; do
-        [ -f "$FILE_PATH" ] && return 0
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-standalone-event-faults: timed out waiting for $FILE_PATH" >&2
-    return 1
-}
-
-wait_for_log() {
-    LOG_FILE=$1
-    LOG_TEXT=$2
-    i=0
-    while [ "$i" -lt 300 ]; do
-        grep -F "$LOG_TEXT" "$LOG_FILE" >/dev/null 2>&1 && return 0
-        i=$((i + 1))
-        sleep 0.1
-    done
-    echo "logical-standalone-event-faults: timed out waiting for '$LOG_TEXT' in $LOG_FILE" >&2
-    return 1
+    test_wait_for_marker "$1" 300
 }
 
 normalize_lsn() {
@@ -368,7 +336,7 @@ exercise_catalog_terminal_fault() {
     restart_target "$fault_point" "$marker" "$TMP/$fault_point-target.log"
     faulted_target_pid=$TARGET_PID
     start_worker "$worker_log"
-    wait_for_log "$worker_log" "streaming from"
+    test_wait_for_log_text "$worker_log" "streaming from"
     progress_before=$(wait_for_stable_progress)
     confirmed_before=$(slot_confirmation)
       source_lsn_before_event=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
@@ -429,7 +397,7 @@ exercise_catalog_terminal_fault() {
     fi
 
     start_worker "$retry_log"
-    wait_for_log "$retry_log" "streaming from"
+    test_wait_for_log_text "$retry_log" "streaming from"
     event_progress=$(wait_for_progress_advance \
                      "$TARGET_PORT" standalone_event_slot "$progress_before")
     wait_for_slot_confirmation standalone_event_slot "$event_progress"
@@ -463,7 +431,7 @@ exercise_slot_acknowledgment_fault() {
           "$TMP/$fault_point-source.log" "$TMP/$fault_point-target.marker"
     start_paused_worker "$TMP/$fault_point-worker.log" \
         "$TMP/$fault_point-target.marker" "$TMP/$fault_point-release"
-    wait_for_log "$TMP/$fault_point-worker.log" "streaming from"
+    test_wait_for_log_text "$TMP/$fault_point-worker.log" "streaming from"
     sql "$SOURCE_PORT" \
         "INSERT INTO fault_rows VALUES ($row_id, '$row_label')" >/dev/null
     wait_for_file "$TMP/$fault_point-target.marker"
@@ -514,7 +482,7 @@ exercise_slot_acknowledgment_fault() {
     fi
 
     start_worker "$TMP/$fault_point-worker-restart.log"
-    wait_for_log "$TMP/$fault_point-worker-restart.log" "streaming from"
+    test_wait_for_log_text "$TMP/$fault_point-worker-restart.log" "streaming from"
     wait_for_slot_confirmation standalone_event_slot "$progress_after"
     [ "$(sql "$TARGET_PORT" "SELECT count(*) FROM fault_rows WHERE id = $row_id")" = 1 ] || {
         echo "logical-standalone-event-faults: reconnect duplicated or lost the row" >&2
@@ -563,7 +531,7 @@ sql "$SOURCE_PORT" \
     "CREATE TABLE fault_rows (id integer PRIMARY KEY, label varchar(64)); CREATE SEQUENCE fault_counter START WITH 10 INCREMENT BY 3; INSERT INTO fault_rows VALUES (1, 'seed')" \
     >/dev/null
 start_worker "$TMP/worker-initial.log"
-wait_for_log "$TMP/worker-initial.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-initial.log" "streaming from"
 progress_before=$(sql "$TARGET_PORT" \
     "SELECT source_lsn FROM pg_lisp_subscription_progress WHERE source_slot = 'standalone_event_slot' AND state = 'ready'")
 wait_for_slot_confirmation standalone_event_slot "$progress_before"
@@ -573,7 +541,7 @@ stop_worker
 # the separate subscriber-progress update and publisher feedback are still ahead.
 start_paused_event_apply_worker "$TMP/worker-ddl-apply-fault.log" \
     "$TMP/ddl-apply.marker" "$TMP/ddl-apply-release"
-wait_for_log "$TMP/worker-ddl-apply-fault.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-ddl-apply-fault.log" "streaming from"
 progress_before=$(wait_for_stable_progress)
 sql "$SOURCE_PORT" "CREATE TABLE applied_before_progress (id integer PRIMARY KEY)" >/dev/null
 wait_for_file "$TMP/ddl-apply.marker"
@@ -623,7 +591,7 @@ progress_after=$(sql "$TARGET_PORT" \
     exit 1
 }
 start_worker "$TMP/worker-ddl-retry.log"
-wait_for_log "$TMP/worker-ddl-retry.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-ddl-retry.log" "streaming from"
 ddl_progress=$(wait_for_progress_advance \
     "$TARGET_PORT" standalone_event_slot "$progress_while_paused")
 wait_for_slot_confirmation standalone_event_slot "$ddl_progress"
@@ -642,7 +610,7 @@ PG_LISP_TEST_FAILPOINT_ACTION=crash \
 PG_LISP_TEST_FAILPOINT_ONCE_FILE="$TMP/sequence-progress.marker" \
     start_worker "$TMP/worker-sequence-progress-fault.log" \
         after-standalone-progress-before-feedback "$TMP/sequence-progress.marker"
-wait_for_log "$TMP/worker-sequence-progress-fault.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-sequence-progress-fault.log" "streaming from"
 sql "$SOURCE_PORT" "SELECT nextval('fault_counter')" >/dev/null
 wait_for_file "$TMP/sequence-progress.marker"
 if wait "$WORKER_PID"; then
@@ -679,7 +647,7 @@ source_sequence_state=$(sql "$SOURCE_PORT" \
       exit 1
   }
 start_worker "$TMP/worker-sequence-restart.log"
-wait_for_log "$TMP/worker-sequence-restart.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-sequence-restart.log" "streaming from"
 wait_for_slot_confirmation standalone_event_slot "$progress_after"
 [ "$(sql "$TARGET_PORT" "SELECT pg_lisp_sequence_state('fault_counter')" | sed -E 's/:OID [0-9]+//')" = "$sequence_after_apply" ] || {
     echo "logical-standalone-event-faults: reconnect changed an already applied sequence state" >&2
@@ -698,7 +666,7 @@ target_drifted_state=$(sql "$TARGET_PORT" \
   # pg_current_wal_lsn() reports this boundary in xlogfuncs.c.
   source_lsn_before_event=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 sql "$SOURCE_PORT" "SELECT nextval('fault_counter')" >/dev/null
-wait_for_log "$TMP/worker-sequence-restart.log" \
+test_wait_for_log_text "$TMP/worker-sequence-restart.log" \
     "definition does not match publisher"
 if wait "$WORKER_PID"; then
     echo "logical-standalone-event-faults: sequence-state apply accepted target definition drift" >&2
@@ -732,7 +700,7 @@ WORKER_PID=
 # pending event and apply only its value/called state.
 sql "$TARGET_PORT" "ALTER SEQUENCE fault_counter INCREMENT BY 3" >/dev/null
 start_worker "$TMP/worker-sequence-drift-retry.log"
-wait_for_log "$TMP/worker-sequence-drift-retry.log" "streaming from"
+test_wait_for_log_text "$TMP/worker-sequence-drift-retry.log" "streaming from"
 drift_retry_progress=$(wait_for_progress_advance \
     "$TARGET_PORT" standalone_event_slot "$progress_before_drift")
 wait_for_slot_confirmation standalone_event_slot "$drift_retry_progress"
@@ -772,13 +740,13 @@ exercise_slot_acknowledgment_fault \
 stop_worker
 restart_source_with_scan_budget 1
 start_worker "$TMP/scan-budget-drain.log"
-wait_for_log "$TMP/scan-budget-drain.log" "streaming from"
+test_wait_for_log_text "$TMP/scan-budget-drain.log" "streaming from"
 progress_before_scan=$(wait_for_stable_progress)
 confirmed_before_scan=$(slot_confirmation)
 stop_worker
 start_scan_failpoint_worker "$TMP/scan-progress-fault.log" \
     "$TMP/scan-progress.marker"
-wait_for_log "$TMP/scan-progress-fault.log" "streaming from"
+test_wait_for_log_text "$TMP/scan-progress-fault.log" "streaming from"
 sql "$SOURCE_PORT" "CHECKPOINT" >/dev/null
 wait_for_file "$TMP/scan-progress.marker"
 if wait "$WORKER_PID"; then
@@ -823,7 +791,7 @@ lsn_is_after "$progress_after_scan" "$confirmation_after_target_restart" || {
 sql "$SOURCE_PORT" "SELECT nextval('fault_counter')" >/dev/null
 scan_retry_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
 start_worker "$TMP/scan-progress-retry.log"
-wait_for_log "$TMP/scan-progress-retry.log" "streaming from $progress_after_scan"
+test_wait_for_log_text "$TMP/scan-progress-retry.log" "streaming from $progress_after_scan"
 wait_for_slot_confirmation standalone_event_slot "$scan_retry_barrier"
 [ "$(sql "$TARGET_PORT" \
         "SELECT pg_lisp_sequence_state('fault_counter')" | sed -E 's/:OID [0-9]+//')" \
