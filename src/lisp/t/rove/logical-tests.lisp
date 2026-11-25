@@ -2499,28 +2499,62 @@
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-extended-select-guard-and-schema-drift
-    (let* ((path (merge-pathnames (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000)) (uiop:temporary-directory)))
+    (let* ((*backend* (make-backend))
+           (*extended-query-state* (make-extended-query-state))
+           (*active-snapshots* 0)
+           (*active-snapshot-set* (make-hash-table :test #'eq))
+           (path (merge-pathnames
+                  (format nil "pg-select-drift-~d-~d" (sb-posix:getpid) (random 1000000))
+                  (uiop:temporary-directory)))
+           (old-start (symbol-function 'statement-start))
+           (old-columns (symbol-function 'extended-select-result-columns))
            (old-plan (symbol-function 'plan-select-query))
-           (old-column (symbol-function 'target->result-column))
-           (old-run (symbol-function 'map-query-plan-rows))
-           (*select-suppress-description* t)
-           (*select-expected-result-columns* (list (make-result-column :name "old" :type-oid 17)))
-           (calls 0))
+           (old-iterator (symbol-function 'make-resumable-query-plan-iterator))
+           (columns (list (make-result-column :name "old" :type-oid 23)))
+           (statement (make-extended-statement
+                       :ast (first (parse-statements "SELECT 1 AS new"))
+                       :types #() :result-signature (extended-result-signature columns)))
+           (planned-with-snapshot nil)
+           (iterator-calls 0))
+      (set-backend-state *backend* :in-progress)
+      (setf (gethash "s" (extended-query-state-statements *extended-query-state*)) statement)
       (unwind-protect
-           (progn
-             (setf (symbol-function 'plan-select-query)
-                   (lambda (ast) (declare (ignore ast))
-                     (%make-query-plan :prepared '(:relations nil :targets ((:type :bytea)))))
-                   (symbol-function 'target->result-column)
-                   (lambda (target) (declare (ignore target)) (make-result-column :name "new" :type-oid 17))
-                   (symbol-function 'map-query-plan-rows)
-                   (lambda (&rest args) (declare (ignore args)) (incf calls)))
-             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-               (rove:ok (handler-case (progn (exec-select out nil) nil) (error () t)))
-               (rove:ok (zerop calls)) (rove:ok (zerop (file-position out)))))
-        (setf (symbol-function 'plan-select-query) old-plan
-              (symbol-function 'target->result-column) old-column
-              (symbol-function 'map-query-plan-rows) old-run)
+           (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+             (setf (symbol-function 'statement-start) #'logical-test-extended-statement-start
+                   ;; Bind's metadata still matches Parse. Portal initialization
+                   ;; plans against the changed descriptor under its own snapshot.
+                   (symbol-function 'extended-select-result-columns)
+                   (lambda (ast &optional register-p)
+                     (declare (ignore ast register-p))
+                     columns)
+                   (symbol-function 'plan-select-query)
+                   (lambda (ast)
+                     (multiple-value-prog1 (funcall old-plan ast)
+                       (setf planned-with-snapshot
+                             (and *current-snapshot* (= *active-snapshots* 1)))))
+                   (symbol-function 'make-resumable-query-plan-iterator)
+                   (lambda (&rest args)
+                     (incf iterator-calls)
+                     (apply old-iterator args)))
+             (let ((condition
+                     (handler-case (progn (extended-apply-operation out '(:bind "p" "s" () () ()) #())
+                                          nil)
+                       (pg-error (condition) condition))))
+               (rove:ok (and condition
+                             (string= "0A000" (pg-error-sqlstate condition))
+                             (string= "cached plan must not change result type"
+                                      (pg-error-message condition))))
+               (rove:ok planned-with-snapshot)
+               (rove:ok (not (gethash "p" (extended-query-state-portals *extended-query-state*))))
+               (rove:ok (zerop *active-snapshots*))
+               (rove:ok (zerop iterator-calls))
+               (rove:ok (zerop (file-position out)))))
+        (extended-clear-portals-for-backend *backend*)
+        (setf (symbol-function 'statement-start) old-start
+              (symbol-function 'extended-select-result-columns) old-columns
+              (symbol-function 'plan-select-query) old-plan
+              (symbol-function 'make-resumable-query-plan-iterator) old-iterator)
         (when (probe-file path) (delete-file path)))))
 
 (rove:deftest test-empty-copy-row-description-validation

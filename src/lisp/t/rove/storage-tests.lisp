@@ -168,6 +168,45 @@
         (setf (symbol-function 'buf-acquire-read-page) old-read
               (symbol-function 'buf-nblocks) old-count))))
 
+(rove:deftest test-visible-heap-page-iterator-reuses-page-and-commit-status
+    (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
+           (page (page-init (make-page)))
+           (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (*backend* nil)
+           (*next-xid* 10)
+           (old-status (symbol-function 'xid-committed-p))
+           (old-deform (symbol-function 'deform-heap-tuple))
+           (lookups nil)
+           (tuple-spans nil))
+      (page-add-item page (form-heap-tuple (vector "one") columns 5 0 0 0 0))
+      (page-add-item page (form-heap-tuple (vector "two") columns 5 0 0 0 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'xid-committed-p)
+                   (lambda (xid)
+                     (push xid lookups)
+                     t)
+                   (symbol-function 'deform-heap-tuple)
+                   (lambda (bytes columns &rest bounds)
+                     (push (list (eq page bytes) (getf bounds :start) (getf bounds :limit))
+                           tuple-spans)
+                     (apply old-deform bytes columns bounds)))
+             (let ((iterator (make-visible-heap-page-iterator page 0 columns snapshot)))
+               (unwind-protect
+                    (loop for expected in '("one" "two")
+                          for offnum from 1
+                          do (multiple-value-bind (tuple present) (sql-iterator-next iterator)
+                               (rove:ok (and present (equal expected (aref (htup-values tuple) 0)))))
+                             (multiple-value-bind (offset flags length) (page-get-lp page offnum)
+                               (declare (ignore flags))
+                               (rove:ok (equal (first tuple-spans) (list t offset (+ offset length)))
+                                        "deformation uses the original page and the line pointer bounds")))
+                 (close-sql-iterator iterator)))
+             (rove:ok (equal lookups '(5))
+                      "separate pulls reuse the committed status of the same XID"))
+        (setf (symbol-function 'xid-committed-p) old-status
+              (symbol-function 'deform-heap-tuple) old-deform))))
+
 (rove:deftest test-btree-equal-child-range-with-duplicate-separators
     (flet ((index-key (value) (encode-index-key (list value) '(:int4))))
       (dolist (scenario '(((10 20 20 30) (5 0 0) (10 0 0) (15 0 0) (20 0 2)

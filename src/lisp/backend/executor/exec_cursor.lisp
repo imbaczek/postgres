@@ -63,7 +63,9 @@
 
 Check tuple visibility before deforming it, and leave later tuples untouched
 until their next pull.  SNAPSHOT must remain registered for this iterator."
-  (let ((offnum 0) (count (page-lp-count page)))
+  (let ((offnum 0)
+        (count (page-lp-count page))
+        (committed-xid-cache (list nil)))
     (make-sql-iterator
      (lambda ()
        (loop while (< offnum count)
@@ -77,10 +79,11 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
                         (cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
                         (infomask (page-u16 page (+ offset +heap-tuple-infomask-off+))))
                     (when (heap-tuple-visible-p xmin xmax cid snapshot
-                                                (and *backend* (backend-xid *backend*)) infomask)
+                                                (and *backend* (backend-xid *backend*)) infomask
+                                                committed-xid-cache)
                       (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
                                             ctid-block ctid-offnum physical-compressed)
-                          (deform-heap-tuple (subseq page offset (+ offset length)) columns)
+                          (deform-heap-tuple page columns :start offset :limit (+ offset length))
                         (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
                         (return
                           (values (make-htup :block block :offnum offnum
