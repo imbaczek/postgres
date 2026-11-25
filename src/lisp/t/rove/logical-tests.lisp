@@ -2510,7 +2510,7 @@
            (old-columns (symbol-function 'extended-select-result-columns))
            (old-plan (symbol-function 'plan-select-query))
            (old-iterator (symbol-function 'make-resumable-query-plan-iterator))
-           (columns (list (make-result-column :name "old" :type-oid 23)))
+           (columns (list (make-result-column :name "old" :type-oid 23 :typlen 4)))
            (statement (make-extended-statement
                        :ast (first (parse-statements "SELECT 1 AS new"))
                        :types #() :result-signature (extended-result-signature columns)))
