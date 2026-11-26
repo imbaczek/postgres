@@ -793,6 +793,8 @@ CREATE UNIQUE INDEX name ON t (cols);
 CREATE UNIQUE INDEX name ON t (cols) NULLS NOT DISTINCT;
 CREATE INDEX name ON t (cols);
 DROP INDEX [IF EXISTS] name;
+CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS] name ON t (cols);
+DROP INDEX CONCURRENTLY [IF EXISTS] name [RESTRICT];
 ALTER INDEX name RENAME TO new_name;
 CREATE [IF NOT EXISTS] SEQUENCE name [START [WITH] n] [INCREMENT [BY] n]
   [MINVALUE n] [MAXVALUE n];
@@ -811,6 +813,20 @@ ALTER TABLE t DROP CONSTRAINT name;     -- CHECK, UNIQUE and PRIMARY KEY constra
 ALTER TABLE t DROP CONSTRAINT old_name,
   ADD CONSTRAINT new_name PRIMARY KEY USING INDEX index_name;
 ```
+
+Concurrent index DDL accepts named B-tree indexes on plain columns and runs as
+a standalone command. Concurrent drop accepts a single index with no owning
+constraint. Readers and writers can use the heap during build and validation.
+If a build fails after its first catalog commit, it can leave an invalid index.
+An invalid unique index that has reached `indisready` still enforces uniqueness.
+Drop the invalid index before retrying CREATE.
+
+The logical DDL extension orders a replica-identity change after every
+transaction that wrote using the previous key. At that boundary, additional
+writers on that heap wait for the old writers and the durable catalog update.
+Schema publication also waits for existing exported-snapshot and repeatable-read
+schema leases. Intermediate index states appear in `pg_index` through
+`indisvalid`, `indisready`, and `indislive`.
 
 DML:
 
@@ -1621,6 +1637,11 @@ python3 ./t/truncate-speed.py # check truncation of a large sparse relation
 ./t/index-scan-regression.sh # indexed/SeqScan differential and DROP INDEX handoff
 ./t/index-lock-contention.sh # unrelated INSERT progress during duplicate-key scans
 ./t/index-build-contention.sh # detached build, relation gate, publication name race
+python3 ./t/concurrent-index-ddl.py sql # phase admission, validation, and upserts
+python3 ./t/concurrent-index-ddl.py crash # cancellation and restart at durable phases
+python3 ./t/concurrent-index-ddl.py logical # logical replica-identity cutover
+python3 ./t/concurrent-index-ddl.py physical # standby replay with a pinned reader
+python3 ./t/concurrent-index-memory.py # manual Linux allocation and peak RSS benchmark
 ./t/join-streaming.sh    # outer-join results and unordered LIMIT early stop
 ./t/join-ddl-concurrency.sh # atomic JOIN admission against concurrent DROP TABLE
 ./t/spill-crash-recovery.sh # crash cleanup, restart recovery, and temp-file limit

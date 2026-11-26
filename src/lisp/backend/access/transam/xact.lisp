@@ -430,11 +430,86 @@ These reserve capacity only; they do not grant conflict permissions.")
   (print-unreadable-object (object stream :type t :identity t)))
 
 (defstruct (relation-gate-token
-            (:constructor make-relation-gate-token (owner))
+            (:constructor make-relation-gate-token (owner &optional kind))
             (:print-function print-relation-gate-token))
   "A gate scope with an owner independent of the build group metadata.
 OWNER may be an XID or backend; a token without an owner identifies itself."
-  (owner nil :read-only t))
+  (owner nil :read-only t)
+  (kind nil :read-only t))
+
+(defvar *active-xid-backends* (make-hash-table :test #'eql)
+  "Backend owners of active real XIDs, protected by *XID-LOCK*.")
+
+(defvar *relation-wait-dependencies* (make-hash-table :test #'eq)
+  "Gate tokens, XIDs, and snapshots blocking each backend under the relation lock.")
+
+(defun relation-wait-owner (dependency)
+  "Resolve a dependency only while the corresponding resource is still held."
+  (etypecase dependency
+    (integer
+     (let ((owner (if (minusp dependency)
+                      (gethash dependency *recovery-reader-xids*)
+                      (sb-thread:with-mutex (*xid-lock*)
+                        (gethash dependency *active-xid-backends*)))))
+       (when (backend-p owner) owner)))
+    (relation-gate-token
+     (when (or (gethash dependency *relation-build-groups*)
+               (loop for token being the hash-values of *relation-maintainers*
+                       thereis (eq token dependency)))
+       (let ((owner (relation-gate-token-owner dependency)))
+         (etypecase owner
+           (null nil)
+           (backend owner)
+           (integer (relation-wait-owner owner))))))
+    (snapshot
+     (sb-thread:with-mutex (*snapshot-count-lock*)
+       (let ((owner (gethash dependency *active-snapshot-set*)))
+         (when (backend-p owner) owner))))))
+
+(defun relation-wait-cycle-p (backend)
+  "Test whether BACKEND can reach itself through current wait dependencies."
+  (let ((seen nil))
+    (labels ((visit (actor)
+               (and actor
+                    (or (eq actor backend)
+                        (when (gethash actor *relation-wait-dependencies*)
+                          (unless seen (setf seen (make-hash-table :test #'eq)))
+                          (unless (gethash actor seen)
+                            (setf (gethash actor seen) t)
+                            (follow actor))))))
+             (follow (actor)
+               (some (lambda (dependency) (visit (relation-wait-owner dependency)))
+                     (gethash actor *relation-wait-dependencies*))))
+      (follow backend))))
+
+(defun wait-for-relation-dependencies (blockers)
+  "Sleep once with wait edges published under *RELATION-LOCK-MUTEX*.
+Callers recheck their own admission predicates on wakeup.  Resolve edges to
+current owners before sleeping so a cycle involving a gate, XID or snapshot
+fails instead of waiting indefinitely.  Remove the edges on every exit."
+  (check-for-interrupts)
+  (if (null *backend*)
+      (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)
+      (sb-sys:without-interrupts
+        (unwind-protect
+             (progn
+               (setf (gethash *backend* *relation-wait-dependencies*) blockers)
+               (when (relation-wait-cycle-p *backend*)
+                 (ereport "40P01" "deadlock detected"))
+               (sb-sys:with-local-interrupts
+                 (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
+          (remhash *backend* *relation-wait-dependencies*)))))
+
+(defun relation-build-admission-blocker (relfilenode)
+  "Return a gate that must retire before new DML blockers can be published."
+  (or (gethash relfilenode *relation-builders*)
+      (let ((maintenance (gethash relfilenode *relation-maintainers*)))
+        (when (and maintenance (eq :concurrent-index (relation-gate-token-kind maintenance)))
+          maintenance))))
+
+(defun relation-maintenance-admission-blocker (relfilenode)
+  (or (gethash relfilenode *relation-builders*)
+      (gethash relfilenode *relation-maintainers*)))
 
 (defun relation-resource-footprint-under-lock (&optional requested owner)
   "Count distinct relations and relation-owner pairs under relation exclusion.
@@ -977,7 +1052,8 @@ counter under the XID lock and interrupt mask, so cleanup can find it."
             (cdr link) *active-xids*
             *active-xids* link
             *next-xid* next)
-      (when owner (setf (backend-xid owner) xid)))
+      (when owner (setf (backend-xid owner) xid
+                        (gethash xid *active-xid-backends*) owner)))
     xid))
 
 (defun assign-xid (&optional owner)
@@ -1064,8 +1140,13 @@ Mutation capture uses the real XID; gates and quotas use the canonical owner."
                (dolist (node reads)
                  (pushnew relation-xid (gethash node *relation-readers*) :test #'=)))
              (return))
-           (check-for-interrupts)
-           (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))))
+           (wait-for-relation-dependencies
+            (nconc (loop for node in writes
+                         unless (relation-writer-admissible-p node relation-xid)
+                           collect (gethash node *relation-builders*))
+                   (loop for node in reads
+                         unless (relation-reader-admissible-p node relation-xid)
+                           collect (gethash node *relation-reader-blockers*)))))))))
   (values))
 
 (defun register-relation-writer (relfilenode xid)
@@ -1196,12 +1277,10 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
        (unwind-protect
             (progn
               (sb-thread:with-mutex (*relation-lock-mutex*)
-                (loop while (some (lambda (relfilenode)
-                                    (gethash relfilenode *relation-builders*))
-                                  relfilenodes)
-                      do (check-for-interrupts)
-                         (condition-wait-with-timeout *relation-lock-cv*
-                                                      *relation-lock-mutex*))
+                (loop for blockers = (loop for node in relfilenodes
+                                           for token = (relation-build-admission-blocker node)
+                                           when token collect token)
+                      while blockers do (wait-for-relation-dependencies blockers))
                 (sb-sys:without-interrupts
                   (remhash request *relation-resource-requests*)
                   ;; Own the complete set before any partial map update can fail.
@@ -1220,8 +1299,7 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
                   (unless user (return))
                   (if (and (consp user) (eq (first user) :maintenance))
                       (sb-thread:with-mutex (*relation-lock-mutex*)
-                        (condition-wait-with-timeout *relation-lock-cv*
-                                                     *relation-lock-mutex*))
+                        (wait-for-relation-dependencies (list (second user))))
                       (wait-for-xid user))))
               (setf completed t)
               token)
@@ -1271,14 +1349,14 @@ must protect the return-to-owner handoff from interrupts; prefer the scoped macr
                   #'release-relation-build-locks)
          ,@body))))
 
-(defun acquire-relation-maintenance-locks (relfilenodes &optional on-acquired)
+(defun acquire-relation-maintenance-locks (relfilenodes &optional on-acquired kind)
   "Serialize VACUUM on relations while allowing registered DML to proceed.
 ON-ACQUIRED publishes cleanup ownership atomically with the maintenance gates.
 Without it raw callers must protect the return-to-owner handoff from interrupts;
 prefer WITH-RELATION-MAINTENANCE-LOCKS."
   (let ((relfilenodes (sort (remove-duplicates (copy-list relfilenodes) :test #'=)
                             #'<))
-        (token (make-relation-gate-token *backend*))
+        (token (make-relation-gate-token *backend* kind))
         (published nil)
         (completed nil))
     (when (null relfilenodes)
@@ -1290,10 +1368,8 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
             (progn
               (sb-thread:with-mutex (*relation-lock-mutex*)
                 (loop
-                  (unless (some (lambda (relfilenode)
-                                  (or (gethash relfilenode *relation-builders*)
-                                      (gethash relfilenode *relation-maintainers*)))
-                                relfilenodes)
+                  (unless (loop for node in relfilenodes
+                                  thereis (relation-maintenance-admission-blocker node))
                     (sb-sys:without-interrupts
                       (remhash request *relation-resource-requests*)
                       (setf published t)
@@ -1301,9 +1377,10 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
                         (setf (gethash relfilenode *relation-maintainers*) token))
                       (when on-acquired (funcall on-acquired relfilenodes token)))
                     (return))
-                  (check-for-interrupts)
-                  (condition-wait-with-timeout *relation-lock-cv*
-                                               *relation-lock-mutex*)))
+                  (wait-for-relation-dependencies
+                   (loop for node in relfilenodes
+                         for token = (relation-maintenance-admission-blocker node)
+                         when token collect token))))
               (setf completed t)
               (values relfilenodes token))
          (when (and published (not completed))
@@ -1328,7 +1405,7 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
 (defun release-relation-maintenance-lock (relfilenode token)
   (release-relation-maintenance-locks (list relfilenode) token))
 
-(defmacro with-relation-maintenance-locks ((relfilenodes) &body body)
+(defmacro with-relation-maintenance-locks ((relfilenodes &optional kind) &body body)
   (let ((requested (gensym "REQUESTED-"))
         (rels (gensym "RELATIONS-"))
         (token (gensym "MAINTENANCE-TOKEN-")))
@@ -1336,7 +1413,7 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
        (with-acquired-relation-locks
            (,rels ,token
                   (lambda (publish)
-                    (acquire-relation-maintenance-locks ,requested publish))
+                    (acquire-relation-maintenance-locks ,requested publish ,kind))
                   #'release-relation-maintenance-locks)
          ,@body))))
 
@@ -1360,6 +1437,7 @@ XID lock.  Relation waiters are notified after the registrations are removed."
     (remhash xid *recovery-reader-xids*)
     (sb-thread:with-mutex (*xid-lock*)
       (setf *active-xids* (delete xid *active-xids* :test #'=))
+      (remhash xid *active-xid-backends*)
       ;; WAL snapshot-boundary state shares the XID lock so removal from the
       ;; active set and removal of its retained LSN remain one atomic change.
       (wal-forget-xid-under-xid-lock xid)
@@ -1429,18 +1507,89 @@ Pass BACKEND when releasing its virtual reader ID."
   "Check a virtual reader in its registry or a real XID in the active set."
   (if (minusp xid)
       (sb-thread:with-mutex (*relation-lock-mutex*)
-        (not (null (gethash xid *recovery-reader-xids*))))
+        (relation-user-active-under-lock-p xid))
       (xid-active-p xid)))
+
+(defun relation-user-active-under-lock-p (xid)
+  (if (minusp xid)
+      (not (null (gethash xid *recovery-reader-xids*)))
+      (xid-active-p xid)))
+
+(defun concurrent-index-older-snapshots (reference)
+  "Collect current pins whose horizon predates REFERENCE in the same database.
+Hold the snapshot lock. Copies retain their horizon, so a pin transferred after
+the wait begins still counts. Later snapshots cannot enter the cohort."
+  (let ((origin (snapshot-origin reference))
+        (database (snapshot-database reference))
+        (older nil))
+    (maphash (lambda (snapshot owner)
+               (declare (ignore owner))
+               (when (and (not (snapshot-concurrent-index-safe-p snapshot))
+                          (equal database (snapshot-database snapshot))
+                          (snapshot-origin snapshot)
+                          (< (snapshot-origin snapshot) origin))
+                 (push snapshot older)))
+             *active-snapshot-set*)
+    older))
+
+(defun wait-for-concurrent-index-snapshots (reference)
+  "Drain old snapshots before a plain-column concurrent index can be scanned."
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (loop for older = (sb-thread:with-mutex (*snapshot-count-lock*)
+                        (concurrent-index-older-snapshots reference))
+          while older do (wait-for-relation-dependencies older))))
+
+(defun capture-concurrent-index-snapshot (registration)
+  "Pin a fresh build horizon without waiting on wraparound while holding a gate."
+  (let ((*concurrent-index-snapshot-safe-p* t))
+    (sb-thread:with-mutex (*xid-wrap-lock*)
+      (when (or *xid-wrap-pending* *xid-wrap-failure*)
+        (ereport "55000" "transaction ID wraparound interrupted the concurrent index build"))
+      (make-snapshot 0 :register registration))))
+
+(defun wait-for-concurrent-index-users (relfilenode &key readers)
+  "Wait for a fixed cohort captured after a concurrent index phase commits.
+Registrations made after this census cannot prolong the wait."
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (loop with cohort = (if readers
+                            (remove-duplicates
+                             (append (gethash relfilenode *relation-writers*)
+                                     (copy-list (gethash relfilenode *relation-readers*)))
+                             :test #'eql)
+                            (copy-list (gethash relfilenode *relation-writers*)))
+          while (setf cohort (delete-if-not #'relation-user-active-under-lock-p cohort))
+          do (wait-for-relation-dependencies cohort))))
+
+(defun acquire-concurrent-index-writer-fence (node on-acquired)
+  (let ((relations (list node)))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (let ((owner (gethash node *relation-maintainers*)))
+        (unless (and owner (eq *backend* (relation-gate-token-owner owner))
+                     (eq :concurrent-index (relation-gate-token-kind owner))
+                     (not (gethash node *relation-builders*)))
+          (error "logical index cutover requires the unblocked online DDL gate"))
+        (sb-sys:without-interrupts
+          (funcall on-acquired relations owner)
+          (setf (gethash node *relation-builders*) owner))))))
+
+(defun call-with-concurrent-index-writer-fence (node function)
+  "Drain transactions using the old logical key while retaining heap read access.
+The online DDL token becomes a temporary writer blocker. Existing writers may
+proceed, and scoped cleanup removes only the writer blocker."
+  (with-acquired-relation-locks
+      (relations token
+                 (lambda (publish) (acquire-concurrent-index-writer-fence node publish))
+                 #'release-relation-build-locks)
+    (wait-for-concurrent-index-users node)
+    (funcall function)))
 
 (defun wait-for-xid (xid)
   "Block until XID ends. Called without the write lock held."
   (with-backend-wait-state (*backend* backend-waiting-xid xid)
-    (loop
-      (unless (relation-user-active-p xid) (return))
-      (check-for-interrupts)
-      (sb-thread:with-mutex (*xact-cv-mutex*)
-        (when (relation-user-active-p xid)
-          (condition-wait-with-timeout *xact-cv* *xact-cv-mutex*)))))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (loop with blockers = (list xid)
+            while (relation-user-active-under-lock-p xid)
+            do (wait-for-relation-dependencies blockers))))
   (values))
 
 (defun logical-capture-xid-needed-p (xid)
@@ -1554,7 +1703,10 @@ snapshot retains its coverage and XIP for its lifetime."
     (let* ((xip (copy-list (if covered (getf source :running) *active-xids*)))
            (xmin (if xip (reduce #'min xip) xmax))
            (snapshot (make-snapshot-struct :xmin xmin :xmax xmax :xip xip :curcid curcid
-                                           :source-xids-complete-p (not (null covered)))))
+                                           :source-xids-complete-p (not (null covered))
+                                           :origin (incf *concurrent-index-snapshot-origin*)
+                                           :database (and *backend* (backend-database *backend*))
+                                           :concurrent-index-safe-p *concurrent-index-snapshot-safe-p*)))
       (when register (register-active-snapshot snapshot register))
       snapshot)))
 
@@ -2336,7 +2488,7 @@ transaction until cleanup and is not a durable XID."
                      (- (incf *recovery-reader-xid-counter*)))))
         (unless (and (integerp xid) (minusp xid))
           (error "invalid recovery reader identity"))
-        (setf (gethash xid *recovery-reader-xids*) t
+        (setf (gethash xid *recovery-reader-xids*) backend
               (backend-virtual-reader-xid backend) xid)
         xid))))
 

@@ -465,10 +465,9 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
                        (aref (pg-class-columns table) (1- attnum))))
                     attnums)))))
 
-(defun logical-table-replica-identity (table)
+(defun logical-table-replica-identity (table &optional (indexes (table-indexes table)))
   "Choose the primary or otherwise unambiguous unique index for pgoutput K."
-  (let* ((indexes (table-indexes table))
-         (primary (find-if (lambda (index)
+  (let* ((primary (find-if (lambda (index)
                              (and (pg-index-primary-p index)
                                   (logical-identity-index-usable-p index table)))
                            indexes))

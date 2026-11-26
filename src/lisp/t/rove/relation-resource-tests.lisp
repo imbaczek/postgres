@@ -281,7 +281,7 @@
   (let* ((variables '(*relation-readers* *relation-writers* *relation-builders*
                       *relation-reader-blockers* *relation-build-groups* *relation-maintainers*
                       *relation-lock-object-limit* *relation-lock-owner-limit* *relation-resource-requests*
-                      *active-xids* *backend*))
+                      *recovery-reader-xids* *active-xids* *backend*))
          (bindings (mapcar #'symbol-value variables))
          (outcome (list :running))
          (worker (sb-thread:make-thread
@@ -350,6 +350,102 @@
            (release-relation-build-locks '(1) token)))
        (rove:ok (equal '(0 0) (multiple-value-list (relation-resource-footprint)))))
      :objects 2 :owners 4))
+
+(rove:deftest concurrent-index-snapshot-cohort-follows-copies-and-skips-newer-snapshots
+    (let* ((*active-snapshot-set* (make-hash-table :test #'eq))
+           (*active-snapshots* 0)
+           (*active-xids* (list 90))
+           (*next-xid* 100)
+           (*wal-ready* nil)
+           (*physical-recovery-state* nil)
+           (*backend* (make-backend :database "postgres"))
+           (other (make-backend :database "other"))
+           (old-registration (make-snapshot-registration))
+           (copy-registration (make-snapshot-registration))
+           (late-registration (make-snapshot-registration))
+           (other-registration (make-snapshot-registration))
+           (old (make-snapshot 0 :register old-registration))
+           (clone (copy-snapshot old))
+           (other-snapshot (let ((*backend* other))
+                             (make-snapshot 0 :register other-registration)))
+           (reference (make-snapshot 0))
+           (late (make-snapshot 0 :register late-registration)))
+      (unwind-protect
+           (progn
+             (rove:ok (= (snapshot-xmin other-snapshot) (snapshot-xmin reference)))
+             (sb-thread:with-mutex (*xid-lock*)
+               (register-active-snapshot clone copy-registration))
+             (release-snapshot-registration old-registration)
+             (rove:ok (= (snapshot-xmin late) (snapshot-xmin reference)))
+             (sb-thread:with-mutex (*snapshot-count-lock*)
+               (rove:ok
+                (equal (list clone)
+                       (funcall (symbol-function 'concurrent-index-older-snapshots)
+                                reference))
+                "only the retained pin on the old horizon can block validation")))
+        (mapc #'release-snapshot-registration
+              (list old-registration copy-registration late-registration other-registration)))))
+
+(rove:deftest online-index-writer-wait-detects-ddl-upgrade-cycle
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (let* ((*backend* (make-backend))
+              (writer (get-current-reader-xid))
+              (builder (make-backend))
+              (dependencies (make-hash-table :test #'eq)))
+         ;; PROGV also lets the pre-fix suite load and fail on the missing behavior.
+         (progv '(*relation-wait-dependencies*) (list dependencies)
+           (register-relation-writer 1 writer)
+           (unwind-protect
+                (call-with-relation-resource-waiter
+                 (lambda ()
+                   (let ((*backend* builder))
+                     (progv '(*relation-wait-dependencies*) (list dependencies)
+                       (with-relation-maintenance-locks ((list 1) :concurrent-index)
+                         (wait-for-xid writer)))))
+                 (lambda (worker outcome)
+                   (unless (loop repeat 1000
+                                 when (sb-thread:with-mutex (*relation-lock-mutex*)
+                                        (gethash builder dependencies))
+                                   return t
+                                 do (sleep 0.005))
+                     (error "online index waiter did not register its dependency"))
+                   (let ((condition
+                           (relation-resource-error
+                            (lambda ()
+                              (with-relation-build-locks ((list 1) t)
+                                (error "ordinary DDL crossed the online gate"))))))
+                     (rove:ok (and condition
+                                   (equal "40P01" (pg-error-sqlstate condition)))))
+                   (release-xid writer *backend*)
+                   (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                   (rove:ok (eq :returned (car outcome)))
+                   (rove:ok (zerop (hash-table-count dependencies)))))
+             (when (backend-virtual-reader-xid *backend*)
+               (release-xid writer *backend*))))))))
+
+(rove:deftest queued-ordinary-ddl-keeps-online-index-dml-admissible
+    (call-with-relation-resource-fixture
+     (lambda ()
+       (multiple-value-bind (relations token)
+           (funcall (symbol-function 'acquire-relation-maintenance-locks)
+                    '(1) nil :concurrent-index)
+         (unwind-protect
+              (call-with-relation-resource-waiter
+               (lambda ()
+                 (let ((builder (acquire-relation-build-locks '(1) 22 t)))
+                   (release-relation-build-locks '(1) builder)))
+               (lambda (worker outcome)
+                 (await-relation-resource-request)
+                 (sb-thread:with-mutex (*relation-lock-mutex*)
+                   (rove:ok (relation-reader-admissible-p 1 33))
+                   (rove:ok (relation-writer-admissible-p 1 33))
+                   (rove:ok (null (gethash 1 *relation-builders*))))
+                 (release-relation-maintenance-locks relations token)
+                 (sb-thread:join-thread worker :timeout 5 :default :timeout)
+                 (rove:ok (eq :returned (car outcome)))))
+           (release-relation-maintenance-locks relations token))))
+     :objects 1 :owners 2))
 
 (rove:deftest relation-resource-queued-gates-release-capacity-before-publication
     (dolist (kind '(:build :maintenance))

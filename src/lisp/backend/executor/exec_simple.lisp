@@ -880,6 +880,120 @@ read lease to protect the index lookup."
       (funcall function)
       (call-with-btree-relation-read-lock relfilenode function)))
 
+(defun index-build-key (index table tuple snapshot)
+  "Read only indexed attributes and retain their original compression metadata.
+Save the physical values before materializing external attributes, so the index
+key can preserve the source tuple's eligible compressed representation."
+  (let* ((values (htup-values tuple))
+         (columns (pg-index-columns index))
+         (compressed (htup-physical-compressed tuple))
+         (external (some (lambda (attnum)
+                           (heap-external-varlena-p (aref values (1- attnum))))
+                         columns))
+         (physical (when (or external compressed) (copy-seq values))))
+    (when compressed
+      (dolist (attnum columns)
+        (let ((offset (1- attnum)))
+          (when (aref compressed offset)
+            (setf (aref physical offset) (aref compressed offset))))))
+    (when external
+      (materialize-select-tuple table tuple (statement-protection-snapshot snapshot)
+                                :index-reader #'index-build-toast-reader
+                                :demand (cons table columns) :retain-external-p t))
+    (let ((keys (index-values index values)))
+      (values (index-storage-key index table keys physical) keys))))
+
+(defun check-index-build-uniqueness (index table snapshot key name)
+  "Reject a conflicting version visible to the build horizon."
+  (let ((heap (pg-class-relfilenode table))
+        (columns (pg-class-columns table)))
+    (btree-scan-equal
+     (pg-index-relfilenode index) key
+     (lambda (tid)
+       (let ((candidate (heapam-get-tuple heap (car tid) (cdr tid) columns)))
+         (when (and candidate (htup-visible-p candidate snapshot))
+           (ereport "23505" "could not create unique index \"~a\"" name)))))))
+
+(defun build-concurrent-index (index table snapshot)
+  "Build from one MVCC horizon while table writers still ignore this index."
+  (let ((heap (pg-class-relfilenode table))
+        (node (pg-index-relfilenode index))
+        (columns (pg-class-columns table)))
+    (heapam-scan
+     heap columns snapshot
+     (lambda (tuple)
+       (check-for-interrupts)
+       (multiple-value-bind (key values) (index-build-key index table tuple snapshot)
+         (when (index-key-requires-uniqueness-check-p index values)
+           (check-index-build-uniqueness index table snapshot key (pg-index-name index)))
+         (btree-insert node key (htup-block tuple) (htup-offnum tuple)))))))
+
+(defun concurrent-index-validation-conflict (table tuple cursor)
+  "Return the live conflict or XID wait that can still affect TUPLE's key."
+  (let ((wait nil))
+    (loop for tid = (btree-cursor-next-tid cursor)
+          while tid
+          finally (return wait)
+          do
+             (let ((candidate (heapam-get-tuple (pg-class-relfilenode table)
+                                                (car tid) (cdr tid) (pg-class-columns table))))
+               (when candidate
+                 (let ((status (unique-conflict-status candidate nil)))
+                   (cond
+                     ((eq status :violation)
+                      ;; The source tuple might have been replaced since the
+                      ;; validation snapshot. Its successor can live under this key.
+                      (let* ((source (heapam-get-tuple (pg-class-relfilenode table)
+                                                       (htup-block tuple) (htup-offnum tuple)
+                                                       (pg-class-columns table)))
+                             (source-status (and source (unique-conflict-status source nil))))
+                        (return (if (eq source-status :free) nil source-status))))
+                     ((consp status) (setf wait status)))))))))
+
+(defun validate-concurrent-index-tuple (index table tuple key unique)
+  "Insert a reference-snapshot TID once, serializing with ordinary index writes."
+  (let ((node (pg-index-relfilenode index))
+        (block (htup-block tuple))
+        (offset (htup-offnum tuple)))
+    (loop
+      (check-for-interrupts)
+      (let ((status
+              (with-btree-relation-lock (node)
+                (let ((cursor (open-btree-equal-cursor-unlocked node key))
+                      (matching nil))
+                  (loop for tid = (btree-cursor-next-tid cursor)
+                        while tid
+                        do (setf matching t)
+                           (when (and (= block (car tid)) (= offset (cdr tid)))
+                             (return-from validate-concurrent-index-tuple nil)))
+                  (with-write-lock
+                    (let ((conflict
+                            (when (and unique matching)
+                              (concurrent-index-validation-conflict
+                               table tuple (open-btree-equal-cursor-unlocked node key)))))
+                      (unless conflict (btree-insert-unlocked node key block offset))
+                      conflict))))))
+        (cond
+          ((null status) (return))
+          ((eq status :violation)
+           (ereport "23505" "could not create unique index \"~a\"" (pg-index-name index)))
+          (t (wait-for-xid (cdr status))))))))
+
+(defun validate-concurrent-index (index table snapshot built-snapshot)
+  "Add missing TIDs visible to the reference snapshot.
+Every version visible to BUILT-SNAPSHOT was indexed by the completed build.
+The heap maintenance gate keeps these versions and their index entries stable
+between scans. Checking the original horizon avoids probing the index for
+unchanged rows, even when one key has many entries."
+  (heapam-scan
+   (pg-class-relfilenode table) (pg-class-columns table) snapshot
+   (lambda (tuple)
+     (check-for-interrupts)
+     (unless (htup-visible-p tuple built-snapshot)
+       (multiple-value-bind (key values) (index-build-key index table tuple snapshot)
+         (validate-concurrent-index-tuple index table tuple key
+                                          (index-key-requires-uniqueness-check-p index values)))))))
+
 (defun build-index-entries (idx table &key unique name (removal-horizon (vacuum-data-oldest-xmin)))
   "Populate IDX with heap versions retained by REMOVAL-HORIZON.
 The default horizon includes local activity and physical slots.
@@ -901,34 +1015,12 @@ before this removal horizon is captured."
                               (not (tuple-prunable-p (htup-xmin tuple)
                                                      (htup-xmax tuple)
                                                      removal-horizon)))
-                     (let* ((physical-values
-                              (let ((physical (copy-seq (htup-values tuple))))
-                                (when (htup-physical-compressed tuple)
-                                  (loop for value across (htup-physical-compressed tuple) for i from 0
-                                        when value do (setf (aref physical i) value)))
-                                (materialize-select-tuple
-                                 table tuple (statement-protection-snapshot snapshot)
-                                 :index-reader #'index-build-toast-reader)
-                                physical))
-                            (vals (index-values idx (htup-values tuple)))
-                            (key (index-storage-key idx table vals physical-values)))
+                     (multiple-value-bind (key vals) (index-build-key idx table tuple snapshot)
                        ;; Retain recently dead versions for old snapshots, but
                        ;; don't let those versions create unique violations.
-                       (when (and unique
-                                  (htup-visible-p tuple snapshot)
-                                  (not (and (key-has-null-p vals)
-                                            (not (pg-index-nulls-not-distinct-p
-                                                  idx)))))
-                         (dolist (tid (btree-search index-relfilenode key))
-                           (let ((candidate
-                                   (heapam-get-tuple heap-relfilenode
-                                                     (car tid) (cdr tid)
-                                                     columns)))
-                             (when (and candidate
-                                        (htup-visible-p candidate snapshot))
-                               (ereport "23505"
-                                        "could not create unique index \"~a\""
-                                        name)))))
+                       (when (and (index-key-requires-uniqueness-check-p idx vals unique)
+                                  (htup-visible-p tuple snapshot))
+                         (check-index-build-uniqueness idx table snapshot key name))
                        (btree-insert index-relfilenode key
                                      (htup-block tuple)
                                      (htup-offnum tuple)))))))
@@ -1219,62 +1311,307 @@ Release these locks before waiting for commit or sending replies."
                    "NOTICE" "42P07"))
     (send-command-complete stream "CREATE INDEX")))
 
+(defun refresh-index-ddl-target (name original &optional if-exists)
+  "Follow catalog versions of the same locked index, never a replacement."
+  (let ((current (lookup-index name)))
+    (cond
+      ((and current (= (pg-index-oid current) (pg-index-oid original))
+            (= (pg-index-relfilenode current) (pg-index-relfilenode original)))
+       current)
+      (current
+       (ereport "55000" "index \"~a\" changed while waiting for lock" name))
+      ((not if-exists)
+       (ereport "42704" "index \"~a\" does not exist" name)))))
+
+(defun logical-index-drop-ast (database ast entries)
+  "Exclude local-only indexes and relations that appeared after target capture."
+  (let ((names
+          (loop for (name . index) in entries
+                for current = (gethash name (database-indexes database))
+                when (or (null current)
+                         (and (eq index current) (pg-index-logical-visible-p current)))
+                  collect name)))
+    (when names
+      (let ((event (copy-list ast)))
+        (setf (getf event :names) names)
+        event))))
+
+(defun logical-index-ddl-event (ast)
+  "Verify the received event's target shape even when local cleanup emits no event."
+  (cond
+    (ast (logical-catalog-event-for-ast ast))
+    (*logical-event-schema-contract*
+     (logical-validate-schema-contract-under-write-lock
+      (getf *logical-event-schema-contract* :schema-after) :after)
+     nil)))
+
 (defun exec-drop-index (stream ast)
   (let* ((names (getf ast :names))
          (if-exists (getf ast :if-exists))
-         (db nil)
+         (database nil)
          (entries nil)
          (relfilenodes nil))
     (with-write-lock
-      (setf db (current-database)
-            entries
-            (mapcar (lambda (name)
-                      (cons name (gethash name (database-indexes db))))
-                    names)
-            relfilenodes
-            (drop-index-relation-lock-set entries #'find-table-by-oid)))
+      (setf database (current-database)
+            entries (mapcar (lambda (name) (cons name (lookup-index name))) names)
+            relfilenodes (drop-index-relation-lock-set entries #'find-table-by-oid)))
     (dolist (entry entries)
       (unless (or (cdr entry) if-exists)
         (ereport "42704" "index \"~a\" does not exist" (car entry))))
     (with-relation-build-locks (relfilenodes t)
       (with-logical-ddl-publication (ast)
-        ;; Revalidate every captured index before making any change.  This
-        ;; keeps a concurrent drop/recreate from redirecting this statement.
         (dolist (entry entries)
-          (let* ((name (car entry))
-                 (original (cdr entry))
-                 (current (gethash name (database-indexes db))))
-            (when (and original (not (eq original current)))
-              (cond
-                (current
-                 (ereport "55000" "index \"~a\" changed while waiting for lock"
-                          name))
-                ((not if-exists)
-                 (ereport "42704" "index \"~a\" does not exist" name))))))
-        ;; Check dependencies as a preflight, so a multi-index statement
-        ;; cannot drop an earlier index and then fail on a later one.
-        (dolist (entry entries)
-          (let* ((name (car entry))
-                 (idx (cdr entry)))
-            (when (and idx (eq idx (gethash name (database-indexes db)))
-                       (pg-index-constraint-owned-p idx))
-              (let ((table (find-table-by-oid (pg-index-table-oid idx))))
-                (ereport "2BP01"
-                         "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
-                         name name (if table (pg-class-name table) "?"))))))
-        (with-catalog-mutation-rollback (db)
-          (dolist (entry entries)
-            (let* ((name (car entry))
-                   (original (cdr entry)))
-              (if (and original
-                       (eq original (gethash name (database-indexes db))))
-                  (drop-index* db name)
-                  (send-notice stream
-                               (format nil "index \"~a\" does not exist, skipping"
-                                       name)))))
-          (save-catalog :final-ddl-p t :logical-event
-                        (logical-catalog-event-for-ast ast)))))
+          (when (cdr entry)
+            (setf (cdr entry) (refresh-index-ddl-target (car entry) (cdr entry) if-exists))))
+        ;; Preflight every dependency before changing any part of a multi-index drop.
+        (loop for (name . index) in entries
+              when (and index (pg-index-constraint-owned-p index))
+                do (let ((table (find-table-by-oid (pg-index-table-oid index))))
+                     (ereport "2BP01"
+                              "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
+                              name name (if table (pg-class-name table) "?"))))
+        (let ((logical-ast (logical-index-drop-ast database ast entries)))
+          (with-catalog-mutation-rollback (database)
+            (loop for (name . index) in entries
+                  do (if (and index (eq index (gethash name (database-indexes database))))
+                         (drop-index* database name)
+                         (send-notice stream (format nil "index \"~a\" does not exist, skipping" name))))
+            (save-catalog :final-ddl-p t :logical-event (logical-index-ddl-event logical-ast))))))
     (send-command-complete stream "DROP INDEX")))
+
+(defun concurrent-drop-target (table name original if-exists)
+  (let ((current (refresh-index-ddl-target name original if-exists)))
+    (when current (ensure-current-table table))
+    current))
+
+(defun call-with-concurrent-index-phase (function)
+  "Finish one durable phase without retaining transaction resources in the wait."
+  (let ((*catalog-save-error-after-durable-p* nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (progn
+             (set-backend-state *backend* :in-progress)
+             (sb-sys:with-local-interrupts
+               (call-with-prepared-final-ddl
+                (lambda ()
+                  (funcall function)
+                  (commit-transaction)))))
+        (when (eq (backend-state *backend*) :in-progress)
+          (abort-transaction))))))
+
+(defun write-concurrent-index-state (database old new &optional logical-ast)
+  "Replace the catalog object so admitted writers keep their original index state."
+  (let* ((indexes (database-indexes database))
+         (name (pg-index-name old)))
+    (unless (eq old (gethash name indexes))
+      (error "concurrent index phase lost catalog ownership"))
+    (call-with-catalog-durability-rollback-under-lock
+     (lambda () (setf (gethash name indexes) old))
+     (lambda ()
+       (setf (gethash name indexes) new)
+       (save-catalog :final-ddl-p t :applied-logical-event-id nil
+                     :logical-event (when logical-ast
+                                      (logical-catalog-event-for-ast logical-ast)))))))
+
+(defun concurrent-index-identity-changes-p (table old new)
+  (with-write-lock
+    (let* ((indexes (table-indexes table))
+           (before (logical-table-replica-identity table indexes))
+           (after (logical-table-replica-identity table (substitute new old indexes :test #'eq))))
+      (not (equal (sort before #'<) (sort after #'<))))))
+
+(defun publish-concurrent-index-state (database table old new logical-ast)
+  "Keep old logical row keys ordered before the catalog event that changes them.
+When the identity changes, block new writers and drain those admitted under the
+old identity before publishing the event and replacement catalog object."
+  (call-with-concurrent-index-phase
+   (lambda ()
+     (if logical-ast
+         (with-schema-write-lock
+           (flet ((publish ()
+                    (with-logical-ddl-publication (logical-ast)
+                      (write-concurrent-index-state database old new logical-ast))))
+             (if (concurrent-index-identity-changes-p table old new)
+                 (call-with-concurrent-index-writer-fence (pg-class-relfilenode table) #'publish)
+                 (publish))))
+         (with-write-catalog-locks
+           (write-concurrent-index-state database old new))))))
+
+(defun set-concurrent-drop-state (database table index &key dead)
+  (let* ((new (copy-pg-index index))
+         (logical-ast (when (pg-index-logical-visible-p index)
+                        (list :type :drop-index :names (list (pg-index-name index))))))
+    (setf (pg-index-valid-p new) nil
+          (pg-index-logical-visible-p new) nil)
+    (when dead
+      (setf (pg-index-ready-p new) nil
+            (pg-index-live-p new) nil))
+    (publish-concurrent-index-state database table index new logical-ast)
+    new))
+
+(defun run-concurrent-index-drop (database table index)
+  ;; First stop new scans, then drain users before marking the index dead.
+  ;; Drain users of the old state again before removing its catalog and storage.
+  (let ((node (pg-class-relfilenode table)))
+    (when (or (pg-index-valid-p index) (pg-index-logical-visible-p index))
+      (setf index (set-concurrent-drop-state database table index)))
+    (when (pg-index-live-p index)
+      (wal-test-pause :after-concurrent-index-invalid)
+      (wait-for-concurrent-index-users node :readers t)
+      (setf index (set-concurrent-drop-state database table index :dead t)))
+    (wal-test-pause :after-concurrent-index-dead)
+    (wait-for-concurrent-index-users node :readers t)
+    (call-with-concurrent-index-phase
+     (lambda ()
+       (with-write-catalog-locks
+         (ensure-current-table table)
+         (unless (eq index (lookup-index (pg-index-name index)))
+           (error "concurrent index drop lost catalog ownership"))
+         (with-catalog-mutation-rollback (database)
+           (drop-index* database (pg-index-name index))
+           (save-catalog :final-ddl-p t :applied-logical-event-id nil)))))))
+
+(defun exec-drop-index-concurrently (stream ast)
+  (let* ((name (first (getf ast :names)))
+         (if-exists (getf ast :if-exists))
+         (database (current-database))
+         (index nil)
+         (table nil)
+         (removed nil))
+    (with-write-lock
+      (setf index (lookup-index name)
+            table (and index (find-table-by-oid (pg-index-table-oid index))))
+      (when (and (null index) (relation-name-in-use-p database name))
+        (ereport "42809" "\"~a\" is not an index" name)))
+    (when (and index (null table))
+      (error "index has no owning table"))
+    (when table
+      (with-relation-maintenance-locks
+          ((list (pg-class-relfilenode table) (pg-index-relfilenode index)) :concurrent-index)
+        (let ((target (with-write-lock
+                        (concurrent-drop-target table name index if-exists))))
+          (when target
+            (when (pg-index-constraint-owned-p target)
+              (ereport "2BP01"
+                       "cannot drop index \"~a\" because constraint \"~a\" on table \"~a\" requires it"
+                       name name (pg-class-name table)))
+            (run-concurrent-index-drop database table target)
+            (setf removed t)))))
+    (unless removed
+      (unless if-exists (ereport "42704" "index \"~a\" does not exist" name))
+      (send-notice stream (format nil "index \"~a\" does not exist, skipping" name)))
+    (send-command-complete stream "DROP INDEX")))
+
+(defun concurrent-index-name-available-p (database name if-not-exists)
+  (or (not (relation-name-in-use-p database name))
+      (and (not if-not-exists)
+           (ereport "42P07" "relation \"~a\" already exists" name))))
+
+(defun reserve-concurrent-index (database table ast)
+  (with-write-catalog-locks
+    (ensure-current-table table)
+    (let* ((name (getf ast :name))
+           (columns (resolve-attnums table (getf ast :columns))))
+      (check-index-definition table columns)
+      (when (concurrent-index-name-available-p database name (getf ast :if-not-exists))
+        (let ((index (make-index-object (allocate-oid) name table columns
+                                        :unique (getf ast :unique)
+                                        :nulls-not-distinct (getf ast :nulls-not-distinct))))
+          (setf (pg-index-ready-p index) nil
+                (pg-index-logical-visible-p index) nil)
+          (save-catalog :applied-logical-event-id nil)
+          index)))))
+
+(defun publish-concurrent-index-definition (database table index if-not-exists)
+  (let ((published nil))
+    (call-with-concurrent-index-phase
+     (lambda ()
+       (with-write-catalog-locks
+         (ensure-current-table table)
+         (let ((name (pg-index-name index))
+               (old-indexes (pg-class-indexes table)))
+           (when (concurrent-index-name-available-p database name if-not-exists)
+             (call-with-catalog-durability-rollback-under-lock
+              (lambda ()
+                (remhash name (database-indexes database))
+                (setf (pg-class-indexes table) old-indexes))
+              (lambda ()
+                (publish-index* database index table)
+                (save-catalog :final-ddl-p t :applied-logical-event-id nil)
+                (setf published t))))))))
+    published))
+
+(defun cleanup-unpublished-concurrent-index (database index)
+  "Discard reserved storage if no durable catalog phase owns it."
+  (unless *wal-poisoned*
+    (with-write-catalog-locks
+      (unless (eq index (gethash (pg-index-name index) (database-indexes database)))
+        (wal-defer-relation-delete (pg-index-relfilenode index))
+        (save-catalog :applied-logical-event-id nil)))))
+
+(defun install-concurrent-index-definition (database table index ast)
+  (let ((published nil))
+    (unwind-protect
+         (progn
+           (btree-init (pg-index-relfilenode index))
+           (setf published
+                 (publish-concurrent-index-definition
+                  database table index (getf ast :if-not-exists))))
+      (unless published
+        (cleanup-unpublished-concurrent-index database index)))))
+
+(defun set-concurrent-create-state (database table index &optional logical-ast)
+  (let ((new (copy-pg-index index)))
+    (setf (pg-index-ready-p new) t)
+    (when logical-ast
+      (setf (pg-index-valid-p new) t
+            (pg-index-logical-visible-p new) t))
+    (publish-concurrent-index-state database table index new logical-ast)
+    new))
+
+(defun run-concurrent-index-create (database table index ast)
+  ;; Wait out writers that did not see the definition, build, then make writers
+  ;; maintain the index.  After those using the unready state have finished,
+  ;; validate against a fresh snapshot and drain older snapshots before making
+  ;; the index valid.  Each published state survives a later phase failure.
+  (let ((heap (pg-class-relfilenode table))
+        (logical-ast (copy-list ast))
+        (*wal-row-page-write-p* nil))
+    (remf logical-ast :concurrently)
+    (wal-test-pause :after-concurrent-index-unready)
+    (wait-for-concurrent-index-users heap)
+    (let ((built-snapshot
+            (with-statement-snapshot (snapshot #'capture-concurrent-index-snapshot)
+              (build-concurrent-index index table snapshot)
+              snapshot)))
+      (wal-test-pause :after-concurrent-index-build)
+      (setf index (set-concurrent-create-state database table index))
+      (wal-test-pause :after-concurrent-index-ready)
+      (wait-for-concurrent-index-users heap)
+      (let ((reference
+              (with-statement-snapshot (snapshot #'capture-concurrent-index-snapshot)
+                (wal-test-pause :before-concurrent-index-validation)
+                (validate-concurrent-index index table snapshot built-snapshot)
+                snapshot)))
+        (wal-test-pause :after-concurrent-index-validation)
+        (wait-for-concurrent-index-snapshots reference)))
+    (set-concurrent-create-state database table index logical-ast)))
+
+(defun exec-create-index-concurrently (stream ast)
+  (let* ((database (current-database))
+         (table (with-write-lock (resolve-table-or-error (getf ast :table))))
+         (built nil))
+    (check-index-key-count (getf ast :columns))
+    (with-relation-maintenance-locks ((list (pg-class-relfilenode table)) :concurrent-index)
+      (let ((index (reserve-concurrent-index database table ast)))
+        (when (and index (install-concurrent-index-definition database table index ast))
+          (run-concurrent-index-create database table index ast)
+          (setf built t))))
+    (unless built
+      (send-notice stream
+                   (format nil "relation \"~a\" already exists, skipping" (getf ast :name))
+                   "NOTICE" "42P07"))
+    (send-command-complete stream "CREATE INDEX")))
 
 (defun exec-alter-index (stream ast)
   (let* ((name (getf ast :name))
@@ -1291,16 +1628,11 @@ Release these locks before waiting for commit or sending replies."
     (unless table
       (ereport "42P01" "table for index \"~a\" does not exist" name))
     (with-table-ddl (table :ast ast :indexes (list idx) :wait-readers t)
-      (let ((current (lookup-index name)))
-        (unless (eq idx current)
-          (if current
-              (ereport "55000" "index \"~a\" changed while waiting for lock"
-                       name)
-              (ereport "42704" "index \"~a\" does not exist" name)))
+      (let ((current (refresh-index-ddl-target name idx)))
         (with-catalog-mutation-rollback (db)
           (rename-index* db name new-name)
           (save-catalog :final-ddl-p t :logical-event
-                        (logical-catalog-event-for-ast ast)))))
+                        (logical-index-ddl-event (when (pg-index-logical-visible-p current) ast))))))
     (send-command-complete stream "ALTER INDEX")))
 
 (defun exec-alter-table-using-index (db table ast primary)
@@ -1312,12 +1644,9 @@ Release these locks before waiting for commit or sending replies."
                            :indexes (list idx)
                            :wait-readers t)
       ;; Recheck after waiting for both the heap and index readers.
-      (let ((current (lookup-index index-name)))
-        (unless (eq idx current)
-          (if current
-              (ereport "55000" "index \"~a\" changed while waiting for lock"
-                       index-name)
-              (ereport "42704" "index \"~a\" does not exist" index-name))))
+      (setf idx (refresh-index-ddl-target index-name idx))
+      (unless (pg-index-valid-p idx)
+        (ereport "55000" "index \"~a\" is not valid" index-name))
       (when (pg-index-constraint-owned-p idx)
         (ereport "55000"
                  "index \"~a\" is already associated with a constraint"
@@ -1691,7 +2020,12 @@ without a change; each actual publication captures its own schema precondition."
   (let ((implicit (not (or (backend-explicit *backend*)
                            (backend-implicit-query-block *backend*))))
         (logical-ddl-responses nil)
-        (copy-row-count nil))
+        (copy-row-count nil)
+        (*concurrent-index-snapshot-safe-p*
+          (or (member (getf ast :type) '(:create-index :drop-index :alter-index
+                                         :drop-table :alter-table))
+              (and (eq :truncate (getf ast :type))
+                   (eq :read-committed (backend-isolation-level *backend*))))))
     (when (and (backend-transaction-read-only-p)
                (member (getf ast :type)
                        '(:insert :update :delete :truncate :create-table :drop-table
@@ -1766,25 +2100,46 @@ without a change; each actual publication captures its own schema precondition."
     (when copy-row-count
       (send-copy-command-complete stream copy-row-count))))
 
+(defun call-with-prepared-final-ddl (function)
+  "Protect cleanup after durable final DDL publication on every exit."
+  (prepare-backend-final-ddl *backend*)
+  (let ((context (backend-wal-obligation *backend*))
+        (complete nil))
+    (sb-sys:without-interrupts
+      (unwind-protect
+           (multiple-value-prog1
+               (sb-sys:allow-with-interrupts
+                 (sb-sys:with-local-interrupts (funcall function)))
+             (setf complete t))
+        (when (and (not complete) (transaction-wal-obligation-final-ddl-p context))
+          (finish-failed-final-ddl *backend*))))))
+
+(defun concurrent-index-ddl-p (ast)
+  (and (getf ast :concurrently)
+       (member (getf ast :type) '(:create-index :drop-index))))
+
+(defun check-concurrent-index-transaction (ast &optional multi-statement-p)
+  (when (or multi-statement-p
+            (not (eq (backend-state *backend*) :idle)))
+    (ereport "25001" "~a cannot run inside a transaction block"
+             (if (eq :create-index (getf ast :type))
+                 "CREATE INDEX CONCURRENTLY" "DROP INDEX CONCURRENTLY"))))
+
+(defun execute-concurrent-index (stream ast)
+  (check-concurrent-index-transaction ast)
+  (when (backend-transaction-read-only-p)
+    (ereport "25006" "cannot execute write statement in a read-only transaction"))
+  (prepare-xid-wraparound-for-statement *backend*)
+  (ecase (getf ast :type)
+    (:drop-index (exec-drop-index-concurrently stream ast))
+    (:create-index (exec-create-index-concurrently stream ast))))
+
 (defun execute-in-transaction (stream ast)
-  "Run a statement and protect cleanup after final DDL publication.
-Mask entry to unwind cleanup and mark completion only after the interrupt mask
-is restored. An incomplete exit after final publication suppresses output and
-retires the transaction without undoing the catalog."
+  "Run a statement in the current transaction or in an ordinary autocommit scope."
+  (when (concurrent-index-ddl-p ast)
+    (ereport "25001" "concurrent index commands must run as top-level statements"))
   (if (ddl-p ast)
-      (progn
-        (prepare-backend-final-ddl *backend*)
-        (let ((context (backend-wal-obligation *backend*))
-              (complete nil))
-          (sb-sys:without-interrupts
-            (unwind-protect
-                 (multiple-value-prog1
-                     (sb-sys:allow-with-interrupts
-                       (sb-sys:with-local-interrupts
-                         (execute-in-transaction-body stream ast)))
-                   (setf complete t))
-              (when (and (not complete) (transaction-wal-obligation-final-ddl-p context))
-                (finish-failed-final-ddl *backend*))))))
+      (call-with-prepared-final-ddl (lambda () (execute-in-transaction-body stream ast)))
       (execute-in-transaction-body stream ast)))
 
 (defun execute-statement (stream ast)
@@ -1796,6 +2151,8 @@ retires the transaction without undoing the catalog."
     ;; Every command still passes the cluster recovery guard before dispatch.
     ;; A failed transaction exits above without executing any command.
     (recovery-check-statement ast)
+    (when (concurrent-index-ddl-p ast)
+      (return-from execute-statement (execute-concurrent-index stream ast)))
     (case type
       (:begin (command-begin stream ast))
       (:commit (command-commit stream))
@@ -1872,6 +2229,9 @@ Protect setup, commit completion and abort cleanup from interrupts; statement
 execution and final network output remain interruptible. The last command tag
 is sent only after commit."
   (check-rewind-sql-statements statements)
+  (when (rest statements)
+    (let ((concurrent (find-if #'concurrent-index-ddl-p statements)))
+      (when concurrent (check-concurrent-index-transaction concurrent t))))
   (when *extended-simple-multi-p*
     (return-from execute-simple-query-statements
       (execute-query-statements stream statements t)))

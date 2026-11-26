@@ -744,22 +744,24 @@ Send its row description before execution and close it before reporting completi
 (defun extended-apply-parse (stream state operation)
   (destructuring-bind (kind name sql oids) operation
     (declare (ignore kind))
-    (when (eq (backend-state *backend*) :idle)
-      (sb-sys:without-interrupts
-        (begin-extended-implicit-query-block)
-        (setf (extended-query-state-implicit-p state) t)))
     (when (zerop (length name))
       (remhash "" (extended-query-state-statements state)))
     (when (and (plusp (length name)) (gethash name (extended-query-state-statements state)))
       (ereport "42P05" "prepared statement already exists"))
     (let* ((statements (parse-statements sql))
+           (ast (first statements))
+           (concurrent (concurrent-index-ddl-p ast))
            (slot-query-p (and (= (length statements) 1)
                               (patroni-slot-query-shape-p (first statements))))
            (types (map 'vector (lambda (oid) (unless (zerop oid) (extended-type-from-oid oid))) oids)))
       (check-rewind-sql-statements statements)
       (unless (and (= (length statements) 1)
-                   (member (getf (first statements) :type) '(:insert :update :delete :select :do)))
-        (ereport "0A000" "extended query supports DML, SELECT or DO"))
+                   (or concurrent (member (getf ast :type) '(:insert :update :delete :select :do))))
+        (ereport "0A000" "unsupported statement in extended query"))
+      (when (and (not concurrent) (eq (backend-state *backend*) :idle))
+        (sb-sys:without-interrupts
+          (begin-extended-implicit-query-block)
+          (setf (extended-query-state-implicit-p state) t)))
       (when (and (not slot-query-p)
                  (extended-context-sensitive-literal-p (first statements)))
         (ereport "0A000" "string literals in extended statements are not supported; use parameters"))
@@ -768,9 +770,8 @@ Send its row description before execution and close it before reporting completi
       ;; Parse establishes the repeatable-read horizon; planned relation
       ;; readers remain registered until transaction end.
       (let* ((*query-parameter-types* types)
-             (ast (first statements))
              (signature
-               (unless (eq (getf ast :type) :do)
+               (unless (or concurrent (eq (getf ast :type) :do))
                  (with-statement-snapshot
                      (snapshot (lambda (registration) (statement-start registration nil)))
                    (extended-result-signature (extended-statement-result-columns ast t)))))
@@ -779,17 +780,19 @@ Send its row description before execution and close it before reporting completi
           (when unknown
             (report-unresolved-query-parameter (1+ unknown))))
         (setf (gethash name (extended-query-state-statements state)) statement))
-      (incf (backend-command-id *backend*))
+      (unless (eq (backend-state *backend*) :idle)
+        (incf (backend-command-id *backend*)))
       (write-message stream #\1 #()))))
 
 (defun extended-apply-bind (stream state operation payload)
   (destructuring-bind (kind portal name formats ranges results) operation
     (declare (ignore kind))
-    (let ((statement (gethash name (extended-query-state-statements state))))
+    (let* ((statement (gethash name (extended-query-state-statements state)))
+           (concurrent (and statement (concurrent-index-ddl-p (extended-statement-ast statement)))))
       (unless statement (ereport "26000" "prepared statement does not exist"))
       (when (eq (backend-state *backend*) :aborted)
         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
-      (when (eq (backend-state *backend*) :idle)
+      (when (and (not concurrent) (eq (backend-state *backend*) :idle))
         (sb-sys:without-interrupts
           (begin-extended-implicit-query-block)
           (setf (extended-query-state-implicit-p state) t)))
@@ -805,7 +808,8 @@ Send its row description before execution and close it before reporting completi
       ;; Admit the RR horizon first so those readers cannot block TRUNCATE
       ;; while waiting for its schema writer lease. DML in RC still snapshots
       ;; at Execute.
-      (when (and (eq (backend-isolation-level *backend*) :repeatable-read)
+      (when (and (not concurrent)
+                 (eq (backend-isolation-level *backend*) :repeatable-read)
                  (not (eq (getf (extended-statement-ast statement) :type) :do)))
         (unless (recovery-in-progress-p)
           (prepare-xid-wraparound-for-statement *backend*))
@@ -855,6 +859,24 @@ Send its row description before execution and close it before reporting completi
             (setf (gethash portal (extended-query-state-portals state)) bound))
           (write-message stream #\2 #()))))))
 
+(defun extended-execute-concurrent-index (stream state ast)
+  "Finish a standalone utility immediately, preserving the surrounding Sync."
+  (when (and (extended-query-state-implicit-p state)
+             (not (extended-query-state-executed-in-cycle-p state))
+             (not (backend-explicit *backend*)))
+    ;; Parse and Bind can establish a planning horizon. With no prior Execute
+    ;; this is not an implicit pipeline transaction for utility admission.
+    (commit-transaction)
+    (setf (extended-query-state-implicit-p state) nil))
+  (let ((*deferred-command-completes* nil))
+    (let ((*defer-command-complete-p* t))
+      (execute-concurrent-index stream ast))
+    (extended-clear-portals-for-backend *backend*)
+    (dolist (response (nreverse *deferred-command-completes*))
+      (apply #'send-command-complete response)))
+  (clear-statement-timeout)
+  t)
+
 (defun extended-apply-execute (stream state operation)
   (destructuring-bind (kind name limit) operation
     (declare (ignore kind))
@@ -865,7 +887,11 @@ Send its row description before execution and close it before reporting completi
         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
       (when (rewind-restricted-sql-session-p)
         (check-rewind-sql-statements (list (extended-statement-ast (extended-portal-statement portal)))))
-      (recovery-check-statement (extended-statement-ast (extended-portal-statement portal)))
+      (let ((ast (extended-statement-ast (extended-portal-statement portal))))
+        (recovery-check-statement ast)
+        (when (concurrent-index-ddl-p ast)
+          (return-from extended-apply-execute
+            (extended-execute-concurrent-index stream state ast))))
       (when (eq (backend-state *backend*) :idle)
         (begin-extended-implicit-query-block)
         (setf (extended-query-state-implicit-p state) t))

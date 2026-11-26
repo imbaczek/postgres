@@ -556,6 +556,57 @@
          (rove:ok (extended-query-state-ignore-until-sync *extended-query-state*))
          (rove:ok (zerop *active-snapshots*))))))
 
+(rove:deftest extended-concurrent-index-is-a-standalone-utility
+    (call-with-select-portal-test
+     (lambda (stream)
+       (let* ((*catalog* (make-catalog))
+              (database (make-database :name "postgres" :oid 1))
+              (command "DROP INDEX CONCURRENTLY IF EXISTS absent"))
+         (setf (backend-database *backend*) "postgres"
+               (gethash "postgres" (catalog-databases *catalog*)) database)
+         (flet ((op (operation) (extended-apply-operation stream operation #()))
+                (sqlstate (function)
+                  (handler-case (progn (funcall function) nil)
+                    (pg-error (condition) (pg-error-sqlstate condition)))))
+           (op (list :parse "s" command nil))
+           (op '(:bind "p" "s" () () ()))
+           (rove:ok (equal "25001" (sqlstate (lambda () (op '(:execute "p" 0)))))
+                    "a concurrent index utility is forbidden in an explicit block")
+           (setf (backend-explicit *backend*) nil)
+           (set-backend-state *backend* :idle)
+           (op '(:execute "p" 0))
+           (rove:ok (eq :idle (backend-state *backend*))
+                    "standalone Execute completes without waiting for Sync")
+           (rove:ok (equalp (string->bytes (concatenate 'string "DROP INDEX" (string #\Null)))
+                            (cdr (assoc #\C (select-portal-test-frames stream))))
+                    "Execute sends the command tag before Sync")
+           (op '(:sync))
+           (op '(:parse "read" "SELECT 1" ()))
+           (op '(:bind "unexecuted" "read" () () ()))
+           (op '(:bind "standalone" "s" () () ()))
+           (op '(:execute "standalone" 0))
+           (rove:ok (eq :idle (backend-state *backend*))
+                    "Parse and Bind without prior Execute do not create a pipeline transaction")
+           (op '(:sync))
+           (op '(:bind "r" "read" () () ()))
+           (op '(:execute "r" 0))
+           (op '(:bind "again" "s" () () ()))
+           (rove:ok (equal "25001" (sqlstate (lambda () (op '(:execute "again" 0)))))
+                    "a prior query in the same cycle prevents the utility")
+           (op '(:sync)))))))
+
+(rove:deftest concurrent-index-utility-rejects-multi-statement-simple-query
+    (call-with-select-portal-test
+     (lambda (stream)
+       (setf (backend-explicit *backend*) nil)
+       (set-backend-state *backend* :idle)
+       (let ((statements
+               (parse-statements "SELECT 1; DROP INDEX CONCURRENTLY IF EXISTS absent")))
+         (rove:ok (equal "25001"
+                         (handler-case (execute-simple-query-statements stream statements)
+                           (pg-error (condition) (pg-error-sqlstate condition)))))
+         (rove:ok (eq :idle (backend-state *backend*)))))))
+
 (rove:deftest select-portal-implicit-sync-retires-owner
     (call-with-select-portal-test
      (lambda (stream)

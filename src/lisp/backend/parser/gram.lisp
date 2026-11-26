@@ -1092,7 +1092,8 @@ Range and negative checks occur when the LIMIT executes."
        (ereport "0A000" "unsupported table constraint")))))
 
 (defun parse-create-index (p unique)
-  (let ((if-not-exists
+  (let ((concurrently (match-kw p "concurrently"))
+        (if-not-exists
           (when (match-kw p "if")
             (expect-kw p "not")
             (expect-kw p "exists")
@@ -1123,6 +1124,7 @@ Range and negative checks occur when the LIMIT executes."
             (ereport "0A000" "partial indexes are not supported"))
           (list :type :create-index
                 :name name
+                :concurrently concurrently
                 :table table
                 :columns (nreverse cols)
                 :unique unique
@@ -1157,14 +1159,21 @@ Range and negative checks occur when the LIMIT executes."
          (match-kw p "restrict")
          (list :type :drop-table :names names :if-exists if-exists))))
     ((match-kw p "index")
-     (let ((if-exists (when (match-kw p "if")
-                        (expect-kw p "exists")
-                        t)))
-       (let ((names (loop collect (parse-mutation-relation-identifier p)
-                          while (match-punct p #\,))))
-         (match-kw p "cascade")
-         (match-kw p "restrict")
-         (list :type :drop-index :names names :if-exists if-exists))))
+     (let* ((concurrently (match-kw p "concurrently"))
+            (if-exists (when (match-kw p "if")
+                         (expect-kw p "exists")
+                         t))
+            (names (loop collect (parse-mutation-relation-identifier p)
+                         while (match-punct p #\,)))
+            (cascade (match-kw p "cascade")))
+       (unless cascade (match-kw p "restrict"))
+       (when concurrently
+         (when (rest names)
+           (ereport "0A000" "DROP INDEX CONCURRENTLY does not support dropping multiple objects"))
+         (when cascade
+           (ereport "0A000" "DROP INDEX CONCURRENTLY does not support CASCADE")))
+       (list :type :drop-index :names names :if-exists if-exists
+             :concurrently concurrently)))
     (t
      (ereport "0A000" "unsupported DROP statement"))))
 

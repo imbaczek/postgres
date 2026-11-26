@@ -557,7 +557,8 @@ synchronous_commit. Reject unsupported parameters and other local settings."
                                         '(("indexrelid" :oid t 1) ("indrelid" :oid t 2)
                                           ("indisunique" :bool t 5) ("indisprimary" :bool t 7)
                                           ("indisvalid" :bool t 11) ("indkey" :int2vector t 16)
-                                          ("indnkeyatts" :int2 t 4)))
+                                          ("indnkeyatts" :int2 t 4)
+                                          ("indisready" :bool t 13) ("indislive" :bool t 14)))
    (make-sql-system-relation-descriptor 2615 "pg_namespace" #\r 'sql-namespace-rows
                                         '(("oid" :oid t 1) ("nspname" :name t 2)))
    (make-sql-system-relation-descriptor 6104 "pg_publication" #\r 'sql-publication-rows
@@ -761,14 +762,15 @@ Capture policy and keep size once for every row in the snapshot."
                  (push (vector (pg-index-oid index) (pg-index-table-oid index)
                                (pg-index-unique-p index) (pg-index-primary-p index)
                                (pg-index-valid-p index) (coerce (pg-index-columns index) 'vector)
-                               (length (pg-index-columns index))) rows))
+                               (length (pg-index-columns index))
+                               (pg-index-ready-p index) (pg-index-live-p index)) rows))
                (database-indexes database))
       (maphash (lambda (name table)
                  (declare (ignore name))
                  (let ((toast (pg-class-toast table)))
                    (when toast
                      (push (vector (pg-toast-index-oid toast) (pg-toast-oid toast)
-                                   t t t #(1 2) 2) rows))))
+                                   t t t #(1 2) 2 t t) rows))))
                (database-tables database))
       rows)))
 

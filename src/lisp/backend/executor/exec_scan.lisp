@@ -1127,7 +1127,8 @@ Mark direct scalar function sources through their aliases."
             :joins joins))))
 
 (defun select-index-current-p (table idx)
-  (and (= (pg-index-table-oid idx) (pg-class-oid table))
+  (and (pg-index-valid-p idx)
+       (= (pg-index-table-oid idx) (pg-class-oid table))
        (member idx (table-indexes table) :test #'eq)))
 
 (defun select-relation-reader-relfilenodes (relations)

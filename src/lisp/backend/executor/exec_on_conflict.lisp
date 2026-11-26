@@ -63,10 +63,34 @@
     (and (subsetp columns attributes :test #'=)
          (subsetp attributes columns :test #'=))))
 
+(defun on-conflict-arbiter-oids (indexes constraint inference-p columns &optional admitted)
+  "Find the ready unique indexes that arbitrate a conflict.
+New inference requires a valid match because a ready index may be incomplete.
+ADMITTED contains arbiters already inferred after this writer registered."
+  (cond
+    (constraint
+     (let ((index (find constraint indexes :key #'pg-index-name :test #'string=)))
+       (unless (and index (pg-index-unique-p index) (pg-index-valid-p index)
+                    (pg-index-constraint-owned-p index))
+         (ereport "42704" "constraint \"~a\" does not exist" constraint))
+       (list (pg-index-oid index))))
+    (inference-p
+     (let ((valid nil))
+       (let ((arbiters (loop for index in indexes
+                             when (and (pg-index-unique-p index)
+                                       (on-conflict-index-matches-columns-p index columns))
+                               collect (pg-index-oid index)
+                               and do (when (pg-index-valid-p index) (setf valid t)))))
+         (unless (or valid (some (lambda (oid) (member oid admitted :test #'eql)) arbiters))
+           (ereport "42P10" "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
+         arbiters)))
+    (t (loop for index in indexes
+             when (pg-index-unique-p index) collect (pg-index-oid index)))))
+
 (defun prepare-on-conflict (table raw alias)
   (when raw
     (let* ((target-scope (make-base-select-scope (pg-class-name table) alias table))
-           (indexes (unique-indexes table))
+           (indexes (ready-unique-indexes table))
            (constraint (getf raw :constraint))
            (inference (getf raw :columns))
            (columns nil)
@@ -75,12 +99,6 @@
            (sets nil)
            (where-target nil)
            (expression-scope nil))
-      (when constraint
-        (let ((index (find constraint indexes :key #'pg-index-name :test #'string=)))
-          (unless (and index (pg-index-constraint-owned-p index))
-            (ereport "42704" "constraint \"~a\" for table \"~a\" does not exist"
-                     constraint (pg-class-name table)))
-          (setf arbiters (list (pg-index-oid index)))))
       (when inference
         (let ((simple-p t))
           (dolist (raw-expression inference)
@@ -88,15 +106,9 @@
               (if (eq (first expression) :col)
                   (pushnew (second expression) columns :test #'=)
                   (setf simple-p nil))))
-          (when simple-p
-            (setf arbiters
-                  (loop for index in indexes
-                        when (on-conflict-index-matches-columns-p index columns)
-                          collect (pg-index-oid index)))))
-        (unless arbiters
-          (ereport "42P10" "there is no unique or exclusion constraint matching the ON CONFLICT specification")))
-      (unless (or constraint inference)
-        (setf arbiters (mapcar #'pg-index-oid indexes)))
+          (unless simple-p
+            (setf columns nil))))
+      (setf arbiters (on-conflict-arbiter-oids indexes constraint inference columns))
       (when (getf raw :predicate)
         (let ((*select-sublinks-allowed-p* nil))
           (let ((expression (coerce-boolean-expression
@@ -126,7 +138,7 @@
             (setf where-target (list :expr (coerce-boolean-expression
                                             (analyze-expr (getf raw :where) scope) "ON CONFLICT DO UPDATE WHERE")))
             (push where-target targets))))
-      (list :action (getf raw :action) :arbiters arbiters
+      (list :action (getf raw :action) :arbiters arbiters :arbiters-admitted-p nil
             :source-presence (if expression-scope
                                  (map 'vector #'select-relation-identity
                                       (select-scope-relations expression-scope))
@@ -135,28 +147,16 @@
             :sets (sort sets #'< :key (lambda (item) (pg-column-attnum (car item)))) :where-target where-target :targets (nreverse targets)))))
 
 (defun refresh-on-conflict-arbiters (table conflict)
-  ;; Called after relation admission under the catalog lock: refresh only index
-  ;; metadata here, without analyzing or evaluating user expressions.
+  "Resolve arbiters after writer admission, preserving a bound portal's choices."
   (when conflict
-    (let* ((indexes (unique-indexes table))
-           (constraint (getf conflict :constraint))
-           (columns (getf conflict :inference-columns))
-           (arbiters
-             (cond
-               (constraint
-                (let ((index (find constraint indexes :key #'pg-index-name :test #'string=)))
-                  (unless (and index (pg-index-constraint-owned-p index))
-                    (ereport "42704" "constraint ~a for table ~a does not exist"
-                             constraint (pg-class-name table)))
-                  (list (pg-index-oid index))))
-               ((getf conflict :inference-p)
-                (loop for index in indexes
-                      when (on-conflict-index-matches-columns-p index columns)
-                        collect (pg-index-oid index)))
-               (t (mapcar #'pg-index-oid indexes)))))
-      (when (and (getf conflict :inference-p) (null arbiters))
-        (ereport "42P10" "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
-      (setf (getf conflict :arbiters) arbiters))))
+    (setf (getf conflict :arbiters)
+          (on-conflict-arbiter-oids (ready-unique-indexes table)
+                                    (getf conflict :constraint)
+                                    (getf conflict :inference-p)
+                                    (getf conflict :inference-columns)
+                                    (when (getf conflict :arbiters-admitted-p)
+                                      (getf conflict :arbiters)))
+          (getf conflict :arbiters-admitted-p) t)))
 
 (defun find-on-conflict-tuple (table values indexes arbiters)
   (let ((wait nil) (found nil) (xid (backend-xid *backend*)))
@@ -190,11 +190,11 @@
            (getf conflict :sets))
    old (concatenate 'vector old excluded)))
 
-(defun claim-on-conflict-candidate (table values conflict indexes)
+(defun claim-on-conflict-candidate (table values conflict indexes arbiters)
   ;; Claim before WHERE, retaining ownership to transaction end even when WHERE
   ;; rejects the row. Visibility and cardinality errors also precede WHERE.
   (multiple-value-bind (status candidate)
-      (find-on-conflict-tuple table values indexes (getf conflict :arbiters))
+      (find-on-conflict-tuple table values indexes arbiters)
     (when (eq status :conflict)
       (check-on-conflict-visible candidate)
       (when (eq (getf conflict :action) :update)
@@ -216,7 +216,17 @@
            table values :publication-kind :insert :compressed-reuse compressed-reuse
            :before-check
            (when conflict
-             (lambda (indexes) (claim-on-conflict-candidate table values conflict indexes))))
+             (let ((arbiters :unresolved))
+               (lambda (indexes)
+                 (when (eq arbiters :unresolved)
+                   (setf arbiters
+                         (on-conflict-arbiter-oids indexes
+                                                   (getf conflict :constraint)
+                                                   (getf conflict :inference-p)
+                                                   (getf conflict :inference-columns)
+                                                   (when (getf conflict :arbiters-admitted-p)
+                                                     (getf conflict :arbiters)))))
+                 (claim-on-conflict-candidate table values conflict indexes arbiters)))))
         (declare (ignore block off))
         (unless (eq action :conflict)
           (logical-note-row-change :insert table :new-values values :publication-selection publications)

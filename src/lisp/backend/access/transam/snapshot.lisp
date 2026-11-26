@@ -4,7 +4,8 @@
 
 (defstruct (snapshot (:constructor make-snapshot-struct
                          (&key xmin xmax xip curcid sequence-database-oid
-                            sequence-state-captured-p sequence-states source-xids-complete-p)))
+                            sequence-state-captured-p sequence-states source-xids-complete-p
+                            origin database concurrent-index-safe-p)))
   xmin
   xmax
   xip
@@ -14,7 +15,11 @@
   sequence-states
   ;; True when source tracking covered this snapshot's acquisition boundary.
   ;; Coverage and XIP stay fixed while replay advances.
-  (source-xids-complete-p nil))
+  (source-xids-complete-p nil)
+  ;; A copied horizon keeps its original capture order for concurrent builds.
+  (origin nil :read-only t)
+  (database nil :read-only t)
+  (concurrent-index-safe-p nil :read-only t))
 
 (defstruct snapshot-wal-boundary
   "Immutable evidence captured with a snapshot's WAL pin.
@@ -98,6 +103,14 @@ does not park admission or authorize replay.")
 (declaim (ftype function finish-expired-exported-logical-snapshot)
          (ftype function release-schema-read-lock))
 
+(declaim (special *backend*))
+
+(defvar *concurrent-index-snapshot-origin* 0
+  "Fresh snapshot capture sequence, serialized by *XID-LOCK*.")
+
+(defvar *concurrent-index-snapshot-safe-p* nil
+  "True while capturing a snapshot for a command that cannot scan the new index.")
+
 (defun register-active-snapshot (snapshot registration)
   "Publish SNAPSHOT's xmin while the caller still holds the XID lock.
 
@@ -113,7 +126,7 @@ generation, so an older WAL-pin release cannot retire this snapshot."
         (error "snapshot-registration token is active or being released"))
       (incf (snapshot-registration-lifecycle-generation registration))
       (incf *active-snapshots*)
-      (setf (gethash snapshot *active-snapshot-set*) t
+      (setf (gethash snapshot *active-snapshot-set*) (or *backend* t)
             (snapshot-registration-snapshot registration) snapshot
             (snapshot-registration-active-p registration) t)))
   snapshot)

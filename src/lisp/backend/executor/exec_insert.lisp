@@ -43,20 +43,23 @@
 (defun key-has-null-p (values)
   (some (lambda (v) (eq v +null+)) values))
 
-(defun check-unique-indexes (table values exclude-tid)
+(defun index-key-requires-uniqueness-check-p (index values &optional (unique (pg-index-unique-p index)))
+  (and unique
+       (or (pg-index-nulls-not-distinct-p index) (not (key-has-null-p values)))))
+
+(defun check-unique-indexes (table indexes values exclude-tid)
   "Return :ok, (:violation . index-name), or (:wait . xid).
 
 Default unique indexes treat NULLs as distinct; NULLS NOT DISTINCT indexes
-check NULL-containing keys for conflicts too. The caller holds every table
-index's B-tree mutex."
+check NULL-containing keys for conflicts too. The caller holds the B-tree
+mutex for each index in INDEXES."
   (let ((wait nil)
         (violation nil)
         (my-xid (backend-xid *backend*)))
-    (dolist (idx (unique-indexes table))
+    (loop for idx in indexes when (pg-index-unique-p idx) do
       (let* ((types (index-types idx table))
              (vals (index-values idx values)))
-        (unless (and (key-has-null-p vals)
-                     (not (pg-index-nulls-not-distinct-p idx)))
+        (when (index-key-requires-uniqueness-check-p idx vals t)
           (let ((tids (btree-search-unlocked
                        (pg-index-relfilenode idx)
                        (encode-index-key vals types))))
@@ -84,7 +87,7 @@ index's B-tree mutex."
 Take *WRITE-LOCK* only for the snapshot; the caller releases it before acquiring
 B-tree relation locks, then reacquires it and checks the TOAST identity."
   (with-write-lock
-    (let* ((indexes (table-indexes table))
+    (let* ((indexes (table-indexes table nil #'pg-index-ready-p))
            (toast (pg-class-toast table))
            (toast-node (and toast (pg-toast-index-relfilenode toast))))
       (values indexes
@@ -122,7 +125,7 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                 (return-from insert-tuple-with-unique
                   (values nil nil nil :conflict payload)))
               (let ((check (if (eq action :wait) (cons :wait payload)
-                               (check-unique-indexes table values exclude-tid))))
+                               (check-unique-indexes table indexes values exclude-tid))))
                 (cond
                   ((eq check :ok)
                    (let* ((columns (pg-class-columns table))

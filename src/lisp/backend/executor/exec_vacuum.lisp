@@ -12,9 +12,10 @@
   (with-statement-snapshot
       (snapshot
        (lambda (registration)
-         (begin-statement-snapshot *backend*
-                                   (backend-command-id *backend*)
-                                   registration)))
+         (let ((*concurrent-index-snapshot-safe-p* t))
+           (begin-statement-snapshot *backend*
+                                     (backend-command-id *backend*)
+                                     registration))))
     (let ((table (with-write-lock
                    (resolve-table-or-error (getf ast :table)))))
       (if (getf ast :full-p)

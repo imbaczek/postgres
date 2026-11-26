@@ -1412,6 +1412,111 @@
              (*toast-slice-current* (list (cons text (list nil nil nil saved)))))
         (rove:ok (= 2 (eval-expr text other))))))
 
+(rove:deftest invalid-index-is-rejected-at-scan-admission
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres"))
+           (database (make-database :name "postgres" :oid 1))
+           (table (make-pg-class :oid 41 :name "tbl" :indexes (list 51)))
+           (index (make-pg-index :oid 51 :table-oid 41 :valid-p t))
+           (path (make-select-scan-path :kind :index-scan :index index))
+           (spec (list :table table :columns (pg-class-columns table) :path path)))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database
+            (gethash "tbl" (database-tables database)) table
+            (gethash "idx" (database-indexes database)) index)
+      (revalidate-select-relations (list spec))
+      (rove:ok (eq path (getf spec :path)) "a valid index can be scanned")
+      (setf (pg-index-valid-p index) nil)
+      (revalidate-select-relations (list spec))
+      (rove:ok (eq :seq-scan (select-scan-path-kind (getf spec :path)))
+               "a planned index scan falls back if invalidated before admission")))
+
+(rove:deftest insert-uses-one-index-set-for-locks-checks-and-insertion
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres" :xid 43))
+           (*relation-writers* (make-hash-table :test #'eql))
+           (*logical-capture-xid-modes* (make-hash-table :test #'eql))
+           (database (make-database :name "postgres" :oid 1))
+           (columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)))
+           (table (make-pg-class :oid 41 :name "tbl" :relfilenode 41
+                                 :columns columns :indexes (list 51)))
+           (old-index (make-pg-index :oid 51 :name "first" :relfilenode 51
+                                     :columns (list 1) :unique-p t :valid-p t))
+           (new-index (make-pg-index :oid 52 :name "later" :relfilenode 52
+                                     :columns (list 1) :unique-p t :valid-p t))
+           (search (symbol-function 'btree-search-unlocked))
+           (insert (symbol-function 'btree-insert-unlocked))
+           (heap-insert (symbol-function 'heapam-insert))
+           (searched nil)
+           (written nil))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database
+            (gethash "tbl" (database-tables database)) table
+            (gethash "first" (database-indexes database)) old-index)
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'btree-search-unlocked)
+                   (lambda (node key)
+                     (declare (ignore key))
+                     (push node searched)
+                     nil)
+                   (symbol-function 'btree-insert-unlocked)
+                   (lambda (node key block offset)
+                     (declare (ignore key block offset))
+                     (push node written))
+                   (symbol-function 'heapam-insert)
+                   (lambda (&rest args)
+                     (declare (ignore args))
+                     (values 0 1)))
+             (insert-tuple-with-unique
+              table #(7) :before-check
+              (lambda (indexes)
+                (rove:ok (equal indexes (list old-index)))
+                ;; Model a catalog publication after the write captured its locks.
+                (setf (gethash "later" (database-indexes database)) new-index
+                      (pg-class-indexes table) (list 51 52))
+                (values nil nil)))
+             (rove:ok (equal '(51) written))
+             (rove:ok (equal searched written)
+                      "unique probes and inserts use the same admitted indexes"))
+        (setf (symbol-function 'btree-search-unlocked) search
+              (symbol-function 'btree-insert-unlocked) insert
+              (symbol-function 'heapam-insert) heap-insert))))
+
+(rove:deftest on-conflict-inference-needs-a-valid-index
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres"))
+           (database (make-database :name "postgres" :oid 1))
+           (columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)))
+           (table (make-pg-class :oid 41 :name "tbl" :columns columns
+                                 :indexes (list 51)))
+           (building (index-from-sexp
+                      '(:oid 51 :table-oid 41 :columns (1) :unique t :valid nil
+                        :ready t :live t :logical-visible nil)))
+           (valid (index-from-sexp
+                   '(:oid 52 :table-oid 41 :columns (1) :unique t :valid t)))
+           (unready (index-from-sexp
+                     '(:oid 53 :table-oid 41 :columns (1) :unique t
+                       :ready nil :valid nil)))
+           (raw (getf (first (parse-statements
+                              "INSERT INTO tbl VALUES (1) ON CONFLICT (id) DO NOTHING"))
+                      :on-conflict)))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database
+            (gethash "building" (database-indexes database)) building
+            (gethash "valid" (database-indexes database)) valid
+            (gethash "unready" (database-indexes database)) unready)
+      (rove:ok (equal "42P10"
+                      (handler-case (prepare-on-conflict table raw nil)
+                        (pg-error (condition) (pg-error-sqlstate condition))))
+               "a ready-invalid index alone cannot support inference")
+      (setf (pg-class-indexes table) (list 51 52 53))
+      (let ((prepared (prepare-on-conflict table raw nil)))
+        (rove:ok (equal '(51 52) (getf prepared :arbiters))
+                 "include a matching ready-invalid index when a matching valid index exists")
+        (setf (pg-class-indexes table) (list 51 53))
+        (rove:ok (equal "42P10"
+                        (handler-case (refresh-on-conflict-arbiters table prepared)
+                          (pg-error (condition) (pg-error-sqlstate condition))))
+                 "revalidation also requires a valid index"))))
+
 (rove:deftest test-simple-update-toast-demand
     (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
                             (make-pg-column :name "counter" :type :int4 :attnum 2)

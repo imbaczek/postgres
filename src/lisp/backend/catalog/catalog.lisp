@@ -47,6 +47,9 @@
   primary-p
   constraint-p      ; a table constraint depends on this index
   nulls-not-distinct-p
+  (ready-p t)                  ; maintained by writers
+  (live-p t)                   ; false in the durable dead phase before unlink
+  (logical-visible-p t)         ; present in logical bootstrap and DDL contracts
   valid-p)           ; false for legacy indexes that may be incomplete
 
 (defstruct pg-column-statistics
@@ -147,8 +150,9 @@ When NAME is (NAME SHALLOW-COPY), also generate a mutation snapshot and an
 in-place restore using the same accessors. Snapshot copying is independent of
 serialization so rollback can preserve live references and catalog identity.
 
-Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE DEFAULT SNAPSHOT-COPY).
-DEFAULT applies only when the serialized key is absent, preserving explicit NIL.
+Each FIELD is (SEXP-KEY ACCESSOR CONSTRUCTOR-KEY &key ENCODE DECODE DEFAULT
+OMIT-DEFAULT SNAPSHOT-COPY). DEFAULT applies only to an absent key.
+OMIT-DEFAULT keeps the legacy encoding when a field has its default value.
 SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (destructuring-bind (name &optional shallow-copy) (if (consp name) name (list name))
     (let ((to-sexp (intern (format nil "~a-TO-SEXP" name) *package*))
@@ -157,13 +161,23 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
           (saved (gensym "SAVED")))
       `(progn
          (defun ,to-sexp (,object)
-           (list
+           (list*
             ,@(loop for (key accessor nil . options) in fields
                     for encode = (getf options :encode)
-                    append `(,key
-                             ,(if encode
-                                  `(funcall ,encode (,accessor ,object))
-                                  `(,accessor ,object))))))
+                    unless (getf options :omit-default)
+                      append `(,key
+                               ,(if encode
+                                    `(funcall ,encode (,accessor ,object))
+                                    `(,accessor ,object))))
+            (nconc
+             ,@(loop for (key accessor nil . options) in fields
+                     for encode = (getf options :encode)
+                     when (getf options :omit-default)
+                       collect `(unless (eql (,accessor ,object) ,(getf options :default))
+                                  (list ,key
+                                        ,(if encode
+                                             `(funcall ,encode (,accessor ,object))
+                                             `(,accessor ,object))))))))
          (defun ,from-sexp (sexp)
            (,constructor
             ,@(loop for (key nil constructor-key . options) in fields
@@ -342,7 +356,11 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:primary pg-index-primary-p :primary-p)
   (:constraint pg-index-constraint-p :constraint-p)
   (:nulls-not-distinct pg-index-nulls-not-distinct-p :nulls-not-distinct-p)
-  (:valid pg-index-valid-p :valid-p))
+  (:valid pg-index-valid-p :valid-p)
+  ;; Catalogs written before these flags existed describe ordinary live indexes.
+  (:ready pg-index-ready-p :ready-p :default t :omit-default t)
+  (:live pg-index-live-p :live-p :default t :omit-default t)
+  (:logical-visible pg-index-logical-visible-p :logical-visible-p :default t :omit-default t))
 
 (defun database-to-sexp (db)
   `(:name ,(database-name db)
@@ -1398,7 +1416,8 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
                 append (loop for index in (sort (table-indexes table)
                                                 #'string<
                                                 :key #'pg-index-name)
-                             unless (pg-index-constraint-owned-p index)
+                             when (and (pg-index-logical-visible-p index)
+                                       (not (pg-index-constraint-owned-p index)))
                                collect
                              ;; pg_index.indrelid records index ownership;
                              ;; preserve that relation before schema filtering.
@@ -1456,13 +1475,15 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
         when (= (pg-class-oid table) oid)
           return table))
 
-(defun table-indexes (class &optional db)
+(defun table-indexes (class &optional db predicate)
   (loop for oid in (pg-class-indexes class)
         for idx = (find-index-by-oid oid db)
-        when idx collect idx))
+        when (and idx (or (null predicate) (funcall predicate idx)))
+          collect idx))
 
-(defun unique-indexes (class)
-  (remove-if-not #'pg-index-unique-p (table-indexes class)))
+(defun ready-unique-indexes (class)
+  (table-indexes class nil (lambda (index)
+                             (and (pg-index-ready-p index) (pg-index-unique-p index)))))
 
 (defun index-types (idx class)
   (loop for attnum in (pg-index-columns idx)
@@ -1576,7 +1597,8 @@ The segments preserve their storage representation across B-tree page rewrites."
                  :nulls-not-distinct-p nulls-not-distinct))
 
 (defun publish-index* (db index table)
-  "Install a fully built INDEX in the database and its owning table."
+  "Install INDEX in the database and its owning table.
+A concurrent build initially publishes it unready and invalid."
   (check-new-relation-name db (pg-index-name index))
   (unless (= (pg-index-table-oid index) (pg-class-oid table))
     (ereport "XX000" "index \"~a\" belongs to another table"

@@ -178,6 +178,72 @@
       (rove:ok (= 101 (pg-toast-relfilenode (pg-class-toast class)))
                "rollback restores independent TOAST ownership metadata")))
 
+(rove:deftest concurrent-index-ddl-parses-supported-options
+    (let ((create (first (parse-statements
+                          "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx ON tbl (id) NULLS NOT DISTINCT")))
+          (drop (first (parse-statements
+                        "DROP INDEX CONCURRENTLY IF EXISTS idx RESTRICT")))
+          (ordinary (first (parse-statements "DROP INDEX idx"))))
+      (rove:ok (eq :create-index (getf create :type)))
+      (rove:ok (and (getf create :concurrently) (getf create :unique)
+                    (getf create :if-not-exists) (getf create :nulls-not-distinct)))
+      (rove:ok (and (eq :drop-index (getf drop :type))
+                    (getf drop :concurrently) (getf drop :if-exists)
+                    (equal '("idx") (getf drop :names))))
+      (rove:ok (not (getf ordinary :concurrently))))
+  (dolist (sql '("DROP INDEX CONCURRENTLY a, b" "DROP INDEX CONCURRENTLY a CASCADE"))
+    (rove:ok (equal "0A000"
+                    (handler-case (parse-statements sql)
+                      (pg-error (condition) (pg-error-sqlstate condition)))))))
+
+(rove:deftest index-catalog-defaults-preserve-legacy-invalid-indexes
+    (let ((index (index-from-sexp '(:oid 51 :name "legacy" :valid nil))))
+      (rove:ok (not (pg-index-valid-p index)))
+      (rove:ok (pg-index-ready-p index) "legacy invalid indexes are still maintained")
+      (rove:ok (pg-index-live-p index))
+      (rove:ok (pg-index-logical-visible-p index)
+               "old catalogs included legacy indexes in logical bootstrap")))
+
+(rove:deftest logical-bootstrap-excludes-local-index-residue
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "postgres"))
+           (database (make-database :name "postgres" :oid 1))
+           (columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)))
+           (table (make-pg-class :name "tbl" :oid 41 :columns columns
+                                 :indexes (list 51 52)))
+           (creating (index-from-sexp
+                      '(:oid 51 :name "creating" :table-oid 41 :columns (1)
+                        :valid nil :ready t :live t :logical-visible nil)))
+           (legacy (index-from-sexp
+                    '(:oid 52 :name "legacy" :table-oid 41 :columns (1)
+                      :valid nil :ready t :live t :logical-visible t))))
+      (setf (gethash "postgres" (catalog-databases *catalog*)) database
+            (gethash "tbl" (database-tables database)) table
+            (gethash "creating" (database-indexes database)) creating
+            (gethash "legacy" (database-indexes database)) legacy)
+      (rove:ok (equal '("legacy")
+                      (mapcar (lambda (entry) (getf entry :name))
+                              (getf (catalog-replication-bootstrap-data database) :indexes))))
+      (rove:ok (eq nil (getf (index-to-sexp creating) :logical-visible :missing)))
+      (rove:ok (pg-index-logical-visible-p (index-from-sexp (index-to-sexp legacy))))))
+
+(cl-spec:defproperty concurrent-index-catalog-state-roundtrip
+    ((valid (member nil t)) (ready (member nil t)) (live (member nil t))
+                            (logical-visible (member nil t)))
+  (:about index-from-sexp index-to-sexp)
+  (:trials (:normal 100))
+  (let* ((encoded (list :valid valid :ready ready :live live :logical-visible logical-visible))
+         (result (index-from-sexp (index-to-sexp (index-from-sexp encoded)))))
+    (and (eq valid (pg-index-valid-p result))
+         (eq ready (pg-index-ready-p result))
+         (eq live (pg-index-live-p result))
+         (eq logical-visible (pg-index-logical-visible-p result)))))
+
+(rove:deftest concurrent-index-catalog-generated-roundtrip
+    (let ((result (cl-spec:result-data
+                   (cl-spec:run-property 'concurrent-index-catalog-state-roundtrip :seed 1050))))
+      (rove:ok (eq :passed (getf result :status)) (format nil "~s" result))))
+
 (rove:deftest test-catalog-mutation-rollback-preserves-object-identity
     (let* ((*catalog* (make-catalog :next-oid 20000))
            (*wal-pending-deletes* nil)
