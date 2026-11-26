@@ -831,6 +831,9 @@ def verify_bind_activity(connection, observer):
     assert old_text == "SELECT 1" and old_id is not None
     source = b"SELECT 1::bigint"
     connection.send(b"P", b"activity_stmt\0" + source + b"\0\0\0")
+    connection.send(b"H", b"")
+    receive_until(connection, b"1")
+    assert observer.query(activity) == [[source.decode(), None]]
     connection.send(b"B", b"activity_portal\0activity_stmt\0" + bytes(6))
     connection.send(b"H", b"")
     receive_until(connection, b"2")
@@ -838,6 +841,34 @@ def verify_bind_activity(connection, observer):
     assert text == source.decode() and query_id is not None and query_id != old_id
     connection.send(b"S", b"")
     receive_until(connection, b"Z")
+
+
+def verify_tracking_disabled_before_completion(connection, observer):
+    [[planning]] = connection.query("SHOW pg_stat_statements.track_planning")
+    connection.query("SET pg_stat_statements.track_planning TO off")
+    report(observer, "SELECT pg_stat_statements_reset()")
+    connection.query("SELECT set_config('pg_stat_statements.track', 'none', false)")
+    assert counters(observer) == []
+    connection.query("RESET pg_stat_statements.track")
+
+    for finish in (b"E", b"C"):
+        report(observer, "SELECT pg_stat_statements_reset()")
+        connection.query("BEGIN")
+        connection.send(b"P", b"\0SELECT 1 UNION ALL SELECT 2\0\0\0")
+        connection.send(b"B", b"tracking_portal\0\0" + bytes(6))
+        connection.send(b"E", b"tracking_portal\0" + struct.pack("!I", 1))
+        connection.send(b"S", b"")
+        assert b"s" in receive_until(connection, b"Z")
+        connection.query("SET pg_stat_statements.track TO 'none'")
+        payload = (b"tracking_portal\0" + bytes(4) if finish == b"E"
+                   else b"Ptracking_portal\0")
+        connection.send(finish, payload)
+        connection.send(b"S", b"")
+        assert (b"C" if finish == b"E" else b"3") in receive_until(connection, b"Z")
+        connection.query("COMMIT")
+        assert counters(observer) == []
+        connection.query("RESET pg_stat_statements.track")
+    connection.query(f"SET pg_stat_statements.track_planning TO {planning}")
 
 
 def verify_activity_without_counter_collection(connection, observer):
@@ -1182,6 +1213,7 @@ def main():
             observer = Connection(server.port)
             try:
                 verify_bind_activity(connection, observer)
+                verify_tracking_disabled_before_completion(connection, observer)
                 verify_activity_without_counter_collection(connection, observer)
                 verify_partial_frame_wait(connection, observer)
                 verify_client_write_wait(server, observer)

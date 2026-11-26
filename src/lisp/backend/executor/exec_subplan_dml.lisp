@@ -288,13 +288,17 @@
 
 (defvar *dml-bound-preparation* nil)
 
+(defun statement-tracking-enabled-p (toplevel)
+  "Check the current session's tracking mode for the statement's nesting level."
+  (let ((mode (and *backend*
+                   (gethash "pg_stat_statements.track" (backend-settings *backend*) "top"))))
+    (or (equal mode "all") (and toplevel (equal mode "top")))))
+
 (defun statement-tracking-store ()
   "Return the store and nesting classification for a new statement."
-  (let* ((store *statement-statistics-store*)
-         (toplevel (not (or *statement-nested-p* *active-statement-observation*)))
-         (mode (and store *backend*
-                    (gethash "pg_stat_statements.track" (backend-settings *backend*) "top"))))
-    (values (when (or (equal mode "all") (and toplevel (equal mode "top"))) store)
+  (let ((store *statement-statistics-store*)
+        (toplevel (not (or *statement-nested-p* *active-statement-observation*))))
+    (values (when (and store (statement-tracking-enabled-p toplevel)) store)
             toplevel)))
 
 (defun statement-track-planning-p ()

@@ -327,11 +327,12 @@ execution failed, so later retirement cannot publish a successful execution."
               (text (statement-observation-text observation)))
           (case status
             (:success
-             (store-statement-statistics-phase
-              store key :execution
-              (statement-observation-milliseconds (statement-observation-execution-ticks observation))
-              (statement-observation-rows observation) text
-              (statement-observation-resources observation)))
+             (when (statement-tracking-enabled-p (third key))
+               (store-statement-statistics-phase
+                store key :execution
+                (statement-observation-milliseconds (statement-observation-execution-ticks observation))
+                (statement-observation-rows observation) text
+                (statement-observation-resources observation))))
             ((:error :canceled)
              (store-statement-statistics-phase store key status 0.0d0 0 text)))))))
   (values))

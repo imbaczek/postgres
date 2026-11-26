@@ -796,6 +796,7 @@ Send its row description before execution and close it before reporting completi
 (defun extended-apply-parse (stream state operation)
   (destructuring-bind (kind name sql oids) operation
     (declare (ignore kind))
+    (publish-backend-activity-query *backend* sql)
     (when (zerop (length name))
       (remhash "" (extended-query-state-statements state)))
     (when (and (plusp (length name)) (gethash name (extended-query-state-statements state)))

@@ -779,7 +779,8 @@
       (rove:ok (null (statement-dml-fingerprint :merge (list :table table))))))
 
 (rove:deftest test-statement-observation-lifecycle
-    (let* ((store (make-statement-statistics-store 4 64))
+    (let* ((*backend* (make-backend))
+           (store (make-statement-statistics-store 4 64))
            (observation (make-statement-observation :store store :key '(1 2 t 10) :text "select"))
            (ticks 0)
            (*statement-observation-clock* (lambda () ticks)))
