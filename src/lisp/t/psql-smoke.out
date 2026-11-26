@@ -333,10 +333,9 @@ INSERT 0 4
 INSERT 0 5
 INSERT 0 3
 Project
-  Filter
-    Nested Loop Inner Join
-      Seq Scan on join_left
-      Seq Scan on join_right
+  Nested Loop Inner Join
+    Seq Scan on join_left
+    Seq Scan on join_right
 1|right-one
 1|right-one-dup
 3|right-three
@@ -370,10 +369,9 @@ INSERT 0 4
 Sort (actual time=<timing> rows=4.00 loops=1)
   Project (actual time=<timing> rows=4.00 loops=1)
     HashAggregate (actual time=<timing> rows=4.00 loops=1)
-      Filter (actual time=<timing> rows=8.00 loops=1)
-        Nested Loop Inner Join (actual time=<timing> rows=16.00 loops=1)
-          Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
-          Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+      Nested Loop Inner Join (actual time=<timing> rows=8.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
+        Seq Scan on tenk1 (actual time=<timing> rows=4.00 loops=1)
 Execution Time: <timing> ms
 20|100|2
 20|200|2

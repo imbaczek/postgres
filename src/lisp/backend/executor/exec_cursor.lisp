@@ -514,6 +514,14 @@ separate projection. Closing the result closes the sort and its source."
        (close-sql-iterator left)
        (setf current-left nil left-origins nil)))))
 
+(defun integer-join-candidate-p (left right offsets)
+  "Reject nonmatches without copying a replayed row or combining environments."
+  (let ((a (aref left (car offsets)))
+        (b (aref right (cdr offsets))))
+    (cond ((or (eq a +null+) (eq b +null+)) nil)
+          ((and (integerp a) (integerp b)) (= a b))
+          (t t))))
+
 ;; The join owns LEFT and a replay store owning RIGHT.  A fresh reader scans
 ;; RIGHT for each left row; right/full joins make one final pass for unmatched
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
@@ -524,6 +532,9 @@ separate projection. Closing the result closes the sort and its source."
          (match-memory (nested-loop-match-memory spool-memory))
          (store (make-query-replay-store right spool-memory))
          (reader nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil)
+         (key-offsets (integer-join-key-offsets join qual))
+         (candidate-p (when key-offsets
+                        (lambda (row) (integer-join-candidate-p current-left row key-offsets))))
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (matches nil)
@@ -541,7 +552,8 @@ separate projection. Closing the result closes the sort and its source."
            (when left-present
              (when (and outer-p (not left-seen))
                (setf matches (make-query-match-map match-memory)))
-             (setf left-seen t matched nil right-index 0 reader (make-query-replay-reader store))))
+             (setf left-seen t matched nil right-index 0
+                   reader (make-query-replay-reader store :candidate-p candidate-p))))
          (when (and left-done (not outer-p)) (return (values nil nil)))
          (when (and left-done (not right-phase))
            (setf right-phase t right-index 0)
@@ -568,13 +580,15 @@ separate projection. Closing the result closes the sort and its source."
                 (query-match-map-append matches))
               (let ((index right-index))
                 (incf right-index)
-                (multiple-value-bind (joined origins presence)
-                    (qualify-select-join-pair join qual current-left row left-origins right-origins
-                                              left-presence right-presence *datum-origin-capture*)
-                  (when joined
-                    (setf matched t)
-                    (when matches (query-match-map-mark matches index))
-                    (return (values joined t origins nil presence))))))
+                ;; The reader still counts a rejected candidate as a right row.
+                (when row
+                  (multiple-value-bind (joined origins presence)
+                      (qualify-select-join-pair join qual current-left row left-origins right-origins
+                                                left-presence right-presence *datum-origin-capture*)
+                    (when joined
+                      (setf matched t)
+                      (when matches (query-match-map-mark matches index))
+                      (return (values joined t origins nil presence)))))))
              (t
               (close-sql-iterator reader)
               (setf reader nil left-present nil)

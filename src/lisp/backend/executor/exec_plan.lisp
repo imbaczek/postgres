@@ -57,8 +57,9 @@
   "Greedily add the cheapest INNER/CROSS relation, preserving source Var slots.
 
 The bounded search follows joinrels.c's level-by-level idea without building
-PostgreSQL's full join-relation graph. Join quals are applied above the
-reordered tree, and each parameterized path can reference only joined Vars."
+PostgreSQL's full join-relation graph. Each parameterized path can reference
+only joined Vars. Join quals normally filter above the reordered tree. A
+physical two-way nested loop can apply a supported integer equality at the join."
   (let* ((relations (getf prepared :relations))
          (paths (make-array (length relations)))
          (remaining (loop for index below (length relations) collect index))
@@ -333,6 +334,29 @@ sorting and adjacent equality. The remaining key order controls sort priority."
                    keys)
         keys)))
 
+(defun integer-join-key-offsets (join qual)
+  "Return the two input offsets for a bare integer column equality."
+  (when (and (consp qual) (eq (first qual) :binop) (equal (second qual) "="))
+    (let ((a (third qual))
+          (b (fourth qual)))
+      (when (and (consp a) (eq (first a) :col)
+                 (consp b) (eq (first b) :col)
+                 (member (expr-type a) '(:int2 :int4 :int8))
+                 (member (expr-type b) '(:int2 :int4 :int8)))
+        (let* ((start (if (getf join :reordered)
+                          (getf join :right-offset)
+                          (getf join :left-width)))
+               (end (+ start (getf join :right-width)))
+               (width (+ (getf join :left-width) (getf join :right-width)))
+               (a (1- (second a)))
+               (b (1- (second b))))
+          (when (and (<= 0 a) (< a width) (<= 0 b) (< b width))
+            (cond
+              ((and (not (<= start a (1- end))) (<= start b (1- end)))
+               (cons a (- b start)))
+              ((and (not (<= start b (1- end))) (<= start a (1- end)))
+               (cons b (- a start))))))))))
+
 (defun build-select-plan-tree (prepared physical-p paths)
   (let* ((input (select-plan-input-form prepared physical-p paths))
          (where (getf prepared :where))
@@ -348,7 +372,15 @@ sorting and adjacent equality. The remaining key order controls sort priority."
           (when (and (window-constant-expression-p join-qual)
                      (not (true-p (eval-expr join-qual #()))))
             (setf input '(:result)))
-          (setf input (list :filter join-qual input)))))
+          (if (and physical-p
+                   (= (length (getf prepared :join-order)) 2)
+                   (eq (first input) :nested-loop-join)
+                   (integer-join-key-offsets (second input) join-qual))
+              ;; Both Vars have their final source slots at this two-way join,
+              ;; even if scan order changed. Test the equality here so failed
+              ;; pairs do not need an owned result row.
+              (setf (getf (second input) :qual) join-qual)
+              (setf input (list :filter join-qual input))))))
     (when degenerate-having-p
       ;; With no transitions or grouping keys, HAVING alone generates one row;
       ;; neither the FROM input nor its WHERE clause can change that group.

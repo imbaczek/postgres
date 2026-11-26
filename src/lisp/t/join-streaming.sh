@@ -74,6 +74,20 @@ run < "$TMP/right.sql" > "$TMP/right.out" 2>&1 \
     || fail "large right input insert failed"
 run -c "insert into join_limit_left values (NULL)" >/dev/null
 
+{
+    printf 'inner\n'
+    run -c 'select l.id, r.id from join_left l join join_right r on l.id = r.id'
+    printf 'left\n'
+    run -c 'select l.id, r.id from join_left l left join join_right r on l.id = r.id'
+    printf 'right\n'
+    run -c 'select l.id, r.id from join_left l right join join_right r on l.id = r.id'
+    printf 'full\n'
+    run -c 'select l.id, r.id from join_left l full join join_right r on l.id = r.id'
+    printf 'where-after-on\n'
+    run -c 'select l.id from join_left l left join join_right r on l.id = r.id where r.id is null'
+} > "$TMP/results.out" 2>&1 || fail "JOIN query failed"
+
+# Count only the CROSS JOIN qualifications used by the LIMIT checks.
 install_output=$(control <<'EOF'
 (defvar *join-limit-original-eval-expr* (symbol-function 'eval-expr))
 (defvar *join-limit-original-offer-row* (symbol-function 'offer-select-top-n-row))
@@ -100,23 +114,13 @@ echo "$install_output" | grep -Eq ';; (read )?error:' \
     && fail "JOIN evaluation counter setup failed"
 
 {
-    printf 'inner\n'
-    run -c 'select l.id, r.id from join_left l join join_right r on l.id = r.id'
-    printf 'left\n'
-    run -c 'select l.id, r.id from join_left l left join join_right r on l.id = r.id'
-    printf 'right\n'
-    run -c 'select l.id, r.id from join_left l right join join_right r on l.id = r.id'
-    printf 'full\n'
-    run -c 'select l.id, r.id from join_left l full join join_right r on l.id = r.id'
-    printf 'where-after-on\n'
-    run -c 'select l.id from join_left l left join join_right r on l.id = r.id where r.id is null'
     printf 'limit\n'
     run -c 'select l.id from join_limit_left l cross join join_limit_right r limit 1'
     printf 'ordered-asc-limit\n'
     run -c 'select l.id from join_limit_left l cross join join_limit_right r order by l.id limit 1'
     printf 'ordered-desc-limit\n'
     run -c 'select l.id from join_limit_left l cross join join_limit_right r where l.id is not null order by l.id desc limit 1'
-} > "$TMP/results.out" 2>&1 || fail "JOIN query failed"
+} >> "$TMP/results.out" 2>&1 || fail "JOIN LIMIT query failed"
 
 cat > "$TMP/expected.out" <<'EOF'
 inner
@@ -150,7 +154,7 @@ if ! cmp -s "$TMP/expected.out" "$TMP/results.out"; then
 fi
 
 counter_output=$(control <<'EOF'
-  (if (and (= *join-limit-qual-evaluations* 20210)
+  (if (and (= *join-limit-qual-evaluations* 20201)
          (= *join-limit-top-n-offers* 20100)
          (= *join-limit-top-n-max-size* 1))
     :ORDERED-CANDIDATES-CONSUMED

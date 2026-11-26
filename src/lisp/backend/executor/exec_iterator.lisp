@@ -166,7 +166,11 @@ ownership is claimed, close the newly created store."
         (setf (query-replay-store-memory-rows store) nil)
         (vector-push-extend copy (query-replay-store-memory-rows store)))))
 
-(defun make-query-replay-reader (store)
+(defun make-query-replay-reader (store &key candidate-p)
+  "Read owned rows. CANDIDATE-P may inspect, but must not retain or modify,
+the borrowed row before copying it. A rejected row advances the position and
+returns NIL with PRESENT-P true, preserving its ordinal for callers tracking
+matches across replays."
   ;; Each reader keeps its own position and input stream. Closing a reader
   ;; releases that stream; closing the store also closes every live reader.
   (let ((index 0) (input nil) (offset nil) (reader nil))
@@ -202,15 +206,19 @@ ownership is claimed, close the newly created store."
                                  (setf offset (file-position input))))
                              (aref (query-replay-store-memory-rows store) index))))
                    (incf index)
-                   (if (or (query-replay-store-capture-origins-p store)
-                           (query-replay-store-capture-presence-p store))
-                       (values (copy-query-sort-value (first value)) t
-                               (when (query-replay-store-capture-origins-p store)
-                                 (datum-origins-from-spill (second value)))
-                               nil
-                               (when (query-replay-store-capture-presence-p store)
-                                 (copy-query-sort-value (third value))))
-                       (values (copy-query-sort-value value) t nil nil nil))))))
+                   (let* ((metadata (or (query-replay-store-capture-origins-p store)
+                                        (query-replay-store-capture-presence-p store)))
+                          (row (if metadata (first value) value)))
+                     (cond
+                       ((and candidate-p (not (funcall candidate-p row))) (values nil t))
+                       (metadata
+                        (values (copy-query-sort-value row) t
+                                (when (query-replay-store-capture-origins-p store)
+                                  (datum-origins-from-spill (second value)))
+                                nil
+                                (when (query-replay-store-capture-presence-p store)
+                                  (copy-query-sort-value (third value)))))
+                       (t (values (copy-query-sort-value row) t nil nil nil))))))))
            (lambda ()
              (when input (finish-query-temp-stream input nil))
              (setf (query-replay-store-readers store)

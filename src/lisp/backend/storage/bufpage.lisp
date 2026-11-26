@@ -157,27 +157,38 @@ are bound for each live item; dead and unused slots are skipped."
   (page-compact page)
   (>= (page-free-space page) (+ extra aligned)))
 
-(defun page-add-item (page data &key allow-reuse)
-  "Allocate DATA as a new tuple on PAGE. Return the 1-based line pointer
-number, or NIL if the page has no room. With ALLOW-REUSE, LP_UNUSED slots may
-be recycled. LP_DEAD slots remain unavailable until VACUUM has removed every
+(defun page-add-item (page data &key allow-reuse offset-number)
+  "Allocate DATA as a new tuple on PAGE and return its 1-based line pointer.
+Return NIL if there is no room or OFFSET-NUMBER is outside the insertion range.
+An explicit OFFSET-NUMBER inserts a pointer and shifts subsequent pointers,
+as PageAddItemExtended does; callers must allow existing pointer numbers to change.
+When the offset is omitted and ALLOW-REUSE is true, LP_UNUSED slots may be
+recycled. LP_DEAD slots remain unavailable until VACUUM has removed every
 index entry that can reference them and changed them to LP_UNUSED."
   (let* ((len (length data))
          (aligned (maxalign len))
          (slot nil))
-    (when allow-reuse
-      (loop for i from 1 to (page-lp-count page)
-            do (multiple-value-bind (off flags l) (page-get-lp page i)
-                 (declare (ignore off l))
-                 (when (= flags +lp-unused+)
-                   (setf slot i)
-                   (return)))))
+    (cond
+      (offset-number
+       (unless (<= 1 offset-number (1+ (page-lp-count page)))
+         (return-from page-add-item nil)))
+      (allow-reuse
+       (loop for i from 1 to (page-lp-count page)
+             do (multiple-value-bind (off flags l) (page-get-lp page i)
+                  (declare (ignore off l))
+                  (when (= flags +lp-unused+)
+                    (setf slot i)
+                    (return))))))
     (unless (page-ensure-space page (if slot 0 +size-of-item-id+) aligned)
       (return-from page-add-item nil))
     (unless slot
-      (setf slot (1+ (page-lp-count page)))
-      (setf (page-lower page)
-            (+ +size-of-page-header+ (* +size-of-item-id+ slot))))
+      (setf slot (or offset-number (1+ (page-lp-count page))))
+      (when offset-number
+        (let ((start (+ +size-of-page-header+ (* (1- slot) +size-of-item-id+)))
+              (lower (page-lower page)))
+          (when (< start lower)
+            (replace page page :start1 (+ start +size-of-item-id+) :start2 start :end2 lower))))
+      (incf (page-lower page) +size-of-item-id+))
     (let ((newoff (- (page-upper page) aligned)))
       (setf (page-upper page) newoff)
       (replace page data :start1 newoff)

@@ -305,14 +305,20 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 (defun btree-logical-key (key)
   (if (btree-storage-key-p key) (btree-storage-key-logical key) key))
 
+(defun compare-btree-key-bytes (left right right-start right-length)
+  "Compare a logical key with a key stored in a vector slice."
+  (let ((left-length (length left)))
+    (loop for i from 0 below (min left-length right-length)
+          for j from right-start
+          for a = (aref left i)
+          for b = (aref right j)
+          do (cond ((< a b) (return -1))
+                   ((> a b) (return 1)))
+          finally (return (signum (- left-length right-length))))))
+
 (defun key-compare (a b)
   (setf a (btree-logical-key a) b (btree-logical-key b))
-  (loop for i from 0 below (min (length a) (length b))
-        do (cond ((< (aref a i) (aref b i)) (return -1))
-                 ((> (aref a i) (aref b i)) (return 1)))
-        finally (return (cond ((< (length a) (length b)) -1)
-                              ((> (length a) (length b)) 1)
-                              (t 0)))))
+  (compare-btree-key-bytes a b 0 (length b)))
 
 (defun key< (a b) (minusp (key-compare a b)))
 (defun key= (a b) (zerop (key-compare a b)))
@@ -659,11 +665,54 @@ Both pages must be nonempty; signal 54000 if no boundary fits."
     (unless best (ereport "54000" "index entry is too large"))
     (values (subseq entries 0 best) (subseq entries best))))
 
+(defun btree-plain-leaf-insert-slot (page key block offset)
+  "Find the new tuple's slot on a packed leaf containing only plain keys.
+Compare key bytes and then heap TID, validating every pointer and entry length
+before changing PAGE. The rebuild path handles segmented keys and any leaf with
+non-normal pointers."
+  (let ((slot nil)
+        (count (page-lp-count page))
+        (upper (page-upper page)))
+    (loop for i from 1 to count
+          do (multiple-value-bind (start flags len) (page-get-lp page i)
+               (unless (and (= flags +lp-normal+) (>= len 8)
+                            (<= upper start (+ start len) +blcksz+)
+                            (= (page-u16 page start) (- len 8)))
+                 (return-from btree-plain-leaf-insert-slot nil))
+               (unless slot
+                 (let* ((key-length (- len 8))
+                        (order (compare-btree-key-bytes key page (+ start 2) key-length)))
+                   (when (or (minusp order)
+                             (and (zerop order)
+                                  (let* ((tid (+ start 2 key-length))
+                                         (other-block (page-u32 page tid)))
+                                    (or (< block other-block)
+                                        (and (= block other-block)
+                                             (<= offset (page-u16 page (+ tid 4))))))))
+                     (setf slot i))))))
+    (or slot (1+ count))))
+
+(defun btree-insert-plain-leaf (page key block offset)
+  "Insert into an owned leaf with room for the new tuple and its line pointer.
+Return NIL without changing PAGE when the general rebuild or split is needed."
+  (when (and (not (btree-storage-key-p key))
+             (<= +size-of-page-header+ (page-lower page) (page-upper page) +blcksz+)
+             (= (page-u16 page +pd-special-off+) +blcksz+)
+             (zerop (mod (- (page-lower page) +size-of-page-header+) +size-of-item-id+))
+             (>= (page-free-space page) (+ +size-of-item-id+ (maxalign (+ (length key) 8)))))
+    (let ((slot (btree-plain-leaf-insert-slot page key block offset)))
+      (when slot
+        (page-add-item page (encode-leaf-entry key block offset) :offset-number slot)))))
+
 (defun btree-insert-rec (relfilenode level block key tid-block tid-off)
   "Return (values split-p separator new-block)."
   (let ((page (buf-read relfilenode block)))
     (unless page
       (ereport "XX000" "index page ~a is missing" block))
+    (when (and (zerop level) (btree-insert-plain-leaf page key tid-block tid-off))
+      (buf-write relfilenode block page :main :take-ownership)
+      (mark-dirty relfilenode)
+      (return-from btree-insert-rec (values nil nil nil)))
     (if (zerop level)
         (let* ((entries (btree-page-entries page nil))
                (new-entry (list key tid-block tid-off))
