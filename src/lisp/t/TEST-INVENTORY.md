@@ -383,6 +383,26 @@ The converted cases require no shared PGDATA/CLOG fixture. Remaining tests still
 use the original shared fixture and execution order. Do not parallelize them with
 tests that replace global functions or mutate admission/ownership state.
 
+### Manual WAL reader replay benchmark
+
+Run from `src/lisp/` with the test dependencies installed:
+
+```sh
+sbcl --noinform --non-interactive \
+  --eval '(require :asdf)' \
+  --eval '(push (truename "./") asdf:*central-registry*)' \
+  --eval '(defparameter *pg-test-system* "pg-physical-tests")' \
+  --load t/test-dependencies.lisp \
+  --load t/wal-reader-replay-benchmark.lisp
+```
+
+The benchmark reads one transaction per call from synthetic WAL in a temporary
+directory. Incremental mode starts scanning at the last returned position.
+Replay mode starts at the beginning and returns only transactions beyond that
+position. Both modes check transaction order and the final WAL position. Compare
+`decoded` to see how the work scales and use elapsed time and allocated bytes as
+diagnostics. The benchmark runs manually and has no timing thresholds.
+
 ## Generated domains and limits
 
 The migrated declarations below use `:normal 200` for Properties and 200 Function
