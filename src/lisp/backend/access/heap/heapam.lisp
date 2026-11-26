@@ -885,7 +885,7 @@ when supplied, its result is returned as a sixth value."
                         snapshot
                         (and *backend* (backend-xid *backend*)) (htup-infomask tuple)))
 
-(defun heapam-scan-page (page block columns snapshot callback)
+(defun heapam-scan-page (page block columns snapshot callback &optional prefilter demand)
   ;; Check visibility from the tuple header before copying or deforming attributes.
   ;; Like page_collect_tuples in src/backend/access/heap/heapam.c, only visible
   ;; tuples proceed through the scan; invisible tuple payloads are never decoded.
@@ -898,9 +898,12 @@ when supplied, its result is returned as a sixth value."
             (xmax (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmax-off+))))
             (cid (page-u32 page (+ off +heap-tuple-cid-off+)))
             (infomask (page-u16 page (+ off +heap-tuple-infomask-off+))))
-        (when (heap-tuple-visible-p xmin xmax cid snapshot
-                                    (and *backend* (backend-xid *backend*)) infomask
-                                    committed-xid-cache)
+        (when (and (heap-tuple-visible-p xmin xmax cid snapshot
+                                         (and *backend* (backend-xid *backend*)) infomask
+                                         committed-xid-cache)
+                   (or (null prefilter)
+                       (funcall prefilter (deform-heap-tuple page columns :demand demand
+                                                                          :start off :limit (+ off len)))))
           ;; Deform within this line pointer's bounds while the page is held.
           ;; The resulting values can outlive the page and its buffer.
           (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
@@ -914,14 +917,16 @@ when supplied, its result is returned as a sixth value."
               (when (eq (funcall callback tuple) :stop)
                 (return-from heapam-scan-page :stop)))))))))
 
-(defun heapam-scan (relfilenode columns snapshot callback)
-  "Call CALLBACK with each visible HTUP. CALLBACK may return :stop."
+(defun heapam-scan (relfilenode columns snapshot callback &key prefilter demand)
+  "Call CALLBACK with each visible HTUP. CALLBACK may return :stop.
+PREFILTER receives values from a narrow deformation using zero-based DEMAND.
+Only tuples passing that predicate are fully deformed and passed to CALLBACK."
   (let ((nblocks (buf-nblocks relfilenode))
         (handle (make-buf-page-handle)))
     (dotimes (block nblocks)
       (unwind-protect
            (let ((page (buf-acquire-read-page handle relfilenode block)))
-             (when (and page (eq (heapam-scan-page page block columns snapshot callback)
+             (when (and page (eq (heapam-scan-page page block columns snapshot callback prefilter demand)
                                  :stop))
                (return)))
         (sb-sys:without-interrupts (buf-release-page handle)))))

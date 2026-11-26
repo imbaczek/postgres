@@ -272,7 +272,8 @@
                  (cond (position
                         (pushnew position used)
                         (list :col (+ width position 1) :type (expr-type expression)
-                              :typmod (expr-typmod expression)))
+                              :typmod (expr-typmod expression)
+                              :window-input-expression expression))
                        ((or (atom expression)
                             (member (first expression) '(:subplan :outer-ref :window-ref)))
                         expression)

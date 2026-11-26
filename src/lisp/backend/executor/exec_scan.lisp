@@ -2,7 +2,7 @@
 
 (in-package #:pg)
 
-(defmacro do-table-tuples ((tuple table &key relfilenode) &body body)
+(defmacro do-table-tuples ((tuple table &key relfilenode prefilter demand) &body body)
   "Run BODY for visible tuples in TABLE, checking interrupts per tuple.
 
 An already-bound RELFILENODE may be supplied when relation registration must
@@ -18,7 +18,8 @@ precede scanning. Registration and locking remain the caller's responsibility."
        (heapam-scan ,rel ,columns ,snapshot
                     (lambda (,tuple)
                       (check-for-interrupts)
-                      ,@body)))))
+                      ,@body)
+                    ,@(when prefilter `(:prefilter ,prefilter :demand ,demand))))))
 
 (defmacro with-registered-relation-access
     ((relfilenodes xid mode) relation-expression validation-form &body body)
@@ -389,7 +390,7 @@ this Poisson approximation stays monotone and bounded for the small planner."
                           (exp (- (/ matching-rows (float pages 1.0d0))))))))))
 
 (defun select-scan-path-cost (table path)
-  "Estimate SeqScan and IndexScan using costsize.c's page/tuple model.
+  "Return a scan's total cost, row estimate, and startup cost using costsize.c's page/tuple model.
 
 The constants intentionally follow costsize.c's default sequential page,
 random page, and tuple CPU costs; this is a stable first choice model rather
@@ -397,17 +398,17 @@ than a configurable cost GUC surface."
   (let* ((rows (table-row-estimate table))
          (pages (table-page-estimate table)))
     (if (eq (select-scan-path-kind path) :seq-scan)
-        (+ pages (* rows 0.01d0))
+        (values (+ pages (* rows 0.01d0)) rows 0.0d0)
         (let* ((index (select-scan-path-index path))
                (index-pages (max 1 (buf-nblocks (pg-index-relfilenode index))))
                (levels (max 1 (ceiling (log index-pages 100))))
                (selectivity (or (select-scan-path-selectivity path) 0.1d0))
                (index-rows (* rows selectivity))
+               (startup-cost (* 4.0d0 levels))
                (heap-pages (planner-random-heap-page-estimate
                             pages index-rows)))
-          (+ (* 4.0d0 levels)
-             (* 4.0d0 heap-pages)
-             (* 0.01d0 index-rows))))))
+          (values (+ startup-cost (* 4.0d0 heap-pages) (* 0.01d0 index-rows))
+                  index-rows startup-cost)))))
 
 (defun select-scan-path-row-estimate (table path)
   (* (table-row-estimate table)
@@ -1077,6 +1078,8 @@ Mark direct scalar function sources through their aliases."
            (aggregate-p (or aggregate-p (plusp (length aggregates))))
            (order (if aggregate-p (finalize-query-group-expressions targets order group-keys scope (getf ast :distinct))
                       order))
+           ;; Keep the analyzed clause boundaries for workload identity.
+           (qualification-identity (when (getf ast :having) (cons where having)))
            (having-analysis (multiple-value-list
                              (prepare-having-qualifications where having group-keys scope)))
            (where (first having-analysis))
@@ -1102,29 +1105,32 @@ Mark direct scalar function sources through their aliases."
       (when (getf ast :distinct)
         (let ((target (find-if (lambda (item) (member (getf item :type) '(:json :json-array))) targets)))
           (when target (json-equality-or-order-error (getf target :type) nil))))
-      (list :window-validation-keys
-            (when *cte-definition-analysis-p*
-              (mapcar (lambda (target) (getf target :expr)) *window-key-targets*))
-            :window-keys (third window-analysis)
-            :window-unused-key-indices (fourth window-analysis)
-            :windows (coerce *select-window-functions* 'list) :window-input-width width
-            :table first-table
-            :source-relations relations
-            :relations relations
-            :scope scope
-            :targets (first set-analysis) :set-functions (third set-analysis) :distinct (getf ast :distinct)
-            :where where :having having :has-having (not (null (getf ast :having)))
-            ;; Gate skeletons preserve the two preprocessing boundaries after
-            ;; pushdown without retaining Vars or subplan descriptors.
-            :where-gate-clauses where-gate-clauses
-            :having-gate-clauses having-gate-clauses
-            :group-keys group-keys
-            :aggregate-p aggregate-p
-            :aggregate-count (length aggregates) :aggregates (coerce aggregates 'list)
-            :order (second set-analysis)
-            :limit limit
-            :join-order nil
-            :joins joins))))
+      (list* :window-validation-keys
+             (when *cte-definition-analysis-p*
+               (mapcar (lambda (target) (getf target :expr)) *window-key-targets*))
+             :window-keys (third window-analysis)
+             :window-unused-key-indices (fourth window-analysis)
+             :windows (coerce *select-window-functions* 'list) :window-input-width width
+             :table first-table
+             :source-relations relations
+             :relations relations
+             :scope scope
+             :targets (first set-analysis) :set-functions (third set-analysis) :distinct (getf ast :distinct)
+             :where where :having having :has-having (not (null (getf ast :having)))
+             ;; Gate skeletons preserve the two preprocessing boundaries after
+             ;; pushdown without retaining Vars or subplan descriptors.
+             :where-gate-clauses where-gate-clauses
+             :having-gate-clauses having-gate-clauses
+             :group-keys group-keys
+             :aggregate-p aggregate-p
+             :aggregate-count (length aggregates) :aggregates (coerce aggregates 'list)
+             :order (second set-analysis)
+             :limit limit
+             :join-order nil
+             :joins joins
+             (append (when (getf ast :values-query-p) (list :values-query-p t))
+                     (when qualification-identity
+                       (list :qualification-identity qualification-identity)))))))
 
 (defun select-index-current-p (table idx)
   (and (pg-index-valid-p idx)
@@ -1855,8 +1861,9 @@ FLUSH-P controls whether the completed frame is flushed immediately."
     (sb-sys:without-interrupts
       (unwind-protect
            (sb-sys:with-local-interrupts
-             (write-sequence buffer stream :end end)
-             (when flush-p (force-output stream))
+             (with-backend-client-write-wait (stream)
+               (write-sequence buffer stream :end end)
+               (when flush-p (force-output stream)))
              (setf complete t))
         (unless complete (ignore-errors (close stream :abort t)))))))
 
@@ -1907,15 +1914,17 @@ Close the stream on a failed write, since a partial frame cannot be retried."
                                      (make-select-data-row-frame size (length targets) fields))))
       (labels ((emit (octets)
                  (when (plusp (length octets))
-                   (when last-byte (write-byte last-byte stream))
-                   (when (> (length octets) 1)
-                     (write-sequence octets stream :end (1- (length octets))))
+                   (with-backend-client-write-wait (stream)
+                     (when last-byte (write-byte last-byte stream))
+                     (when (> (length octets) 1)
+                       (write-sequence octets stream :end (1- (length octets)))))
                    (setf last-byte (aref octets (1- (length octets)))))))
         (sb-sys:without-interrupts
           (unwind-protect
                (sb-sys:with-local-interrupts
                  (if frame
-                     (write-sequence frame stream)
+                     (with-backend-client-write-wait (stream)
+                       (write-sequence frame stream))
                      (progn
                        (emit (vector (char-code #\D)))
                        (emit (u32-to-bytes size))
@@ -1931,8 +1940,10 @@ Close the stream on a failed write, since a partial frame cannot be retried."
                                     (unless (and (= length actual) (= checksum actual-checksum))
                                       (error "DataRow field changed during output")))))))
                        (unless last-byte (error "empty DataRow frame"))
-                       (write-byte last-byte stream)))
-                 (when (or flush-p (null frame)) (force-output stream))
+                       (with-backend-client-write-wait (stream)
+                         (write-byte last-byte stream))))
+                 (when (or flush-p (null frame))
+                   (with-backend-client-write-wait (stream) (force-output stream)))
                  (setf complete t))
             (unless complete (ignore-errors (close stream :abort t))))))))
   (values))

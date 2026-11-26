@@ -44,6 +44,8 @@
   ;; Interrupt state: the equivalents of QueryCancelPending and the
   ;; backend's own thread, used by pg_cancel_backend()/pg_terminate_backend().
   (executing nil)
+  activity-query activity-queryid activity-query-start activity-state-change
+  activity-wait-event
   (cancel-pending nil)
   ;; Published under the admission mutex and retained across query boundaries
   ;; until the target delivers termination.  Future masked sync waits may inspect
@@ -161,18 +163,42 @@ count; an XID alone, shared cache pages and an empty context do not."
   state)
 
 (defmacro with-backend-wait-state ((backend accessor value) &body body)
-  "Publish BACKEND's wait state for BODY and clear it on every exit."
+  "Publish BACKEND's wait state for BODY and restore the previous value on exit.
+The backend thread writes one slot. Readers may sample it without waiting on
+the lock that the backend is trying to acquire."
   (let ((backend-value (gensym "BACKEND-"))
-        (wait-value (gensym "WAIT-VALUE-")))
-    `(let ((,backend-value ,backend)
-           (,wait-value ,value))
+        (wait-value (gensym "WAIT-VALUE-"))
+        (previous (gensym "PREVIOUS-")))
+    `(let* ((,backend-value ,backend)
+            (,wait-value ,value)
+            (,previous (when ,backend-value (,accessor ,backend-value))))
        (unwind-protect
             (progn
               (when ,backend-value
                 (setf (,accessor ,backend-value) ,wait-value))
               ,@body)
          (when ,backend-value
-           (setf (,accessor ,backend-value) nil))))))
+           (setf (,accessor ,backend-value) ,previous))))))
+
+(defmacro with-backend-client-read-wait (&body body)
+  "Mark frontend input waits for the current backend."
+  `(with-backend-wait-state (*backend* backend-activity-wait-event :client-read)
+     ,@body))
+
+(defmacro with-backend-client-write-wait ((stream) &body body)
+  "Mark frontend I/O while omitting buffered or discarded SQL destinations."
+  (let ((destination (gensym "DESTINATION-")))
+    `(let ((,destination ,stream))
+       (with-backend-wait-state
+           ((and *backend* (eq ,destination (backend-stream *backend*)) *backend*)
+            backend-activity-wait-event :client-write)
+         ,@body))))
+
+(defun call-with-backend-io-wait (event function)
+  "Expose I/O while executing FUNCTION under its existing storage ownership."
+  (declare (dynamic-extent function))
+  (with-backend-wait-state (*backend* backend-activity-wait-event event)
+    (funcall function)))
 
 (defun clear-statement-timeout (&optional (backend *backend*))
   (when backend (setf (backend-statement-deadline backend) nil)))
@@ -234,6 +260,20 @@ After a WAL failure, leave pending interrupts alone so they cannot replace it."
     (setf (backend-cancel-pending *backend*) nil)
     (ereport "57014" "canceling statement due to user request")))
 
+(defun backend-activity-now ()
+  (multiple-value-bind (seconds microseconds) (sb-ext:get-time-of-day)
+    (+ (* seconds 1000000) microseconds)))
+
+(defun publish-backend-activity-query (backend text &optional queryid)
+  "Publish a bounded query independently of statement statistics collection."
+  (when (and backend text)
+    (let ((copy (subseq text 0 (min 1024 (length text)))))
+      (sb-thread:with-mutex (*live-operation-lock*)
+        (setf (backend-activity-query backend) copy
+              (backend-activity-queryid backend) queryid
+              (backend-activity-query-start backend) (backend-activity-now)))))
+  (values))
+
 (defun begin-backend-query-execution (backend)
   "Mark a frontend query active before it waits for reload admission."
   (when backend
@@ -242,6 +282,7 @@ After a WAL failure, leave pending interrupts alone so they cannot replace it."
       ;; arriving after this transition will be observed by admission waiters.
       (setf (backend-cancel-pending backend) nil
             (backend-executing backend) t
+            (backend-activity-state-change backend) (backend-activity-now)
             (gethash backend *live-operation-backend-query-tokens*)
             (cons nil nil))))
   (values))
@@ -252,6 +293,7 @@ After a WAL failure, leave pending interrupts alone so they cannot replace it."
   (when backend
     (sb-thread:with-mutex (*live-operation-lock*)
       (setf (backend-executing backend) nil
+            (backend-activity-state-change backend) (backend-activity-now)
             (backend-cancel-pending backend) nil)
       (remhash backend *live-operation-backend-query-tokens*)
       (sb-thread:condition-broadcast *live-operation-cv*)))
@@ -484,9 +526,9 @@ OWNER may be an XID or backend; a token without an owner identifies itself."
 
 (defun wait-for-relation-dependencies (blockers)
   "Sleep once with wait edges published under *RELATION-LOCK-MUTEX*.
-Callers recheck their own admission predicates on wakeup.  Resolve edges to
+Callers recheck their own admission predicates on wakeup. Resolve edges to
 current owners before sleeping so a cycle involving a gate, XID or snapshot
-fails instead of waiting indefinitely.  Remove the edges on every exit."
+fails instead of waiting indefinitely. Remove the edges on every exit."
   (check-for-interrupts)
   (if (null *backend*)
       (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)
@@ -496,8 +538,11 @@ fails instead of waiting indefinitely.  Remove the edges on every exit."
                (setf (gethash *backend* *relation-wait-dependencies*) blockers)
                (when (relation-wait-cycle-p *backend*)
                  (ereport "40P01" "deadlock detected"))
-               (sb-sys:with-local-interrupts
-                 (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*)))
+               (with-backend-wait-state (*backend* backend-activity-wait-event
+                                                   (if (backend-waiting-xid *backend*)
+                                                       :transactionid :relation))
+                 (sb-sys:with-local-interrupts
+                   (condition-wait-with-timeout *relation-lock-cv* *relation-lock-mutex*))))
           (remhash *backend* *relation-wait-dependencies*)))))
 
 (defun relation-build-admission-blocker (relfilenode)
@@ -2694,7 +2739,8 @@ so no interrupt can discard the owner of a virtual ID or its relation locks."
   ;; Retire portals before transaction resources; incomplete cleanup prevents
   ;; commit, while abort can continue with the remaining cleanup paths.
   (when (fboundp 'extended-clear-portals-for-backend)
-    (let ((pending (funcall 'extended-clear-portals-for-backend backend)))
+    (let ((pending (funcall 'extended-clear-portals-for-backend backend
+                            :discard-observations-p (not commit-p))))
       (when (and pending commit-p)
         (ereport "58030" "query execution cleanup remains incomplete"))))
   (values))

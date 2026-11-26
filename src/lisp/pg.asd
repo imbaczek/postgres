@@ -36,6 +36,7 @@
     :components
     ((:file "utils/recovery")
      (:file "utils/lwlock")
+     (:file "utils/query-observation")
      (:module "libpq"
       :serial t
       :components ((:file "pqcomm.hot")
@@ -140,6 +141,7 @@
                    (:file "subselect")
                    (:file "window")
                    (:file "analyze")))
+     (:file "utils/query-identity")
      (:module "executor"
       :serial t
       :components ((:file "exec_arena")

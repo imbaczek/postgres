@@ -255,6 +255,11 @@ synchronous configuration plan against the same source and generation."
    (make-startup-setting-descriptor "wal_level" :postmaster :wal-level "replica")
    (make-startup-setting-descriptor "wal_log_hints" :postmaster :boolean "off")
    (make-startup-setting-descriptor "full_page_writes" :sighup :boolean "on")
+   (make-startup-setting-descriptor "pg_lisp.build_revision" :postmaster :string "")
+   (make-startup-setting-descriptor "pg_stat_statements.enabled" :postmaster :boolean "off")
+   (make-startup-setting-descriptor "pg_stat_statements.max" :postmaster :integer "5000" 1 2147483647 nil)
+   (make-startup-setting-descriptor "pg_stat_statements.max_text_bytes"
+                                    :postmaster :integer "1048576" 0 2147483647 nil)
    (make-startup-setting-descriptor "max_connections" :postmaster :integer "100" 1 262143 nil)
    (make-startup-setting-descriptor "max_wal_senders" :postmaster :integer "10" 0 262143 nil)
    (make-startup-setting-descriptor "max_worker_processes" :postmaster :integer "8" 0 262143 nil)
@@ -367,7 +372,8 @@ synchronous configuration plan against the same source and generation."
     (:wal-level '("minimal" "replica" "logical"))
     (:archive-mode '("always" "on" "off"))
     (:synchronous-commit '("local" "remote_write" "remote_apply" "on" "off"))
-    (:bytea-output '("hex" "escape"))))
+    (:bytea-output '("hex" "escape"))
+    (:statement-tracking '("none" "top" "all"))))
 
 (defun startup-parse-wal-level (text)
   "Parse WAL level names, mapping the deprecated archive and hot_standby aliases
@@ -415,7 +421,8 @@ original spelling. Synchronous commit values use the session normalizer."
         (:standby-names (parse-sync-standby-names text) text)
         (:synchronous-commit (session-normalize-synchronous-commit text))
         (:string
-         (unless (or (member name '("archive_command" "restore_command" "hba_file" "ident_file") :test #'string=)
+         (unless (or (member name '("archive_command" "restore_command" "hba_file" "ident_file"
+                                    "pg_lisp.build_revision") :test #'string=)
                      (member name *startup-recovery-target-settings* :test #'string=)
                      (plusp (length text)))
            (error "invalid empty configuration parameter ~a" name))
@@ -1142,6 +1149,13 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
     (:integer "integer") (:boolean "bool")
     (t (if (setting-descriptor-enum-choices spec) "enum" "string"))))
 
+(defun setting-descriptor-enum-values (spec)
+  (let ((choices (setting-descriptor-enum-choices spec)))
+    (if choices
+        (make-sql-array :element-type-id :text :elements (coerce choices 'vector)
+                        :dimensions (list (length choices)) :lower-bounds '(1))
+        +null+)))
+
 (defun startup-settings-row (name entry &optional (configuration (startup-capture-configuration)))
   "Expose actual installed settings in guc_funcs.c column units and provenance.
 List canonical enum names for WAL level, archive mode and synchronous commit.
@@ -1170,11 +1184,7 @@ CONFIGURATION supplies slot policy and provenance from the same root as ENTRY."
             (ecase source
               (:default "default") (:file "configuration file") (:override "override")
               (:command-line "command line") (:environment "environment variable"))
-            (let ((choices (setting-descriptor-enum-choices spec)))
-              (if choices
-                  (make-sql-array :element-type-id :text :elements (coerce choices 'vector)
-                                  :dimensions (list (length choices)) :lower-bounds '(1))
-                  +null+))
+            (setting-descriptor-enum-values spec)
             (if (eq source :file) (or (getf entry :sourcefile) +null+) +null+)
             (if (eq source :file) (or (getf entry :sourceline) +null+) +null+)
             (not (null (getf entry :pending-restart))))))
@@ -1194,7 +1204,10 @@ Without an installed root, return session rows."
      (when configuration (list (startup-effective-wal-level-settings-row configuration)))
      (let ((row (session-synchronous-commit-settings-row configuration)))
        (when row (list row)))
-     (list (session-timeout-settings-row) (session-application-name-settings-row)))))
+     (list (session-timeout-settings-row)
+           (session-application-name-settings-row)
+           (session-setting-descriptor-row (find-session-setting "pg_stat_statements.track"))
+           (session-setting-descriptor-row (find-session-setting "pg_stat_statements.track_planning"))))))
 
 (defun startup-setting-show-value (name)
   "Read NAME from one installed root and render the descriptor's display units."

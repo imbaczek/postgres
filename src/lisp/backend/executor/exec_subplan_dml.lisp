@@ -142,10 +142,15 @@
           (query-row-spool-append *dml-returning-spool* (copy-query-sort-value (car row)))
           (send-select-row stream row targets)))))
 
-(defun finish-dml-command (stream targets tag)
+(defvar *dml-statement-observation* nil
+  "Observation owning the current DML command's affected-row count.")
+
+(defun finish-dml-command (stream targets tag &optional row-count)
   ;; Like FillPortalStore for PORTAL_ONE_RETURNING, finish all mutations before
   ;; publishing rows; a later statement error must not expose partial results.
   (check-for-interrupts)
+  (when (and row-count *dml-statement-observation*)
+    (setf (statement-observation-rows *dml-statement-observation*) row-count))
   (when (and targets *dml-returning-spool*)
     (query-row-spool-seal *dml-returning-spool*)
     ;; The receiver gets the sealed spool and command tag after the mutations.
@@ -164,7 +169,7 @@
                            (send-select-row stream (cons values values) targets))))
   (send-command-complete stream tag))
 
-(defun prepare-dml-subqueries (ast)
+(defun analyze-dml-subqueries (ast)
   (let ((prepared
           (with-write-lock
             (let* ((table (resolve-table-or-error (getf ast :table)))
@@ -266,17 +271,85 @@
                       :insert-source source :insert-source-plan nil :source-assignments source-assignments
                       :dml-source dml-source :dml-source-plan nil :dml-one-time-quals nil :dml-row-where nil))))))
     (clear-query-analysis-contexts prepared)
-    (setf prepared (prepare-dml-column-defaults prepared ast))
-    (plan-query-ctes prepared)
-    (when (getf prepared :insert-source)
-      (setf (getf prepared :insert-source-plan)
-            (plan-prepared-select (getf prepared :insert-source))))
-    (when (getf prepared :dml-source)
-      (setf (getf prepared :dml-source-plan) (plan-prepared-select (getf prepared :dml-source))))
-    (plan-expression-subqueries prepared)
-    (prepare-joined-dml-qualifications prepared)))
+    (prepare-dml-column-defaults prepared ast)))
+
+(defun plan-dml-subqueries (prepared)
+  (plan-query-ctes prepared)
+  (when (getf prepared :insert-source)
+    (setf (getf prepared :insert-source-plan)
+          (plan-prepared-select (getf prepared :insert-source))))
+  (when (getf prepared :dml-source)
+    (setf (getf prepared :dml-source-plan) (plan-prepared-select (getf prepared :dml-source))))
+  (plan-expression-subqueries prepared)
+  (prepare-joined-dml-qualifications prepared))
+
+(defun prepare-dml-subqueries (ast)
+  (plan-dml-subqueries (analyze-dml-subqueries ast)))
 
 (defvar *dml-bound-preparation* nil)
+
+(defun statement-tracking-store ()
+  "Return the store and nesting classification for a new statement."
+  (let* ((store *statement-statistics-store*)
+         (toplevel (not (or *statement-nested-p* *active-statement-observation*)))
+         (mode (and store *backend*
+                    (gethash "pg_stat_statements.track" (backend-settings *backend*) "top"))))
+    (values (when (or (equal mode "all") (and toplevel (equal mode "top"))) store)
+            toplevel)))
+
+(defun statement-track-planning-p ()
+  (equal "on" (gethash "pg_stat_statements.track_planning" (backend-settings *backend*))))
+
+(defun begin-planned-statement-observation (store toplevel queryid planning-ticks &optional text)
+  "Attach a resolved workload identity and publish successful planning."
+  (when queryid
+    (when toplevel
+      (sb-thread:with-mutex (*live-operation-lock*)
+        (setf (backend-activity-queryid *backend*) queryid)))
+    (when store
+      (let* ((database (get-database (backend-database *backend*)))
+             (user (backend-startup-user *backend*))
+             (role (and user (authentication-committed-role user)))
+             (userid (cond (role (pg-role-oid role))
+                           ((equal user "postgres") +bootstrap-role-oid+))))
+        (when (and database userid)
+          (let ((key (list userid (database-oid database) toplevel queryid)))
+            (when planning-ticks
+              (store-statement-statistics-phase
+               store key :planning (statement-observation-milliseconds planning-ticks) 0 text))
+            (make-statement-observation :store store :key key :text text)))))))
+
+(defun prepare-observed-dml (ast store toplevel)
+  "Return the preparation, optional observation, and analyzed DML query ID."
+  (unless (and *backend* *statement-statistics-store*)
+    (return-from prepare-observed-dml (prepare-dml-subqueries ast)))
+  (with-statement-planning ((analyzed (analyze-dml-subqueries ast))
+                            (query-id (statement-dml-fingerprint (getf ast :type) analyzed))
+                            ((prepared) (plan-dml-subqueries analyzed))
+                            ticks (and store (statement-track-planning-p)))
+    (values prepared
+            (begin-planned-statement-observation
+             store toplevel query-id ticks (getf ast :normalized-statement-text))
+            query-id)))
+
+(defun call-with-observed-dml (ast function)
+  "Share one resolved plan between fingerprinting and ordinary DML execution."
+  (declare (dynamic-extent function))
+  (multiple-value-bind (store toplevel) (statement-tracking-store)
+    (cond
+      ;; The extended protocol owns an already prepared RETURNING execution.
+      ((and *dml-bound-preparation* (eq ast (car *dml-bound-preparation*)))
+       (funcall function))
+      ((not (and *backend* *statement-statistics-store*))
+       (let ((*dml-statement-observation* nil))
+         (funcall function)))
+      (t
+       (multiple-value-bind (prepared observation) (prepare-observed-dml ast store toplevel)
+         (let ((*dml-bound-preparation* (cons ast prepared))
+               (*dml-statement-observation* observation))
+           (multiple-value-prog1
+               (call-with-statement-execution-slice observation function)
+             (finish-statement-observation observation :success))))))))
 
 (defun dml-execution-preparation (ast)
   (if (and *dml-bound-preparation* (eq ast (car *dml-bound-preparation*)))
@@ -502,7 +575,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                   (car row)))))
                  (let ((*datum-origin-capture* t))
                    (dolist (row (getf prepared :rows)) (insert-row row nil))))))
-         (finish-dml-command stream returning (format nil "INSERT 0 ~a" count)))))))
+         (finish-dml-command stream returning (format nil "INSERT 0 ~a" count) count))))))
 
 (defun exec-delete-subqueries (stream ast)
   (let* ((prepared (dml-execution-preparation ast))
@@ -544,7 +617,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                       :old-values (htup-values tuple) :new-values nil :source-values source)
                   (incf count))
                 deleted))))
-         (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count)))))))
+         (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count) count))))))
 
 (defun simple-update-toast-demand (prepared table xid)
   "Return required slots for a narrow UPDATE, or NIL for full fetch."
@@ -709,4 +782,4 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                     (incf count))
                   deleted))))
           toast-demand)
-         (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count)))))))
+         (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count) count))))))

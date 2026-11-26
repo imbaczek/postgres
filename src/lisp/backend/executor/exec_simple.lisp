@@ -2004,6 +2004,7 @@ bindings until transaction end. Discard child command tags and emit one DO
 completion after success; anonymous source cannot inherit Bind parameters."
   (let ((block (do-statement-block ast))
         (*executing-do-p* t)
+        (*statement-nested-p* t)
         (*inline-do-found-p* nil)
         (*query-parameter-types* nil)
         (*query-parameter-values* nil))
@@ -2207,7 +2208,8 @@ Transaction options and session characteristics are excluded."
 Advance the command ID after each successful non-transaction statement."
   (loop for tail on statements
         for ast = (first tail)
-        do (when (and *extended-simple-multi-p*
+        do (publish-backend-activity-query *backend* (getf ast :activity-statement-text))
+           (when (and *extended-simple-multi-p*
                       (eq (backend-state *backend*) :idle)
                       (not (member (getf ast :type) '(:begin :commit :rollback))))
              (begin-extended-implicit-query-block))
@@ -2268,8 +2270,12 @@ is sent only after commit."
            (setf result
                  (handler-case
                      (progn
+                       (unless statements-p (publish-backend-activity-query *backend* query))
                        (arm-statement-timeout)
-                       (let ((stmts (if statements-p statements (parse-statements query))))
+                       (let ((stmts (if statements-p statements
+                                        (parse-statements
+                                         query :collect-activity-text-p t
+                                               :collect-statement-text-p (when *statement-statistics-store* :defer)))))
                          (check-for-interrupts)
                          (prog1
                              (cond

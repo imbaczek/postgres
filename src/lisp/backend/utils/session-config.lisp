@@ -25,6 +25,8 @@
    (make-startup-setting-descriptor "log_min_duration_statement" :user :disabled-logging "-1")
    (make-startup-setting-descriptor "log_min_error_statement" :user :disabled-logging "error")
    (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds)
+   (make-startup-setting-descriptor "pg_stat_statements.track" :superuser :statement-tracking "top")
+   (make-startup-setting-descriptor "pg_stat_statements.track_planning" :superuser :boolean "off")
    (make-startup-setting-descriptor "application_name" :user :string "")))
 
 (defun find-session-setting (name)
@@ -44,7 +46,7 @@
             (setting-descriptor-unit-label spec)
             (string-downcase (symbol-name (startup-setting-descriptor-context spec)))
             (setting-descriptor-kind-label spec)
-            source +null+ +null+ +null+ nil)))
+            source (setting-descriptor-enum-values spec) +null+ +null+ nil)))
 
 (defun session-integer-setting (name value minimum maximum unit)
   (handler-case
@@ -111,6 +113,15 @@
        (unless (member value (setting-descriptor-enum-choices spec) :test #'string-equal)
          (ereport "22023" "invalid value for parameter \"bytea_output\": \"~a\"" value))
        (string-downcase value))
+      (:boolean
+       (handler-case
+           (if (startup-parse-boolean-setting (princ-to-string value)) "on" "off")
+         (error () (ereport "22023" "invalid value for parameter ~s: ~s" name value))))
+      (:statement-tracking
+       (let ((setting (string-downcase (princ-to-string value))))
+         (unless (member setting (setting-descriptor-enum-choices spec) :test #'string=)
+           (ereport "22023" "invalid value for parameter ~s: ~s" name value))
+         setting))
       (:datestyle (session-normalize-datestyle value))
       (:intervalstyle
        (let ((boot (startup-setting-descriptor-boot spec)))
@@ -312,11 +323,18 @@ The saved settings allow an abort to restore the values in effect at transaction
   (when (string= name "synchronous_commit")
     (session-set-synchronous-commit value)
     (return-from session-set-extra-setting (session-synchronous-commit-value)))
+  (when (and *statement-statistics-store*
+             (member name '("pg_stat_statements.track" "pg_stat_statements.track_planning")
+                     :test #'string=))
+    (let* ((user (backend-startup-user *backend*))
+           (role (and user (authentication-committed-role user))))
+      (unless (if role (pg-role-superuser-p role) (equal user "postgres"))
+        (ereport "42501" "permission denied to set parameter ~s" name))))
   (let* ((settings (backend-settings *backend*))
          (reset-p (or (eq value :default) (eq value +null+)))
          (reset (backend-settings-reset *backend*)))
     (session-remember-settings)
-    (when (session-custom-setting-p name)
+    (when (and (not (find-session-setting name)) (session-custom-setting-p name))
       (unless (nth-value 1 (gethash name reset))
         (setf (gethash name reset) "")))
     (if reset-p

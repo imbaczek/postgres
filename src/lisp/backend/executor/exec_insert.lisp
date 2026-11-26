@@ -149,4 +149,4 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
         (when wait-xid (wait-for-xid wait-xid))))))
 
 (defun exec-insert (stream ast)
-  (exec-insert-subqueries stream ast))
+  (call-with-observed-dml ast (lambda () (exec-insert-subqueries stream ast))))

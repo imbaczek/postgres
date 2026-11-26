@@ -462,6 +462,526 @@
                  (if (typep condition 'error) :handled :unexpected))))
            "nonfatal handler handles ordinary errors"))
 
+(rove:deftest test-statement-statistics-startup-settings
+    (let ((*statement-statistics-store* nil)
+          (settings (startup-default-settings "/test")))
+      (initialize-statement-statistics settings)
+      (rove:ok (null *statement-statistics-store*))
+      (setf (gethash "pg_stat_statements.enabled" settings) (list :value t)
+            (gethash "pg_stat_statements.max" settings) (list :value 3)
+            (gethash "pg_stat_statements.max_text_bytes" settings) (list :value 19))
+      (initialize-statement-statistics settings)
+      (rove:ok (= 3 (reduce #'+ *statement-statistics-store*
+                            :key #'statement-statistics-shard-capacity)))
+      (rove:ok (= 19 (reduce #'+ *statement-statistics-store*
+                             :key #'statement-statistics-shard-text-budget)))))
+
+(rove:deftest test-statement-statistics-session-track
+    (let ((*statement-statistics-store* (make-statement-statistics-store 2 0))
+          (*catalog* nil)
+          (*backend* (make-backend :startup-user "postgres"))
+          (setting "pg_stat_statements.track"))
+      (rove:ok (string= "top" (session-extra-setting-value setting)))
+      (session-set-extra-setting setting "NONE")
+      (rove:ok (string= "none" (session-extra-setting-value setting)))
+      (let ((condition (handler-case (progn (session-set-extra-setting setting "invalid") nil)
+                         (pg-error (error) error))))
+        (rove:ok (and condition (string= "22023" (pg-error-sqlstate condition)))))
+      (rove:ok (string= "none" (session-extra-setting-value setting)))
+      (session-set-extra-setting setting :default)
+      (rove:ok (string= "top" (session-extra-setting-value setting)))
+      (let* ((*backend* (make-backend :startup-user "reporter"))
+             (condition (handler-case (progn (session-set-extra-setting setting "none") nil)
+                          (pg-error (error) error))))
+        (rove:ok (and condition (string= "42501" (pg-error-sqlstate condition)))))))
+
+(rove:deftest test-sql-activity-view-row
+    (let ((backend (make-backend :startup-user "postgres" :pid 42))
+          (*catalog* nil)
+          (query (make-string 1100 :initial-element #\x)))
+      (unwind-protect
+           (progn
+             (begin-backend-query-execution backend)
+             (publish-backend-activity-query backend query 123)
+             (setf (backend-application-name backend) (copy-seq "test client"))
+             (with-backend-wait-state (backend backend-activity-wait-event :relation)
+               (catch 'interrupted
+                 (with-backend-wait-state (backend backend-activity-wait-event :transactionid)
+                   (let ((row (sql-activity-view-row backend "postgres" nil))
+                         (hidden (sql-activity-view-row backend "observer" nil)))
+                     (rove:ok (string= "Lock" (aref row 8)))
+                     (rove:ok (string= "transactionid" (aref row 9)))
+                     (rove:ok (string= "active" (aref row 10)))
+                     (rove:ok (= 123 (aref row 11)))
+                     (rove:ok (= 1024 (length (aref row 12))))
+                     (setf (char (aref row 12) 0) #\z
+                           (char (aref row 4) 0) #\z)
+                     (let ((next (sql-activity-view-row backend "postgres" nil)))
+                       (rove:ok (char= #\x (char (aref next 12) 0)))
+                       (rove:ok (string= "test client" (aref next 4))))
+                     (rove:ok (eq +null+ (aref hidden 9)))
+                     (rove:ok (eq +null+ (aref hidden 11)))
+                     (rove:ok (string= "<insufficient privilege>" (aref hidden 12))))
+                   (throw 'interrupted nil)))
+               (rove:ok (eq :relation (backend-activity-wait-event backend)))
+               (let ((*backend* backend))
+                 (call-with-backend-io-wait
+                  :data-file-read
+                  (lambda ()
+                    (let ((row (sql-activity-view-row backend "postgres" nil)))
+                      (rove:ok (string= "IO" (aref row 8)))
+                      (rove:ok (string= "DataFileRead" (aref row 9)))))))
+               (rove:ok (eq :relation (backend-activity-wait-event backend)))))
+        (end-backend-query-execution backend))
+      (let ((row (sql-activity-view-row backend "postgres" nil)))
+        (rove:ok (string= "idle" (aref row 10)))
+        (rove:ok (eq +null+ (aref row 9)))
+        (rove:ok (>= (aref row 7) (aref row 6))))))
+
+(rove:deftest test-sql-statement-statistics-rows
+    (let ((*statement-statistics-store* (make-statement-statistics-store 4 64 :shards 1))
+          (*catalog* nil)
+          (key '(10 5 t 120)))
+      (store-statement-statistics-phase *statement-statistics-store* key :planning 2.0d0 0 "select $1")
+      (store-statement-statistics-phase *statement-statistics-store* key :execution 4.0d0 3 nil
+                                        (make-statement-resource-usage :relation-reads 2
+                                                                       :wal-records 1 :wal-bytes 32))
+      (let* ((*backend* (make-backend :startup-user "postgres"))
+             (row (first (sql-statement-statistics-rows))))
+        (rove:ok (= 54 (length row)))
+        (rove:ok (equalp (subseq row 0 18)
+                         #(10 5 t 120 "select $1" 1 2.0d0 2.0d0 2.0d0 2.0d0 0.0d0
+                           1 4.0d0 4.0d0 4.0d0 4.0d0 0.0d0 3)))
+        (rove:ok (every (lambda (value) (eq value +null+)) (subseq row 18 52)))
+        (rove:ok (and (integerp (aref row 52)) (= (aref row 52) (aref row 53)))))
+      (let ((*backend* (make-backend :startup-user "postgres")))
+        (rove:ok (equalp (sql-statement-statistics-resource-rows)
+                         (list #(10 5 t 120 2 0 0 0 0 1 32 0 0)))))
+      (let* ((*backend* (make-backend :startup-user "reporter"))
+             (row (first (sql-statement-statistics-rows))))
+        (rove:ok (eq +null+ (aref row 3)))
+        (rove:ok (string= "<insufficient privilege>" (aref row 4)))
+        (rove:ok (= 3 (aref row 17))))))
+
+(rove:deftest test-sql-statement-statistics-reset
+    (let ((*statement-statistics-store* (make-statement-statistics-store 2 0))
+          (*catalog* nil))
+      (store-statement-statistics-phase *statement-statistics-store* '(10 5 t 120)
+                                        :execution 4.0d0 3 nil)
+      (let ((*backend* (make-backend :startup-user "reporter")))
+        (let ((condition (handler-case (progn (sql-statement-statistics-reset) nil)
+                           (pg-error (error) error))))
+          (rove:ok (and condition (string= (pg-error-sqlstate condition) "42501"))))
+        (rove:ok (= 1 (length (sql-statement-statistics-rows)))))
+      (let ((*backend* (make-backend :startup-user "postgres")))
+        (let ((reset-time (sql-statement-statistics-reset)))
+          (rove:ok (integerp reset-time))
+          (rove:ok (equalp (list (vector 0 reset-time)) (sql-statement-statistics-info-rows))))
+        (rove:ok (null (sql-statement-statistics-rows))))))
+
+(rove:deftest test-statement-statistics-store
+    (let* ((store (make-statement-statistics-store 2 8 :shards 1))
+           (first '(1 2 t 3))
+           (second '(1 2 t 4))
+           (third '(1 2 t 5)))
+      (store-statement-statistics-phase store first :planning 2.0d0 0 "a")
+      (dolist (elapsed '(3.0d0 1.0d0 5.0d0))
+        (store-statement-statistics-phase store first :execution elapsed 1 "a"))
+      (let* ((entry (first (snapshot-statement-statistics store)))
+             (timing (statement-statistics-entry-execution entry)))
+        (rove:ok (= 3 (statement-statistics-entry-rows entry)))
+        (rove:ok (= 1 (statement-phase-statistics-count
+                       (statement-statistics-entry-planning entry))))
+        (rove:ok (= 3 (statement-phase-statistics-count timing)))
+        (rove:ok (= 9.0d0 (statement-phase-statistics-total timing)))
+        (rove:ok (= 1.0d0 (statement-phase-statistics-minimum timing)))
+        (rove:ok (= 5.0d0 (statement-phase-statistics-maximum timing)))
+        (rove:ok (= 3.0d0 (statement-phase-statistics-mean timing)))
+        (rove:ok (= 8.0d0 (statement-phase-statistics-m2 timing)))
+        (setf (char (statement-statistics-entry-text entry) 0) #\z)
+        (rove:ok (string= "a" (statement-statistics-entry-text
+                               (first (snapshot-statement-statistics store))))))
+      (store-statement-statistics-phase store second :execution 1.0d0 1 "b")
+      (store-statement-statistics-phase store third :execution 1.0d0 1 "too long")
+      (let ((entries (snapshot-statement-statistics store)))
+        (rove:ok (= 2 (length entries)))
+        (rove:ok (not (find first entries :key #'statement-statistics-entry-key :test #'equal)))
+        (rove:ok (null (statement-statistics-entry-text
+                        (find third entries :key #'statement-statistics-entry-key :test #'equal)))))
+      (rove:ok (= 1 (statement-statistics-info store)))
+      (reset-statement-statistics store)
+      (rove:ok (zerop (statement-statistics-info store)))
+      (rove:ok (null (snapshot-statement-statistics store)))
+      (store-statement-statistics-phase store first :execution 7.0d0 1 "a")
+      (rove:ok (= 1 (statement-statistics-entry-rows
+                     (first (snapshot-statement-statistics store)))))))
+
+(rove:deftest test-statement-statistics-text-is-rendered-on-insertion
+    (let ((store (make-statement-statistics-store 1 64 :shards 1))
+          (key '(1 2 t 3))
+          (renders 0))
+      (flet ((record ()
+               (store-statement-statistics-phase
+                store key :execution 1.0d0 1
+                (lambda ()
+                  ;; A reset between lookup and publication must complete
+                  ;; without the producer holding the shard lock.
+                  (reset-statement-statistics store)
+                  (incf renders)
+                  "select $1"))))
+        (record)
+        (record)
+        (rove:ok (= renders 1))
+        (let ((entry (first (snapshot-statement-statistics store))))
+          (rove:ok (= 2 (statement-statistics-entry-rows entry)))
+          (rove:ok (string= "select $1" (statement-statistics-entry-text entry))))
+        (reset-statement-statistics store)
+        (record)
+        (rove:ok (= renders 2))
+        (rove:ok (= 1 (statement-statistics-entry-rows
+                       (first (snapshot-statement-statistics store))))))))
+
+(rove:deftest test-statement-statistics-targeted-reset
+    (let* ((store (make-statement-statistics-store 3 96 :shards 1))
+           (initial-reset (nth-value 1 (statement-statistics-info store)))
+           (first '(1 5 t 10))
+           (middle '(1 5 t 11))
+           (last '(2 5 t 12)))
+      (dolist (key (list first middle last))
+        (store-statement-statistics-phase store key :execution 2.0d0 1 "select"))
+      (reset-statement-statistics store (lambda () 100) 1 5 11 t)
+      (store-statement-statistics-phase store middle :execution 6.0d0 1 nil)
+      (let* ((entry (find middle (snapshot-statement-statistics store)
+                          :key #'statement-statistics-entry-key :test #'equal))
+             (phase (statement-statistics-entry-execution entry)))
+        (rove:ok (= 2 (statement-phase-statistics-count phase)))
+        (rove:ok (= 8.0d0 (statement-phase-statistics-total phase)))
+        (rove:ok (= 6.0d0 (statement-phase-statistics-minimum phase)))
+        (rove:ok (= 6.0d0 (statement-phase-statistics-maximum phase))))
+      (reset-statement-statistics store (lambda () 110) 1 5 11)
+      (let ((shard (aref store 0)))
+        (rove:ok (equal last (statement-statistics-entry-key (statement-statistics-shard-newest shard))))
+        (rove:ok (equal first (statement-statistics-entry-key (statement-statistics-shard-oldest shard))))
+        (rove:ok (= 48 (statement-statistics-shard-text-bytes shard))))
+      (rove:ok (integerp initial-reset))
+      (rove:ok (= initial-reset (nth-value 1 (statement-statistics-info store))))))
+
+(rove:deftest test-normalized-statement-text
+    (let ((statements
+            (parse-statements "SELECT $2, 'secret', $$private$$, 123, NULL /* comment */; SELECT 8"
+                              :collect-statement-text-p t)))
+      (rove:ok (equal (mapcar (lambda (ast) (getf ast :normalized-statement-text)) statements)
+                      '("select $2 , $3 , $4 , $5 , $6" "select $1")))
+      (rove:ok (null (getf (first (parse-statements "SELECT 8")) :normalized-statement-text))))
+  (let ((statements (parse-statements "select 'secret'::varchar(8), cast(25 as numeric(4,2))"
+                                      :collect-statement-text-p t)))
+    (rove:ok (equal "select $1 :: varchar ( 8 ) , cast ( $2 as numeric ( 4 , 2 ) )"
+                    (getf (first statements) :normalized-statement-text))))
+  (let* ((name (make-string 3000 :initial-element #\x))
+         (ast (first (parse-statements (format nil "SELECT 1 AS ~a" name)
+                                       :collect-statement-text-p t))))
+    (rove:ok (null (getf ast :normalized-statement-text)))))
+
+(rove:deftest test-statement-fingerprint-version-one
+    (let ((shape '(:select (16384) ((:col :int4 -1 0))
+                   (:binop :bool -1 "=" (:col :int4 -1 0) (:const :int4 -1)) nil nil)))
+      (rove:ok (= 1 +statement-fingerprint-version+))
+      (rove:ok (= 2044300642419585876 (statement-shape-id shape)))))
+
+(rove:deftest test-statement-select-fingerprint
+    (flet ((fingerprint (sql)
+             (statement-select-fingerprint (prepare-select (first (parse-statements sql))))))
+      (let ((plain (fingerprint "select 1"))
+            (cast (fingerprint "select 3::bigint")))
+        (rove:ok (integerp plain))
+        (rove:ok (eql plain (fingerprint "select 2")))
+        (rove:ok (integerp cast))
+        (rove:ok (eql cast (fingerprint "select 4::bigint")))
+        (rove:ok (not (eql plain cast)))
+        (rove:ok (not (eql plain (fingerprint "select 1 limit 1")))))
+      (let ((union-all (fingerprint "select 1 union all select 2 order by 1 desc limit 3")))
+        (rove:ok (integerp union-all))
+        (rove:ok (eql union-all (fingerprint "select 4 union all select 5 order by 1 desc limit 6")))
+        (rove:ok (not (eql union-all (fingerprint "select 4 union select 5 order by 1 desc limit 6"))))
+        (rove:ok (not (eql union-all (fingerprint "select 4 union all select 5::bigint order by 1 desc limit 6"))))
+        (rove:ok (not (eql union-all (fingerprint "select 4 union all select 5 order by 1 asc limit 6")))))
+      (let ((derived (fingerprint "select x from (select 1 as x) s")))
+        (rove:ok (integerp derived))
+        (rove:ok (eql derived (fingerprint "select y from (select 2 as y) t")))
+        (rove:ok (not (eql derived (fingerprint "select x from (select 1 + 2 as x) s")))))
+      (let ((join (fingerprint "select a.x from (select 1 as x) a join (select 2 as x) b on a.x = b.x")))
+        (rove:ok (integerp join))
+        (rove:ok (eql join (fingerprint "select p.y from (select 3 as y) p join (select 4 as y) q on p.y = q.y")))
+        (rove:ok (not (eql join (fingerprint "select a.x from (select 1 as x) a left join (select 2 as x) b on a.x = b.x"))))
+        (rove:ok (not (eql join (fingerprint "select a.x from (select 1 as x) a join (select 2 as x) b on a.x < b.x")))))
+      (let ((lower (fingerprint "select lower('abc')")))
+        (rove:ok (integerp lower))
+        (rove:ok (eql lower (fingerprint "select pg_catalog.lower('def')")))
+        (let ((length (fingerprint "select length('abc'::text)"))
+              (character-length (fingerprint "select character_length('abc'::text)")))
+          (rove:ok (every #'integerp (list length character-length)))
+          (rove:ok (not (eql length character-length)))))
+      (let ((equality (fingerprint "select 1 where 2 = 3"))
+            (ordering (fingerprint "select 1 where 2 > 3")))
+        (rove:ok (integerp equality))
+        (rove:ok (eql equality (fingerprint "select 4 where 5 = 6")))
+        (rove:ok (integerp ordering))
+        (rove:ok (not (eql equality ordering))))
+      (let ((is-null (fingerprint "select 1 is null"))
+            (is-not-null (fingerprint "select 1 is not null"))
+            (true (fingerprint "select true")))
+        (rove:ok (every #'integerp (list is-null is-not-null true)))
+        (rove:ok (not (eql is-null is-not-null)))
+        (rove:ok (eql true (fingerprint "select false"))))
+      (let ((ordered (fingerprint "select 1 as x order by x desc")))
+        (rove:ok (integerp ordered))
+        (rove:ok (eql ordered (fingerprint "select 2 order by 1 desc")))
+        (rove:ok (not (eql ordered (fingerprint "select 2 order by 1 asc")))))
+      (let ((aggregates (fingerprint "select count(*), sum(1), sum(1)")))
+        (rove:ok (integerp aggregates))
+        (rove:ok (eql aggregates (fingerprint "select count(*), sum(2), sum(3)")))
+        (rove:ok (not (eql aggregates (fingerprint "select count(1), sum(2), sum(3)")))))
+      (let ((having (fingerprint "select count(*) having count(*) > 1 and 2 > 1")))
+        (rove:ok (integerp having))
+        (rove:ok (eql having (fingerprint "select count(*) having count(*) > 3 and 4 > 3")))
+        (rove:ok (not (eql having
+                           (fingerprint "select count(*) where 2 > 1 having count(*) > 1")))))))
+
+(rove:deftest test-statement-fingerprint-rejects-unknown-node
+    (let ((unknown '(:unknown-analyzed-node :type :int4 :typmod -1)))
+      (rove:ok (null (statement-select-fingerprint (list :targets (list (list :expr unknown))))))
+      (rove:ok (null (statement-dml-fingerprint
+                      :insert (list :table (make-pg-class :oid 30000)
+                                    :attnums '(1)
+                                    :rows (list (list (list :assignment unknown :type :int4 :typmod -1)))))))))
+
+(rove:deftest test-statement-dml-fingerprint
+    (let ((table (make-pg-class :oid 30000))
+          (column (make-pg-column :attnum 1)))
+      (flet ((fingerprint (kind value &optional returning)
+               (let* ((expression (list :const value :type :int4 :typmod -1))
+                      (assignment (list :assignment expression :type :int4 :typmod -1)))
+                 (statement-dml-fingerprint
+                  kind (list :table table
+                             :attnums (when (eq kind :insert) '(1))
+                             :rows (when (eq kind :insert) (list (list assignment)))
+                             :sets (when (eq kind :update) (list (cons column assignment)))
+                             :returning (when returning (list (list :expr expression))))))))
+        (let ((insert (fingerprint :insert 1))
+              (update (fingerprint :update 1))
+              (delete (fingerprint :delete 1)))
+          (rove:ok (every #'integerp (list insert update delete)))
+          (rove:ok (eql insert (fingerprint :insert 2)))
+          (rove:ok (eql update (fingerprint :update 2)))
+          (rove:ok (not (eql insert update)))
+          (rove:ok (not (eql update delete)))
+          (rove:ok (not (eql insert (fingerprint :insert 1 t))))))
+      (rove:ok (null (statement-dml-fingerprint :merge (list :table table))))))
+
+(rove:deftest test-statement-observation-lifecycle
+    (let* ((store (make-statement-statistics-store 4 64))
+           (observation (make-statement-observation :store store :key '(1 2 t 10) :text "select"))
+           (ticks 0)
+           (*statement-observation-clock* (lambda () ticks)))
+      (with-statement-planning ((analyzed (progn (incf ticks 3) :analyzed))
+                                (query-id (progn (incf ticks 100) 10))
+                                ((first second) (progn (incf ticks 5) (values analyzed :planned)))
+                                planning-ticks t)
+        (rove:ok (equal (list first second query-id) '(:analyzed :planned 10)))
+        (rove:ok (= planning-ticks 8))
+        (store-statement-statistics-phase
+         store '(1 2 t 10) :planning (statement-observation-milliseconds planning-ticks) 0 "select"))
+      (call-with-statement-execution-slice
+       observation
+       (lambda ()
+         (rove:ok (eq *active-statement-observation* observation))
+         (incf (statement-resource-usage-relation-reads *statement-resource-usage*) 2)
+         (incf ticks 5)
+         (incf (statement-observation-rows observation))))
+      (rove:ok (null *active-statement-observation*))
+      (rove:ok (null *statement-resource-usage*))
+      (rove:ok (zerop (statement-phase-statistics-count
+                       (statement-statistics-entry-execution
+                        (first (snapshot-statement-statistics store))))))
+      (reset-statement-statistics store)
+      (incf ticks 1000)
+      (call-with-statement-execution-slice
+       observation
+       (lambda ()
+         (incf (statement-resource-usage-relation-reads *statement-resource-usage*))
+         (incf ticks 7)
+         (incf (statement-observation-rows observation))))
+      (rove:ok (= 3 (statement-resource-usage-relation-reads
+                     (statement-observation-resources observation))))
+      (finish-statement-observation observation :success)
+      (finish-statement-observation observation :success)
+      (let* ((entry (first (snapshot-statement-statistics store)))
+             (execution (statement-statistics-entry-execution entry)))
+        (rove:ok (= 2 (statement-statistics-entry-rows entry)))
+        (rove:ok (= 3 (statement-resource-usage-relation-reads
+                       (statement-statistics-entry-resources entry))))
+        (rove:ok (= 1 (statement-phase-statistics-count execution)))
+        (rove:ok (= (statement-observation-milliseconds 12)
+                    (statement-phase-statistics-total execution)))
+        (rove:ok (zerop (statement-phase-statistics-count
+                         (statement-statistics-entry-planning entry)))))
+      (let ((failed (make-statement-observation :store store :key '(1 2 t 11))))
+        (catch 'interrupted
+          (call-with-statement-execution-slice
+           failed (lambda () (incf ticks 20) (throw 'interrupted nil))))
+        (rove:ok (eq :failed (statement-observation-terminal-status failed)))
+        (finish-statement-observation failed :success)
+        (rove:ok (= 1 (length (snapshot-statement-statistics store)))))))
+
+(rove:deftest test-explain-timing-off
+    (let* ((ast (first (parse-statements "explain (analyze, timing off) select 1")))
+           (plan (plan-select-query (getf ast :statement)))
+           (*query-plan-instrumentation-p* :rows))
+      (rove:ok (getf ast :analyze-p))
+      (rove:ok (null (getf ast :timing-p)))
+      (map-query-plan-rows plan nil (lambda (row) (declare (ignore row))))
+      (let ((description (format-query-plan plan nil t)))
+        (rove:ok (search "actual rows=" description))
+        (rove:ok (search "loops=1" description))
+        (rove:ok (not (search "actual time=" description))))
+      (maphash (lambda (node metadata)
+                 (declare (ignore node))
+                 (rove:ok (zerop (plan-node-metadata-actual-total-time-ticks metadata))))
+               (query-plan-metadata plan)))
+  (let ((condition (handler-case
+                       (progn (parse-statements "explain (timing on) select 1") nil)
+                     (pg-error (error) error))))
+    (rove:ok (and condition (string= (pg-error-sqlstate condition) "22023")))))
+
+(rove:deftest test-explain-empty-rescan-average
+    (let* ((plan (plan-select-query (first (parse-statements "select 1"))))
+           (*cte-active-plan* plan)
+           (*query-plan-instrumentation-p* t)
+           (clock 0)
+           (*statement-observation-clock* (lambda () clock))
+           (node (query-plan-physical plan))
+           (metadata (gethash node (query-plan-metadata plan))))
+      (dolist (present-p '(t nil))
+        (let ((iterator (instrument-physical-plan-iterator
+                         node (make-sql-iterator
+                               (lambda ()
+                                 (incf clock (if present-p 3 7))
+                                 (values #(1) present-p))))))
+          (unwind-protect (sql-iterator-next iterator)
+            (close-sql-iterator iterator))))
+      (rove:ok (= 2 (plan-node-metadata-actual-loops metadata)))
+      (rove:ok (= 1/2 (plan-node-metadata-actual-rows metadata)))
+      (rove:ok (= 10 (plan-node-metadata-actual-total-time-ticks metadata)))))
+
+(rove:deftest test-explain-inclusive-resource-deltas
+    (let* ((plan (plan-select-query (first (parse-statements "select 1"))))
+           (*cte-active-plan* plan)
+           (*query-plan-instrumentation-p* t)
+           (ticks 0)
+           (*statement-observation-clock* (lambda () ticks))
+           (*statement-resource-usage* (make-statement-resource-usage))
+           (parent (query-plan-physical plan))
+           (child (first (physical-plan-node-children parent)))
+           (leaf (make-sql-iterator
+                  (lambda ()
+                    (incf (statement-resource-usage-relation-reads *statement-resource-usage*))
+                    (incf (statement-resource-usage-spill-read-bytes *statement-resource-usage*) 3)
+                    (incf ticks 4)
+                    (values #(1) t))))
+           (iterator (instrument-physical-plan-iterator
+                      parent (instrument-physical-plan-iterator child leaf))))
+      (unwind-protect
+           (progn
+             (dotimes (pull 2) (sql-iterator-next iterator))
+             (rove:ok (= 2 (statement-resource-usage-relation-reads *statement-resource-usage*)))
+             (dolist (node (list parent child))
+               (let* ((metadata (gethash node (query-plan-metadata plan)))
+                      (resources (plan-node-metadata-resources metadata)))
+                 (rove:ok (= 4 (plan-node-metadata-actual-startup-time-ticks metadata)))
+                 (rove:ok (= 8 (plan-node-metadata-actual-total-time-ticks metadata)))
+                 (rove:ok (= 2 (statement-resource-usage-relation-reads resources)))
+                 (rove:ok (= 6 (statement-resource-usage-spill-read-bytes resources))))))
+        (close-sql-iterator iterator))))
+
+(rove:deftest test-explain-json
+    (let* ((ast (first (parse-statements "explain (format 'JSON', analyze +1, timing -0) select 1")))
+           (plan (plan-select-query (getf ast :statement)))
+           (*query-plan-instrumentation-p* :rows))
+      (rove:ok (eq (getf ast :format) :json))
+      (rove:ok (not (getf ast :timing-p)))
+      (map-query-plan-rows plan nil (lambda (row) (declare (ignore row))))
+      (let ((description (format-query-plan-json plan nil t nil 0.25d0 0.125d0)))
+        (rove:ok (equal (sql-json-input description) description))
+        (rove:ok (search "\"Plans\":[" description))
+        (rove:ok (search "\"Actual Rows\":1.00" description))
+        (rove:ok (search "\"Actual Loops\":1" description))
+        (rove:ok (search "\"Execution Time\":0.250" description))
+        (rove:ok (search "\"Planning Time\":0.125" description))
+        (rove:ok (search "\"Parent Relationship\":\"Outer\"" description))
+        (rove:ok (not (search "\"Actual Total Time\"" description))))))
+
+(rove:deftest test-explain-dependent-plans
+    (let* ((*backend* (make-backend))
+           (statement (first (parse-statements
+                              "with q as materialized (select 2 as x) select (select x from q)")))
+           (plan (plan-select-query statement)))
+      (unwind-protect
+           (call-with-admitted-select-plan
+            plan
+            (lambda (relations)
+              (let ((text (format-query-plan plan relations))
+                    (json (format-query-plan-json plan relations nil nil 0.0d0)))
+                (rove:ok (equal (sql-json-input json) json))
+                (dolist (label '("InitPlan 1 (scalar)" "CTE q (shared)"))
+                  (rove:ok (search label text))
+                  (rove:ok (search (format nil "\"Subplan Name\":~s" label) json))))))
+        (reset-backend-transaction *backend*))))
+
+(rove:deftest test-explain-filtered-rows
+    (let* ((*backend* (make-backend))
+           (ast (first (parse-statements
+                        "select x from (select 1 as x union all select 2
+                                      union all select 3 union all select null::int) v where x > 2")))
+           (plan (plan-select-query ast))
+           (*query-plan-instrumentation-p* :rows))
+      (unwind-protect
+           (call-with-admitted-select-plan
+            plan
+            (lambda (relations)
+              (dotimes (run 2)
+                (map-query-plan-rows plan relations (lambda (row) (declare (ignore row))))
+                (let ((text (format-query-plan plan relations t))
+                      (json (format-query-plan-json plan relations t nil 0.0d0)))
+                  (rove:ok (search "Rows Removed by Filter: 3" text))
+                  (rove:ok (equal (sql-json-input json) json))
+                  (rove:ok (search "\"Rows Removed by Filter\":3" json))))))
+        (reset-backend-transaction *backend*))))
+
+(rove:deftest test-explain-join-filtered-rows
+    (let ((*backend* (make-backend))
+          (*query-plan-instrumentation-p* :rows))
+      (unwind-protect
+           (loop for (sql rejected) in
+                 '(("select a.x from (select 1 x union all select 2) a
+                   left join (select 1 x union all select 3 union all select null::int) b
+                   on a.x = b.x" 5)
+                   ("select a.x from (select 1 x union all select 2) a
+                   left join lateral (select a.x + 1 y) b on a.x = b.y" 2))
+                 for plan = (plan-select-query (first (parse-statements sql)))
+                 do (call-with-admitted-select-plan
+                     plan
+                     (lambda (relations)
+                       (let ((count 0))
+                         (map-query-plan-rows plan relations (lambda (row)
+                                                               (declare (ignore row))
+                                                               (incf count)))
+                         (rove:ok (= count 2))
+                         (rove:ok (search (format nil "Rows Removed by Join Filter: ~d" rejected)
+                                          (format-query-plan plan relations t)))
+                         (rove:ok (search (format nil "\"Rows Removed by Join Filter\":~d" rejected)
+                                          (format-query-plan-json plan relations t nil 0.0d0)))))))
+        (reset-backend-transaction *backend*))))
+
 (rove:deftest test-query-plan-ir-and-count-aggregate
     (let* ((ast (first (parse-statements
                         "select category, count(*) as n from events group by category order by n desc limit 2")))

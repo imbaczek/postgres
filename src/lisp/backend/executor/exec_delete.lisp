@@ -22,7 +22,7 @@
   (values))
 
 (defun exec-delete (stream ast)
-  (exec-delete-subqueries stream ast))
+  (call-with-observed-dml ast (lambda () (exec-delete-subqueries stream ast))))
 
 (defun exec-update (stream ast)
-  (exec-update-subqueries stream ast))
+  (call-with-observed-dml ast (lambda () (exec-update-subqueries stream ast))))

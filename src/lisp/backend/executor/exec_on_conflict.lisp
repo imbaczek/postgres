@@ -98,6 +98,7 @@ ADMITTED contains arbiters already inferred after this writer registered."
            (targets nil)
            (sets nil)
            (where-target nil)
+           (arbiter-predicate nil)
            (expression-scope nil))
       (when inference
         (let ((simple-p t))
@@ -111,9 +112,9 @@ ADMITTED contains arbiters already inferred after this writer registered."
       (setf arbiters (on-conflict-arbiter-oids indexes constraint inference columns))
       (when (getf raw :predicate)
         (let ((*select-sublinks-allowed-p* nil))
-          (let ((expression (coerce-boolean-expression
-                             (analyze-expr (getf raw :predicate) target-scope) "ON CONFLICT")))
-            (declare (ignore expression)))))
+          (setf arbiter-predicate
+                (coerce-boolean-expression
+                 (analyze-expr (getf raw :predicate) target-scope) "ON CONFLICT"))))
       (when (eq (getf raw :action) :update)
         (let ((scope (on-conflict-expression-scope table alias)) (groups nil))
           (setf expression-scope scope)
@@ -143,6 +144,7 @@ ADMITTED contains arbiters already inferred after this writer registered."
                                  (map 'vector #'select-relation-identity
                                       (select-scope-relations expression-scope))
                                  #())
+            :arbiter-predicate arbiter-predicate
             :constraint constraint :inference-p (not (null inference)) :inference-columns columns
             :sets (sort sets #'< :key (lambda (item) (pg-column-attnum (car item)))) :where-target where-target :targets (nreverse targets)))))
 

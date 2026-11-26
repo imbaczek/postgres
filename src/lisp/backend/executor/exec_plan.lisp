@@ -5,12 +5,21 @@
 (defstruct plan-node-metadata
   estimated-rows
   estimated-cost
-  actual-rows
+  estimated-startup-cost
   (actual-row-count 0)
+  (filtered-row-count 0)
+  resources
+  sort-methods
   (actual-loops 0)
   (actual-startup-time-ticks 0)
   (actual-total-time-ticks 0)
   selection-rule)
+
+(defun plan-node-metadata-actual-rows (metadata)
+  "Compute the row average from all loops, including loops with no output."
+  (let ((loops (plan-node-metadata-actual-loops metadata)))
+    (when (plusp loops)
+      (/ (plan-node-metadata-actual-row-count metadata) loops))))
 
 (defstruct (query-plan (:constructor %make-query-plan))
   logical
@@ -19,7 +28,11 @@
   prepared
   (metadata (make-hash-table :test #'eq)))
 
-(defvar *query-plan-instrumentation-p* nil)
+(defvar *query-plan-instrumentation-p* nil
+  "NIL disables node statistics, :ROWS collects counts, and T also collects timing.")
+
+(defvar *explain-estimates-p* nil
+  "Capture planner estimates for EXPLAIN with costs enabled.")
 
 (defun internal-time-ticks->milliseconds (ticks)
   (* 1000.0d0 (/ ticks internal-time-units-per-second)))
@@ -488,6 +501,347 @@ CTE definitions and expression subplans belong to their own plan domains."
   "Prepare nested SELECTs together, then choose paths without holding the catalog mutex."
   (plan-prepared-select (prepare-select ast)))
 
+(defun explain-sort-input-table (node relations)
+  "Find the base scan for an input whose width can be approximated from its heap."
+  (case (first node)
+    ((:seq-scan :index-scan)
+     (getf (nth (second node) relations) :table))
+    (:project
+     (when (every (lambda (target) (eq (first (getf target :expr)) :col)) (second node))
+       (explain-sort-input-table (third node) relations)))
+    (:window-input
+     (when (every (lambda (key) (member (first key) '(:col :const))) (second node))
+       (explain-sort-input-table (third node) relations)))
+    ((:limit :filter) (explain-sort-input-table (third node) relations))))
+
+(defconstant +query-sort-merge-fan-in+ 32)
+
+(defun explain-heap-row-width (table)
+  (/ (* 8192 (table-page-estimate table)) (max 1 (table-row-estimate table))))
+
+(defun explain-sort-cost (input-cost rows output-rows table)
+  "Estimate comparison CPU, temporary page transfers, and output CPU.
+cost_tuplesort in optimizer/path/costsize.c supplies the comparison and
+extraction model. Native work memory charges include record containers.
+Heap bytes per row approximate the payload for a direct scan or
+column-only projection. Estimate run counts from retained record bytes and
+charge sequential I/O for the payload on each estimated merge pass."
+  (let* ((tuples (max 2 rows))
+         (memory (max 1 *query-work-memory-bytes*))
+         (heap-width (explain-heap-row-width table))
+         (record-width (+ heap-width (query-spill-record-size #(0 #() #()))))
+         (input-bytes (* rows record-width))
+         (spills (>= (* output-rows record-width) memory))
+         (bounded (and (< output-rows rows) (not spills)
+                       (or (> tuples (* 2 output-rows)) (> input-bytes memory))))
+         (comparison-width (if bounded (max 2 (* 2 output-rows)) tuples))
+         (io-cost
+           (if spills
+               (let* ((runs (max 2 (ceiling input-bytes memory)))
+                      (fan-in (min +query-sort-merge-fan-in+
+                                   (max 2 (floor memory record-width))))
+                      (passes (max 1 (ceiling (log runs fan-in)))))
+                 (* 2 (ceiling (* rows heap-width) 8192) passes))
+               0))
+         (startup (+ input-cost (* 0.005d0 tuples (log comparison-width 2.0d0)) io-cost)))
+    (values output-rows startup (+ startup (* 0.0025d0 output-rows)))))
+
+(defun explain-window-cost (stage rows startup total table)
+  "Cost ranking windows that emit rows without buffering peers or partitions.
+Following cost_windowagg in costsize.c, charge each window function, key
+comparison, and output tuple. A required internal sort is blocking."
+  (let ((functions (getf stage :functions)))
+    (unless (and rows total
+                 (every (lambda (function)
+                          (member (getf function :kind) '(:row-number :rank :dense-rank)))
+                        functions))
+      (return-from explain-window-cost rows))
+    (when (getf stage :sort-required)
+      (unless table (return-from explain-window-cost rows))
+      (multiple-value-setq (rows startup total) (explain-sort-cost total rows rows table)))
+    (let ((operators (+ (length functions) (length (getf stage :partition))
+                        (length (getf stage :order)))))
+      (values rows startup (+ total (* rows (+ 0.01d0 (* 0.0025d0 operators))))))))
+
+(defun explain-equality-join-mcv-selectivity (left-stats right-stats left-mcv right-mcv)
+  "Combine exact common-value matches and C's residual eqjoinsel_inner estimate."
+  (let ((matches 0) (matched-product 0.0d0)
+                    (left-unmatched 0.0d0)
+                    (right-unmatched
+                      (loop for (value . frequency) in right-mcv
+                            unless (assoc value left-mcv) sum frequency)))
+    (dolist (entry left-mcv)
+      (let ((match (assoc (car entry) right-mcv)))
+        (if match
+            (progn (incf matches)
+                   (incf matched-product (* (cdr entry) (cdr match))))
+            (incf left-unmatched (cdr entry)))))
+    (flet ((residual (stats common)
+             (max 0.0d0 (- 1.0d0 (pg-column-statistics-null-fraction stats)
+                           (reduce #'+ common :key #'cdr :initial-value 0.0d0))))
+           (contribution (unmatched other-unmatched residual other-residual other-distinct other-common)
+             (+ (if (> other-distinct other-common)
+                    (/ (* unmatched other-residual) (- other-distinct other-common))
+                    0.0d0)
+                (if (> other-distinct matches)
+                    (/ (* residual (+ other-residual other-unmatched)) (- other-distinct matches))
+                    0.0d0))))
+      (let ((left-residual (residual left-stats left-mcv))
+            (right-residual (residual right-stats right-mcv)))
+        (min 1.0d0
+             (+ matched-product
+                (min (contribution left-unmatched right-unmatched left-residual right-residual
+                                   (pg-column-statistics-distinct-count right-stats) (length right-mcv))
+                     (contribution right-unmatched left-unmatched right-residual left-residual
+                                   (pg-column-statistics-distinct-count left-stats) (length left-mcv)))))))))
+
+(defun explain-equality-join-selectivity (join left right relations)
+  "Estimate a bare integer equality from the ANALYZE statistics of two scans."
+  (let ((offsets (integer-join-key-offsets join (getf join :qual))))
+    (when (and offsets (eq (first left) :seq-scan) (eq (first right) :seq-scan))
+      (let* ((left-relation (nth (second left) relations))
+             (right-relation (nth (second right) relations))
+             (left-attnum (- (1+ (car offsets))
+                             (if (getf join :reordered) (getf left-relation :offset 0) 0)))
+             (left-stats (table-statistics-column (getf left-relation :table) left-attnum))
+             (right-stats (table-statistics-column (getf right-relation :table) (1+ (cdr offsets)))))
+        (when (and left-stats right-stats)
+          (let ((left-mcv (pg-column-statistics-most-common-values left-stats))
+                (right-mcv (pg-column-statistics-most-common-values right-stats)))
+            (if (and left-mcv right-mcv)
+                (explain-equality-join-mcv-selectivity left-stats right-stats left-mcv right-mcv)
+                ;; eqjoinsel_inner in selfuncs.c uses this estimate when
+                ;; it cannot compare common-value lists for both sides.
+                (/ (* (- 1.0d0 (pg-column-statistics-null-fraction left-stats))
+                      (- 1.0d0 (pg-column-statistics-null-fraction right-stats)))
+                   (max 1 (pg-column-statistics-distinct-count left-stats)
+                        (pg-column-statistics-distinct-count right-stats))))))))))
+
+(defun explain-nested-loop-estimates (node outer inner relations)
+  "Estimate independent Cartesian and simple integer equality nested loops."
+  (let* ((join (second node))
+         (qual (getf join :qual))
+         (left (third node))
+         (right (fourth node))
+         (outer-rows (plan-node-metadata-estimated-rows outer))
+         (inner-rows (plan-node-metadata-estimated-rows inner)))
+    (when (and outer-rows inner-rows
+               (member (getf join :type) '(:inner :cross))
+               (not (physical-join-rescans-inner-p join right)))
+      (let* ((cartesian-p (or (null qual) (and (eq (first qual) :bool) (eq (second qual) t))))
+             (selectivity (if cartesian-p 1 (explain-equality-join-selectivity join left right relations))))
+        (when selectivity
+          (let* ((candidates (* outer-rows inner-rows))
+                 (rows (if cartesian-p candidates (max 1 (round (* candidates selectivity)))))
+                 (relation (when (member (first right) '(:seq-scan :index-scan))
+                             (nth (second right) relations)))
+                 (outer-total (plan-node-metadata-estimated-cost outer)))
+            (if (and outer-total (plan-node-metadata-estimated-cost inner)
+                     (getf relation :table) (getf relation :path))
+                (values rows
+                        (+ (plan-node-metadata-estimated-startup-cost outer)
+                           (plan-node-metadata-estimated-startup-cost inner))
+                        (+ outer-total
+                           (nested-loop-inner-path-cost (getf relation :table) (getf relation :path) outer-rows)
+                           (* (if cartesian-p 0.01d0 0.0125d0) candidates)))
+                rows)))))))
+
+(defun explain-scan-filter-estimates (node rows startup total relations)
+  "Estimate one resolved column-equals-literal filter on a sequential scan.
+The scan cost already includes visiting each input. Charge the default
+operator CPU per input, as cost_seqscan does for a simple qualification."
+  (let ((child (third node)))
+    (unless (and rows total (eq (first child) :seq-scan))
+      (return-from explain-scan-filter-estimates nil))
+    (let ((table (explain-sort-input-table child relations)))
+      (multiple-value-bind (attnum literal matched-p)
+          (equality-column-constant (second node))
+        (when (and table matched-p (<= 1 attnum (length (pg-class-columns table))))
+          (let ((column (aref (pg-class-columns table) (1- attnum))))
+            (when (indexable-equality-value-p literal (pg-column-type column))
+              (let ((selectivity (planner-equality-selectivity table attnum literal)))
+                (values (max 1 (round (* rows selectivity)))
+                        startup (+ total (* 0.0025d0 rows)))))))))))
+
+(defun explain-group-row-estimate (node rows relations)
+  "Use the analyzed distinct count for one grouping column of a full heap scan."
+  (let ((keys (second node))
+        (child (fourth node)))
+    (when (and rows (eq (first child) :seq-scan)
+               (consp keys) (null (rest keys)) (eq (caar keys) :col))
+      (let* ((table (explain-sort-input-table child relations))
+             (statistics (when table (table-statistics-column table (second (first keys))))))
+        (when statistics
+          ;; Like estimate_num_groups in selfuncs.c, cap the number of groups
+          ;; by the input rows. Native statistics count non-null values only.
+          (max 1 (min rows (+ (pg-column-statistics-distinct-count statistics)
+                              (if (plusp (pg-column-statistics-null-fraction statistics)) 1 0)))))))))
+
+(defparameter +hash-aggregate-entry-overhead-bytes+ 128)
+
+(defun hash-aggregate-entry-size (key values origins)
+  "Compute the work-memory charge used by the hash aggregate."
+  (+ +hash-aggregate-entry-overhead-bytes+
+     (query-spill-record-size (list key values (datum-origins-for-spill origins)))))
+
+(defparameter +hash-aggregate-partition-count+ 16)
+
+(defun explain-hash-overflow-cost (rows groups capacity table)
+  "Estimate the initial overflow file and subsequent partition passes.
+Like cost_agg in costsize.c, estimate recursion from batches and fan-out.
+The native executor writes one overflow file before yielding and repartitions
+afterward. Assume uniform groups and use heap width as a spill-volume proxy."
+  (if (>= capacity groups)
+      (values 0.0d0 0.0d0)
+      (let* ((overflow-groups (- groups capacity))
+             (overflow-rows (* rows (/ overflow-groups groups)))
+             (depth (max 1 (ceiling (log (ceiling overflow-groups capacity)
+                                         +hash-aggregate-partition-count+))))
+             (direction-cost (+ (ceiling (* overflow-rows (explain-heap-row-width table)) 8192)
+                                (* 0.01d0 overflow-rows))))
+        (values direction-cost (* 2 (1+ depth) direction-cost)))))
+
+(defun explain-hash-aggregate-estimates (node rows total relations)
+  "Cost COUNT aggregation, including modeled overflow for one integer key."
+  (let* ((keys (second node))
+         (groups (if keys (explain-group-row-estimate node rows relations) 1)))
+    (unless (and groups rows total)
+      (return-from explain-hash-aggregate-estimates groups))
+    ;; cost_agg in costsize.c charges COUNT transitions and hashing
+    ;; before the first output, and one tuple cost per emitted group.
+    (let* ((base-start (+ total (* 0.0025d0 rows (+ (third node) (length keys)))))
+           (base-total (+ base-start (* 0.01d0 groups))))
+      (unless keys
+        (return-from explain-hash-aggregate-estimates (values groups base-start base-total)))
+      (let ((type (expr-type (first keys))))
+        (if (and (member type '(:int2 :int4 :int8)) (not *datum-origin-capture*))
+            (let* ((entry-size
+                     (loop for value in (list (- (ash 1 63)) +null+)
+                           maximize (hash-aggregate-entry-size
+                                     (list (sql-group-value-key value type)) (list value) nil)))
+                   (capacity (max 1 (floor *query-work-memory-bytes* entry-size)))
+                   (table (explain-sort-input-table (fourth node) relations)))
+              (multiple-value-bind (spill-start spill-total)
+                  (explain-hash-overflow-cost rows groups capacity table)
+                (values groups (+ base-start spill-start) (+ base-total spill-total))))
+            groups)))))
+
+(defun explain-sorted-aggregate-estimates (node rows total relations)
+  "Estimate simple integer SUM with the default transition and comparison costs."
+  (let* ((keys (second node))
+         (descriptors (third node))
+         (groups (if keys (explain-group-row-estimate node rows relations) 1)))
+    (unless (and groups rows total
+                 (every (lambda (descriptor)
+                          (let ((input (getf descriptor :input)))
+                            (and (eq (getf descriptor :kind) :sum)
+                                 (eq (first input) :col)
+                                 (member (expr-type input) '(:int2 :int4)))))
+                        descriptors))
+      (return-from explain-sorted-aggregate-estimates groups))
+    (let ((per-row (* 0.0025d0 (+ (length descriptors) (length keys))))
+          (output-cost (* 0.01d0 groups)))
+      (if keys
+          (let ((table (explain-sort-input-table (fourth node) relations)))
+            (unless table (return-from explain-sorted-aggregate-estimates groups))
+            ;; cost_agg in costsize.c separates output tuple CPU from
+            ;; transition and grouping work. Native grouping sorts first,
+            ;; then reads through the first group before it can emit a row.
+            (multiple-value-bind (sort-rows sort-start sort-total)
+                (explain-sort-cost total rows rows table)
+              (declare (ignore sort-rows))
+              (let* ((first-group (/ rows groups))
+                     (extract (/ (- sort-total sort-start) (max 1 rows)))
+                     (startup (+ sort-start (* per-row first-group)
+                                 (* extract (min rows (1+ first-group))))))
+                (values groups startup (+ sort-total (* per-row rows) output-cost)))))
+          (let ((startup (+ total (* per-row rows))))
+            (values groups startup (+ startup output-cost)))))))
+
+(defun propagate-explain-plan-estimates (plan)
+  "Propagate row estimates and modeled child costs for EXPLAIN.
+Projection and subquery wrappers carry the input cost until expression CPU
+costs are modeled. Nodes with unmodeled work do not publish a total cost."
+  (labels ((visit (node)
+             (let* ((metadata (gethash node (query-plan-metadata plan)))
+                    (children (mapcar #'visit (physical-plan-node-children node)))
+                    (input (first children)))
+               (multiple-value-bind (rows startup total)
+                   (node-estimates node metadata children input)
+                 (setf (plan-node-metadata-estimated-rows metadata) rows
+                       (plan-node-metadata-estimated-startup-cost metadata) startup
+                       (plan-node-metadata-estimated-cost metadata) total))
+               metadata))
+           (node-estimates (node metadata children input)
+             (let ((rows (and input (plan-node-metadata-estimated-rows input)))
+                   (startup (and input (plan-node-metadata-estimated-startup-cost input)))
+                   (total (and input (plan-node-metadata-estimated-cost input))))
+               (case (first node)
+                 (:result (values 1 0.0d0 0.01d0))
+                 ((:project :subquery-scan) (values rows startup total))
+                 (:with-ctes rows)
+                 (:filter
+                  (explain-scan-filter-estimates
+                   node rows startup total (getf (query-plan-prepared plan) :relations)))
+                 (:nested-loop-join
+                  (explain-nested-loop-estimates node input (second children)
+                                                 (getf (query-plan-prepared plan) :relations)))
+                 (:window-input
+                  (if (every (lambda (key) (member (first key) '(:col :const))) (second node))
+                      (values rows startup total)
+                      rows))
+                 (:window
+                  (let* ((stage (second node))
+                         (table (when (and total (getf stage :sort-required))
+                                  (explain-sort-input-table
+                                   (third node) (getf (query-plan-prepared plan) :relations)))))
+                    (explain-window-cost stage rows startup total table)))
+                 (:hash-aggregate
+                  (explain-hash-aggregate-estimates
+                   node rows total (getf (query-plan-prepared plan) :relations)))
+                 (:sorted-aggregate
+                  (explain-sorted-aggregate-estimates
+                   node rows total (getf (query-plan-prepared plan) :relations)))
+                 (:limit
+                  (when rows
+                    (let ((count (min rows (max 1 (second node)))))
+                      ;; preprocess_limit floors the requested estimate at
+                      ;; one. adjust_limit_rows_costs prorates the run cost.
+                      (values (max 1 count) startup
+                              (when total
+                                (if (plusp rows)
+                                    (+ startup (* (- total startup) (/ count rows)))
+                                    total))))))
+                 ((:sort :top-n)
+                  (when rows
+                    (let* ((limit (and (eq (first node) :top-n) (third node)))
+                           (output-rows (if limit (max 1 (min rows limit)) rows))
+                           (table (and total (not (eql limit 0))
+                                       (every (lambda (key) (member (caar key) '(:col :sort-output)))
+                                              (second node))
+                                       (explain-sort-input-table
+                                        (physical-buffered-node-child node)
+                                        (getf (query-plan-prepared plan) :relations)))))
+                      (if table
+                          (explain-sort-cost total rows output-rows table)
+                          output-rows))))
+                 (:append
+                  ;; cost_append uses the first child's startup cost and
+                  ;; charges half the CPU tuple cost per output row.
+                  (let ((output-rows (sum-child-estimates children #'plan-node-metadata-estimated-rows))
+                        (child-cost (sum-child-estimates children #'plan-node-metadata-estimated-cost)))
+                    (if (and output-rows child-cost)
+                        (values output-rows startup (+ child-cost (* 0.005d0 output-rows)))
+                        output-rows)))
+                 (otherwise
+                  (values (plan-node-metadata-estimated-rows metadata)
+                          (plan-node-metadata-estimated-startup-cost metadata)
+                          (plan-node-metadata-estimated-cost metadata))))))
+           (sum-child-estimates (children accessor)
+             (when (and children (every accessor children))
+               (reduce #'+ children :key accessor))))
+    (visit (query-plan-physical plan))))
+
 (defun finish-query-plan (prepared registered logical physical alternatives)
   "Install one relation domain and metadata map after all child trees are rebased."
   ;; Registration IDs identify relations across local child handles; metadata
@@ -509,12 +863,19 @@ CTE definitions and expression subplans belong to their own plan domains."
         (when (member (first node) '(:seq-scan :index-scan) :test #'eq)
           (let* ((relation (nth (second node) registered))
                  (path (getf relation :path)))
+            (when (and *explain-estimates-p* (not (getf relation :virtual-p)))
+              (multiple-value-bind (cost rows startup)
+                  (select-scan-path-cost (getf relation :table) path)
+                (setf (plan-node-metadata-estimated-rows metadata) (max 1 (round rows))
+                      (plan-node-metadata-estimated-cost metadata) cost
+                      (plan-node-metadata-estimated-startup-cost metadata) startup)))
             (setf (plan-node-metadata-selection-rule metadata)
                   (if (eq (select-scan-path-kind path) :index-scan)
                       (if (select-scan-path-parameter-expr path)
                           :parameterized-equality-index :equality-index)
                       :sequential-fallback))))
         (setf (gethash node (query-plan-metadata plan)) metadata)))
+    (when *explain-estimates-p* (propagate-explain-plan-estimates plan))
     plan))
 
 (defun finish-select-plan-tree (input prepared physical-p)
@@ -854,8 +1215,6 @@ across runs, while preserving the order of equal keys."
                   always (or (null next) (funcall less-p (third run) (second next))))
         ordered))))
 
-(defconstant +query-sort-merge-fan-in+ 32)
-
 (defun make-query-sort-merge-iterator (runs order &key delete-runs-p)
   "Pull stable sort items from runs, keeping one decoded item per input.
 The iterator closes its input streams. DELETE-RUNS-P also removes the run files
@@ -1012,6 +1371,7 @@ is raised only if comparison reaches it."
 
 (defun prepare-select-sort (input order arena limit projected-only-p)
   "Consume INPUT and return an iterator over sorted items.
+The second value names the method selected for this invocation.
 LIMIT bounds the initial top-N collector. If it exceeds the memory budget,
 its retained items become sorted runs and the reader enforces the final limit.
 PROJECTED-ONLY-P stores projected values without row metadata. The caller owns
@@ -1090,24 +1450,24 @@ iterator. In-memory arena items are copied out before the arena is destroyed."
                                              (lambda (left right)
                                                (select-sort-item-less-p left right order)))))
                      (when arena (setf items (copy-query-sort-value items)))
-                     (make-sql-iterator (lambda () (when items (values (pop items) t))))))
+                     (values (make-sql-iterator (lambda () (when items (values (pop items) t))))
+                             (if top-n :top-n-heap :in-memory))))
                  (progn
                    (flush-run)
                    (let* ((ordered (nreverse runs))
                           (disjoint (disjoint-query-sort-runs ordered (cdar order))))
                      (if disjoint
-                         (make-disjoint-query-sort-iterator disjoint)
+                         (values (make-disjoint-query-sort-iterator disjoint) :external-runs)
                          (let ((paths (mapcar #'first ordered))
                                ;; Allow two inputs even if a single row exceeds work_mem.
                                (fan-in (min +query-sort-merge-fan-in+
                                             (max 2 (floor memory-limit max-item-bytes)))))
                            (loop while (> (length paths) fan-in)
                                  do (setf paths (merge-query-sort-run-pass paths order fan-in)))
-                           (make-query-sort-merge-iterator paths order :delete-runs-p t)))))))
+                           (values (make-query-sort-merge-iterator paths order :delete-runs-p t)
+                                   :external-merge)))))))
         (setf buffer nil)))))
 
-(defparameter +hash-aggregate-partition-count+ 16)
-(defparameter +hash-aggregate-entry-overhead-bytes+ 128)
 (defparameter +hash-aggregate-max-partition-depth+ 8)
 
 (defun hash-aggregate-group (group-keys environment)
@@ -1215,8 +1575,7 @@ returned overflow file and processes it after the in-memory groups."
                       (incf spill-count))
                      (t
                       (let ((entry-size
-                              (+ +hash-aggregate-entry-overhead-bytes+
-                                 (query-spill-record-size (list key values (datum-origins-for-spill origins))))))
+                              (hash-aggregate-entry-size key values origins)))
                         (when (and group-keys group-order
                                    (> (+ memory-used entry-size) memory-limit))
                           (start-spill))
@@ -1812,8 +2171,10 @@ Only this node can discard source rows and their metadata during sorting.")
 (defun reset-query-plan-instrumentation (metadata-map)
   (maphash (lambda (node metadata)
              (declare (ignore node))
-             (setf (plan-node-metadata-actual-rows metadata) nil
-                   (plan-node-metadata-actual-row-count metadata) 0
+             (setf (plan-node-metadata-actual-row-count metadata) 0
+                   (plan-node-metadata-filtered-row-count metadata) 0
+                   (plan-node-metadata-resources metadata) nil
+                   (plan-node-metadata-sort-methods metadata) nil
                    (plan-node-metadata-actual-loops metadata) 0
                    (plan-node-metadata-actual-startup-time-ticks metadata) 0
                    (plan-node-metadata-actual-total-time-ticks metadata) 0))
@@ -2054,6 +2415,95 @@ projection or filter forms fall back to ordinary full materialization."
 (defun plan-node-average-time-ms (ticks loops)
   (internal-time-ticks->milliseconds (/ ticks loops)))
 
+(defun map-explain-dependent-plans (function plan relations)
+  "Visit each separately planned expression subquery and CTE in display order."
+  (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
+    (labels ((visit (child relationship label)
+               (let ((child-relations (subquery-registered-relations child)))
+                 (reconcile-query-plan-access-paths child child-relations)
+                 (funcall function child child-relations relationship label))))
+      (loop for descriptor in (query-plan-expression-subplans plan)
+            for number from 1
+            for kind = (sql-subplan-kind descriptor)
+            for relationship = (if (and (member kind '(:scalar :exists :array))
+                                        (not (member 1 (sql-subplan-depths descriptor))))
+                                   "InitPlan" "SubPlan")
+            do (visit (sql-subplan-plan descriptor) relationship
+                      (format nil "~a ~d (~a)" relationship number
+                              (string-downcase (symbol-name kind)))))
+      (dolist (definition (query-plan-cte-definitions plan))
+        (when (sql-cte-shared-p definition)
+          (visit (sql-cte-plan definition) "InitPlan"
+                 (format nil "CTE ~a (shared)" (sql-cte-name definition)))))
+      (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
+        (when (eq (first node) :cte-scan)
+          (let* ((relation (physical-scan-relation node relations))
+                 (reference (getf relation :cte-reference-plan)))
+            (when reference
+              (visit reference "SubPlan"
+                     (format nil "CTE ~a (per reference)"
+                             (sql-cte-name (getf relation :cte)))))))))))
+
+(defun explain-plan-shape-id (plan relations)
+  "Identify an admitted physical tree by node kinds, scan objects and join shape."
+  (labels ((node-shape (node)
+             (let ((kind (first node)))
+               (list kind
+                     (case kind
+                       (:seq-scan (third node))
+                       (:index-scan (list (third node) (fourth node)))
+                       (:nested-loop-join (getf (second node) :type)))
+                     (mapcar #'node-shape (physical-plan-node-children node)))))
+           (plan-shape (current registered)
+             (let ((dependent nil))
+               (map-explain-dependent-plans
+                (lambda (child child-relations relationship label)
+                  (declare (ignore label))
+                  (push (list relationship (plan-shape child child-relations)) dependent))
+                current registered)
+               (list (node-shape (query-plan-physical current)) (nreverse dependent)))))
+    (statement-shape-id (cons :physical-plan (plan-shape plan relations)) 1)))
+
+(defun explain-filter-count-label (node)
+  (case (first node)
+    (:filter "Rows Removed by Filter")
+    (:nested-loop-join "Rows Removed by Join Filter")))
+
+(defun write-explain-resource-usage (stream usage json-p)
+  "Write native storage and spill counters at a query or plan-node boundary."
+  (let ((reads (statement-resource-usage-relation-reads usage))
+        (hits (statement-resource-usage-clean-cache-hits usage))
+        (writes (statement-resource-usage-relation-writes usage))
+        (spill-reads (statement-resource-usage-spill-read-bytes usage))
+        (spill-writes (statement-resource-usage-spill-written-bytes usage))
+        (wal-records (statement-resource-usage-wal-records usage))
+        (wal-bytes (statement-resource-usage-wal-bytes usage)))
+    (if json-p
+        (format stream ",\"Native Relation Reads\":~d,\"Native Clean Cache Hits\":~d,~
+                        \"Native Relation Writes\":~d,\"Native Spill Read Bytes\":~d,~
+                        \"Native Spill Written Bytes\":~d,\"Native WAL Records\":~d,\"Native WAL Bytes\":~d"
+                reads hits writes spill-reads spill-writes wal-records wal-bytes)
+        (format stream
+                "Native Buffers: relation reads=~d clean cache hits=~d relation writes=~d spill read bytes=~d spill written bytes=~d WAL records=~d WAL bytes=~d"
+                reads hits writes spill-reads spill-writes wal-records wal-bytes))))
+
+(defun write-explain-sort-methods (stream methods json-p)
+  "Report the native sort methods seen across this node's executions."
+  (flet ((label (method)
+           (ecase method
+             (:in-memory "in-memory stable sort")
+             (:top-n-heap "top-N heap")
+             (:external-runs "external run concatenation")
+             (:external-merge "external merge")))
+         (disk-p (method) (member method '(:external-runs :external-merge))))
+    (let ((name (format nil "~{~a~^, ~}" (mapcar #'label methods)))
+          (space (cond ((every #'disk-p methods) "Disk")
+                       ((some #'disk-p methods) "Mixed")
+                       (t "Memory"))))
+      (if json-p
+          (format stream ",\"Sort Method\":~s,\"Sort Space Type\":~s" name space)
+          (format stream "Sort Method: ~a  Space Type: ~a" name space)))))
+
 (defun format-query-plan (plan &optional registered-relations analyze-p
                                  execution-time nested-p)
   "Format the selected physical tree for EXPLAIN, with run stats if requested."
@@ -2064,67 +2514,65 @@ projection or filter forms fall back to ordinary full materialization."
                  (format stream "~a~a"
                          (make-string (* depth 2) :initial-element #\Space)
                          (physical-plan-node-label node relations))
+                 (let* ((metadata (gethash node (query-plan-metadata plan)))
+                        (estimated (and metadata (plan-node-metadata-estimated-rows metadata))))
+                   (when estimated
+                     (let ((cost (plan-node-metadata-estimated-cost metadata)))
+                       (if cost
+                           (format stream " (cost=~,2f..~,2f rows=~d)"
+                                   (plan-node-metadata-estimated-startup-cost metadata) cost estimated)
+                           (format stream " (rows=~d)" estimated)))))
                  (when analyze-p
                    (let* ((metadata (gethash node
                                              (query-plan-metadata plan)))
                           (loops (and metadata
                                       (plan-node-metadata-actual-loops metadata))))
-                     (if (and loops (plusp loops))
-                         (format stream
-                                 " (actual time=~,3f..~,3f rows=~,2f loops=~d)"
-                                 (plan-node-average-time-ms
-                                  (plan-node-metadata-actual-startup-time-ticks
-                                   metadata)
-                                  loops)
-                                 (plan-node-average-time-ms
-                                  (plan-node-metadata-actual-total-time-ticks
-                                   metadata)
-                                  loops)
-                                 (float
-                                  (plan-node-metadata-actual-rows metadata)
-                                  1.0d0)
+                     (cond
+                       ((not (and loops (plusp loops)))
+                        (write-string " (never executed)" stream))
+                       ((eq *query-plan-instrumentation-p* :rows)
+                        (format stream " (actual rows=~,2f loops=~d)"
+                                (float (plan-node-metadata-actual-rows metadata) 1.0d0)
+                                loops))
+                       (t
+                        (format stream
+                                " (actual time=~,3f..~,3f rows=~,2f loops=~d)"
+                                (plan-node-average-time-ms
+                                 (plan-node-metadata-actual-startup-time-ticks
+                                  metadata)
                                  loops)
-                         (write-string " (never executed)" stream))))
+                                (plan-node-average-time-ms
+                                 (plan-node-metadata-actual-total-time-ticks
+                                  metadata)
+                                 loops)
+                                (float
+                                 (plan-node-metadata-actual-rows metadata)
+                                 1.0d0)
+                                loops)))
+                     (let ((label (explain-filter-count-label node)))
+                       (when (and label loops (plusp loops)
+                                  (plusp (plan-node-metadata-filtered-row-count metadata)))
+                         (format stream " (~a: ~d)" label
+                                 (round (plan-node-metadata-filtered-row-count metadata) loops))))
+                     (when (and metadata (plan-node-metadata-sort-methods metadata))
+                       (format stream "~%~v@T" (+ 2 (* depth 2)))
+                       (write-explain-sort-methods stream (plan-node-metadata-sort-methods metadata) nil))
+                     (when (and metadata (plan-node-metadata-resources metadata))
+                       (format stream "~%~v@T" (+ 2 (* depth 2)))
+                       (write-explain-resource-usage stream (plan-node-metadata-resources metadata) nil))))
                  (dolist (child (physical-plan-node-children node))
                    (terpri stream)
                    (print-node child (1+ depth)))))
         (print-node (query-plan-physical plan) 0)
-        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
-          (loop for descriptor in (query-plan-expression-subplans plan) for number from 1
-                for child = (sql-subplan-plan descriptor)
-                for child-relations = (subquery-registered-relations child)
-                do (reconcile-query-plan-access-paths child child-relations)
-                   (format stream "~%  ~a ~d (~a)"
-                           (if (and (member (sql-subplan-kind descriptor) '(:scalar :exists :array))
-                                    (not (member 1 (sql-subplan-depths descriptor))))
-                               "InitPlan" "SubPlan")
-                           number (string-downcase (symbol-name (sql-subplan-kind descriptor))))
-                   (dolist (line (uiop:split-string
-                                  (format-query-plan child child-relations analyze-p nil t)
-                                  :separator (string #\Newline)))
-                     (format stream "~%    ~a" line))))
-        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
-          (dolist (definition (remove-if-not #'sql-cte-shared-p (query-plan-cte-definitions plan)))
-            (format stream "~%  CTE ~a (~a)" (sql-cte-name definition)
-                    (if (sql-cte-shared-p definition) "shared" "per reference"))
-            (dolist (line (uiop:split-string
-                           (format-query-plan (sql-cte-plan definition)
-                                              (subquery-registered-relations (sql-cte-plan definition))
-                                              analyze-p nil t)
-                           :separator (string #\Newline)))
-              (format stream "~%    ~a" line))))
-        (let ((*subquery-registered-relations* (or *subquery-registered-relations* relations)))
-          (dolist (node (collect-query-plan-nodes (query-plan-physical plan)))
-            (when (eq (first node) :cte-scan)
-              (let* ((relation (physical-scan-relation node relations))
-                     (reference (getf relation :cte-reference-plan)))
-                (when reference
-                  (format stream "~%  CTE ~a (per reference)" (sql-cte-name (getf relation :cte)))
-                  (dolist (line (uiop:split-string
-                                 (format-query-plan reference (subquery-registered-relations reference)
-                                                    analyze-p nil t)
-                                 :separator (string #\Newline)))
-                    (format stream "~%    ~a" line)))))))
+        (map-explain-dependent-plans
+         (lambda (child child-relations relationship label)
+           (declare (ignore relationship))
+           (format stream "~%  ~a" label)
+           (dolist (line (uiop:split-string
+                          (format-query-plan child child-relations analyze-p nil t)
+                          :separator (string #\Newline)))
+             (format stream "~%    ~a" line)))
+         plan relations)
         (when (and analyze-p (not nested-p))
           (terpri stream)
           (format stream "Execution Time: ~,3f ms" (or execution-time 0.0d0)))))))
@@ -2142,24 +2590,40 @@ Compare the advertised column shape, independently of result format codes."
     (ereport "0A000" "cached plan must not change result type"))
   columns)
 
-(defun prepare-select-result (ast)
-  "Plan AST and derive the wire descriptor from its final output targets."
-  (let* ((plan (plan-select-query ast))
+(defun prepare-select-result (ast &optional prepared)
+  "Plan AST or its analyzed query and derive the final wire descriptor."
+  (let* ((plan (if prepared (plan-prepared-select prepared) (plan-select-query ast)))
          (targets (getf (query-plan-prepared plan) :targets)))
     (values plan targets (mapcar #'target->result-column targets))))
 
 (defun exec-perform (ast)
-  "Execute a SELECT for its effects and report whether it returned any rows."
-  (let ((plan (plan-select-query ast))
-        (found-p nil))
-    (flet ((discard-row (row)
-             (declare (ignore row))
-             (check-for-interrupts)
-             (setf found-p t)))
-      (call-with-admitted-select-plan
-       plan (lambda (registered)
-              (map-query-plan-rows plan registered #'discard-row))))
-    found-p))
+  "Execute a SELECT for effects and return the PL/pgSQL FOUND value."
+  (multiple-value-bind (store toplevel) (statement-tracking-store)
+    (multiple-value-bind (plan observation)
+        (if store
+            (with-statement-planning ((prepared (prepare-select ast))
+                                      (query-id (statement-select-fingerprint prepared))
+                                      ((plan) (plan-prepared-select prepared))
+                                      ticks (statement-track-planning-p))
+              (values plan (begin-planned-statement-observation
+                            store toplevel query-id ticks (getf ast :normalized-statement-text))))
+            (plan-select-query ast))
+      (let ((rows 0))
+        (flet ((discard-row (row)
+                 (declare (ignore row))
+                 (check-for-interrupts)
+                 (incf rows)
+                 nil))
+          (call-with-statement-execution-slice
+           observation
+           (lambda ()
+             (call-with-admitted-select-plan
+              plan (lambda (registered)
+                     (map-query-plan-rows plan registered #'discard-row))))))
+        (when observation
+          (setf (statement-observation-rows observation) rows)
+          (finish-statement-observation observation :success))
+        (plusp rows)))))
 
 (defun copy-write-frame (stream type payload)
   "A partially transmitted COPY frame must close rather than interleave an error."
@@ -2222,31 +2686,187 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
       (copy-write-frame stream #\c #())
       count)))
 
+(defun write-explain-json-node-identity (stream node relations)
+  "Write structural scan names separately from their catalog object names."
+  (let ((kind (first node)))
+    (case kind
+      ((:seq-scan :index-scan)
+       (let* ((relation (physical-scan-relation node relations))
+              (table (getf relation :table))
+              (index-p (eq kind :index-scan)))
+         (format stream "~s:~s,~s:~a"
+                 "Node Type" (if index-p "Index Scan" "Seq Scan")
+                 "Relation Name" (sql-typed-to-json :text (pg-class-name table)))
+         (when index-p
+           (format stream ",~s:~a" "Index Name"
+                   (sql-typed-to-json
+                    :text (pg-index-name (select-scan-path-index
+                                          (physical-scan-path node relation))))))))
+      ((:cte-scan :worktable-scan :subquery-scan)
+       (let* ((relation (physical-scan-relation node relations))
+              (node-type (ecase kind
+                           (:cte-scan "CTE Scan")
+                           (:worktable-scan "WorkTable Scan")
+                           (:subquery-scan "Subquery Scan")))
+              (cte (getf relation :cte))
+              (alias (getf relation :alias)))
+         (format stream "~s:~s" "Node Type" node-type)
+         (when cte
+           (format stream ",~s:~a" "CTE Name" (sql-typed-to-json :text (sql-cte-name cte))))
+         (when alias
+           (format stream ",~s:~a" "Alias" (sql-typed-to-json :text alias)))))
+      (:nested-loop-join
+       (let ((join-type (getf (second node) :type)))
+         (format stream "~s:~s,~s:~s" "Node Type" "Nested Loop" "Join Type"
+                 (if (eq join-type :cross) "Inner" (string-capitalize (symbol-name join-type))))))
+      (otherwise
+       (format stream "~s:~a" "Node Type"
+               (sql-typed-to-json :text (physical-plan-node-label node relations)))))))
+
+(defun format-query-plan-json (plan relations analyze-p timing-p execution-time &optional planning-time resources query-id temp-peak)
+  "Encode the selected physical plan and its available execution statistics."
+  (with-output-to-string (stream)
+    (labels ((write-node (node plan relations &optional root-p relationship label)
+               (write-char #\{ stream)
+               (write-explain-json-node-identity stream node relations)
+               (when relationship
+                 (format stream ",~s:~a" "Parent Relationship" (sql-typed-to-json :text relationship)))
+               (when label
+                 (format stream ",~s:~a" "Subplan Name" (sql-typed-to-json :text label)))
+               (let* ((metadata (gethash node (query-plan-metadata plan)))
+                      (estimated (and metadata (plan-node-metadata-estimated-rows metadata))))
+                 (when estimated
+                   (let ((cost (plan-node-metadata-estimated-cost metadata)))
+                     (when cost
+                       (format stream ",\"Startup Cost\":~,2f,\"Total Cost\":~,2f"
+                               (plan-node-metadata-estimated-startup-cost metadata) cost)))
+                   (format stream ",\"Plan Rows\":~d" estimated)))
+               (when analyze-p
+                 (let* ((metadata (gethash node (query-plan-metadata plan)))
+                        (loops (if metadata (plan-node-metadata-actual-loops metadata) 0))
+                        (rows (if (plusp loops) (plan-node-metadata-actual-rows metadata) 0)))
+                   (format stream ",~s:~,2f,~s:~d" "Actual Rows" (float rows 1.0d0)
+                           "Actual Loops" loops)
+                   ;; Native B-tree quals are exact. Heap visibility skips are
+                   ;; not failures of an index predicate recheck.
+                   (when (and (eq (first node) :index-scan) (fifth node))
+                     (write-string ",\"Rows Removed by Index Recheck\":0" stream))
+                   (let ((label (explain-filter-count-label node)))
+                     (when label
+                       (format stream ",~s:~d" label
+                               (if (plusp loops)
+                                   (round (plan-node-metadata-filtered-row-count metadata) loops)
+                                   0))))
+                   (when (and metadata (plan-node-metadata-sort-methods metadata))
+                     (write-explain-sort-methods stream (plan-node-metadata-sort-methods metadata) t))
+                   (when (and metadata (plan-node-metadata-resources metadata))
+                     (write-explain-resource-usage stream (plan-node-metadata-resources metadata) t))
+                   (when timing-p
+                     (format stream ",~s:~,3f,~s:~,3f"
+                             "Actual Startup Time"
+                             (if (plusp loops)
+                                 (plan-node-average-time-ms
+                                  (plan-node-metadata-actual-startup-time-ticks metadata) loops)
+                                 0.0d0)
+                             "Actual Total Time"
+                             (if (plusp loops)
+                                 (plan-node-average-time-ms
+                                  (plan-node-metadata-actual-total-time-ticks metadata) loops)
+                                 0.0d0)))))
+               (let ((opened-p nil))
+                 (flet ((write-child (child child-plan child-relations
+                                      &optional child-root-p child-relationship child-label)
+                          (if opened-p
+                              (write-char #\, stream)
+                              (progn
+                                (format stream ",~s:[" "Plans")
+                                (setf opened-p t)))
+                          (write-node child child-plan child-relations
+                                      child-root-p child-relationship child-label)))
+                   (loop for child in (physical-plan-node-children node)
+                         for position from 0
+                         for role = (cond ((eq (first node) :append) "Member")
+                                          ((eq (first node) :subquery-scan) "Subquery")
+                                          ((zerop position) "Outer")
+                                          ((= position 1) "Inner"))
+                         do (write-child child plan relations nil role))
+                   (when root-p
+                     (map-explain-dependent-plans
+                      (lambda (child-plan child-relations child-relationship child-label)
+                        (write-child (query-plan-physical child-plan) child-plan child-relations
+                                     t child-relationship child-label))
+                      plan relations)))
+                 (when opened-p (write-char #\] stream)))
+               (write-char #\} stream)))
+      (format stream "[{~s:" "Plan")
+      (write-node (query-plan-physical plan) plan relations t)
+      (when query-id
+        (format stream ",\"Query Identifier\":~d,\"Plan Identifier\":~d"
+                query-id (explain-plan-shape-id plan relations)))
+      (when planning-time
+        (format stream ",~s:~,3f" "Planning Time" planning-time))
+      (when analyze-p
+        (format stream ",~s:~,3f" "Execution Time" execution-time))
+      (when resources
+        (write-explain-resource-usage stream resources t))
+      (when temp-peak
+        (format stream ",\"Native Peak Temp Bytes\":~d" temp-peak))
+      (write-string "}]" stream))))
+
 (defun exec-explain (stream ast)
-  (let* ((plan (plan-select-query (getf ast :statement)))
-         (analyze-p (getf ast :analyze-p))
+  (let* ((analyze-p (getf ast :analyze-p))
+         (timing-p (getf ast :timing-p t))
+         (json-p (eq (getf ast :format) :json))
+         (planning-start (when (and analyze-p json-p) (get-internal-real-time)))
+         (resources (when (getf ast :buffers-p) (make-statement-resource-usage)))
+         (query-id nil)
+         (plan (let ((*statement-resource-usage* (if analyze-p *statement-resource-usage* resources))
+                     (*explain-estimates-p* (getf ast :costs-p json-p)))
+                 (if (and json-p *statement-statistics-store*)
+                     (let ((prepared (prepare-select (getf ast :statement))))
+                       (setf query-id (statement-select-fingerprint prepared))
+                       (plan-prepared-select prepared))
+                     (plan-select-query (getf ast :statement)))))
+         (planning-time (when planning-start
+                          (internal-time-ticks->milliseconds
+                           (- (get-internal-real-time) planning-start))))
+         (*query-plan-instrumentation-p* (and analyze-p (if timing-p t :rows)))
          (description nil)
+         (temp-peak nil)
          (execution-time 0.0d0))
     (labels ((prepare-explain (registered)
                (when analyze-p
-                 (let ((started (get-internal-real-time)))
-                   (let ((*query-plan-instrumentation-p* t))
-                     (map-query-plan-rows
-                      plan registered
-                      (lambda (row)
-                        (declare (ignore row))
-                        nil)))
+                 (let ((started (get-internal-real-time))
+                       (*statement-resource-usage* (or resources *statement-resource-usage*))
+                       (*query-temp-space-sample* (when resources (make-query-temp-space-sample))))
+                   (map-query-plan-rows
+                    plan registered
+                    (lambda (row)
+                      (declare (ignore row))
+                      nil)
+                    :projected-only-p t)
                    (setf execution-time
                          (internal-time-ticks->milliseconds
-                          (- (get-internal-real-time) started)))))
+                          (- (get-internal-real-time) started))
+                         temp-peak (when *query-temp-space-sample*
+                                     (query-temp-space-sample-peak-bytes *query-temp-space-sample*)))))
                (setf description
-                     (format-query-plan plan registered analyze-p
-                                        execution-time))))
+                     (if json-p
+                         (format-query-plan-json plan registered analyze-p timing-p
+                                                 execution-time planning-time resources query-id temp-peak)
+                         (let ((text (format-query-plan plan registered analyze-p execution-time)))
+                           (if resources
+                               (with-output-to-string (output)
+                                 (write-line text output)
+                                 (write-explain-resource-usage output resources nil)
+                                 (when temp-peak
+                                   (format output "~%Native Peak Temp Bytes: ~d" temp-peak)))
+                               text))))))
       (call-with-admitted-select-plan plan #'prepare-explain))
     (send-row-description
      stream
      (list (make-result-column :name "QUERY PLAN"
-                               :type-oid +textoid+
+                               :type-oid (if json-p (type-oid :json) +textoid+)
                                :typlen -1
                                :typmod -1)))
     (send-data-row-text stream (list description))

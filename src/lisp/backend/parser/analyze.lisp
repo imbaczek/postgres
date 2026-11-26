@@ -571,6 +571,18 @@
                    (make-scalar-builtin :name "pg_stat_get_activity" :argument-types '(:int4) :result-type '(:record . +activity-result-fields+)
                                         :volatility :stable :implicit-arguments-p t
                                         :evaluator '(:iterator make-activity-result-iterator))
+                   (make-scalar-builtin :name "pg_stat_statements" :argument-types '(:bool)
+                                        :result-type '(:record . +statement-statistics-result-fields+)
+                                        :volatility :volatile :strict-p t
+                                        :evaluator '(:iterator make-statement-statistics-result-iterator))
+                   (make-scalar-builtin :name "pg_stat_statements_info"
+                                        :result-type '(:record . +statement-statistics-info-fields+)
+                                        :volatility :volatile
+                                        :evaluator '(:iterator make-statement-statistics-info-iterator))
+                   (make-named-volatile-builtin
+                    "pg_stat_statements_reset"
+                    '(("userid" :oid 0) ("dbid" :oid 0) ("queryid" :int8 0) ("minmax_only" :bool nil))
+                    :timestamptz 'sql-statement-statistics-reset)
                    (make-scalar-builtin :name "pg_stat_get_wal_receiver" :result-type '(:record . +wal-receiver-result-fields+)
                                         :volatility :stable :evaluator 'wal-receiver-result)
                    (make-scalar-builtin :name "pg_control_checkpoint" :result-type '(:record . +control-checkpoint-result-fields+)
@@ -2935,7 +2947,7 @@ checks still apply."
                       (setf position (length calls))
                       (vector-push-extend form calls))
                     (list :col (+ input-width position 1) :type (expr-type form)
-                          :typmod -1 :table-oid 0 :attnum 0)))
+                          :typmod -1 :table-oid 0 :attnum 0 :set-function-expression form)))
                  ((member (first form) '(:subplan :outer-ref)) form)
                  (t (map-local-expression-operands
                      (lambda (operand) (lift operand reuse-p)) form)))))

@@ -88,6 +88,27 @@
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
 
+(rove:deftest test-scan-prefilters-before-full-deformation
+    (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
+                            (make-pg-column :name "payload" :type :text :attnum 2)))
+           (page (page-init (make-page)))
+           (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (screened nil)
+           (seen nil))
+      (loop for (key visibility) in (list (list 2 100) (list +null+ +frozen-xid+)
+                                          (list 3 +frozen-xid+) (list 2 +frozen-xid+))
+            do (page-add-item page (form-heap-tuple (vector key "payload") columns visibility 0 0 0 0)))
+      (heapam-scan-page page 0 columns snapshot
+                        (lambda (tuple)
+                          (push (list (htup-offnum tuple) (coerce (htup-values tuple) 'list)) seen))
+                        (lambda (values)
+                          (push (coerce values 'list) screened)
+                          (eql (aref values 0) 2))
+                        0)
+      (rove:ok (equal (nreverse screened)
+                      (list (list +null+ +null+) (list 3 +null+) (list 2 +null+))))
+      (rove:ok (equal seen '((4 (2 "payload")))))))
+
 (rove:deftest test-visible-heap-page-iterator-decodes-only-when-pulled
     (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
            (hidden (form-heap-tuple (vector "hidden") columns 100 0 0 0 0))

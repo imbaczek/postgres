@@ -1307,15 +1307,12 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
 (defun wal-open-output (segment)
   (unless (eql segment *wal-output-segment*)
     (when *wal-output-stream*
-      (finish-output *wal-output-stream*)
       ;; Rotation can happen in the middle of a commit batch. Make every
       ;; previous segment and its directory entry durable before opening a
       ;; later segment. The final segment is flushed once the batch's
       ;; commit/catalog record has been appended.
-      (fsync-stream *wal-output-stream*)
-      (when *wal-new-segments*
-        (fsync-directory (wal-directory))
-        (setf *wal-new-segments* '()))
+      (wal-sync-output-bytes *wal-output-stream* *wal-new-segments*)
+      (setf *wal-new-segments* nil)
       (close *wal-output-stream*)
       (setf *wal-output-stream* nil))
     (wal-note-primary-archive-rotation segment)
@@ -1330,6 +1327,7 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
   *wal-output-stream*)
 
 (defun wal-append-record (type xid payload)
+  (declare (ftype function call-with-backend-io-wait))
   (pg.wal-publication:wal-check-publication-append)
   (wal-require-ordinary-record-type type)
   (wal-check-healthy)
@@ -1342,16 +1340,26 @@ during cleanup, and keep backend termination from replacing a latched WAL failur
              (stream (wal-open-output segment)))
         (unless (= (or (file-position stream) offset) offset)
           (error "WAL segment ~a is not positioned at offset ~a" segment offset))
-        (write-sequence record stream)
+        (call-with-backend-io-wait :wal-write (lambda () (write-sequence record stream)))
         (setf *wal-end-lsn* (+ start length))
+        (when *statement-resource-usage*
+          (incf (statement-resource-usage-wal-records *statement-resource-usage*))
+          (incf (statement-resource-usage-wal-bytes *statement-resource-usage*) length))
         *wal-end-lsn*)
     (error (condition)
       (wal-fail-stop condition))))
 
 (defun wal-sync-output-bytes (stream sync-names)
   "Make WAL bytes/names durable without advancing any control-file claim."
-  (when stream (finish-output stream) (fsync-stream stream))
-  (when sync-names (fsync-directory (wal-directory))))
+  (declare (ftype function call-with-backend-io-wait))
+  (when stream
+    (call-with-backend-io-wait :wal-write (lambda () (finish-output stream))))
+  (when (or stream sync-names)
+    (call-with-backend-io-wait
+     :wal-sync
+     (lambda ()
+       (when stream (fsync-stream stream))
+       (when sync-names (fsync-directory (wal-directory)))))))
 
 (declaim (ftype function notify-primary-wal-writer-async-under-lock))
 

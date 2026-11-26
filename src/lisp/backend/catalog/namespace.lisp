@@ -525,10 +525,74 @@ synchronous_commit. Reject unsupported parameters and other local settings."
   (%make-sql-system-relation-descriptor
    oid name kind rows fields (reduce #'max fields :key #'fourth)))
 
+(defparameter +sql-statement-statistics-fields+
+  '(("userid" :oid t 1) ("dbid" :oid t 2) ("toplevel" :bool t 3)
+    ("queryid" :int8 nil 4) ("query" :text nil 5) ("plans" :int8 t 6)
+    ("total_plan_time" :float8 t 7) ("min_plan_time" :float8 t 8)
+    ("max_plan_time" :float8 t 9) ("mean_plan_time" :float8 t 10)
+    ("stddev_plan_time" :float8 t 11) ("calls" :int8 t 12)
+    ("total_exec_time" :float8 t 13) ("min_exec_time" :float8 t 14)
+    ("max_exec_time" :float8 t 15) ("mean_exec_time" :float8 t 16)
+    ("stddev_exec_time" :float8 t 17) ("rows" :int8 t 18)
+    ("shared_blks_hit" :int8 nil 19) ("shared_blks_read" :int8 nil 20)
+    ("shared_blks_dirtied" :int8 nil 21) ("shared_blks_written" :int8 nil 22)
+    ("local_blks_hit" :int8 nil 23) ("local_blks_read" :int8 nil 24)
+    ("local_blks_dirtied" :int8 nil 25) ("local_blks_written" :int8 nil 26)
+    ("temp_blks_read" :int8 nil 27) ("temp_blks_written" :int8 nil 28)
+    ("shared_blk_read_time" :float8 nil 29) ("shared_blk_write_time" :float8 nil 30)
+    ("local_blk_read_time" :float8 nil 31) ("local_blk_write_time" :float8 nil 32)
+    ("temp_blk_read_time" :float8 nil 33) ("temp_blk_write_time" :float8 nil 34)
+    ("wal_records" :int8 nil 35) ("wal_fpi" :int8 nil 36) ("wal_bytes" :numeric nil 37)
+    ("wal_buffers_full" :int8 nil 38)
+    ("jit_functions" :int8 nil 39) ("jit_generation_time" :float8 nil 40)
+    ("jit_inlining_count" :int8 nil 41) ("jit_inlining_time" :float8 nil 42)
+    ("jit_optimization_count" :int8 nil 43) ("jit_optimization_time" :float8 nil 44)
+    ("jit_emission_count" :int8 nil 45) ("jit_emission_time" :float8 nil 46)
+    ("jit_deform_count" :int8 nil 47) ("jit_deform_time" :float8 nil 48)
+    ("parallel_workers_to_launch" :int8 nil 49) ("parallel_workers_launched" :int8 nil 50)
+    ("generic_plan_calls" :int8 nil 51) ("custom_plan_calls" :int8 nil 52)
+    ("stats_since" :timestamptz t 53) ("minmax_stats_since" :timestamptz t 54)))
+
+(defparameter +statement-statistics-result-fields+
+  (mapcar (lambda (field) (list (first field) (second field)))
+          +sql-statement-statistics-fields+))
+
+(defparameter +statement-statistics-info-fields+
+  '(("dealloc" :int8) ("stats_reset" :timestamptz)))
+
+(defparameter +sql-activity-view-fields+
+  '(("datname" :name nil 2) ("pid" :int4 t 3)
+    ("usesysid" :oid nil 5) ("usename" :name nil 6)
+    ("application_name" :text t 7)
+    ("xact_start" :timestamptz nil 12) ("query_start" :timestamptz nil 13)
+    ("state_change" :timestamptz nil 14)
+    ("wait_event_type" :text nil 15) ("wait_event" :text nil 16) ("state" :text nil 17)
+    ("query_id" :int8 nil 20) ("query" :text nil 21) ("backend_type" :text t 22)))
+
 (defparameter +sql-system-relations+
   ;; Catalog OIDs and original attribute numbers follow the pinned C tree.
   ;; The sequence view OID is from that tree's unmodified initdb catalog.
   (list
+   (make-sql-system-relation-descriptor 15990 "pg_stat_statements" #\v
+                                        'sql-statement-statistics-rows
+                                        +sql-statement-statistics-fields+)
+   (make-sql-system-relation-descriptor
+    15991 "pg_stat_statements_info" #\v 'sql-statement-statistics-info-rows
+    '(("dealloc" :int8 t 1) ("stats_reset" :timestamptz nil 2)))
+   (make-sql-system-relation-descriptor 15992 "pg_stat_activity" #\v
+                                        'sql-activity-view-rows +sql-activity-view-fields+)
+   (make-sql-system-relation-descriptor
+    15993 "pg_stat_statements_resources" #\v 'sql-statement-statistics-resource-rows
+    '(("userid" :oid t 1) ("dbid" :oid t 2) ("toplevel" :bool t 3)
+      ("queryid" :int8 nil 4) ("relation_reads" :int8 t 5)
+      ("clean_cache_hits" :int8 t 6) ("relation_writes" :int8 t 7)
+      ("spill_read_bytes" :int8 t 8) ("spill_written_bytes" :int8 t 9)
+      ("wal_records" :int8 t 10) ("wal_bytes" :int8 t 11)
+      ("execution_errors" :int8 t 12) ("execution_cancellations" :int8 t 13)))
+   (make-sql-system-relation-descriptor
+    15994 "pg_lisp_runtime_stats" #\v 'sql-lisp-runtime-stats-rows
+    '(("gc_cpu_time_ms" :float8 t 1) ("allocated_bytes" :int8 t 2)
+      ("dynamic_heap_bytes" :int8 t 3) ("build_revision" :text nil 4)))
    (make-sql-system-relation-descriptor 12109 "pg_settings" #\v
                                         'startup-settings-rows +sql-settings-fields+)
    (make-sql-system-relation-descriptor 1260 "pg_authid" #\r 'sql-authid-rows
@@ -579,6 +643,181 @@ synchronous_commit. Reject unsupported parameters and other local settings."
 (defun sql-system-row-source (table)
   (let ((descriptor (sql-system-relation-definition (pg-class-oid table))))
     (when descriptor (sql-system-relation-descriptor-rows descriptor))))
+
+(defun write-sql-statement-phase (row offset phase)
+  (let ((count (statement-phase-statistics-count phase)))
+    (setf (aref row offset) count
+          (aref row (+ offset 1)) (statement-phase-statistics-total phase)
+          (aref row (+ offset 2)) (statement-phase-statistics-minimum phase)
+          (aref row (+ offset 3)) (statement-phase-statistics-maximum phase)
+          (aref row (+ offset 4)) (statement-phase-statistics-mean phase)
+          (aref row (+ offset 5))
+          (if (> count 1)
+              (sqrt (/ (max 0.0d0 (statement-phase-statistics-m2 phase)) count))
+              0.0d0))))
+
+(defun sql-lisp-runtime-stats-rows ()
+  "Sample process-wide SBCL counters without running a collection."
+  (let ((revision (startup-setting-show-value "pg_lisp.build_revision")))
+    (list (vector (internal-time-ticks->milliseconds sb-ext:*gc-run-time*)
+                  (sb-ext:get-bytes-consed)
+                  (sb-kernel:dynamic-usage)
+                  (if (and revision (plusp (length revision))) revision +null+)))))
+
+(defun sql-statement-statistics-info-rows ()
+  (let ((store *statement-statistics-store*))
+    (when store
+      (multiple-value-bind (evictions reset-time) (statement-statistics-info store)
+        (list (vector evictions (or reset-time +null+)))))))
+
+(defun make-statement-statistics-info-iterator ()
+  (make-status-record-iterator +statement-statistics-info-fields+
+                               (sql-statement-statistics-info-rows)))
+
+(defun sql-statement-statistics-reset (&optional (userid 0) (dbid 0) (queryid 0) minmax-only)
+  "Clear cumulative statistics and return the PostgreSQL timestamp of the reset."
+  (let* ((name (and *backend* (backend-startup-user *backend*)))
+         (role (and name *catalog* (gethash name (catalog-roles *catalog*))))
+         (store *statement-statistics-store*))
+    (unless (if role (pg-role-superuser-p role) (equal name "postgres"))
+      (ereport "42501" "permission denied for function pg_stat_statements_reset"))
+    (if store
+        (reset-statement-statistics store (lambda () (sql-current-local-microseconds nil nil))
+                                    userid dbid queryid minmax-only)
+        +null+)))
+
+(defun sql-statement-statistics-reader-identity ()
+  (let* ((name (and *backend* (backend-startup-user *backend*)))
+         (role (and name (authentication-committed-role name))))
+    (values (cond (role (pg-role-oid role))
+                  ((equal name "postgres") +bootstrap-role-oid+))
+            (if role (pg-role-superuser-p role) (equal name "postgres")))))
+
+(defun sql-statement-statistics-resource-rows ()
+  "Report completed execution resources in native units."
+  (let ((store *statement-statistics-store*))
+    (when store
+      (multiple-value-bind (userid superuser-p) (sql-statement-statistics-reader-identity)
+        (loop with empty-usage = (make-statement-resource-usage)
+              for entry in (snapshot-statement-statistics store nil)
+              for resources = (statement-statistics-entry-resources entry)
+              for usage = (or resources empty-usage)
+              for errors = (statement-statistics-entry-execution-errors entry)
+              for cancellations = (statement-statistics-entry-execution-cancellations entry)
+              when (or resources (plusp errors) (plusp cancellations))
+                collect
+                (destructuring-bind (owner database toplevel queryid)
+                    (statement-statistics-entry-key entry)
+                  (vector owner database toplevel
+                          (if (or superuser-p (eql userid owner)) queryid +null+)
+                          (statement-resource-usage-relation-reads usage)
+                          (statement-resource-usage-clean-cache-hits usage)
+                          (statement-resource-usage-relation-writes usage)
+                          (statement-resource-usage-spill-read-bytes usage)
+                          (statement-resource-usage-spill-written-bytes usage)
+                          (statement-resource-usage-wal-records usage)
+                          (statement-resource-usage-wal-bytes usage)
+                          errors cancellations)))))))
+
+(defun sql-statement-statistics-rows (&optional (showtext t))
+  "Adapt detached cumulative entries to the supported pg_stat_statements columns."
+  (let ((store *statement-statistics-store*))
+    (when store
+      (multiple-value-bind (userid superuser-p) (sql-statement-statistics-reader-identity)
+        (loop for entry in (snapshot-statement-statistics store showtext)
+              when (or (plusp (statement-phase-statistics-count
+                               (statement-statistics-entry-planning entry)))
+                       (plusp (statement-phase-statistics-count
+                               (statement-statistics-entry-execution entry))))
+                collect
+                (destructuring-bind (owner database toplevel queryid)
+                    (statement-statistics-entry-key entry)
+                  (let* ((visible-p (or superuser-p (eql userid owner)))
+                         (row (make-array (length +sql-statement-statistics-fields+)
+                                          :initial-element +null+)))
+                    (setf (aref row 0) owner
+                          (aref row 1) database
+                          (aref row 2) toplevel
+                          (aref row 3) (if visible-p queryid +null+)
+                          (aref row 4) (cond ((not showtext) +null+)
+                                             (visible-p
+                                              (or (statement-statistics-entry-text entry) +null+))
+                                             (t "<insufficient privilege>"))
+                          (aref row 17) (statement-statistics-entry-rows entry)
+                          (aref row 52) (statement-statistics-entry-stats-since entry)
+                          (aref row 53) (statement-statistics-entry-minmax-stats-since entry))
+                    (write-sql-statement-phase row 5 (statement-statistics-entry-planning entry))
+                    (write-sql-statement-phase row 11 (statement-statistics-entry-execution entry))
+                    row)))))))
+
+(defun make-statement-statistics-result-iterator (showtext)
+  (make-status-record-iterator +statement-statistics-result-fields+
+                               (unless (eq showtext +null+)
+                                 (sql-statement-statistics-rows showtext))))
+
+(defun backend-wait-event-labels (event)
+  "Return the SQL wait class and name for a published backend wait."
+  (case event
+    (:relation (values "Lock" "relation"))
+    (:transactionid (values "Lock" "transactionid"))
+    (:btree (values "LWLock" "BtreeRelation"))
+    (:client-read (values "Client" "ClientRead"))
+    (:client-write (values "Client" "ClientWrite"))
+    (:data-file-read (values "IO" "DataFileRead"))
+    (:data-file-write (values "IO" "DataFileWrite"))
+    (:wal-write (values "IO" "WALWrite"))
+    (:wal-sync (values "IO" "WALSync"))
+    (:sync-rep (values "IPC" "SyncRep"))
+    (otherwise (values +null+ +null+))))
+
+(defun sql-activity-view-row (backend viewer privileged-p)
+  "Capture a coherent activity snapshot before copying and formatting its fields."
+  (let* ((name (backend-startup-user backend))
+         (role (authentication-committed-role name))
+         (userid (cond (role (pg-role-oid role))
+                       ((equal name "postgres") +bootstrap-role-oid+)
+                       (t +null+)))
+         (visible-p (or privileged-p (equal viewer name))))
+    (multiple-value-bind (application started query-start state-change wait state queryid query replication)
+        (sb-thread:with-mutex (*live-operation-lock*)
+          ;; These strings are replaced on publication, so the captured
+          ;; references remain valid after releasing the activity mutex.
+          (values (backend-application-name backend)
+                  (and visible-p (backend-transaction-start-unix-microseconds backend))
+                  (and visible-p (backend-activity-query-start backend))
+                  (and visible-p (backend-activity-state-change backend))
+                  (and visible-p (backend-activity-wait-event backend))
+                  (when visible-p
+                    (cond ((backend-executing backend) "active")
+                          ((eq (backend-state backend) :aborted) "idle in transaction (aborted)")
+                          ((eq (backend-state backend) :in-progress) "idle in transaction")
+                          (t "idle")))
+                  (and visible-p (backend-activity-queryid backend))
+                  (and visible-p (backend-activity-query backend))
+                  (backend-replication-mode backend)))
+      (multiple-value-bind (wait-type wait-name) (backend-wait-event-labels wait)
+        (flet ((timestamp (stamp)
+                 (if stamp (sql-current-local-microseconds nil stamp) +null+)))
+          (vector (backend-database backend) (backend-pid backend) userid name
+                  (copy-seq (or application ""))
+                  (timestamp started) (timestamp query-start) (timestamp state-change)
+                  wait-type wait-name (or state +null+) (or queryid +null+)
+                  (cond (query (copy-seq query))
+                        (visible-p +null+)
+                        (t "<insufficient privilege>"))
+                  (if replication "walsender" "client backend")))))))
+
+(defun sql-activity-view-rows ()
+  "Copy admitted backend membership before taking any activity snapshots."
+  (let* ((viewer (and *backend* (backend-startup-user *backend*)))
+         (role (and viewer (authentication-committed-role viewer)))
+         (privileged-p (if role (pg-role-superuser-p role) (equal viewer "postgres")))
+         (backends
+           (sb-thread:with-mutex (*backend-registry-lock*)
+             (loop for backend being the hash-values of *backend-registry*
+                   when (gethash backend *backend-admission-classes*)
+                     collect backend))))
+    (mapcar (lambda (backend) (sql-activity-view-row backend viewer privileged-p)) backends)))
 
 (defun sql-database-rows ()
   "Expose durable database identities to standard replication discovery."

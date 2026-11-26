@@ -116,9 +116,28 @@
          (store (when plan (make-dml-source-replay plan)))
          (target (first (select-scope-relations (getf prepared :scope))))
          (target-presence (vector (select-relation-identity target)))
-         (where (or (getf prepared :dml-row-where) (getf prepared :where))))
+         (where (or (getf prepared :dml-row-where) (getf prepared :where)))
+         ;; A sole built-in integer equality needs no source row, datum origins
+         ;; or TOAST. Reject nonmatches before deforming unrelated attributes.
+         (columns (pg-class-columns table))
+         (equality (when (and (null store)
+                              (some (lambda (column)
+                                      (heap-varlena-type-p (pg-column-type column)))
+                                    columns))
+                     (multiple-value-list (equality-column-constant where))))
+         (slot (destructuring-bind (&optional attnum literal matched-p) equality
+                 (when (and matched-p (integerp literal)
+                            (<= 1 attnum (length columns))
+                            (member (pg-column-type (aref columns (1- attnum)))
+                                    '(:int2 :int4 :int8)))
+                   (1- attnum))))
+         (prefilter (when slot
+                      (let ((literal (second equality)))
+                        (lambda (values)
+                          (check-for-interrupts)
+                          (eql (aref values slot) literal))))))
     (unwind-protect
-         (do-table-tuples (tuple table)
+         (do-table-tuples (tuple table :prefilter prefilter :demand slot)
            (materialize-select-tuple table tuple *current-snapshot*
                                      :demand toast-demand :retain-external-p (not (null toast-demand)))
            (let ((modified-p nil))

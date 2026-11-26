@@ -11,8 +11,8 @@
     (unwind-protect
          (progn
            (setf (symbol-function 'table-indexes)
-                 (lambda (table)
-                   (declare (ignore table))
+                 (lambda (table &optional db predicate)
+                   (declare (ignore table db predicate))
                    (setf lock-held (sb-thread:holding-mutex-p *write-lock*))
                    (list first-index second-index)))
            (multiple-value-bind (indexes relfilenodes toast toast-node)

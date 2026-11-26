@@ -533,7 +533,7 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
               (setf (extended-query-state-statement-deadline state) nil
                     (extended-query-state-executed-in-cycle-p state) nil)
               (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
-                (extended-clear-portals-for-backend *backend*))
+                (extended-clear-portals-for-backend *backend* :discard-observations-p t))
               (when implicit
                 (unless (eq (backend-state *backend*) :idle) (abort-transaction))
                 (restore-session-settings stream))
@@ -703,9 +703,12 @@ Preserve all dispatch values, including secondary values, for the caller."
     (when (wal-sender-backend-stopping-p *backend*)
       (ereport-fatal "57P01" "WAL sender is stopping"))
     (check-backend-frontend-output)
-    (let ((type-byte (read-byte stream nil nil)))
+    (let ((type-byte (with-backend-client-read-wait
+                       (read-byte stream nil nil))))
       (unless type-byte (return))
-      (multiple-value-bind (length-bytes got) (read-exact-bytes stream 4)
+      (multiple-value-bind (length-bytes got)
+          (with-backend-client-read-wait
+            (read-exact-bytes stream 4))
         (declare (ignore got))
         (let ((length (and length-bytes (bytes-to-u32 length-bytes 0))))
           (if (and (= type-byte (char-code #\B)) length
@@ -724,7 +727,8 @@ Preserve all dispatch values, including secondary values, for the caller."
                           (return))))
                   (unless complete (close stream :abort t))))
               (let ((payload (when (and length (<= 4 length +max-query-message-size+))
-                               (read-exact-bytes stream (- length 4)))))
+                               (with-backend-client-read-wait
+                                 (read-exact-bytes stream (- length 4))))))
                 (when (eq (dispatch-frontend-frame stream type-byte length-bytes payload) :terminate)
                   (return)))))))))
 
@@ -1134,6 +1138,14 @@ throughout replay and shutdown."
            (fsync-directory directory))))))
   (sb-ext:exit :code 0))
 
+(defun initialize-statement-statistics (settings)
+  "Install the process-local statistics store before admitting connections."
+  (setf *statement-statistics-store*
+        (when (startup-setting-value settings "pg_stat_statements.enabled")
+          (make-statement-statistics-store
+           (startup-setting-value settings "pg_stat_statements.max")
+           (startup-setting-value settings "pg_stat_statements.max_text_bytes")))))
+
 (defun main ()
   ;; Preflight policy before ownership, then initialize it after owning PGDATA.
   ;; Install resource limits before recovery, and check or report them before listen.
@@ -1157,6 +1169,7 @@ throughout replay and shutdown."
       (authentication-preflight-startup startup-settings)
       (startup-install-initial-settings startup-settings startup-native startup-overrides)
       (startup-install-resource-capacity startup-settings)
+      (initialize-statement-statistics startup-settings)
       (sb-sys:enable-interrupt sb-unix:sigusr1 #'request-physical-promotion)
       ;; Observe before PID repair and consume terminal retirement under ownership
       ;; before mutable bootstrap or storage initialization begins.

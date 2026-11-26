@@ -49,8 +49,9 @@
 
 (defun btree-relation-condition-wait (state)
   (check-for-interrupts)
-  (condition-wait-with-timeout (btree-relation-lock-state-waitqueue state)
-                               (btree-relation-lock-state-mutex state))
+  (with-backend-wait-state (*backend* backend-activity-wait-event :btree)
+    (condition-wait-with-timeout (btree-relation-lock-state-waitqueue state)
+                                 (btree-relation-lock-state-mutex state)))
   (check-for-interrupts))
 
 (defstruct btree-read-lease

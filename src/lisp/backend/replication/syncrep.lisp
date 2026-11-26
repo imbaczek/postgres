@@ -490,9 +490,10 @@ again."
                    do (let ((reason (sync-replication-interruption backend)))
                         (if reason
                             (sync-replication-cancel-under-lock waiter reason)
-                            (unless (sb-thread:condition-wait
-                                     (sync-replication-state-cv *sync-replication-state*)
-                                     *wal-sender-lock* :timeout 0.1)
+                            (unless (with-backend-wait-state (backend backend-activity-wait-event :sync-rep)
+                                      (sb-thread:condition-wait
+                                       (sync-replication-state-cv *sync-replication-state*)
+                                       *wal-sender-lock* :timeout 0.1))
                               ;; SBCL leaves the mutex unowned on timeout.
                               ;; Keep interrupts masked through committed cleanup.
                               (sb-thread:grab-mutex *wal-sender-lock*)))))

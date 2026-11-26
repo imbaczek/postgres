@@ -24,6 +24,12 @@
 (defvar *query-temp-file-lock*
   (sb-thread:make-mutex :name "pg query temporary file names"))
 (defvar *query-temp-quota* nil)
+(defstruct query-temp-space-sample
+  file-bytes
+  (live-bytes 0)
+  (peak-bytes 0))
+(defvar *query-temp-space-sample* nil
+  "Live spill-file high-water accounting for one EXPLAIN ANALYZE execution.")
 (defvar *query-temp-test-pause-initialized-p* nil)
 (defvar *query-temp-test-pause-done-p* nil)
 (defvar *query-temp-test-ready-file* nil)
@@ -653,6 +659,12 @@ on exit unless cleanup has resolved the owner."
 
 (defun forget-query-temp-file-space (pathname)
   (check-query-temp-owner-domain *query-temp-cleanup-owner*)
+  (when *query-temp-space-sample*
+    (let ((files (query-temp-space-sample-file-bytes *query-temp-space-sample*)))
+      (when files
+        (decf (query-temp-space-sample-live-bytes *query-temp-space-sample*)
+              (gethash pathname files 0))
+        (remhash pathname files))))
   (when *query-temp-quota*
     (let* ((quota *query-temp-quota*)
            (size (gethash pathname (query-temp-quota-file-sizes quota) 0)))
@@ -1350,6 +1362,17 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   (values))
 
 (defun query-temp-account-space (pathname bytes &optional stream)
+  (when (and pathname stream *statement-resource-usage*)
+    (incf (statement-resource-usage-spill-written-bytes *statement-resource-usage*) bytes))
+  (when (and pathname *query-temp-space-sample*)
+    (let* ((sample *query-temp-space-sample*)
+           (files (or (query-temp-space-sample-file-bytes sample)
+                      (setf (query-temp-space-sample-file-bytes sample)
+                            (make-hash-table :test #'equal)))))
+      (incf (gethash pathname files 0) bytes)
+      (setf (query-temp-space-sample-peak-bytes sample)
+            (max (query-temp-space-sample-peak-bytes sample)
+                 (incf (query-temp-space-sample-live-bytes sample) bytes)))))
   (when (and pathname *query-temp-quota*)
     (incf (query-temp-quota-used-bytes *query-temp-quota*) bytes)
     (incf (gethash pathname
@@ -1427,14 +1450,28 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
       (query-spill-write-value output value)
       (terpri output))))
 
+(defun call-with-counted-query-spill-read (stream reader)
+  "Attribute bytes consumed from a spill file to the active execution."
+  (declare (dynamic-extent reader))
+  (let* ((usage *statement-resource-usage*)
+         (start (when (and usage (typep stream 'file-stream)) (file-position stream))))
+    (multiple-value-prog1 (funcall reader)
+      (when start
+        (let ((end (file-position stream)))
+          (when end
+            (incf (statement-resource-usage-spill-read-bytes usage) (- end start))))))))
+
 (defun query-spill-read-record (stream)
-  (let ((*read-eval* nil)
-        (*readtable* *query-spill-readtable*)
-        (*package* (find-package '#:pg)))
-    (let ((value (read stream nil +query-spill-eof+)))
-      (if (eq value +query-spill-eof+)
-          +query-spill-eof+
-          (query-spill-decode value)))))
+  (call-with-counted-query-spill-read
+   stream
+   (lambda ()
+     (let ((*read-eval* nil)
+           (*readtable* *query-spill-readtable*)
+           (*package* (find-package '#:pg)))
+       (let ((value (read stream nil +query-spill-eof+)))
+         (if (eq value +query-spill-eof+)
+             +query-spill-eof+
+             (query-spill-decode value)))))))
 
 ;; A sort run uses bivalent streams so compact and readable records can share
 ;; a file. A compact record starts with its two-byte big-endian total length.
@@ -1561,23 +1598,26 @@ BUFFER is scratch owned by the caller and may be reused after writing."
 
 (defun read-query-sort-spill-item (stream buffer)
   "Read one compact or general sort record, returning the spill EOF marker at end."
-  (let ((header (read-byte stream nil nil)))
-    (cond
-      ((null header) +query-spill-eof+)
-      ((= header #xff)
-       (let ((*read-eval* nil)
-             (*readtable* *query-spill-readtable*)
-             (*package* (find-package '#:pg)))
-         (let ((item (read-preserving-whitespace stream)))
-           (unless (eql (read-char stream nil nil) #\Newline)
-             (error "Invalid sort spill record terminator"))
-           (query-spill-decode item))))
-      (t
-       (let ((size (logior (ash header 8) (read-byte stream))))
-         (unless (and (<= 3 size (length buffer))
-                      (= size (read-sequence buffer stream :start 2 :end size)))
-           (error "Invalid sort spill frame length"))
-         (decode-query-sort-spill-item buffer size))))))
+  (call-with-counted-query-spill-read
+   stream
+   (lambda ()
+     (let ((header (read-byte stream nil nil)))
+       (cond
+         ((null header) +query-spill-eof+)
+         ((= header #xff)
+          (let ((*read-eval* nil)
+                (*readtable* *query-spill-readtable*)
+                (*package* (find-package '#:pg)))
+            (let ((item (read-preserving-whitespace stream)))
+              (unless (eql (read-char stream nil nil) #\Newline)
+                (error "Invalid sort spill record terminator"))
+              (query-spill-decode item))))
+         (t
+          (let ((size (logior (ash header 8) (read-byte stream))))
+            (unless (and (<= 3 size (length buffer))
+                         (= size (read-sequence buffer stream :start 2 :end size)))
+              (error "Invalid sort spill frame length"))
+            (decode-query-sort-spill-item buffer size))))))))
 
 (defstruct (query-row-spool (:constructor %make-query-row-spool))
   (rows nil)
@@ -1750,7 +1790,9 @@ both before writing can be interrupted."
   (if (query-match-map-io-stream match-map)
       (progn
         (file-position (query-match-map-io-stream match-map) index)
-        (write-byte 1 (query-match-map-io-stream match-map)))
+        (write-byte 1 (query-match-map-io-stream match-map))
+        (when *statement-resource-usage*
+          (incf (statement-resource-usage-spill-written-bytes *statement-resource-usage*))))
       (setf (aref (query-match-map-bytes match-map) index) 1))
   (values))
 
@@ -1768,7 +1810,9 @@ both before writing can be interrupted."
   (= (if (query-match-map-io-stream match-map)
          (progn
            (file-position (query-match-map-io-stream match-map) index)
-           (read-byte (query-match-map-io-stream match-map)))
+           (prog1 (read-byte (query-match-map-io-stream match-map))
+             (when *statement-resource-usage*
+               (incf (statement-resource-usage-spill-read-bytes *statement-resource-usage*)))))
          (aref (query-match-map-bytes match-map) index))
      1))
 

@@ -190,9 +190,16 @@ Production callers run this inside the live-operation gate."
   (make-array 0 :adjustable t :fill-pointer 0
                 :element-type '(unsigned-byte 8)))
 
-(defun payload-push (p bytes)
-  (loop for b across bytes do (vector-push-extend b p))
-  p)
+(defun payload-push (payload bytes)
+  "Append octets to a message payload, reserving room for the full field."
+  (let* ((start (fill-pointer payload))
+         (end (+ start (length bytes)))
+         (capacity (array-dimension payload 0)))
+    (when (> end capacity)
+      (adjust-array payload (max end (* 2 capacity))))
+    (setf (fill-pointer payload) end)
+    (replace payload bytes :start1 start :end1 end))
+  payload)
 
 (defun payload-push-u16 (p v) (payload-push p (u16-to-bytes v)) p)
 (defun payload-push-u32 (p v) (payload-push p (u32-to-bytes v)) p)

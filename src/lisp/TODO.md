@@ -706,6 +706,861 @@ and one staging writer, mean WAL mutex wait per acquisition fell from
 the writer. Writer median staging latency was 2 microseconds in both
 samples, and the 95th percentile fell from 53 to 23 microseconds.
 
+## Query observability
+
+The observability plans target the SBCL server at `f110a918b0079`.
+P01 owns the query identity and measurement API. P02 can start as soon as
+that API covers nested scopes, portal ownership, and counter snapshots.
+Shared roadmap summary
+
+### P01 — Statement statistics
+
+Expose cumulative statistics for supported SELECT, INSERT, UPDATE, and
+DELETE through a native `pg_stat_statements` virtual relation and built-in
+functions. An operator should be able to rank query shapes by total
+execution time and compare the same workload across revisions. Extension
+packaging can follow in P22. First-release statistics are volatile across
+restart.
+
+- [x] Pin the SQL field and setting contract against C PostgreSQL. Build a
+  versioned, literal-normalized fingerprint from the analyzed query, using
+  resolved object, operator, function, and type identities. Test grouping
+  and reject unhandled node kinds. Keep workload identity, physical plan
+  identity, and implementation revision independent.
+  The fingerprint visitor covers simple SELECT shapes and their analyzed
+  constants, columns, casts, parameters, and binary operators. It omits
+  literal values and physical access paths. Unhandled analyzed forms
+  return no identifier pending traversal coverage.
+  A Rove fixture injects an unhandled analyzed node into SELECT and
+  a DML assignment and verifies that neither gets an identifier.
+  The wire fixture separates different target and predicate attribute
+  positions, groups literal and alias variants of the same native
+  relation, and creates a new group when that table is dropped and
+  recreated. Native keys use resolved relation OIDs. The pinned C
+  peer jumbles the expanded range-table reference name instead,
+  which distinguishes the alias variant and retains the group
+  across a same-name recreation. Numeric query IDs are native to
+  each implementation.
+  DML identity now covers target relation and column OIDs or attribute
+  numbers, typed assignments, predicates, and RETURNING for supported
+  INSERT, UPDATE, and DELETE forms.
+  Ordered and aggregate SELECT fingerprints use resolved sort keys and
+  aggregate expressions. Aggregate argument identity is independent of
+  whether the planner shares a transition. HAVING fingerprints preserve
+  the analyzed WHERE and HAVING boundaries before predicate pushdown.
+  Non-correlated FROM subqueries contribute their resolved query shape.
+  Literals and aliases are normalized at both query levels.
+  Joins contribute their analyzed types and predicates in source order,
+  independently of the physical join plan. Correlated LATERAL sources
+  preserve the referenced outer slot and its scope depth. The wire
+  regression distinguishes an outer reference from a literal operand.
+  Scalar builtin calls contribute their resolved names and typed inputs.
+  CASE, COALESCE, Boolean tests, unary operators, array constructors,
+  subscripts, slices, and quantified comparisons contribute their
+  analyzed operands. The wire regression verifies that literal variants
+  of a CASE group together and that omitted array slice bounds remain
+  distinguishable from explicit bounds.
+  IN lists include their resolved array or per-item comparisons and
+  preserve NOT polarity. The wire regression checks literal grouping
+  and separation by polarity and comparison type. As in the C query
+  jumble, an array of two or more literal or external-parameter elements
+  groups across lengths. Representative text still shows the first
+  captured shape's placeholders individually.
+  Window output fingerprints include the analyzed function, partition,
+  ordering, and frame. Shared pre-window slots carry their analyzed
+  expressions so slot assignment does not determine query identity.
+  The wire regression checks literal grouping and window sort direction.
+  Set-returning builtin calls and record fields use the analyzed call
+  and field position, independent of generated projection slots. The
+  wire regression groups two activity lookups with different PID literals
+  and counts one output row across both calls.
+  Set operations contribute their operation kind, both analyzed branches,
+  and final ordering and limit shape. The wire regression verifies that
+  UNION ALL groups across literal changes and has separate totals from UNION.
+  VALUES queries retain their source kind through analysis, so literal
+  variants group together without merging into SELECT.
+  SELECT expression subqueries contribute their kind, analyzed child, and
+  comparison test when present. SELECT identity is captured before physical
+  planning can simplify a child. The wire regression checks that EXISTS
+  groups literal variants and distinguishes an explicit child cast even
+  when the planner removes the child projection.
+  SELECT fingerprints include WITH definitions and resolve references
+  by lexical scope and definition position. Recursive worktable references
+  do not expand their own definitions. CTE names and explicit materialization
+  directives follow the C query jumble contract. The wire regression
+  covers literal grouping, MATERIALIZED, recursive execution, and the
+  presence of both identifiers in recursive EXPLAIN JSON.
+  DML shares the same lexical WITH traversal. The wire regression checks
+  that INSERT ... SELECT from a CTE groups literal variants and records
+  the exact RETURNING row count.
+  DML captures identity before planning as well. A joined DML source
+  contributes its analyzed query shape. The wire regression checks exact
+  plans, calls, and affected rows for UPDATE FROM a derived source and
+  DELETE with a scalar subquery.
+  INSERT ... ON CONFLICT includes the analyzed conflict action, arbiter
+  specification, assignments, and qualifications. Inferred physical index
+  choices do not affect identity. The wire regression distinguishes
+  DO NOTHING from DO UPDATE and checks both affected-row totals.
+- [x] Wire one observation into the simple-query and extended-query execution
+  owners. Record successful planning and execution independently and track
+  errors and cancellations separately. Preserve top-level status and
+  backend-local counters across portal fetches. Exclude suspended time and
+  count streamed DML RETURNING once. Make completion idempotent through
+  close, error, cancellation, and disconnect.
+  The observation API records successful planning independently and
+  accumulates only active execution slices. Tests cover reset during
+  suspension, unwind, and repeated completion. Simple and extended SELECT
+  share observation ownership through the portal. A wire test exercised a
+  suspended and resumed SELECT alongside a simple SELECT in one group.
+  Collection is opt-in at startup with `pg_stat_statements.enabled=on`.
+  Inline DO classifies its PERFORM statements as nested independently
+  of the outer command's observation. With tracking set to `top`, no
+  PERFORM entry is published. With `all`, simple and extended DO together
+  publish four nested plans, calls, and rows in one literal-normalized
+  group. A direct SELECT of the same shape is a separate top-level group.
+  The pinned C peer matched the wire fixture with utility tracking off.
+  Ordinary DML shares the resolved preparation with the identity visitor.
+  A wire test verified affected-row counts and a unique violation that
+  contributed only a successful planning phase. The extended RETURNING
+  portal publishes one execution when it materializes the result and
+  counts all affected rows. [The SQL wire regression](t/statement-statistics.py)
+  checks partial fetches and early close from a second session. It also
+  checks representative query text from both frontend protocols.
+  Closing DML RETURNING before Execute records only planning and leaves
+  the table intact. A duplicate-key failure during Execute records one
+  execution error, with no successful call or returned rows.
+  Rolling back a suspended SELECT discards its partial execution. An
+  ordinary Close publishes the rows fetched so far, and both paths retain
+  a successful planning phase.
+  A fully fetched extended SELECT publishes at successful Execute completion.
+  Its counts are visible from another session before transaction end and
+  survive a subsequent rollback.
+  Disconnecting a suspended portal also retains only planning and removes
+  the backend's activity row. The wire regression verifies that a clean
+  restart clears prior entries and reset metadata while preserving the
+  queried table.
+  A wire case enters the executable-owner reload gate with a suspended
+  portal. It verifies that admission reopens while reload waits for the
+  owner and that the portal's activity row is still visible while waiting.
+  Rollback lets the drain finish. A subsequent live code reload preserves
+  the planning-only entry and the connected backend's idle activity row.
+- [x] Bound query entries and representative text with configurable limits
+  and a documented eviction policy. Use short sharded locks, detached read
+  snapshots, and online timing summaries. Reacquire entries by key after
+  eviction. Give reset a precise ordering with phase completion. Following
+  the pinned C peer, a successful phase stored after reset contributes to
+  the current entry even if the phase began earlier.
+  The aggregation core now divides entry and text budgets across FIFO
+  shards, copies detached snapshots under individual shard locks, and
+  clears all shards under ordered locks. It charges four bytes per
+  retained text character to the shard's budget. A snapshot can span a
+  concurrent reset across shards. Planning and execution have separate online timing
+  accumulators.
+  Mutations to the shard hash, FIFO links, and byte accounting mask
+  asynchronous backend interrupts. Terminal observation status and its
+  cumulative update are published within the same interrupt mask.
+  A one-entry wire fixture verifies FIFO eviction, dropping over-budget
+  representative text while retaining counters, reacquiring an evicted
+  identity, and resetting the eviction count. A wire case resets a
+  suspended SELECT's planning entry, then four clients record 128 calls
+  and 128 rows in one group while the portal remains suspended. Resuming
+  the original portal publishes exactly one call and both of its rows.
+- [x] Wire the supported relation, reset and information functions, and
+  settings through the catalog and configuration registry. Document field
+  types, unsupported counters, and reset and restart behavior. Keep optional
+  plan, revision, and defensibly attributed allocation metrics in a native
+  companion view. Defer persistence, utility tracking, and routine coverage.
+  The native `pg_stat_statements` relation uses the pinned 1.13 column
+  order and types. It exposes identity, plan and execution timing, calls,
+  rows, and entry and extrema reset timestamps. Unsupported C-specific
+  counters return SQL NULL. The native resource view exposes directly
+  measured resources in their own units. Query text and ID are masked
+  for other roles.
+  A wire-level comparison with the pinned C peer matched every field
+  name, position, type OID, and typmod for the relation and its Boolean
+  function (54 fields each) and for the info relation (two fields).
+  The wire regression now pins those descriptors.
+  A test drives the catalog adapters with a non-superuser backend fixture
+  and checks hidden peer query IDs and text and denied reset and tracking
+  changes. Ordinary non-superuser SQL admission is outside native scope.
+  The `pg_stat_statements(boolean)` function shares the view descriptor
+  and supports counters-only reads. A false argument returns SQL NULL
+  for query text and skips copying it into the detached snapshot.
+  A polling benchmark seeded 512 entries with 256-character texts in
+  one shard. An untracked SQL session ran 128
+  `SELECT calls FROM pg_stat_statements(showtext)` polls per sample,
+  with identical results and three fresh servers per argument. Switching
+  from true to false reduced median allocation from 204301072 to
+  136165712 bytes and sampled peak RSS from 308920320 to 239976448
+  bytes. Median client latency moved from 3.28 to 3.14 ms and p95 from
+  3.64 to 3.49 ms. Post-GC heap stayed near 48.1 MB. This isolates
+  the text snapshot cost with no concurrent writers.
+  Representative text is rendered from scanner tokens, with comments
+  omitted and literals replaced by parameters. Rendering and retained text
+  have separate bounds. Formatting is normalized to space-separated tokens.
+  Numeric tokens in cast type syntax retain their values, including
+  varchar length and numeric precision and scale.
+  Positional ORDER BY keys and NULL or Boolean keywords following IS
+  also retain their values. Literal operands still become parameters.
+  Superusers can clear all entries with `pg_stat_statements_reset()`.
+  The call returns the reset timestamp. With tracking enabled, its
+  enclosing SELECT can publish a successful execution after the reset.
+  The `pg_stat_statements_info`
+  relation and function report evictions and the last full reset together.
+  The timestamp starts at store initialization and advances after a reset
+  that empties the store, following the pinned C implementation.
+  Named or positional reset arguments can filter by user, database, and
+  query ID. The optional `minmax_only` flag clears the selected extrema
+  while retaining counts and cumulative timing.
+  `pg_stat_statements.max` bounds entries (default 5000).
+  `pg_stat_statements.max_text_bytes` bounds representative text (default
+  1048576 bytes). Both are startup settings. Session
+  `pg_stat_statements.track` accepts `none`, `top` (default), and
+  `all`. While collection is enabled, only superusers can change it.
+  Session `pg_stat_statements.track_planning` is off by default, as in C.
+  Superusers can enable planning timing alongside execution tracking.
+  Planning clocks are skipped when it is off.
+  With collection disabled at startup, the native statement relation and
+  functions return no rows. Process runtime counters remain available.
+- [x] Compare grouping and exact phase counts with the C fixtures and an
+  independent log of completed operations. Cover simple queries, repeated
+  Bind/Execute, partial RETURNING, early portal close, failures, eviction,
+  and reset races. Benchmark warmed short, mixed read/write, and long
+  workloads at one and several clients with collection off and on. Record
+  throughput, latency, CPU, allocation, retained memory, eviction, and
+  lock contention. Set the overhead budget before optimization.
+  A clean C build at `f110a918b0079` with extension 1.13 matched the
+  native plan, call, and row totals for seven simple-protocol statements:
+  two scalar SELECTs, two UNION ALL statements, one UNION, and two VALUES
+  statements. Both produced four groups with (plans, calls, rows) of
+  (1, 1, 1), (2, 2, 2), (2, 2, 2), and (2, 2, 4). Planning tracking
+  was enabled on both servers, with C utility tracking disabled.
+  The same pinned pair agreed on repeated parameterized INSERT Bind and
+  Execute (2, 2, 2), early Close after fetching one SELECT row (1, 1, 1),
+  and early Close after fetching one INSERT RETURNING row (1, 1, 3).
+  The fixture checked CommandComplete messages, the number of DataRow
+  messages received before suspension, and the committed table contents.
+  A duplicate-key Execute returned SQLSTATE 23505, retained the original
+  row, and recorded (1, 0, 0) on both servers. The C run disabled utility
+  tracking and forced custom plans so each parameterized Bind replanned.
+  Resetting from another connection after the first DataRow of a
+  suspended two-row SELECT gave (0, 1, 2) on both peers after resume
+  and commit. With a 100-entry setting, 120 simple queries of distinct
+  projection widths all completed. Each surviving entry recorded one
+  plan, call, and row. C retained 90 entries across three eviction
+  cycles. Native retained 83 entries and counted 37 individual
+  evictions under its sharded FIFO policy.
+  Initial memory comparison used SBCL 2.6.10.334-ab0880140 and
+  `t/workload-memory.py --rows 2048 --repeat 3 --runs 3 --case point_reads --case scan --case sort --case mixed`,
+  once with `--statement-statistics` and once without it. Medians across fresh
+  servers are below. The short-query optimization target is under 5%
+  throughput loss with collection enabled.
+
+  | Workload | Tracked calls | Allocated bytes off → on | Peak RSS bytes off → on | Post-GC heap bytes off → on |
+  | --- | ---: | ---: | ---: | ---: |
+  | Indexed point reads | 192 | 12272576 → 12894688 | 114667520 → 115367936 | 47524656 → 47562016 |
+  | Aggregate scan | 0 | 4230640 → 4231232 | 106733568 → 106688512 | 47496416 → 47533616 |
+  | Sort | 0 | 6218112 → 6218032 | 108695552 → 108695552 | 47520560 → 47550320 |
+  | Four-client mixed read/write | 384 | 375916656 → 381088256 | 479100928 → 484274176 | 47846768 → 47853024 |
+
+  The initial aggregate scan and sort rows had no identity coverage.
+  Point reads took
+  68.5 → 75.8 ms per sample and mixed took 1.076 → 1.094 s.
+  Fixed-width hashing preserved the version-one query ID. In the REPL,
+  hashing a prebuilt point-read shape 10000 times reduced measured
+  allocation from 21917424 bytes to zero for that fixnum-valued query ID.
+  Five fresh-server point-read samples per mode measured 12272560 bytes
+  off and 12471552 bytes on, with 192 calls tracked per enabled sample.
+  The enabled allocation premium fell from 622112 to 198992 bytes.
+  Median elapsed time was 69.9 → 73.1 ms, about 4.5% lower throughput.
+  After adding ordered SELECT fingerprints, the three-sort sample
+  tracked all three calls. Across three fresh servers per mode, elapsed
+  time was 30.9 → 31.3 ms and allocated bytes were 6217952 → 6207408.
+  Peak RSS and post-GC heap each differed by less than 5 KiB in this run.
+  After aggregate fingerprints were added, the plain aggregate scan and
+  grouped aggregate each tracked all three calls. Median allocation was
+  4230480 → 4254784 bytes for the scan and 5938592 → 5939792 bytes for
+  the grouped aggregate. Peak RSS differed by less than 80 KiB for each.
+  The benchmark also reports process CPU time and client SQL throughput,
+  median latency, and p95 latency. CPU time has Linux scheduler-tick
+  resolution. Client latency spans each simple-query protocol round trip,
+  including transaction commands in the mixed workload. Peak RSS is
+  sampled every 5 ms. GC time covers the server workload window, with
+  forced heap snapshots outside that window.
+
+  A fresh off/on comparison after adding join, builtin, and set-operation
+  identities used three fresh servers per mode and the same workload
+  sizes as the initial run. Each cell shows the sample median, off → on.
+
+  | Workload | Tracked calls | SQL queries/s | Median / p95 latency (ms) | Server CPU (s) |
+  | --- | ---: | ---: | ---: | ---: |
+  | Indexed point reads | 192 | 2558 → 2695 | 0.374 / 0.577 → 0.360 / 0.459 | 0.04 → 0.04 |
+  | Aggregate scan | 3 | 458 → 461 | 2.006 / 2.555 → 2.042 / 2.518 | 0 → 0 |
+  | Sort | 3 | 98.9 → 93.4 | 9.997 / 10.510 → 10.660 / 10.880 | 0.01 → 0.01 |
+  | Four-client mixed read/write | 384 | 702 → 704 | 4.510 / 16.230 → 4.470 / 16.280 | 0.89 → 0.88 |
+
+  | Workload | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | --- | ---: | ---: | ---: |
+  | Indexed point reads | 12268192 → 12466560 | 114651136 → 115003392 | 47518976 → 47590160 |
+  | Aggregate scan | 4230480 → 4254784 | 106704896 → 106647552 | 47514736 → 47522832 |
+  | Sort | 6217952 → 6207424 | 108605440 → 108556288 | 47484640 → 47523424 |
+  | Four-client mixed read/write | 380327456 → 378746672 | 483598336 → 482037760 | 47848176 → 47932000 |
+
+  All samples reported 0 ms median process GC time. The point-read
+  allocation premium was 198368 bytes (1.6%). Sort throughput moved
+  in opposite directions across runs of similar size, so the three-query
+  samples do not establish a steady-state throughput difference.
+  A later warm point-read run after the portal and statistics-store
+  fixes measured 46486176 → 47252944 allocated bytes, 149389312 →
+  150274048 bytes peak RSS, and 47658752 → 47701600 bytes post-GC
+  heap. It used three fresh servers per mode, 2048 rows, and 768
+  tracked calls per enabled sample, with planning tracking off.
+  The allocation premium was 1.65%. A concurrent unit-suite run
+  makes the elapsed-time comparison unsuitable for a throughput claim.
+  A separate warm run without the unit suite used four fresh servers
+  per mode in alternating two-server groups, with 1024 lookups per
+  sample. Median throughput was 2741 → 2597 queries/s (5.3% lower
+  with tracking), median client latency 0.351 → 0.372 ms, and p95
+  0.454 → 0.488 ms. Allocation was 61872456 → 62937392 bytes (1.7%),
+  peak RSS 164784128 → 165941248 bytes, and post-GC heap
+  47696136 → 47721968 bytes. This run is slightly above the 5%
+  short-query throughput budget.
+  In an isolated renderer check with prebuilt point-read tokens,
+  writing single-digit placeholders directly reduced median CPU time
+  per 100000 renders from 41.4 to 38.3 ms. Allocation stayed near
+  32 MB. This measures only the renderer.
+  A subsequent alternating off/on run after the renderer change used four
+  fresh servers per mode and 1536 warmed lookups per sample. The medians
+  were 2861 → 2580 queries/s (9.8% lower with tracking), 0.339 → 0.380 ms
+  client latency, 0.428 → 0.461 ms p95, and 0.295 → 0.320 s server CPU.
+  Allocation was 92796128 → 94402856 bytes (1.7%), peak RSS was
+  195796992 → 197328896 bytes, and post-GC heap was 47693168 → 47689416
+  bytes. Each enabled sample counted 1536 calls. Enabled throughput
+  ranged from 2058 to 2862 queries/s. The rerun still exceeds the
+  throughput budget and does not isolate the cost of the renderer change.
+  A separate SB-SPROF CPU run sampled 8000 warmed lookups per mode at
+  2 ms intervals. It collected 393 samples with tracking off and 416
+  with tracking on. The enabled profile attributed three inclusive
+  samples to query fingerprinting, two to representative text, and
+  one to the statistics store update. The sample counts do not isolate
+  a single hot tracking function. Server CPU time was 1.57 → 1.66 s.
+  A follow-up ran four fresh servers per mode with 1536 warmed point
+  reads per sample. In disposable servers only, the control REPL
+  substituted either the template's representative string or a fixed
+  query ID after setup. Both substitutions kept the statement store
+  active, and every sample counted 1536 calls with zero evictions.
+  Normal tracking, fixed text, and fixed fingerprint used median
+  allocations of 94402856, 93930160, and 93746552 bytes. Median
+  throughput was 2633, 2723, and 2778 queries/s, and server CPU was
+  0.310, 0.315, and 0.305 s. Peak RSS differed by under 0.3 MB and
+  post-GC heap by under 18 KB. These substitutions estimate the
+  individual costs on a single query shape. They do not qualify a
+  general-purpose replacement, and the elapsed-time effect is larger
+  than the CPU-clock difference in these short samples.
+  Short simple-query messages now defer normalization until a statistics
+  entry is missing. The renderer runs outside the shard lock, then
+  publication rechecks the key. Extended Parse and simple messages over
+  4096 characters render eagerly, bounding how much scanner input a
+  deferred renderer can retain. The store retains only bounded strings.
+  A Rove fixture checks that a repeat hit skips rendering and that a
+  reset during rendering permits publication into the current entry.
+  In the first four-sample rerun with 1536 lookups per sample, enabled
+  median allocation fell from 94402856 to 94003488 bytes after deferring
+  text. Every enabled sample still recorded all calls with zero evictions.
+  A second, balanced-order run used four fresh servers per mode and
+  2048 lookups per sample. Tracking off → on, median throughput was
+  2679 → 2691 queries/s, median latency 0.357 → 0.361 ms, p95
+  0.447 → 0.454 ms, and server CPU 0.405 → 0.415 s. Measured
+  allocation was 123634896 → 125209416 bytes (1.27%), peak RSS
+  226750464 → 228210688 bytes, and post-GC heap 47734712 → 47707840
+  bytes. The enabled samples all recorded 2048 calls and zero evictions.
+  The median met the 5% throughput budget in this run. Dropping the
+  first pair, which contained the slowest disabled sample, yields a
+  3.3% throughput loss with tracking enabled.
+  To exercise same-entry contention, `t/workload-memory.py --rows 2048
+  --repeat 24 --runs 3 --case concurrent_point_reads --warmup` ran the
+  same 1536 lookups across four connections. With tracking off → on,
+  median throughput was 3747 → 3691 queries/s, client median latency
+  0.877 → 0.907 ms, p95 2.049 → 2.039 ms, and server CPU 0.44 s in
+  both modes. Allocation was 93177088 → 94836784 bytes, peak RSS
+  196460544 → 198004736 bytes, and post-GC heap 47819376 → 47826496
+  bytes. The enabled runs recorded all 1536 calls and zero evictions.
+  In a separate probe run, a temporary nonblocking attempt counted 18
+  failed immediate acquisitions of the statement-update shard mutex
+  across 8000 measured and 64 warmup lookups (0.22%). The probe retried
+  through the blocking lock path and was omitted from timing samples.
+  A warmed 16384-row aggregate scan exercised 32 queries in three
+  fresh servers per mode. The serial case used `--case scan --repeat 32`
+  and the four-client case used `--case concurrent_scan --repeat 8`.
+  Tracking counted 32 calls with zero evictions in every enabled sample.
+  The medians below compare tracking off → on. Median process GC time
+  was zero throughout.
+
+  | Clients | Queries/s | Median / p95 (ms) | Server CPU (s) | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 81.4 → 81.2 | 12.234 / 12.791 → 12.142 / 12.955 | 0.39 → 0.39 | 297240416 → 297305136 | 405155840 → 405200896 | 49483520 → 49452720 |
+  | 4 | 269.5 → 282.7 | 13.356 / 18.732 → 13.162 / 13.861 | 0.43 → 0.41 | 297670768 → 297683728 | 405913600 → 405893120 | 49574336 → 49669680 |
+
+  Warmed mixed read/write samples used `--rows 4096 --repeat 6 --runs 3
+  --warmup` with `--case mixed_serial` (one connection) or
+  `--case mixed` (four). Each sample ran 384 transactions with a point
+  SELECT and UPDATE in each, plus the transaction commands. Every enabled
+  sample recorded 768 calls and zero evictions. The fixture checked the
+  selected keys and verified the resulting group sum. The table reports
+  medians, tracking off → on.
+
+  | Clients | Queries/s | Median / p95 (ms) | Server CPU (s) | GC (ms) | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 393.7 → 390.1 | 2.372 / 5.083 → 2.403 / 5.076 | 2.10 → 2.09 | 2 → 2 | 1454584240 → 1455514736 | 982302720 → 982401024 | 47909936 → 47935728 |
+  | 4 | 587.1 → 591.4 | 4.492 / 20.858 → 4.442 / 20.460 | 3.09 → 3.06 | 2 → 3 | 1388598128 → 1387877616 | 965054464 → 965181440 | 48210240 → 48212960 |
+
+  A separate enabled serial mixed run hit the 20000-sample cap of
+  SB-SPROF's allocation profiler. Among the captured replenishments,
+  the direct caller of the allocator was tuple construction in 24.5%,
+  heap tuple deformation in 23.9%, and byte-to-string decoding in
+  25.0%. The UPDATE candidate heap scan accounted for 86.8% of the
+  sampled stacks. The profile covers only part of the run. It identifies
+  candidate scanning and tuple decoding as the main opportunities in
+  the roughly 1.45 GB allocated by either serial mixed mode.
+  Source-free UPDATE and DELETE with a sole integer column equality
+  on a table with variable-length columns now screen visible tuples
+  before full deformation. The screen uses
+  the heap's existing single-column demand to skip unrelated varlena
+  decoding. Matching rows still run the normal predicate, and a changed
+  target version still runs the concurrent-update recheck. The narrow
+  deformation still walks the row and allocates a values vector, so
+  the benefit is greatest when many rows with variable-length data fail
+  the predicate.
+  Repeating the serial mixed benchmark on three fresh servers per mode
+  gave the following medians before → after the change.
+
+  | Tracking | Queries/s | Server CPU (s) | GC (ms) | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | Off | 393.7 → 559.2 | 2.10 → 1.00 | 2 → 0 | 1454584240 → 297242624 | 982302720 → 416665600 | 47909936 → 48029008 |
+  | On | 390.1 → 517.3 | 2.09 → 1.11 | 2 → 0 | 1455514736 → 298299824 | 982401024 → 417460224 | 47935728 → 47998304 |
+  | Off, four clients | 587.1 → 638.0 | 3.09 → 2.04 | 2 → 0 | 1388598128 → 231306768 | 965054464 → 335204352 | 48210240 → 48195776 |
+  | On, four clients | 591.4 → 643.5 | 3.06 → 2.01 | 3 → 0 | 1387877616 → 233101232 | 965181440 → 337272832 | 48212960 → 48201440 |
+
+  The four-client rerun used the same fixture and sample count with
+  the variable-length-column guard in place. Each enabled sample still
+  recorded 768 calls with zero evictions. Rove checks visibility before
+  screening and full values on matches. The SQL wire fixture changes
+  a matching row's key in another transaction and verifies that the
+  blocked UPDATE leaves that newer version alone.
+
+### P02 — Execution and activity diagnostics
+
+Extend the existing EXPLAIN ANALYZE instrumentation and activity reporting
+so operators can correlate a plan and its resource use with a live backend
+and P01 query statistics. Use P01's observation API before adding new
+instrumentation.
+
+- [x] Connect existing EXPLAIN rows, loops, and timing to P01 scopes.
+  Measure node deltas with execution-local counters. Preserve inclusive
+  node totals and count each physical operation once in the query total.
+  Verify nested scopes and rescans with a fake clock and known deltas.
+  Timed node pulls use the statement observation clock. A fake-clock
+  fixture drives nested iterator pulls with known time and I/O deltas,
+  and a second fixture checks timing across an empty rescan.
+- [x] Extend `pg_stat_activity` with bounded query text, query identity,
+  state, and separate query and transaction timestamps. Publish coherent
+  detached snapshots across execute, suspend, commit, error, and disconnect.
+  Keep measurements on suspended portals and distinguish execution work,
+  waits, and client backpressure.
+  The native view snapshots admitted backends and exposes state, query ID
+  when available, transaction and query timestamps, and up to 1024 query
+  characters. Query details are visible to the same role and superusers.
+  Simple-query batches publish bounded source text for each statement and
+  clear the preceding statement's query ID at the boundary. A wire
+  regression observes the blocked middle update and then the final SHOW
+  without an inherited query ID.
+  A wire check saw a blocked writer go from active to idle and disappear
+  on disconnect. Relation, transaction-ID, and B-tree waits publish a
+  single event without acquiring the lock being observed. The wire
+  regression checks a blocked writer's transaction-ID wait and its
+  clearance after progress and cancellation. The canceled update returns
+  SQLSTATE 57014 and contributes one successful plan and no execution
+  or affected rows. Extended wire checks cover identity publication at
+  Bind, a refreshed query timestamp on Execute after suspension, a stable
+  transaction timestamp across both fetches, and cleared transaction
+  state after COMMIT and an implicit-transaction duplicate-key error.
+  With the observer enabled at startup, a session can set
+  `pg_stat_statements.track = none` and still publish analyzed query
+  IDs. Both SELECT and DML portals retain their activity ID through
+  Bind and Execute without creating an observation or statistics entry.
+  The wire fixture checks matching simple and extended IDs and an empty
+  statement store for SELECT and UPDATE RETURNING. The pinned C peer
+  passed the same fixture.
+  Activity rows capture query, state, timestamps, and waits under
+  the publication mutex. Formatting and detached copies of the
+  published query and application strings run after releasing it.
+  Rove mutates the returned strings and verifies that later rows still
+  see the published text.
+- [x] Instrument buffer and storage operations, temporary files, spill,
+  and WAL publication. Describe native cache and page counts in terms of
+  the operations they measure. Register relation, XID, B-tree, WAL, and I/O
+  waits at their owning boundaries. Restore previous nested waits on exit
+  or cancellation. Keep status reads independent of the observed locks.
+  An execution-local accumulator now follows statement slices. Native
+  `EXPLAIN (BUFFERS)` reports relation reads, clean-cache hits, and
+  relation writes in text and JSON. A read means a successful relation
+  stream page read, which can be served by the host page cache. Counts
+  cover execution with ANALYZE and planning otherwise. The iterator records
+  inclusive resource deltas per node, including across pulls. Query totals
+  are counted from the execution scope and are independent of node totals.
+  Spill traffic counts bytes consumed from query temporary files and
+  bytes written to them, including compact sort records and join match
+  maps. A forced sort spill reported 270400 bytes in each direction at
+  the sort node and query scope. The backend loop labels waits for the
+  next frontend message as ClientRead. DataRow writes and their flushes
+  report ClientWrite. The wire regression checks ClientRead during a
+  partial input frame and sees sustained ClientWrite when a client stops
+  reading a large result. The backend disappears after disconnect.
+  Storage-manager page reads and writes expose DataFileRead
+  and DataFileWrite. A controlled storage read held the storage mutex
+  while a SQL observer read the event, then restored the prior wait.
+  WAL appends and output flushes publish WALWrite. Synchronous file and
+  directory syncs publish WALSync, and remote acknowledgment waits publish
+  SyncRep. A controlled INSERT exposed WALWrite to a SQL poller and
+  cleared it at commit. The Rove synchronous-replication test observes
+  SyncRep until acknowledgment. The native
+  `pg_stat_statements_resources` relation reports cumulative completed
+  execution counters for relation I/O, clean-cache hits, spill traffic,
+  and WAL records and bytes. WAL counts include record headers and cover
+  successful appends inside an execution scope. Transaction-end WAL and
+  background writes outside that scope are excluded.
+  The wire regression joins a completed aggregate scan to EXPLAIN by
+  query ID. Total relation reads plus cache hits agree across the two
+  runs, with no writes, spill, or WAL records.
+  A second wire case forces a terminal sort to spill with a 64 KiB
+  work-memory budget. EXPLAIN uses the same projected-row sort as normal
+  SELECT, and both report identical nonzero spill bytes read and written.
+  The resource view also reports execution errors and SQLSTATE 57014
+  cancellations separately. Failed execution does not add successful calls,
+  affected rows, or resource totals. Planning-only rows remain visible in
+  the compatible view when planning tracking is enabled. Wire checks cover
+  a duplicate-key violation and canceling a blocked writer.
+- [x] Extend EXPLAIN with explicit option validation, JSON, `TIMING OFF`,
+  resource counters, and rows removed. Preserve existing default text
+  output and keep row, loop, and resource counts with timing disabled.
+  Enable node timing by default for explicit EXPLAIN ANALYZE. Report
+  process-wide GC separately until it can be attributed to an execution.
+  The wire regression checks default ANALYZE timing, default text
+  layout, and text output with TIMING OFF and BUFFERS ON. That form
+  keeps rows, loops, and native buffer fields without node times.
+  `pg_lisp_runtime_stats` exposes one process-wide row. Its
+  `gc_cpu_time_ms` and `allocated_bytes` are cumulative since process
+  startup. `dynamic_heap_bytes` is current SBCL dynamic-space usage,
+  including objects awaiting collection. Reads sample the counters
+  without forcing a GC or attributing any of the measurements to a query.
+  In the benchmark SBCL build, allocating a 2 MB vector on a worker
+  increased the observing thread's `get-bytes-consed` delta by about
+  2.1 MB. The internal per-thread allocation fields tested on that build
+  stayed zero while the thread allocated about 98 KB. The native views
+  expose allocation at process scope for this runtime.
+  The runtime view also exposes `build_revision`, an optional label
+  supplied using `-c pg_lisp.build_revision=<revision>` at startup.
+  It is SQL NULL when unset. The label identifies the deployment and
+  is independent of both the query ID and the physical plan ID.
+  The text `TIMING OFF` path now retains row and loop counts while
+  skipping per-node clock reads. The overall execution summary still
+  reports elapsed time. Focused Rove and SQL wire checks cover the change.
+  `FORMAT JSON` returns a JSON-typed plan tree with actual rows and loops
+  for ANALYZE, optional node timings, and separate relation and index
+  names on scan nodes. With the statement statistics store enabled,
+  JSON includes the supported SELECT's native Query Identifier. Operators
+  can match it to statement statistics or the activity of a running SELECT.
+  A separate Plan Identifier hashes the admitted physical node structure,
+  scan object OIDs, join kinds, and dependent plans. It changes when the
+  same query switches from a sequential scan to an index scan.
+  Plain EXPLAIN does not add a statement statistics call.
+  Text and JSON share traversal for separately
+  planned subqueries and CTEs. JSON includes their names and parent
+  relationships. JSON ANALYZE reports planning time. Scan and nested-loop
+  nodes expose their names or join type separately, and physical children
+  report their relationship. JSON includes the planner's row estimate and
+  startup and total costs for native sequential and index scans. Startup
+  cost is zero for a sequential scan and includes the modeled B-tree
+  descent for an index scan. Explicit `COSTS ON`
+  includes them in text as well, while `COSTS OFF` suppresses them.
+  Result, projection, sort, subquery scan, window stages, append, and
+  limit nodes also report row estimates where their inputs provide
+  enough information. Result has the default one-tuple CPU cost.
+  Projection and subquery scan propagate modeled input costs, excluding
+  unmodeled expression CPU. An unordered Append pays startup for its
+  first arm and adds half a CPU tuple cost per row to the sum of its
+  arms. A plain Limit interpolates the input run cost by the estimated
+  consumed fraction. On the analyzed 2048-row fixture, the pinned C and
+  native peers matched at 64.48 total for the scan and 32.24 for LIMIT
+  1024. Both estimated 0.03 total and two rows for a two-arm UNION ALL
+  of constants. Both peers also estimate one row and 0.03 total for
+  LIMIT 0 over that scan. pg-lisp's wire regression observes zero actual
+  rows and no input loops. Append still publishes the row sum when a
+  child has no modeled cost, leaving the combined cost absent.
+  The wire regression checks those cost rules and top-N rows.
+  Sort and Top-N over a direct scan or column-only projection estimate
+  comparison and output CPU using the pinned C model. The native
+  disk-cost estimate uses average heap bytes plus a record-container
+  allowance for memory, then charges sequential page transfers per
+  estimated merge pass. It uses whole-row heap width as a proxy for
+  the sort payload. The estimate can differ from actual spill behavior,
+  particularly for narrow projections or compressed values.
+  At 4 MiB work memory, both peers report startup and total costs of
+  177.12 and 182.24 for the full sort, and 90.95 and 90.96 for Top-N 3
+  over the same analyzed table. The wire regression also checks that
+  lowering work memory raises the full sort's modeled costs.
+  The bounded comparison estimate now also covers the case where
+  retained Top-N rows fit but the full input would exceed work memory.
+  A bare column-equals-literal Filter over Seq Scan uses the existing
+  ANALYZE equality selectivity and one operator CPU charge per scanned
+  row. Its estimate can reach the sort above it. The pinned comparison
+  matched one estimated row and 69.61 startup and total costs for the
+  filtered sort. Other filter shapes retain unknown estimates.
+  Global aggregates estimate one output row without relying on input
+  selectivity. Global COUNT with a known input cost adds the default
+  operator CPU cost per input row and transition plus one output tuple.
+  The pinned fixture matched at 69.60 startup and 69.61 total for
+  COUNT(*) and SUM of a plain int2 or int4 column. Computed SUM
+  arguments and COUNT over an unmodeled filter still report one row
+  while leaving their costs absent.
+  Single-column GROUP BY over an analyzed full scan estimates groups
+  from the non-null distinct count, adds one when the sample contains
+  NULL, and caps the estimate at the input cardinality. The native
+  hash COUNT and sorted SUM paths both estimated and produced five
+  groups on the nullable fixture. The pinned C peer estimated four
+  and also produced five. Grouped integer COUNT adds transition and
+  hash CPU plus per-group output cost when the estimated state fits in
+  work memory. It uses the same entry-size charge as the executor.
+  Startup matched C at 1.12 and total was 1.17 versus 1.16 because
+  native includes the NULL group in the output estimate. The overflow
+  model uses the executor's entry charge and partition fan-out, with
+  uniform group frequencies and average heap width as proxies. It
+  charges the initial overflow write before first output and the
+  estimated partition passes afterward. On the 2048-group, 64 KiB
+  fixture, native estimated 137.47 startup and 471.70 total and the
+  wire regression observed spill writes. The pinned C peer estimated
+  74.72 and 95.20 using its own hash-memory and batch model.
+  Sorted SUM of a plain int2 or int4 column adds the internal sort
+  and comparison costs. Startup includes processing the estimated
+  first group and reading ahead to its boundary. The pinned sorted C
+  peer reported 1.20 startup and 1.30 total. Native reported 1.21
+  and 1.31, including the first group work and one more output group
+  for NULL. The hash spill estimate covers a single integer key and
+  does not price skew-driven fallback sorting.
+  Streaming ranking windows add CPU for their functions, partition and
+  order keys, and emitted rows. The internal sort uses the sort cost
+  model for plain scan inputs with known widths. On the pinned fixture,
+  ROW_NUMBER without ordering matched at 0 startup and 90.08 total.
+  Ordered RANK matched at 212.96 total. Native startup is 177.12 and C
+  startup is 177.14 because C also estimates the cost of reading ahead
+  after sorting. Window aggregates with unmodeled buffering keep their
+  row estimates and omit the cost.
+  Cartesian nested loops estimate the product of independent input
+  cardinalities. A direct inner scan uses the planner's existing replay
+  and spill cost, plus tuple CPU for the joined rows. On the three-by-two
+  fixture, both peers estimated and returned six rows. The native
+  cost was 2.14 using its in-iterator replay model. C reported 2.13
+  with a separate Materialize node and the opposite scan order.
+  A bare integer equality between two independent analyzed sequential
+  scans uses the C selectivity formula for inputs without two
+  most-common-value lists. It combines their null fractions and
+  divides by the larger distinct count. The cost includes replay and
+  a comparison per candidate pair. With one null and one matching key
+  in one input, both peers estimated and returned one row.
+  Native cost was 2.16 and pinned C nested-loop cost was 2.15.
+  When both most-common-value lists are available, pg-lisp matches
+  common integer keys directly and applies C's residual estimate to
+  the remaining frequencies. Both peers estimated and returned six
+  rows when the common-value lists covered all non-null keys. Adding
+  unmatched uncommon values raised both estimates to eleven while
+  the joins still produced six rows. Other qualified joins,
+  buffered-window costs, and additional selectivity and width modeling
+  remain open.
+  Explicit Filter nodes report rows rejected by their predicate, including
+  SQL NULL results, in both formats. The count resets on each ANALYZE run
+  and is available with `TIMING OFF`. Row averages include rescans that
+  produced no rows. Nested-loop join counts include
+  rejected replay candidates and lateral join predicates. Outer-join
+  null extension does not add a rejection.
+  The wire regression observes two loops at the inner LATERAL subquery
+  and an average of 0.5 rows when its second invocation returns none.
+  Native B-tree index predicates
+  are exact, so JSON ANALYZE reports zero rows removed by index recheck
+  on qualified index scans. Residual filter rejections remain separate.
+  The wire regression verifies both counts with timing disabled.
+- [x] Diagnose a spilling sort, rescanned nested loop, indexed lookup,
+  blocked writer, suspended portal, and slow consumer through SQL. Reconcile
+  P01 and P02 totals and compare supported EXPLAIN structure, counts, and
+  option behavior with C. Exercise cancellation, disconnect, reload drain,
+  and restart. Publish throughput, median and p95 latency, allocation, GC,
+  polling cost, and contention for disabled instrumentation, counters only,
+  and node timing on the same build and workload.
+  On a 2048-row analyzed table, C and native JSON EXPLAIN agreed on the
+  table and index names, one index scan loop, zero index recheck removals,
+  one residual predicate rejection, and zero output rows. C reports the
+  residual predicate on Index Scan. The native Index Scan produced one
+  candidate and the explicit Filter rejected it. Both omitted node timing
+  and estimates with TIMING OFF and COSTS OFF.
+  With a 64 KiB work-memory limit, the pinned C peer and native server
+  sorted the same 2048 rows in the same order, with one Sort loop and
+  2048 actual rows at the Sort and sequential scan. C reported external
+  merge with 79 temporary blocks read and 86 written. Native reported
+  331776 spill bytes in each direction. The two counters measure their
+  respective storage formats. Both reported zero spill traffic at the
+  scan. The native wire regression also reconciles spill traffic with
+  the statement resource view.
+  EXPLAIN ANALYZE reports the native sort method and a Memory or Disk
+  space type in text and JSON even with TIMING OFF. It distinguishes
+  the stable in-memory sort, the bounded Top-N heap, concatenation
+  of disjoint runs, and merge of overlapping runs. If rescans use
+  different methods, the summary lists the methods seen, with Mixed
+  space type when both memory and disk were used. With ANALYZE and
+  BUFFERS, the query summary also reports Native Peak Temp Bytes, the
+  high-water mark of charged spill files written by that execution.
+  Removing a run deducts its live charge, and files from an earlier
+  execution do not contribute to the sample. This measures logical
+  bytes, while the spill read and write fields measure traffic.
+  In-memory and Top-N cases report zero peak temp bytes. The disjoint
+  sort peaked at 331776 bytes with the same number of bytes written.
+  An 8 KiB overlapping-run case peaked at 449874 bytes while writing
+  995328 bytes over its merge passes.
+  The pinned comparison reports Disk for both peers. The native
+  fixture with disjoint integer ranges reports external run
+  concatenation, whereas the C peer reports external merge.
+  The native wire suite forces overlapping runs as well and verifies
+  the external merge label. It also exercises the sort that orders
+  source rows before evaluating a target-list set-returning function.
+  A point-read rerun after adding sort metadata used three fresh
+  servers per tracking mode and 2048 warmed lookups per sample.
+  Tracking off → on, median throughput was 2686 → 2658 queries/s,
+  allocation 123649168 → 125196048 bytes, peak RSS 226631680 →
+  228241408 bytes, and post-GC heap 47722912 → 47731936 bytes.
+  Every enabled sample counted 2048 calls and zero evictions.
+  A lateral nested-loop fixture forced a sequential inner scan and
+  disabled memoization on the C peer. Both returned one row from a
+  2048-row input, ran the inner Limit twice, and reported 0.5 inner
+  output rows per loop. The filter rejected 15 rows on its successful
+  loop and 2048 on the other, reported as 1032 rows removed per loop
+  after rounding on both peers. C puts the count on Seq Scan and native
+  puts it on the explicit Filter node. Both suppressed node times and
+  costs in JSON when TIMING OFF and COSTS OFF were set.
+  The memory benchmark's `--warmup` and `--explain-mode` options run the
+  same read-only queries through plain SQL or JSON EXPLAIN ANALYZE. The
+  EXPLAIN modes are `rows` (BUFFERS OFF, TIMING OFF), `counters`
+  (BUFFERS ON, TIMING OFF), and `timing` (BUFFERS ON, TIMING ON).
+  All use statement tracking off and suppress plan estimates. Compare EXPLAIN modes directly to
+  see the incremental instrumentation and reporting costs. Plain SQL
+  can send more data, particularly when returning the full sorted result.
+
+  With `--rows 2048 --repeat 12 --runs 3 --warmup`, the medians below
+  compare plain SQL, rows-only EXPLAIN, counters, and counters with timing
+  in that order. Each point-read sample ran 768 queries. The other samples
+  ran 12 queries each.
+
+  | Workload | Queries/s | Client p95 (ms) | Server CPU (s) |
+  | --- | --- | --- | --- |
+  | Indexed point reads | 2837 / 2332 / 2391 / 2508 | 0.433 / 0.512 / 0.501 / 0.463 | 0.16 / 0.16 / 0.18 / 0.17 |
+  | Aggregate scan | 535 / 458 / 490 / 471 | 2.143 / 2.631 / 2.367 / 2.424 | 0.02 / 0.02 / 0.02 / 0.02 |
+  | Sort | 102 / 335 / 332 / 319 | 10.464 / 3.346 / 3.444 / 3.350 | 0.04 / 0.03 / 0.04 / 0.03 |
+  | Join | 121 / 116 / 117 / 114 | 8.584 / 9.159 / 9.069 / 9.376 | 0.10 / 0.10 / 0.10 / 0.11 |
+
+  | Workload | Allocated bytes | Peak RSS bytes |
+  | --- | --- | --- |
+  | Indexed point reads | 46572512 / 50843552 / 60022560 / 62583296 | 149426176 / 153718784 / 162930688 / 165478400 |
+  | Aggregate scan | 14396864 / 14462464 / 14586832 / 14656192 | 117219328 / 117334016 / 117493760 / 117563392 |
+  | Sort | 22321280 / 18374448 / 18526464 / 18562432 | 125173760 / 121114624 / 121225216 / 121303040 |
+  | Join | 39373616 / 39542352 / 39750064 / 39812144 | 142282752 / 142462976 / 142684160 / 142761984 |
+
+  Median post-GC heaps differed by less than 40 KiB across modes for each
+  workload. Median process GC time was 0 ms. Counters added 9179008
+  allocated bytes over rows-only EXPLAIN for the point-read sample.
+  SB-SPROF attributed 16.8% of sampled allocation to JSON plan
+  formatting. Writing the seven fixed resource labels as JSON syntax
+  reduced the counters sample from 60022560 to 59907248 allocated
+  bytes. This recovered 115312 bytes of the measured premium.
+  Reserving capacity once for each encoded frontend field and then
+  copying it in bulk reduced the same sample to 57464288 allocated
+  bytes and 160432128 bytes peak RSS. This recovered another 2442960
+  allocated bytes and 2412544 bytes peak RSS. Median elapsed time was
+  331 → 330 ms for the two runs after the JSON label change.
+  A later warmed 12-sort rerun on the projected-row path measured
+  18390144 allocated bytes with rows only, 18488448 with counters, and
+  18521024 with timing. Peak RSS ranged from 121262080 to 121372672
+  bytes, and post-GC heap from 47592592 to 47656672 bytes. These samples
+  used the default work-memory budget and overlapped the unit suite.
+
+  The same four-client point-read workload compared the EXPLAIN modes
+  with tracking off. Rows only, counters, and node timing respectively
+  used 101799968, 116449200, and 121961824 allocated bytes. Peak RSS was
+  205160448, 219783168, and 225198080 bytes, and post-GC heap ranged
+  from 47755360 to 47797392 bytes with 0 ms median GC time. Throughput
+  was 3947, 4118, and 4072 queries/s, median latency was 0.726, 0.669,
+  and 0.702 ms, and p95 was 2.106, 2.064, and 2.050 ms. Server CPU
+  time was 0.43, 0.42, and 0.44 s. These three samples per mode show
+  stepped memory costs with throughput varying across the modes.
+
+  The warmed 16384-row scans also ran all three EXPLAIN modes with
+  tracking off. Each series is rows only / counters / counters with
+  node timing, with 32 queries per sample and three fresh servers per mode.
+  Median process GC time was zero in all six cases.
+
+  | Clients | Queries/s | Median client latency (ms) | Client p95 (ms) | Server CPU (s) |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 80.0 / 78.0 / 76.6 | 12.442 / 12.766 / 13.021 | 13.113 / 13.284 / 13.769 | 0.39 / 0.40 / 0.40 |
+  | 4 | 281.9 / 268.6 / 269.9 | 13.312 / 13.564 / 13.875 | 14.395 / 14.690 / 15.744 | 0.41 / 0.43 / 0.44 |
+
+  | Clients | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 297374576 / 297689728 / 297880528 | 405303296 / 405659648 / 405811200 | 49459920 / 49521088 / 49451760 |
+  | 4 | 297751664 / 298189360 / 298330304 | 406110208 / 406462464 / 406593536 | 49629472 / 49729072 / 49760608 |
+
+  The activity polling benchmark used 30 admitted connections on one
+  server, with four clients doing 1024 warmed indexed reads each. The
+  poller selected PID, state, wait type, wait name, query ID, and query
+  text at a 10 ms interval. A control returned six comparable fields
+  from a 30-row table. The regular Python wire client reads type, length,
+  and body separately from the socket. With that client, both polling
+  queries reduced measured throughput from about 3692 to about 1610
+  lookups/s. The buffered rerun received up to 64 KiB at a time and
+  parsed complete frames from those bytes. Both polls then ran at the
+  target cadence without the large throughput drop.
+
+  | Poll source | Lookups/s | Lookup median / p95 (ms) | Poll median / p95 (ms) | Server CPU (s) | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | None | 6617 | 0.553 / 0.890 | — | 1.24 | 249727392 | 358100992 | 48655536 |
+  | Activity | 6494 | 0.575 / 0.927 | 0.725 / 1.053 | 1.29 | 253619504 | 362053632 | 48712800 |
+  | Control table | 6402 | 0.581 / 0.939 | 0.746 / 1.172 | 1.29 | 253367856 | 361701376 | 48679888 |
+
+  Each mode used three fresh servers in rotated order. Median activity
+  and control poll counts were 62 and 63. Every sample tracked exactly
+  4096 lookups, and median process GC time was zero in all modes.
+
+  The final cross-mode run used the same buffered 30-connection
+  workload with activity polling at 100 Hz in every mode. Statement
+  collection was disabled, all four workers checked 1024 indexed
+  lookups each, and each mode ran on three fresh servers in rotated
+  order. Mode medians follow. Rows only, counters, and timing used
+  JSON EXPLAIN ANALYZE with COSTS OFF and progressively enabled
+  BUFFERS and TIMING.
+
+  | Mode | Lookups/s | Lookup median / p95 (ms) | Poll median / p95 (ms) | Server CPU (s) | Allocated bytes | Peak RSS bytes | Post-GC heap bytes |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | Plain SQL | 6613 | 0.556 / 0.905 | 0.665 / 1.040 | 1.24 | 250443568 | 358772736 | 48744112 |
+  | Rows only | 6612 | 0.529 / 0.881 | 0.621 / 1.011 | 1.15 | 273504416 | 382078976 | 48740960 |
+  | Counters | 6393 | 0.529 / 0.923 | 0.642 / 0.992 | 1.18 | 313242032 | 421699584 | 48674880 |
+  | Counters and timing | 6397 | 0.541 / 0.932 | 0.645 / 0.989 | 1.20 | 327919232 | 436260864 | 48741168 |
+
+  Median process GC time was zero in all modes. The three EXPLAIN
+  variants all checked the same actual row count and presence of
+  the requested fields. A separate disposable-server probe replaced
+  the blocking activity mutex acquisition at frontend begin and
+  end with one immediate try before falling back to the blocking
+  path. With 4096 lookups and 59–62 polls per sample, misses in the
+  four modes were 152, 133, 137, and 137, respectively, across
+  roughly 8310 acquisitions per mode (1.6–1.8%). These counts
+  cover the two frontend activity publication sites and exclude
+  timing samples. They do not measure lock hold durations.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup

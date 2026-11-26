@@ -8,6 +8,8 @@ full GC. --profiles collects SB-SPROF allocation stacks in separate runs.
 import argparse
 import concurrent.futures
 import json
+import math
+import os
 import random
 import re
 import runpy
@@ -26,10 +28,32 @@ WORKLOADS = (
     "scan", "point_reads", "sort", "aggregate", "join", "copy_out",
     "heap_insert", "indexed_insert", "update", "delete", "mixed", "toast",
 )
+CONCURRENT_READ_WORKLOADS = ("concurrent_point_reads", "concurrent_scan")
+MIXED_WORKLOADS = {"mixed", "mixed_serial"}
+EXPLAIN_WORKLOADS = {"scan", "point_reads", "sort", "join", *CONCURRENT_READ_WORKLOADS}
+EXPLAIN_OPTIONS = {
+    "rows": "BUFFERS OFF, TIMING OFF",
+    "counters": "BUFFERS ON, TIMING OFF",
+    "timing": "BUFFERS ON, TIMING ON",
+}
 
 
-def connect(server):
-    sql = Connection(server.port)
+class MeasuredConnection(Connection):
+    def __init__(self, port, latencies):
+        super().__init__(port)
+        self.latencies = latencies
+
+    def query(self, query):
+        if self.latencies is None:
+            return super().query(query)
+        start = time.monotonic_ns()
+        result = super().query(query)
+        self.latencies.append(time.monotonic_ns() - start)
+        return result
+
+
+def connect(server, latencies=None):
+    sql = MeasuredConnection(server.port, latencies)
     sql.socket.settimeout(120)
     return sql
 
@@ -48,7 +72,9 @@ def check(condition, detail):
 
 def prepare(sql, workload, rows):
     sql.query("CREATE TABLE items (id integer, grp integer, payload text)")
-    if workload in {"point_reads", "indexed_insert", "update", "delete", "mixed"}:
+    if workload in {
+        "point_reads", "concurrent_point_reads", "indexed_insert", "update", "delete", *MIXED_WORKLOADS,
+    }:
         sql.query("CREATE UNIQUE INDEX items_id ON items(id)")
     if workload == "indexed_insert":
         sql.query("CREATE INDEX items_grp ON items(grp)")
@@ -59,21 +85,59 @@ def prepare(sql, workload, rows):
         insert(sql, "groups", 0, 64, 8)
 
 
-def exercise(server, sql, workload, rows, repeat):
-    def run_query(query, expected):
+def exercise(server, sql, workload, rows, repeat, explain_mode=None):
+    def select(query, expected_rows, connection=sql):
+        if explain_mode is None:
+            result = connection.query(query)
+            check(len(result) == expected_rows, query)
+            return result
+        options = EXPLAIN_OPTIONS[explain_mode]
+        result = connection.query(f"EXPLAIN (ANALYZE, FORMAT JSON, COSTS OFF, {options}) {query}")
+        root = json.loads(result[0][0])[0]["Plan"]
+        check(root["Actual Rows"] == expected_rows, root)
+        check(("Actual Total Time" in root) == (explain_mode == "timing"), root)
+        check(("Native Relation Reads" in root) == (explain_mode != "rows"), root)
+        return None
+
+    def run_query(query, expected, connection=sql):
         for _ in range(repeat):
-            check(sql.query(query) == expected, query)
+            result = select(query, len(expected), connection)
+            if result is not None:
+                check(result == expected, query)
+
+    def scan(connection):
+        expected = [[str(rows), str(rows * (rows - 1) // 2)]]
+        run_query("SELECT count(*), sum(id) FROM items", expected, connection)
+
+    def point_reads(connection, count, offset=0):
+        for i in range(count):
+            key = (i + offset) * 241 % rows
+            result = select(f"SELECT id FROM items WHERE id={key}", 1, connection)
+            if result is not None:
+                check(result == [[str(key)]], key)
+
+    def run_clients(operation):
+        def client(worker):
+            connection = connect(server, sql.latencies)
+            try:
+                operation(connection, worker)
+            finally:
+                connection.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(client, range(4)))
 
     if workload == "scan":
-        run_query("SELECT count(*), sum(id) FROM items", [[str(rows), str(rows * (rows - 1) // 2)]])
+        scan(sql)
+    elif workload == "concurrent_scan":
+        run_clients(lambda connection, _: scan(connection))
     elif workload == "point_reads":
-        for i in range(repeat * 64):
-            key = i * 241 % rows
-            check(sql.query(f"SELECT id FROM items WHERE id={key}") == [[str(key)]], key)
+        point_reads(sql, repeat * 64)
+    elif workload == "concurrent_point_reads":
+        run_clients(lambda connection, worker: point_reads(connection, repeat * 16, worker * repeat * 16))
     elif workload == "sort":
         for _ in range(repeat):
-            result = sql.query("SELECT payload,id FROM items ORDER BY grp DESC,id")
-            check(len(result) == rows, len(result))
+            select("SELECT payload,id FROM items ORDER BY grp DESC,id", rows)
     elif workload == "aggregate":
         for _ in range(repeat):
             result = sql.query("SELECT grp,count(*),sum(id) FROM items GROUP BY grp")
@@ -98,21 +162,20 @@ def exercise(server, sql, workload, rows, repeat):
         sql.query("UPDATE items SET grp=grp+1 WHERE id % 4=0")
     elif workload == "delete":
         sql.query("DELETE FROM items WHERE id % 4=0")
-    elif workload == "mixed":
-        def client(worker):
-            connection = connect(server)
-            try:
-                for i in range(repeat * 16):
-                    key = i * 16 + worker
-                    connection.query("BEGIN")
-                    check(connection.query(f"SELECT id FROM items WHERE id={key}") == [[str(key)]], key)
-                    connection.query(f"UPDATE items SET grp=grp+1 WHERE id={key}")
-                    connection.query("COMMIT")
-            finally:
-                connection.close()
+    elif workload in MIXED_WORKLOADS:
+        def mixed(connection, worker):
+            for i in range(repeat * 16):
+                key = i * 16 + worker
+                connection.query("BEGIN")
+                check(connection.query(f"SELECT id FROM items WHERE id={key}") == [[str(key)]], key)
+                connection.query(f"UPDATE items SET grp=grp+1 WHERE id={key}")
+                connection.query("COMMIT")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(client, range(4)))
+        if workload == "mixed":
+            run_clients(mixed)
+        else:
+            for worker in range(4):
+                mixed(sql, worker)
     else:
         # Force external storage with incompressible, repeatable ASCII payloads.
         rng = random.Random(42)
@@ -140,6 +203,11 @@ def rss(pid):
     raise RuntimeError("VmRSS missing for benchmark server")
 
 
+def cpu_seconds(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 def measure(server, operation, profile_path):
     pid = server.process.pid
     if profile_path:
@@ -158,11 +226,13 @@ def measure(server, operation, profile_path):
         server.control("(sb-sprof:start-profiling :mode :alloc :max-samples 20000)")
     sampler = threading.Thread(target=sample)
     sampler.start()
+    cpu_before = cpu_seconds(pid)
     start = time.monotonic()
     try:
         operation()
     finally:
         elapsed = time.monotonic() - start
+        cpu_elapsed = cpu_seconds(pid) - cpu_before
         stopped.set()
         sampler.join()
         peak = max(peak, rss(pid))
@@ -176,27 +246,66 @@ def measure(server, operation, profile_path):
             ":show-progress nil) (values))"
         ))
     return {
-        "seconds": elapsed, "allocated_bytes": after - before,
+        "seconds": elapsed, "server_cpu_seconds": cpu_elapsed,
+        "allocated_bytes": after - before,
         "peak_rss_bytes": peak, "rss_growth_bytes": peak - rss_before,
         "live_heap_before_bytes": live_before, "live_heap_after_bytes": live_after,
         "gc_ms": gc_after - gc_before,
     }
 
 
-def run_case(workload, rows, repeat, profile):
-    server = OwnedLisp()
+def run_case(workload, rows, repeat, profile, statement_statistics=False,
+             explain_mode=None, warmup=False):
+    parameters = (("pg_stat_statements.enabled", "on"),) if statement_statistics else ()
+    server = OwnedLisp(parameters)
     sql = None
     succeeded = False
     try:
         server.start()
         sql = connect(server)
         prepare(sql, workload, rows)
-        result = measure(server, lambda: exercise(server, sql, workload, rows, repeat), profile)
+        if warmup:
+            exercise(server, sql, workload, rows, 1, explain_mode)
+        if statement_statistics:
+            sql.query("SET pg_stat_statements.track TO 'none'")
+            sql.query("SELECT pg_stat_statements_reset()")
+            sql.query("RESET pg_stat_statements.track")
+        # COPY uses a raw frontend exchange and has no Connection.query samples.
+        sql.latencies = []
+        result = measure(server, lambda: exercise(server, sql, workload, rows, repeat, explain_mode),
+                         profile)
+        latencies = sorted(sql.latencies)
+        sql.latencies = None
+        if latencies:
+            result.update(
+                sql_queries=len(latencies),
+                sql_queries_per_second=len(latencies) / result["seconds"],
+                sql_median_ms=statistics.median(latencies) / 1e6,
+                sql_p95_ms=latencies[math.ceil(0.95 * len(latencies)) - 1] / 1e6,
+            )
+        if statement_statistics:
+            sql.query("SET pg_stat_statements.track TO 'none'")
+            calls = sql.query("SELECT coalesce(sum(calls), 0) FROM pg_stat_statements")
+            result["tracked_calls"] = int(calls[0][0])
+            [[dealloc]] = sql.query("SELECT dealloc FROM pg_stat_statements_info")
+            result["statistics_evictions"] = int(dealloc)
+            # Mixed transactions track SELECT and UPDATE. BEGIN and COMMIT are utility commands.
+            tracked_per_repeat = {
+                "point_reads": 64, "concurrent_point_reads": 64,
+                "scan": 1, "concurrent_scan": 4, "mixed": 128, "mixed_serial": 128,
+            }.get(workload)
+            if tracked_per_repeat is not None and explain_mode is None:
+                check(result["tracked_calls"] == repeat * tracked_per_repeat, result)
         if workload in {"heap_insert", "indexed_insert", "delete", "update"}:
             expected = rows - (rows + 3) // 4 if workload == "delete" else rows
             check(sql.query("SELECT count(*) FROM items") == [[str(expected)]], workload)
             if workload == "update":
                 check(sql.query("SELECT count(*) FROM items WHERE grp % 4=0") == [["0"]], workload)
+        if workload in MIXED_WORKLOADS:
+            groups, remainder = divmod(rows, 64)
+            initial_sum = groups * (63 * 64 // 2) + remainder * (remainder - 1) // 2
+            expected_sum = initial_sum + 64 * (repeat + int(warmup))
+            check(sql.query("SELECT sum(grp) FROM items") == [[str(expected_sum)]], workload)
         succeeded = True
         return result
     finally:
@@ -212,28 +321,48 @@ def run_case(workload, rows, repeat, profile):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=4096)
-    parser.add_argument("--repeat", type=int, default=4)
+    parser.add_argument("--repeat", type=int, default=4,
+                        help="Iterations per sample, per client for concurrent_scan")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--case", choices=WORKLOADS, action="append")
+    parser.add_argument("--case", choices=(*WORKLOADS, *CONCURRENT_READ_WORKLOADS, "mixed_serial"),
+                        action="append")
     parser.add_argument("--profiles", type=Path, help="Separate SB-SPROF allocation sample runs")
+    parser.add_argument("--statement-statistics", action="store_true",
+                        help="Enable pg_stat_statements and report observed calls per sample")
+    parser.add_argument("--explain-mode", choices=EXPLAIN_OPTIONS,
+                        help="Run SELECT through EXPLAIN ANALYZE with the selected instrumentation")
+    parser.add_argument("--warmup", action="store_true",
+                        help="Run one warmup iteration for SELECT and mixed read/write workloads")
     args = parser.parse_args()
     workloads = args.case or WORKLOADS
     if min(args.rows, args.repeat, args.runs) < 1:
         parser.error("use positive counts")
-    if "mixed" in workloads and args.rows < args.repeat * 256:
+    if MIXED_WORKLOADS.intersection(workloads) and args.rows < args.repeat * 256:
         parser.error("mixed requires at least repeat * 256 rows")
+    if args.explain_mode and not set(workloads) <= EXPLAIN_WORKLOADS:
+        parser.error("EXPLAIN requires explicit SELECT cases: " + ", ".join(sorted(EXPLAIN_WORKLOADS)))
+    if args.warmup and not set(workloads) <= EXPLAIN_WORKLOADS | MIXED_WORKLOADS:
+        parser.error("warmup requires explicit SELECT or mixed read/write cases")
     if args.profiles:
         args.profiles.mkdir(parents=True, exist_ok=True)
     results = {}
     for workload in workloads:
-        runs = [run_case(workload, args.rows, args.repeat, None) for _ in range(args.runs)]
+        runs = [
+            run_case(workload, args.rows, args.repeat, None, args.statement_statistics,
+                     args.explain_mode, args.warmup)
+            for _ in range(args.runs)
+        ]
         results[workload] = {
             "samples": runs,
             "median": {key: statistics.median(run[key] for run in runs) for key in runs[0]},
         }
         if args.profiles:
-            run_case(workload, args.rows, args.repeat, args.profiles / f"{workload}.txt")
-    print(json.dumps({"rows": args.rows, "repeat": args.repeat, "results": results}, indent=2))
+            run_case(workload, args.rows, args.repeat, args.profiles / f"{workload}.txt",
+                     args.statement_statistics, args.explain_mode, args.warmup)
+    print(json.dumps({"rows": args.rows, "repeat": args.repeat,
+                      "statement_statistics": args.statement_statistics,
+                      "explain_mode": args.explain_mode, "warmup": args.warmup, "results": results},
+                     indent=2))
 
 
 if __name__ == "__main__":

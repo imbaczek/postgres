@@ -763,7 +763,11 @@
     (let ((result
             (call-with-blocking-sync-wait
              (lambda (backend finished)
-               (declare (ignore backend))
+               (rove:ok (loop repeat 50
+                              when (eq :sync-rep (backend-activity-wait-event backend))
+                                return t
+                              do (sleep 0.005))
+                        "the unacknowledged commit advertises SyncRep")
                (sb-thread:with-mutex (*wal-lock*)
                  (rove:ok (zerop (sb-thread:semaphore-count finished))
                           "the wait leaves WAL available to other actors"))
@@ -773,7 +777,8 @@
                           "sent and written WAL do not prove flush")
                  (wal-sender-note-reply sender 150 100 0 2))))))
       (rove:ok (eq :acknowledged (getf result :outcome)))
-      (rove:ok (null (getf result :fatal)))))
+      (rove:ok (null (getf result :fatal)))
+      (rove:ok (null (backend-activity-wait-event (getf result :backend))))))
 
 (rove:deftest synchronous-blocking-wait-reacquires-after-poll-timeout
     (let ((original (symbol-function 'sync-replication-interruption))

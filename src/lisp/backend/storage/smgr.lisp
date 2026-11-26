@@ -72,15 +72,21 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
             ((and (eq fork :visibility) (not (probe-file path))) 0)
             (t (relation-nblocks (smgr-open-locked relfilenode fork)))))))
 
+(defun smgr-read-page (stream block)
+  (declare (ftype function call-with-backend-io-wait))
+  (call-with-backend-io-wait :data-file-read (lambda () (read-page stream block))))
+
 (defun smgr-read-locked (relfilenode block fork)
   (declare (ftype function wal-check-read-page))
   (let* ((stream (gethash (list relfilenode fork) *relation-streams*))
-         (page (cond (stream (read-page stream block))
+         (page (cond (stream (smgr-read-page stream block))
                      ((and (eq fork :visibility)
                            (not (probe-file (relation-file-path relfilenode fork))))
                       nil)
-                     (t (read-page (smgr-open-locked relfilenode fork) block)))))
-    (wal-check-read-page page relfilenode block)))
+                     (t (smgr-read-page (smgr-open-locked relfilenode fork) block)))))
+    (multiple-value-prog1 (wal-check-read-page page relfilenode block)
+      (when (and page *statement-resource-usage*)
+        (incf (statement-resource-usage-relation-reads *statement-resource-usage*))))))
 
 (defun smgr-read (relfilenode block &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)
@@ -129,9 +135,11 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
          (slot (gethash key *smgr-clean-pages*)))
     (when slot
       (return-from smgr-read-clean-page-locked
-        (values (wal-check-read-page (cdr (aref *smgr-clean-slots* slot))
-                                     relfilenode block)
-                t)))
+        (let ((page (wal-check-read-page (cdr (aref *smgr-clean-slots* slot))
+                                         relfilenode block)))
+          (when *statement-resource-usage*
+            (incf (statement-resource-usage-clean-cache-hits *statement-resource-usage*)))
+          (values page t))))
     (let ((page (funcall verify (smgr-read-locked relfilenode block fork)
                          relfilenode block fork)))
       (when page
@@ -158,12 +166,16 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
 (declaim (ftype function wal-check-persisted-page))
 
 (defun smgr-write-page-locked (stream relfilenode block page fork)
+  (declare (ftype function call-with-backend-io-wait))
   (wal-check-persisted-page stream relfilenode block page fork)
   ;; Invalidate before writing: even a failed partial write must not leave a
   ;; stale page available for a subsequent cache lookup.
   (when (plusp (hash-table-count *smgr-clean-pages*))
     (smgr-remove-clean-page-locked (list relfilenode fork block)))
-  (write-page stream block page))
+  (multiple-value-prog1
+      (call-with-backend-io-wait :data-file-write (lambda () (write-page stream block page)))
+    (when *statement-resource-usage*
+      (incf (statement-resource-usage-relation-writes *statement-resource-usage*)))))
 
 (defun smgr-write (relfilenode block page &optional (fork :main))
   (sb-thread:with-mutex (*smgr-lock*)

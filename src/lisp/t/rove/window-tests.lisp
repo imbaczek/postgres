@@ -101,9 +101,10 @@
         (rove:ok (equal keys (list key)))
         (rove:ok (null unused)))
       (rove:ok (equal (getf (aref *select-window-functions* 0) :partition)
-                      '((:col 3 :type :int4 :typmod -1))))
+                      `((:col 3 :type :int4 :typmod -1 :window-input-expression ,key))))
       (let ((planned (getf target :expr)))
-        (rove:ok (equal (first (third planned)) '(:col 3 :type :int4 :typmod -1)))
+        (rove:ok (equal (first (third planned))
+                        `(:col 3 :type :int4 :typmod -1 :window-input-expression ,key)))
         (rove:ok (eq key (second (second (third planned)))))
         (rove:ok (eq key (getf (cdddr planned) :saved))))))
 

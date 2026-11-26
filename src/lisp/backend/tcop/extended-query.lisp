@@ -2,16 +2,16 @@
 
 (in-package #:pg)
 
-(defstruct extended-statement ast types (result-signature nil :read-only t))
+(defstruct extended-statement ast types activity-text (result-signature nil :read-only t))
 
 (defstruct extended-portal statement values (executed-p nil)
            (returns-rows-p nil :read-only t)
            (result-columns nil :read-only t)
            (result-formats nil :read-only t))
 
-(defstruct extended-select-execution owner plan targets iterator (at-end-p nil) (failed-p nil))
+(defstruct extended-select-execution owner plan targets iterator observation queryid (at-end-p nil) (failed-p nil))
 
-(defstruct extended-dml-execution owner prepared targets spool store iterator
+(defstruct extended-dml-execution owner prepared targets spool store iterator observation queryid
            (ready-p nil) (at-end-p nil) (failed-p nil))
 
 (defvar *extended-dml-executions* (make-hash-table :test #'eq :weakness :key))
@@ -37,7 +37,8 @@
            (multiple-value-bind (sink metrics) (logical-encoding-sink size output)
              (loop while (plusp remaining) do
                (let* ((count (min remaining (length buffer)))
-                      (end (read-sequence buffer input :end count)))
+                      (end (with-backend-client-read-wait
+                             (read-sequence buffer input :end count))))
                  (when (zerop end)
                    (error "connection ended during Bind body"))
                  (funcall sink (if (= end (length buffer)) buffer (subseq buffer 0 end)))
@@ -158,6 +159,7 @@
 
 (defun invalidate-extended-dml-execution (execution)
   (setf (extended-dml-execution-failed-p execution) t
+        (extended-dml-execution-observation execution) nil
         (extended-dml-execution-prepared execution) nil
         (extended-dml-execution-targets execution) nil
         (extended-dml-execution-iterator execution) nil
@@ -165,7 +167,7 @@
         (extended-dml-execution-spool execution) nil)
   (values))
 
-(defun extended-close-portal (portal &optional failed-p)
+(defun extended-close-portal (portal &optional failed-p discard-observation-p)
   ;; Failed cleanup keeps its owner reachable for retry. A failed transaction
   ;; may retain portal identity after executable state has been closed.
   (let ((execution (extended-select-execution-for portal)))
@@ -174,7 +176,12 @@
       (multiple-value-bind (closed failures)
           (close-query-execution-owner (extended-select-execution-owner execution))
         (unless closed (return-from extended-close-portal (values nil failures))))
-      (setf (extended-select-execution-plan execution) nil
+      (finish-statement-observation
+       (extended-select-execution-observation execution)
+       (if (or discard-observation-p (extended-select-execution-failed-p execution))
+           :failed :success))
+      (setf (extended-select-execution-observation execution) nil
+            (extended-select-execution-plan execution) nil
             (extended-select-execution-targets execution) nil
             (extended-select-execution-iterator execution) nil)
       (unless failed-p
@@ -225,6 +232,21 @@
                 (setf ,complete t)))
          (unless ,complete (extended-close-portal ,actual-portal))))))
 
+(defun prepare-observed-select-result (ast execution)
+  "Fingerprint the analyzed query before planning can rewrite it."
+  (multiple-value-bind (store toplevel) (statement-tracking-store)
+    (unless (and *backend* *statement-statistics-store*)
+      (return-from prepare-observed-select-result (prepare-select-result ast)))
+    (with-statement-planning ((prepared (prepare-select ast))
+                              (query-id (statement-select-fingerprint prepared))
+                              ((plan targets columns) (prepare-select-result ast prepared))
+                              ticks (and store (statement-track-planning-p)))
+      (setf (extended-select-execution-queryid execution) query-id
+            (extended-select-execution-observation execution)
+            (begin-planned-statement-observation
+             store toplevel query-id ticks (getf ast :normalized-statement-text)))
+      (values plan targets columns))))
+
 (defun extended-initialize-select-portal (portal &key snapshot)
   "Prepare a SELECT portal and return its result columns.
 The owner retains the plan, relations and snapshot until the portal closes.
@@ -244,7 +266,7 @@ for an extended-protocol portal and check its bound result descriptor."
        owner
        (lambda ()
          (multiple-value-bind (plan targets columns)
-             (prepare-select-result (extended-statement-ast statement))
+             (prepare-observed-select-result (extended-statement-ast statement) execution)
            (unless snapshot
              (check-result-column-shape columns *select-expected-result-columns*))
            (setf (extended-select-execution-plan execution) plan
@@ -268,7 +290,7 @@ for an extended-protocol portal and check its bound result descriptor."
                      (sb-sys:without-interrupts
                        (unwind-protect
                             (sb-sys:with-local-interrupts
-                              (force-output stream)
+                              (with-backend-client-write-wait (stream) (force-output stream))
                               (setf complete t))
                          (unless complete (ignore-errors (close stream :abort t)))))))
                  (return-from extended-send-portal-rows (values count t)))
@@ -283,14 +305,13 @@ for an extended-protocol portal and check its bound result descriptor."
                (incf count)))
     (values count nil)))
 
-(defun run-select-portal (stream portal limit)
+(defun run-select-portal-slice (stream execution limit)
   "Send SELECT rows and return the count and whether the portal reached the end.
 A nonpositive LIMIT requests all remaining rows. Keep the iterator in the
 portal owner so a bounded Execute can resume the same plan and snapshot.
 Detach active index scans before a suspended execution releases its leases.
 On completion or error, close the iterators while those leases are still held."
-  (let ((execution (extended-select-execution-for portal))
-        (count 0))
+  (let ((count 0))
     (unless execution (ereport "55000" "portal has no initialized SELECT execution"))
     (when (extended-select-execution-failed-p execution)
       (ereport "55000" "portal cannot be run"))
@@ -336,10 +357,28 @@ On completion or error, close the iterators while those leases are still held."
                     (setf (extended-select-execution-iterator execution) nil))))))))))
     (values count (extended-select-execution-at-end-p execution))))
 
+(defun run-select-portal (stream portal limit)
+  "Account only the active slice, leaving a suspended observation with its portal."
+  (let* ((execution (extended-select-execution-for portal))
+         (observation (and execution
+                           (not (extended-select-execution-at-end-p execution))
+                           (extended-select-execution-observation execution))))
+    (if (null observation)
+        (run-select-portal-slice stream execution limit)
+        (multiple-value-bind (count at-end)
+            (call-with-statement-execution-slice
+             observation (lambda () (run-select-portal-slice stream execution limit)))
+          (incf (statement-observation-rows observation) count)
+          (values count at-end)))))
+
 (defun execute-select-portal (stream portal limit)
   (multiple-value-bind (count at-end) (run-select-portal stream portal limit)
     (if at-end
         (progn
+          (let ((execution (extended-select-execution-for portal)))
+            (when execution
+              (finish-statement-observation
+               (extended-select-execution-observation execution) :success)))
           (send-command-complete stream (format nil "SELECT ~d" count))
           t)
         (progn
@@ -381,10 +420,14 @@ Send its row description before execution and close it before reporting completi
            (prepare-xid-wraparound-for-statement *backend*))
          ;; Disallow isolation changes after Bind has admitted the query.
          (setf (backend-first-snapshot-set *backend*) t)
-         (let ((prepared (prepare-dml-subqueries (extended-statement-ast statement))))
-           (setf (extended-dml-execution-prepared execution) prepared
-                 (extended-dml-execution-targets execution) (getf prepared :returning))
-           (register-dml-subquery-relations prepared (get-current-reader-xid))))))))
+         (multiple-value-bind (store toplevel) (statement-tracking-store)
+           (multiple-value-bind (prepared observation queryid)
+               (prepare-observed-dml (extended-statement-ast statement) store toplevel)
+             (setf (extended-dml-execution-prepared execution) prepared
+                   (extended-dml-execution-targets execution) (getf prepared :returning)
+                   (extended-dml-execution-observation execution) observation
+                   (extended-dml-execution-queryid execution) queryid)
+             (register-dml-subquery-relations prepared (get-current-reader-xid)))))))))
 
 (defun extended-materialize-dml-portal (stream portal execution)
   ;; Run mutations once and retain a sealed result for later pulls. The receiver
@@ -464,6 +507,14 @@ Send its row description before execution and close it before reporting completi
               (sb-ext:timeout (condition) (report-cleanup condition))))))))
   (values))
 
+(defun call-with-extended-dml-observation (execution function)
+  "Measure one mutation run, retaining only its query identity afterward."
+  (declare (dynamic-extent function))
+  (let ((*dml-statement-observation* (extended-dml-execution-observation execution)))
+    (multiple-value-prog1 (call-with-statement-execution-slice *dml-statement-observation* function)
+      (finish-statement-observation *dml-statement-observation* :success)
+      (setf (extended-dml-execution-observation execution) nil))))
+
 (defun extended-execute-dml-portal (stream portal limit)
   ;; The first Execute materializes the statement; subsequent calls only read
   ;; its store. As with SELECT, an exact row limit suspends without an EOF probe.
@@ -473,7 +524,8 @@ Send its row description before execution and close it before reporting completi
     (when (extended-dml-execution-failed-p execution)
       (ereport "55000" "portal cannot be run"))
     (unless (extended-dml-execution-ready-p execution)
-      (extended-materialize-dml-portal stream portal execution))
+      (call-with-extended-dml-observation
+       execution (lambda () (extended-materialize-dml-portal stream portal execution))))
     (unless (extended-dml-execution-at-end-p execution)
       (call-with-query-execution-owner
        (extended-dml-execution-owner execution)
@@ -498,7 +550,7 @@ Send its row description before execution and close it before reporting completi
           (write-message stream #\s #())
           nil))))
 
-(defun extended-clear-portals-for-backend (backend)
+(defun extended-clear-portals-for-backend (backend &key discard-observations-p)
   (when backend
     (let* ((state
              (sb-thread:with-mutex (*extended-query-state-registry-lock*)
@@ -513,7 +565,7 @@ Send its row description before execution and close it before reporting completi
           (clrhash (extended-query-state-portals state)))
         (setf (extended-query-state-executed-in-cycle-p state) nil))
       (dolist (portal portals)
-        (handler-case (extended-close-portal portal *preserve-failed-extended-portals*)
+        (handler-case (extended-close-portal portal *preserve-failed-extended-portals* discard-observations-p)
           (pg-error (condition)
             (when (and (fatal-error-p condition) (null fatal)) (setf fatal condition)))))
       (let ((pending
@@ -748,7 +800,7 @@ Send its row description before execution and close it before reporting completi
       (remhash "" (extended-query-state-statements state)))
     (when (and (plusp (length name)) (gethash name (extended-query-state-statements state)))
       (ereport "42P05" "prepared statement already exists"))
-    (let* ((statements (parse-statements sql))
+    (let* ((statements (parse-statements sql :collect-statement-text-p *statement-statistics-store*))
            (ast (first statements))
            (concurrent (concurrent-index-ddl-p ast))
            (slot-query-p (and (= (length statements) 1)
@@ -775,7 +827,8 @@ Send its row description before execution and close it before reporting completi
                  (with-statement-snapshot
                      (snapshot (lambda (registration) (statement-start registration nil)))
                    (extended-result-signature (extended-statement-result-columns ast t)))))
-             (statement (make-extended-statement :ast ast :types types :result-signature signature)))
+             (statement (make-extended-statement :ast ast :types types :result-signature signature
+                                                 :activity-text (subseq sql 0 (min 1024 (length sql))))))
         (let ((unknown (position nil types)))
           (when unknown
             (report-unresolved-query-parameter (1+ unknown))))
@@ -790,6 +843,7 @@ Send its row description before execution and close it before reporting completi
     (let* ((statement (gethash name (extended-query-state-statements state)))
            (concurrent (and statement (concurrent-index-ddl-p (extended-statement-ast statement)))))
       (unless statement (ereport "26000" "prepared statement does not exist"))
+      (publish-backend-activity-query *backend* (extended-statement-activity-text statement))
       (when (eq (backend-state *backend*) :aborted)
         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
       (when (and (not concurrent) (eq (backend-state *backend*) :idle))
@@ -877,12 +931,25 @@ Send its row description before execution and close it before reporting completi
   (clear-statement-timeout)
   t)
 
+(defun publish-extended-portal-activity (portal)
+  (let* ((statement (extended-portal-statement portal))
+         (queryid
+           (cond
+             ((extended-portal-select-p portal)
+              (let ((execution (extended-select-execution-for portal)))
+                (when execution (extended-select-execution-queryid execution))))
+             ((member (getf (extended-statement-ast statement) :type) '(:insert :update :delete))
+              (let ((execution (extended-dml-execution-for portal)))
+                (when execution (extended-dml-execution-queryid execution)))))))
+    (publish-backend-activity-query *backend* (extended-statement-activity-text statement) queryid)))
+
 (defun extended-apply-execute (stream state operation)
   (destructuring-bind (kind name limit) operation
     (declare (ignore kind))
     (setf *extended-execute-suspended-p* nil)
     (let ((portal (gethash name (extended-query-state-portals state))))
       (unless portal (ereport "34000" "portal \"~a\" does not exist" name))
+      (publish-extended-portal-activity portal)
       (when (eq (backend-state *backend*) :aborted)
         (ereport "25P02" "current transaction is aborted, commands ignored until end of transaction block"))
       (when (rewind-restricted-sql-session-p)
@@ -919,7 +986,8 @@ Send its row description before execution and close it before reporting completi
                           (lambda ()
                             (let ((*dml-bound-preparation*
                                     (cons ast (extended-dml-execution-prepared execution))))
-                              (execute-statement stream ast)))))))
+                              (call-with-extended-dml-observation
+                               execution (lambda () (execute-statement stream ast)))))))))
                  t))))
         (setf (extended-portal-executed-p portal) t
               (extended-query-state-executed-in-cycle-p state) t)

@@ -387,7 +387,7 @@ existing input needs no lazy-child captures or branch."
                                (cdr entry)))))
      (nreverse extra))))
 
-(defun make-sorted-project-set-iterator (node project set-node width calls relations)
+(defun make-sorted-project-set-iterator (node project set-node width calls relations metadata)
   "Sort source rows before expansion when no sort key depends on a set result.
 
 Cache ordinary targets and their origins per source row.  Source origins travel
@@ -421,7 +421,7 @@ separate projection. Closing the result closes the sort and its source."
                      (values row t origins)))))
              (source (make-mapping-sql-iterator
                       (make-physical-plan-iterator (third set-node) relations) transform))
-             (sorted (make-select-sort-iterator source order))
+             (sorted (make-select-sort-iterator source order :metadata metadata))
              (input
                (make-mapping-sql-iterator
                 sorted
@@ -478,7 +478,7 @@ separate projection. Closing the result closes the sort and its source."
             (make-limit-sql-iterator (third node) output)
             output)))))
 
-(defun make-lateral-join-iterator (join left right-factory)
+(defun make-lateral-join-iterator (join left right-factory &optional metadata)
   ;; Each left row owns a fresh right iterator and parameter epoch.
   (let ((qual (getf join :qual))
         (right nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil) (matched nil)
@@ -499,9 +499,11 @@ separate projection. Closing the result closes the sort and its source."
                (multiple-value-bind (joined origins presence)
                    (qualify-select-join-pair join qual current-left row left-origins right-origins
                                              left-presence right-presence *datum-origin-capture*)
-                 (when joined
-                   (setf matched t)
-                   (return (values joined t origins nil presence))))
+                 (cond (joined
+                        (setf matched t)
+                        (return (values joined t origins nil presence)))
+                       (metadata
+                        (incf (plan-node-metadata-filtered-row-count metadata)))))
                (progn
                  (close-sql-iterator right)
                  (setf right nil left-present nil)
@@ -525,7 +527,7 @@ separate projection. Closing the result closes the sort and its source."
 ;; The join owns LEFT and a replay store owning RIGHT.  A fresh reader scans
 ;; RIGHT for each left row; right/full joins make one final pass for unmatched
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
-(defun make-nested-loop-iterator (join left right)
+(defun make-nested-loop-iterator (join left right &optional metadata)
   (let* ((qual (getf join :qual))
          (outer-p (member (getf join :type) '(:right :full)))
          (spool-memory (nested-loop-spool-memory outer-p))
@@ -581,14 +583,16 @@ separate projection. Closing the result closes the sort and its source."
               (let ((index right-index))
                 (incf right-index)
                 ;; The reader still counts a rejected candidate as a right row.
-                (when row
-                  (multiple-value-bind (joined origins presence)
+                (multiple-value-bind (joined origins presence)
+                    (when row
                       (qualify-select-join-pair join qual current-left row left-origins right-origins
-                                                left-presence right-presence *datum-origin-capture*)
-                    (when joined
-                      (setf matched t)
-                      (when matches (query-match-map-mark matches index))
-                      (return (values joined t origins nil presence)))))))
+                                                left-presence right-presence *datum-origin-capture*))
+                  (cond (joined
+                         (setf matched t)
+                         (when matches (query-match-map-mark matches index))
+                         (return (values joined t origins nil presence)))
+                        (metadata
+                         (incf (plan-node-metadata-filtered-row-count metadata)))))))
              (t
               (close-sql-iterator reader)
               (setf reader nil left-present nil)
@@ -606,6 +610,26 @@ separate projection. Closing the result closes the sort and its source."
            (delete-query-temp-file (query-match-map-pathname matches))))
        (setf current-left nil left-origins nil)))))
 
+(defun accumulate-plan-resource-deltas (metadata usage reads hits writes spill-reads spill-writes wal-records wal-bytes)
+  "Add one inclusive pull's delta without changing the query-wide counters."
+  (let ((totals (or (plan-node-metadata-resources metadata)
+                    (setf (plan-node-metadata-resources metadata)
+                          (make-statement-resource-usage)))))
+    (incf (statement-resource-usage-relation-reads totals)
+          (- (statement-resource-usage-relation-reads usage) reads))
+    (incf (statement-resource-usage-clean-cache-hits totals)
+          (- (statement-resource-usage-clean-cache-hits usage) hits))
+    (incf (statement-resource-usage-relation-writes totals)
+          (- (statement-resource-usage-relation-writes usage) writes))
+    (incf (statement-resource-usage-spill-read-bytes totals)
+          (- (statement-resource-usage-spill-read-bytes usage) spill-reads))
+    (incf (statement-resource-usage-spill-written-bytes totals)
+          (- (statement-resource-usage-spill-written-bytes usage) spill-writes))
+    (incf (statement-resource-usage-wal-records totals)
+          (- (statement-resource-usage-wal-records usage) wal-records))
+    (incf (statement-resource-usage-wal-bytes totals)
+          (- (statement-resource-usage-wal-bytes usage) wal-bytes))))
+
 (defun instrument-physical-plan-iterator (node input)
   "Count and time pulls from INPUT for NODE; closing the wrapper closes INPUT."
   (let* ((metadata (and *cte-active-plan* (gethash node (query-plan-metadata *cte-active-plan*))))
@@ -613,22 +637,31 @@ separate projection. Closing the result closes the sort and its source."
     (if (null metadata) input
         (make-sql-iterator
          (lambda ()
-           (let ((started (when *query-plan-instrumentation-p* (get-internal-real-time)))
-                 (first-p (not started-p)))
-             (when started
+           (let* ((started (when (eq *query-plan-instrumentation-p* t)
+                             (funcall *statement-observation-clock*)))
+                  (first-p (not started-p))
+                  (usage (and *query-plan-instrumentation-p* *statement-resource-usage*))
+                  (reads (when usage (statement-resource-usage-relation-reads usage)))
+                  (hits (when usage (statement-resource-usage-clean-cache-hits usage)))
+                  (writes (when usage (statement-resource-usage-relation-writes usage)))
+                  (spill-reads (when usage (statement-resource-usage-spill-read-bytes usage)))
+                  (spill-writes (when usage (statement-resource-usage-spill-written-bytes usage)))
+                  (wal-records (when usage (statement-resource-usage-wal-records usage)))
+                  (wal-bytes (when usage (statement-resource-usage-wal-bytes usage))))
+             (when *query-plan-instrumentation-p*
                (unless started-p
                  (incf (plan-node-metadata-actual-loops metadata))
                  (setf started-p t)))
              (unwind-protect
                   (multiple-value-bind (row present origins toast-context presence) (sql-iterator-next input)
-                    (when (and started present)
-                      (incf (plan-node-metadata-actual-row-count metadata))
-                      (setf (plan-node-metadata-actual-rows metadata)
-                            (/ (plan-node-metadata-actual-row-count metadata)
-                               (plan-node-metadata-actual-loops metadata))))
+                    (when (and *query-plan-instrumentation-p* present)
+                      (incf (plan-node-metadata-actual-row-count metadata)))
                     (values row present origins toast-context presence))
+               (when usage
+                 (accumulate-plan-resource-deltas metadata usage reads hits writes
+                                                  spill-reads spill-writes wal-records wal-bytes))
                (when started
-                 (let ((elapsed (- (get-internal-real-time) started)))
+                 (let ((elapsed (- (funcall *statement-observation-clock*) started)))
                    (incf (plan-node-metadata-actual-total-time-ticks metadata) elapsed)
                    (when first-p
                      (incf (plan-node-metadata-actual-startup-time-ticks metadata) elapsed)))))))
@@ -659,7 +692,7 @@ separate projection. Closing the result closes the sort and its source."
              (values row present origins nil presence))))
        (lambda () (close-sql-iterator input))))))
 
-(defun map-query-plan-rows (plan relations function)
+(defun map-query-plan-rows (plan relations function &key projected-only-p)
   "Consume a plan in the current statement domain, closing it even on early stop."
   (let* ((root-p (not *subquery-execution-active-p*))
          (*subquery-result-cache* (if root-p (make-hash-table :test #'eq) *subquery-result-cache*))
@@ -681,7 +714,10 @@ separate projection. Closing the result closes the sort and its source."
          (call-with-select-index-lease-domain
           (query-plan-index-relfilenodes plan relations)
           (lambda ()
-            (let ((iterator (make-resumable-query-plan-iterator plan relations)))
+            (let ((iterator (if projected-only-p
+                                (make-resumable-query-plan-iterator
+                                 plan relations :projected-only-p t)
+                                (make-resumable-query-plan-iterator plan relations))))
               (unwind-protect
                    (map-sql-iterator
                     iterator
@@ -717,19 +753,23 @@ separate projection. Closing the result closes the sort and its source."
 (defun make-physical-join-iterator (node relations)
   ;; A parameterized index scan needs a new key and iterator for each left
   ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
-  (if (physical-join-rescans-inner-p (second node) (fourth node))
-      (make-lateral-join-iterator
-       (second node) (make-physical-plan-iterator (third node) relations)
-       (lambda (environment origins presence)
-         (let ((*lateral-outer-environment* environment)
-               (*query-row-origins* origins)
-               (*query-row-presence* presence))
-           (make-physical-plan-iterator (fourth node) relations))))
-      (make-nested-loop-iterator
-       (second node) (make-physical-plan-iterator (third node) relations)
-       (make-physical-plan-iterator (fourth node) relations))))
+  (let ((metadata (and *query-plan-instrumentation-p* *cte-active-plan*
+                       (gethash node (query-plan-metadata *cte-active-plan*)))))
+    (if (physical-join-rescans-inner-p (second node) (fourth node))
+        (make-lateral-join-iterator
+         (second node) (make-physical-plan-iterator (third node) relations)
+         (lambda (environment origins presence)
+           (let ((*lateral-outer-environment* environment)
+                 (*query-row-origins* origins)
+                 (*query-row-presence* presence))
+             (make-physical-plan-iterator (fourth node) relations)))
+         metadata)
+        (make-nested-loop-iterator
+         (second node) (make-physical-plan-iterator (third node) relations)
+         (make-physical-plan-iterator (fourth node) relations)
+         metadata))))
 
-(defun make-select-sort-iterator (input order &key limit projected-only-p)
+(defun make-select-sort-iterator (input order &key limit projected-only-p metadata)
   "Prepare the sort on the first pull and return one sorted row per call.
 The reader retains its runs until close. If there is no enclosing temporary
 owner, the iterator creates one and closes it after the reader and input."
@@ -757,10 +797,13 @@ owner, the iterator creates one and closes it after the reader and input."
           (lambda ()
             (let ((*datum-origin-capture* capture-p))
               (unless reader
-                (setf reader
-                      (call-with-query-sort-arena
-                       (lambda (arena)
-                         (prepare-select-sort input order arena limit projected-only-p))))
+                (multiple-value-bind (sorted method)
+                    (call-with-query-sort-arena
+                     (lambda (arena)
+                       (prepare-select-sort input order arena limit projected-only-p)))
+                  (setf reader sorted)
+                  (when metadata
+                    (pushnew method (plan-node-metadata-sort-methods metadata))))
                 (close-sql-iterator input))
               (multiple-value-bind (item present) (sql-iterator-next reader)
                 (when present
@@ -988,10 +1031,16 @@ also closes the active child and input, then removes its remaining files."
     (:append (make-append-sql-iterator (second node) relations))
     (:subquery-scan (make-subquery-scan-iterator node relations))
     (:filter
-     (make-mapping-sql-iterator
-      (make-physical-plan-iterator (third node) relations)
-      (lambda (row) (values row (true-p (eval-expr (second node) row)) *query-row-origins*))
-      :preserve-toast-context t))
+     (let ((metadata (and *query-plan-instrumentation-p* *cte-active-plan*
+                          (gethash node (query-plan-metadata *cte-active-plan*)))))
+       (make-mapping-sql-iterator
+        (make-physical-plan-iterator (third node) relations)
+        (lambda (row)
+          (let ((accepted-p (true-p (eval-expr (second node) row))))
+            (when (and metadata (not accepted-p))
+              (incf (plan-node-metadata-filtered-row-count metadata)))
+            (values row accepted-p *query-row-origins*)))
+        :preserve-toast-context t)))
     (:project
      (let* ((targets (second node))
             (deferred (and *query-sort-project*
@@ -1039,30 +1088,32 @@ also closes the active child and input, then removes its remaining files."
      (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
                                    (second node) (third node)))
     ((:sort :top-n)
-     (let ((child (physical-buffered-node-child node)))
+     (let ((child (physical-buffered-node-child node))
+           (metadata (when (and *query-plan-instrumentation-p* *cte-active-plan*)
+                       (gethash node (query-plan-metadata *cte-active-plan*)))))
        ;; If a key needs an SRF value, keep expansion below sort instead of
        ;; moving it above the sort and changing the key's evaluation point.
        (multiple-value-bind (set-node width calls) (postponable-sort-project-set node child)
          (when set-node
            (return-from %make-physical-plan-iterator
-             (make-sorted-project-set-iterator node child set-node width calls relations)))))
-     (let* ((child (physical-buffered-node-child node))
-            (deferred (sort-projection-deferred-slots node child))
-            (*query-sort-project* (and deferred (cons child deferred)))
-            (input (make-physical-plan-iterator child relations))
-            (buffer (make-select-sort-iterator
-                     input (second node)
-                     :limit (and (eq (first node) :top-n) (third node))
-                     :projected-only-p (and (eq node *select-terminal-sort-node*)
-                                            (eq (first node) :sort)
-                                            (null deferred)
-                                            (not *datum-origin-capture*)))))
-       (if deferred
-           (make-mapping-sql-iterator
-            buffer
-            (lambda (row)
-              (multiple-value-bind (projected origins)
-                  (finish-sort-project-row row (second child) deferred)
-                (values projected t origins))))
-           buffer)))
+             (make-sorted-project-set-iterator node child set-node width calls relations metadata))))
+       (let* ((deferred (sort-projection-deferred-slots node child))
+              (*query-sort-project* (and deferred (cons child deferred)))
+              (input (make-physical-plan-iterator child relations))
+              (buffer (make-select-sort-iterator
+                       input (second node)
+                       :limit (and (eq (first node) :top-n) (third node))
+                       :metadata metadata
+                       :projected-only-p (and (eq node *select-terminal-sort-node*)
+                                              (eq (first node) :sort)
+                                              (null deferred)
+                                              (not *datum-origin-capture*)))))
+         (if deferred
+             (make-mapping-sql-iterator
+              buffer
+              (lambda (row)
+                (multiple-value-bind (projected origins)
+                    (finish-sort-project-row row (second child) deferred)
+                  (values projected t origins))))
+             buffer))))
     (otherwise (ereport "0A000" "unsupported resumable producer node ~a" (first node)))))
