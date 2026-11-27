@@ -3789,7 +3789,10 @@ Stop at the first difference, leaving later field types and counts unchecked."
       (unless table
         (ereport "42P01" "relation \"~a\" does not exist" table-name))
       (format nil "~{~d~^,~}"
-              (sort (copy-list (logical-table-replica-identity table)) #'<)))))
+              (sort (copy-list (logical-project-identity
+                                (logical-live-column-slots table)
+                                (logical-table-replica-identity table)))
+                    #'<)))))
 
 (defun sql-logical-publication-definition (name)
   (with-write-lock

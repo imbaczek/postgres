@@ -4,7 +4,7 @@
 (in-package #:pg)
 
 ;; pg-column is defined by the later catalog component in pg.asd.
-(declaim (notinline pg-column-type))
+(declaim (notinline pg-column-type pg-column-missing-value))
 
 (declaim (ftype function sql-varlena-array-encode sql-varlena-array-decode))
 
@@ -579,10 +579,14 @@ Inline compressed attributes are decompressed, and inline :bytea values are
 fresh octet vectors independent of BYTES. External :varchar, :text, :json,
 :jsonb, :bytea and :numeric attributes remain physical descriptors; TOAST fetching and
 external decompression are deferred. START and LIMIT give the inclusive start and
-exclusive end of the tuple. Decoded values do not retain the input page."
+exclusive end of the tuple. Use the physical attribute count to locate its
+bitmap and decode the descriptor prefix. Attributes added after tuple
+formation use the descriptor's missing values. Decoded values do not retain
+the input page."
   (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
     (ereport "XX001" "invalid heap tuple bounds"))
   (let* ((natts (length columns))
+         (physical-natts (page-u16 bytes (+ start +heap-tuple-natts-off+)))
          (xmin (page-u32 bytes (+ start +heap-tuple-xmin-off+)))
          (xmax (page-u32 bytes (+ start +heap-tuple-xmax-off+)))
          (cid (page-u32 bytes (+ start +heap-tuple-cid-off+)))
@@ -591,8 +595,8 @@ exclusive end of the tuple. Decoded values do not retain the input page."
          (infomask (page-u16 bytes (+ start +heap-tuple-infomask-off+)))
          (values (make-array natts :initial-element +null+))
          (physical-compressed nil)
-         (cursor (heap-tuple-data-offset bytes start limit natts infomask)))
-    (loop for i from 0 below natts
+         (cursor (heap-tuple-data-offset bytes start limit physical-natts infomask)))
+    (loop for i from 0 below (min natts physical-natts)
           for col = (aref columns i)
           do (let ((is-null
                      (and (logtest infomask +heap-hasnull+)
@@ -664,31 +668,40 @@ exclusive end of the tuple. Decoded values do not retain the input page."
                                                      (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
                                              (setf (aref values i) (heap-decode-varlena-payload payload type)
                                                    cursor end))))))))))))))
+    (loop for i from physical-natts below natts
+          do (setf (aref values i) (pg-column-missing-value (aref columns i))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
+
+(defun heapam-deform-page-item (page block offnum off len columns &optional toast-visibility-p)
+  "Deform a live line pointer in an already acquired page."
+  (when (< len +size-of-heap-tuple-header+)
+    (ereport "XX001" "invalid heap tuple bounds"))
+  (let ((xmin (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+)))))
+    ;; An abandoned ALTER TABLE may have written a tuple in a different shape.
+    (unless (if toast-visibility-p
+                (not (heap-toast-tuple-visible-p
+                      xmin (page-u16 page (+ off +heap-tuple-infomask-off+))))
+                (and (> xmin +frozen-xid+)
+                     (= (clog-get xmin) +clog-aborted+)))
+      (multiple-value-bind (values raw-xmin xmax cid infomask
+                            ctid-block ctid-offnum physical-compressed)
+          (deform-heap-tuple page columns :start off :limit (+ off len))
+        (declare (ignore raw-xmin))
+        (make-htup :block block :offnum offnum
+                   :ctid-block ctid-block :ctid-offnum ctid-offnum
+                   :xmin xmin :xmax (full-xid-from-32 xmax) :cid cid
+                   :infomask infomask :values values :physical-compressed physical-compressed)))))
 
 (defun heapam-get-tuple (relfilenode block offnum columns &optional toast-visibility-p)
   "Fetch and deform the live tuple at BLOCK and OFFNUM, or return NIL if absent.
 When TOAST-VISIBILITY-P is true, apply the parent-driven TOAST insertion
 visibility predicate to the tuple header before decoding its attributes; return
 NIL if it fails. This is not an MVCC snapshot check: the caller must establish
-visibility and protect the lifetime of the owning parent separately. With the
-option false, no visibility check is performed."
+visibility and protect the lifetime of the owning parent separately."
   (with-buf-read-page (page relfilenode block)
     (when page
       (with-live-page-item (page offnum off len)
-        (when (and toast-visibility-p
-                   (not (heap-toast-tuple-visible-p
-                         (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+)))
-                         (page-u16 page (+ off +heap-tuple-infomask-off+)))))
-          (return-from heapam-get-tuple nil))
-        (multiple-value-bind (values xmin xmax cid infomask
-                              ctid-block ctid-offnum physical-compressed)
-            (deform-heap-tuple page columns :start off :limit (+ off len))
-          (make-htup :block block :offnum offnum
-                     :ctid-block ctid-block :ctid-offnum ctid-offnum
-                     :xmin (full-xid-from-32 xmin)
-                     :xmax (full-xid-from-32 xmax) :cid cid
-                     :infomask infomask :values values :physical-compressed physical-compressed))))))
+        (heapam-deform-page-item page block offnum off len columns toast-visibility-p)))))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."

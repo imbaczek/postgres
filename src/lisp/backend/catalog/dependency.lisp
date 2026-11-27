@@ -28,5 +28,6 @@
        (eql (pg-index-table-oid index) (pg-class-oid table))
        (let ((column-count (length (pg-class-columns table))))
          (every (lambda (attnum)
-                  (and (integerp attnum) (<= 1 attnum column-count)))
+                  (and (integerp attnum) (<= 1 attnum column-count)
+                       (not (pg-column-dropped-p (aref (pg-class-columns table) (1- attnum))))))
                 (or (pg-index-referenced-columns index) (pg-index-columns index))))))

@@ -1151,10 +1151,11 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                          :type (pg-column-type column) :typmod (pg-column-typmod column)
                          :notnull (pg-column-notnull column)
                          :table-oid table-oid :attnum attnum)
-        collect (make-select-column
-                 :name (pg-column-name column) :expr expr
-                 :type (pg-column-type column) :typmod (pg-column-typmod column)
-                 :table-oid table-oid :attnum attnum)))
+        unless (pg-column-dropped-p column)
+          collect (make-select-column
+                   :name (pg-column-name column) :expr expr
+                   :type (pg-column-type column) :typmod (pg-column-typmod column)
+                   :table-oid table-oid :attnum attnum)))
 
 (defun select-relation-initial-scope (relation)
   "Construct the first FROM namespace from one relation's columns and width."
@@ -2128,25 +2129,31 @@ chunk visibility follows the parent and is not independently filtered."
                 (map 'vector (lambda (value) (when value (make-datum-origin :compressed value))) compressed)))))
     (loop for i below (length values)
           for value = (aref values i)
-          when (heap-external-varlena-p value)
-            do (if (and demand
-                        (eq table (car demand))
-                        (not (member (1+ i) (cdr demand))))
-                   (unless retain-external-p (setf (aref values i) +null+))
-                   (let* ((toast (pg-class-toast table))
-                          (type (pg-column-type (aref columns i))))
-                     (unless toast
-                       (ereport "XX001" "external value has no owning TOAST relation"))
-                     (when *datum-origin-capture*
-                       (let ((compressed (toast-fetch-compressed-value toast value snapshot :index-reader index-reader)))
-                         (unless (htup-origins tuple)
-                           (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
-                         (setf (aref (htup-origins tuple) i)
-                               (make-datum-origin :compressed compressed :external-p t
-                                                  :descriptor (heap-encode-external-varlena value)))))
-                     (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
-                       (setf (aref values i)
-                             (heap-decode-varlena-payload bytes type))))))
+          when (pg-column-dropped-p (aref columns i))
+            do (setf (aref values i) +null+)
+               (when (htup-origins tuple)
+                 (setf (aref (htup-origins tuple) i) nil))
+               (when (htup-physical-compressed tuple)
+                 (setf (aref (htup-physical-compressed tuple) i) nil))
+          else when (heap-external-varlena-p value)
+                 do (if (and demand
+                             (eq table (car demand))
+                             (not (member (1+ i) (cdr demand))))
+                        (unless retain-external-p (setf (aref values i) +null+))
+                        (let* ((toast (pg-class-toast table))
+                               (type (pg-column-type (aref columns i))))
+                          (unless toast
+                            (ereport "XX001" "external value has no owning TOAST relation"))
+                          (when *datum-origin-capture*
+                            (let ((compressed (toast-fetch-compressed-value toast value snapshot :index-reader index-reader)))
+                              (unless (htup-origins tuple)
+                                (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
+                              (setf (aref (htup-origins tuple) i)
+                                    (make-datum-origin :compressed compressed :external-p t
+                                                       :descriptor (heap-encode-external-varlena value)))))
+                          (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
+                            (setf (aref values i)
+                                  (heap-decode-varlena-payload bytes type))))))
     tuple))
 
 (defun unchanged-tuple-toast-pointers (tuple assignments &optional table new-values snapshot)
@@ -2157,7 +2164,9 @@ match the claimed row, protecting against stale candidate evaluation."
          (reuse (make-array (length values) :initial-element nil))
          (actual-values nil))
     (loop for value across values for i from 0
-          when (heap-external-varlena-p value)
+          when (and (heap-external-varlena-p value)
+                    (or (null table)
+                        (not (pg-column-dropped-p (aref (pg-class-columns table) i)))))
             do (let* ((assignment (find (1+ i) assignments
                                         :key (lambda (item) (pg-column-attnum (car item)))))
                       (column (and assignment (car assignment)))
@@ -2191,6 +2200,8 @@ row can carry a physical datum across a concurrent-update recheck."
     (when source
       (let ((result (copy-seq source))
             (old-values (htup-values tuple)))
+        (loop for value across new-values for i from 0
+              when (eq value +null+) do (setf (aref result i) nil))
         (dolist (assignment assignments)
           (let* ((column (car assignment))
                  (i (1- (pg-column-attnum column)))

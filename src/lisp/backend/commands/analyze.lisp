@@ -345,20 +345,27 @@ REMAINING limits decoded distribution values retained across all columns."
     (let* ((columns (pg-class-columns table))
            (statistics (make-array (length columns)))
            (remaining (list +analyze-sample-memory-bytes+)))
-      (dotimes (index (length columns))
-        (setf (aref statistics index)
-              (if (member (pg-column-type (aref columns index)) '(:json :json-array))
-                  (let ((null-count
-                          (count-if (lambda (bytes)
-                                      (and (logtest (page-u16 bytes +heap-tuple-infomask-off+) +heap-hasnull+)
-                                           (logbitp (mod index 8)
-                                                    (aref bytes (+ +size-of-heap-tuple-header+ (floor index 8))))))
-                                    sample)))
-                    (make-pg-column-statistics
-                     :null-fraction (if (zerop (length sample)) 0.0d0
-                                        (/ (float null-count 1.0d0) (length sample)))
-                     :distinct-count 0 :most-common-values nil))
-                  (analyze-physical-column-statistics table sample index row-count snapshot remaining))))
+      (loop for column across columns for index from 0
+            do (setf (aref statistics index)
+                     (cond
+                       ((pg-column-dropped-p column)
+                        (make-pg-column-statistics :null-fraction 1.0d0 :distinct-count 0))
+                       ((member (pg-column-type column) '(:json :json-array))
+                        (let ((null-count
+                                (count-if
+                                 (lambda (bytes)
+                                   (if (>= index (page-u16 bytes +heap-tuple-natts-off+))
+                                       (eq (pg-column-missing-value column) +null+)
+                                       (and (logtest (page-u16 bytes +heap-tuple-infomask-off+) +heap-hasnull+)
+                                            (logbitp (mod index 8)
+                                                     (aref bytes (+ +size-of-heap-tuple-header+
+                                                                    (floor index 8)))))))
+                                 sample)))
+                          (make-pg-column-statistics
+                           :null-fraction (if (zerop (length sample)) 0.0d0
+                                              (/ (float null-count 1.0d0) (length sample)))
+                           :distinct-count 0 :most-common-values nil)))
+                       (t (analyze-physical-column-statistics table sample index row-count snapshot remaining)))))
       (make-pg-table-statistics :row-count row-count :sample-count (length sample)
                                 :average-tuple-bytes (when (plusp row-count) (ceiling tuple-bytes row-count))
                                 :columns statistics))))

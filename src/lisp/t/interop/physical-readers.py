@@ -313,6 +313,32 @@ def check(base, root, source, target, readers, older):
     print("physical-readers: maintenance hidden in a row commit cannot discard an old view PASS", flush=True)
 
 
+def check_column_type_replay(source, target):
+    query(source, "CREATE TABLE replay_type (id integer PRIMARY KEY, code text, payload text)")
+    query(source, "ALTER TABLE replay_type ALTER COLUMN payload SET STORAGE EXTERNAL")
+    query(source, "CREATE UNIQUE INDEX replay_type_code ON replay_type(code)")
+    query(source, "INSERT INTO replay_type VALUES (1, '42', '" + "abcdefgh" * 8000 + "')")
+    query(source, "INSERT INTO replay_type VALUES " + ",".join(
+        f"({value},'{value}', 'short')" for value in range(100, 400)))
+    applied(source, target)
+    assert query(target, "SELECT id, length(payload) FROM replay_type WHERE code='42'") == [
+        (1, 64000)
+    ]
+
+    query(source, "ALTER TABLE replay_type ALTER COLUMN code TYPE integer USING code::integer")
+    applied(source, target)
+    assert scalar(target, """
+        SELECT a.atttypid FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON a.attrelid=c.oid
+        WHERE c.relname='replay_type' AND a.attname='code'
+    """) == 23
+    lookup = "SELECT id, length(payload) FROM replay_type WHERE code>=42 ORDER BY code LIMIT 1"
+    plan = "\n".join(row[0] for row in query(target, "EXPLAIN " + lookup))
+    assert "Index Scan using replay_type_code" in plan, plan
+    assert query(target, lookup) == [(1, 64000)]
+    print("physical-readers: ALTER TYPE replays descriptor, heap, index and TOAST PASS", flush=True)
+
+
 def main():
     base, root = Path(sys.argv[1]), Path(sys.argv[2])
     source = connect(int(sys.argv[3]))
@@ -332,6 +358,7 @@ def main():
                 time.sleep(0.05)
         else:
             check(base, root, source, target, readers, older)
+            check_column_type_replay(source, target)
     finally:
         for connection in [source, target, older, *readers]:
             connection.close()

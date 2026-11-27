@@ -1,9 +1,11 @@
 """Verify transactional catalog visibility and recovery over the SQL wire protocol."""
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import runpy
 import shutil
 import struct
+import subprocess
 import time
 from pathlib import Path
 
@@ -670,6 +672,22 @@ def verify_commit_dependency_races(server):
         absent(concurrent, "publication_race")
         concurrent.query("DROP PUBLICATION race_all_pub")
 
+        concurrent.query("CREATE TABLE publication_column_race (id int, flag boolean)")
+        writer.query("BEGIN")
+        writer.query("ALTER TABLE publication_column_race DROP COLUMN flag")
+        concurrent.query(
+            "CREATE PUBLICATION column_race_pub FOR TABLE publication_column_race WHERE (flag)"
+        )
+        expect_conflict("publication filter")
+        assert concurrent.query("SELECT flag FROM publication_column_race") == []
+        writer.query("BEGIN")
+        writer.query("ALTER TABLE publication_column_race DROP COLUMN flag CASCADE")
+        concurrent.query("ALTER PUBLICATION column_race_pub SET (publish = 'insert')")
+        expect_conflict("publication column_race_pub")
+        assert concurrent.query("SELECT flag FROM publication_column_race") == []
+        concurrent.query("DROP PUBLICATION column_race_pub")
+        concurrent.query("DROP TABLE publication_column_race")
+
         concurrent.query("CREATE SEQUENCE sequence_race")
         writer.query("BEGIN")
         writer.query("CREATE TABLE sequence_race_table (id bigint DEFAULT nextval('sequence_race'))")
@@ -726,6 +744,7 @@ def verify_legacy_slot_noops(server):
             "CREATE INDEX unsupported_capture_ix ON legacy_noop(id)",
             "DROP TABLE IF EXISTS legacy_noop_missing, legacy_noop",
             "DROP INDEX IF EXISTS legacy_noop_missing, legacy_noop_index",
+            "ALTER TABLE legacy_noop ALTER COLUMN id TYPE bigint",
         ):
             writer.query("BEGIN")
             try:
@@ -792,6 +811,440 @@ def verify_ordered_catalog_capture(server):
 
         verify_catalog_capture_records(server)
 
+def verify_column_addition(connection):
+    connection.query("CREATE TABLE evolved_stats (" + ", ".join(f"c{i} integer" for i in range(8)) + ")")
+    connection.query("INSERT INTO evolved_stats VALUES (" + ", ".join(["NULL"] * 8) + ")")
+    connection.query("ALTER TABLE evolved_stats ADD COLUMN payload json")
+    connection.query("ANALYZE evolved_stats")
+    assert connection.query("SELECT payload FROM evolved_stats") == [[None]]
+    connection.query("CREATE TABLE evolved_heap (id integer PRIMARY KEY)")
+    connection.query("INSERT INTO evolved_heap VALUES (1)")
+    connection.query("ALTER TABLE evolved_heap ADD COLUMN flag boolean")
+    assert connection.query("SELECT * FROM evolved_heap") == [["1", None]]
+
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_heap ADD COLUMN abandoned integer")
+    connection.query("INSERT INTO evolved_heap VALUES (2, false, 42)")
+    connection.query("ROLLBACK")
+    assert connection.query("SELECT * FROM evolved_heap") == [["1", None]]
+
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_heap ADD COLUMN label text")
+    connection.query("INSERT INTO evolved_heap VALUES (3, false, 'committed')")
+    connection.query("COMMIT")
+    connection.query("ALTER TABLE evolved_heap ADD COLUMN IF NOT EXISTS label text")
+    connection.query("CREATE INDEX evolved_label_idx ON evolved_heap(label)")
+    connection.query("VACUUM FULL evolved_heap")
+
+    connection.query("CREATE TABLE evolved_defaults (id integer PRIMARY KEY)")
+    connection.query("INSERT INTO evolved_defaults VALUES (1)")
+    connection.query("ALTER TABLE evolved_defaults ADD COLUMN flag boolean DEFAULT false")
+    connection.query("INSERT INTO evolved_defaults VALUES (2, NULL)")
+    connection.query("ALTER TABLE evolved_defaults ALTER COLUMN flag SET DEFAULT true")
+    connection.query("INSERT INTO evolved_defaults (id) VALUES (3)")
+    connection.query("ALTER TABLE evolved_defaults ALTER COLUMN flag DROP DEFAULT")
+    connection.query("INSERT INTO evolved_defaults (id) VALUES (4)")
+
+    connection.query(
+        "CREATE TABLE evolved_rename (id integer PRIMARY KEY, label text CHECK (label <> 'forbidden'))"
+    )
+    connection.query("CREATE INDEX evolved_rename_expr ON evolved_rename ((lower(label)))")
+    connection.query("INSERT INTO evolved_rename VALUES (1, 'Kept')")
+    statement = b"before_column_rename"
+    assert cycle(connection, [parse("SELECT label FROM evolved_rename", (), name=statement)],
+                 with_message=True) == []
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_rename RENAME COLUMN label TO provisional")
+    assert connection.query("SELECT provisional FROM evolved_rename") == [["Kept"]]
+    connection.query("ROLLBACK")
+    assert connection.query("SELECT label FROM evolved_rename") == [["Kept"]]
+    connection.query("ALTER TABLE evolved_rename RENAME COLUMN label TO display")
+    errors = cycle(connection, [bind((), statement=statement), frame(b"E", bytes(5))])
+    assert errors == [(b"E", "42703")], errors
+    try:
+        connection.query("UPDATE evolved_rename SET display = 'forbidden'")
+    except WireError as error:
+        assert error.sqlstate == "23514", error
+    else:
+        raise AssertionError("renaming the column disabled its CHECK constraint")
+
+    connection.query("CREATE TABLE evolved_required (id integer PRIMARY KEY, value integer)")
+    connection.query("INSERT INTO evolved_required VALUES (1, NULL)")
+    try:
+        connection.query("ALTER TABLE evolved_required ALTER COLUMN value SET NOT NULL")
+    except WireError as error:
+        assert error.sqlstate == "23502", error
+    else:
+        raise AssertionError("SET NOT NULL accepted a stored NULL")
+    connection.query("UPDATE evolved_required SET value=7")
+    connection.query("ALTER TABLE evolved_required ALTER COLUMN value SET NOT NULL")
+    try:
+        connection.query("INSERT INTO evolved_required VALUES (2, NULL)")
+    except WireError as error:
+        assert error.sqlstate == "23502", error
+    else:
+        raise AssertionError("validated NOT NULL accepted a new NULL")
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_required ALTER COLUMN value DROP NOT NULL")
+    connection.query("INSERT INTO evolved_required VALUES (2, NULL)")
+    connection.query("COMMIT")
+    connection.query("CREATE TABLE evolved_batch (id integer PRIMARY KEY, v integer)")
+    connection.query("INSERT INTO evolved_batch VALUES (1, NULL)")
+    try:
+        connection.query(
+            "ALTER TABLE evolved_batch ADD COLUMN tentative integer, ALTER COLUMN v SET NOT NULL"
+        )
+    except WireError as error:
+        assert error.sqlstate == "23502", error
+    else:
+        raise AssertionError("multi-action validation accepted a stored NULL")
+    assert connection.query("SELECT * FROM evolved_batch") == [["1", None]]
+    connection.query(
+        "ALTER TABLE evolved_batch ALTER COLUMN flag SET DEFAULT true, "
+        "ALTER COLUMN flag SET NOT NULL, ADD COLUMN flag boolean DEFAULT false"
+    )
+    connection.query("INSERT INTO evolved_batch (id) VALUES (2)")
+    verify_restored_column_addition(connection)
+
+
+def verify_restored_column_addition(connection):
+    assert connection.query("SELECT * FROM evolved_heap ORDER BY id") == [
+        ["1", None, None],
+        ["3", "f", "committed"],
+    ]
+    assert connection.query("SELECT * FROM evolved_defaults ORDER BY id") == [
+        ["1", "f"],
+        ["2", None],
+        ["3", "t"],
+        ["4", None],
+    ]
+    assert connection.query("SELECT display FROM evolved_rename WHERE lower(display)='kept'") == [["Kept"]]
+    assert connection.query("SELECT * FROM evolved_required ORDER BY id") == [["1", "7"], ["2", None]]
+    assert connection.query("SELECT flag FROM evolved_batch ORDER BY id") == [["f"], ["t"]]
+    assert connection.query(
+        "SELECT a.attnum, a.atthasmissing, a.attisdropped "
+        "FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid=c.oid "
+        "WHERE c.relname='evolved_defaults' AND a.attname='flag'"
+    ) == [["2", "t", "f"]]
+
+
+def verify_column_drop(connection):
+    connection.query(
+        "CREATE TABLE evolved_drop (id integer PRIMARY KEY, gone text CHECK (gone <> ''), tail integer)"
+    )
+    connection.query("CREATE INDEX evolved_drop_expression ON evolved_drop ((length(gone)))")
+    connection.query("ALTER TABLE evolved_drop ALTER COLUMN gone SET STORAGE EXTERNAL")
+    connection.query("INSERT INTO evolved_drop VALUES (1, '" + ("abcdefgh" * 8000) + "', 7)")
+    connection.query("CREATE PUBLICATION evolved_drop_pub FOR TABLE evolved_drop WHERE (gone <> '')")
+    try:
+        connection.query("ALTER TABLE evolved_drop DROP COLUMN gone RESTRICT")
+    except WireError as error:
+        assert error.sqlstate == "2BP01", error
+    else:
+        raise AssertionError("DROP COLUMN ignored the publication dependency")
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_drop DROP COLUMN gone CASCADE")
+    assert connection.query("SELECT relid FROM pg_get_publication_tables('evolved_drop_pub')") == []
+    assert connection.query("SELECT * FROM evolved_drop") == [["1", "7"]]
+    connection.query("ROLLBACK")
+    assert connection.query("SELECT length(gone), tail FROM evolved_drop") == [["64000", "7"]]
+    try:
+        connection.query("ALTER TABLE evolved_drop DROP COLUMN gone RESTRICT")
+    except WireError as error:
+        assert error.sqlstate == "2BP01", error
+    else:
+        raise AssertionError("rollback lost the publication dependency")
+    connection.query("ALTER TABLE evolved_drop DROP COLUMN gone CASCADE")
+    assert connection.query("SELECT relid FROM pg_get_publication_tables('evolved_drop_pub')") == []
+    assert connection.query(
+        "SELECT relname FROM pg_catalog.pg_class WHERE relname='evolved_drop_expression'"
+    ) == []
+    connection.query("UPDATE evolved_drop SET tail=8 WHERE id=1")
+    connection.query("INSERT INTO evolved_drop VALUES (2, 9)")
+    connection.query("VACUUM FULL evolved_drop")
+    connection.query("ALTER TABLE evolved_drop ADD COLUMN gone integer DEFAULT 42")
+    verify_restored_column_drop(connection)
+
+
+def verify_restored_column_drop(connection):
+    assert connection.query("SELECT relid FROM pg_get_publication_tables('evolved_drop_pub')") == []
+    assert connection.query("SELECT * FROM evolved_drop ORDER BY id") == [
+        ["1", "8", "42"],
+        ["2", "9", "42"],
+    ]
+    assert connection.query(
+        "SELECT a.attnum, a.attisdropped FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid=c.oid "
+        "WHERE c.relname='evolved_drop' AND a.attnum > 0 ORDER BY a.attnum"
+    ) == [["1", "f"], ["2", "t"], ["3", "f"], ["4", "f"]]
+
+
+def verify_column_type_rewrite(connection):
+    connection.query("CREATE TABLE evolved_rewrite (id integer PRIMARY KEY, code text, payload text)")
+    connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN payload SET STORAGE EXTERNAL")
+    connection.query("CREATE INDEX evolved_rewrite_code ON evolved_rewrite(code)")
+    connection.query(
+        "INSERT INTO evolved_rewrite VALUES (1,'42','" + "abcdefgh" * 8000 + "'),(2,'bad','ok')"
+    )
+    try:
+        connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN code TYPE integer USING code::integer")
+    except WireError as error:
+        assert error.sqlstate == "22P02", error
+    else:
+        raise AssertionError("ALTER TYPE accepted an invalid integer")
+    assert connection.query("SELECT code FROM evolved_rewrite ORDER BY id") == [["42"], ["bad"]]
+    connection.query("UPDATE evolved_rewrite SET code='43' WHERE id=2")
+    try:
+        connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN id TYPE bigint USING 1")
+    except WireError as error:
+        assert error.sqlstate == "23505", error
+    else:
+        raise AssertionError("ALTER TYPE published duplicate primary keys")
+    assert connection.query("SELECT id FROM evolved_rewrite ORDER BY id") == [["1"], ["2"]]
+    connection.query("BEGIN")
+    connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN id SET DATA TYPE bigint")
+    assert connection.query("SELECT id, code FROM evolved_rewrite WHERE id=2") == [["2", "43"]]
+    connection.query("ROLLBACK")
+    connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN code TYPE integer USING code::integer")
+    connection.query("ALTER TABLE evolved_rewrite ALTER COLUMN id TYPE bigint")
+    verify_restored_column_type_rewrite(connection)
+
+
+def verify_restored_column_type_rewrite(connection):
+    assert connection.query(
+        "SELECT id, length(payload) FROM evolved_rewrite WHERE code=42"
+    ) == [["1", "64000"]]
+    assert connection.query(
+        "SELECT a.attname, a.atttypid FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid=c.oid "
+        "WHERE c.relname='evolved_rewrite' AND a.attnum > 0 ORDER BY a.attnum"
+    ) == [["id", "20"], ["code", "23"], ["payload", "25"]]
+
+
+def verify_column_type_rewrite_invalid_index(connection):
+    connection.query("CREATE TABLE invalid_index_rewrite (id integer, code integer)")
+    connection.query("INSERT INTO invalid_index_rewrite VALUES (1, 7), (2, 7)")
+    try:
+        connection.query("CREATE UNIQUE INDEX CONCURRENTLY invalid_rewrite_ix ON invalid_index_rewrite(code)")
+    except WireError as error:
+        assert error.sqlstate == "23505", error
+    else:
+        raise AssertionError("concurrent unique index accepted duplicate input")
+    index_state = (
+        "SELECT i.indisvalid, i.indisready FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+        "WHERE c.relname='invalid_rewrite_ix'"
+    )
+    before = connection.query(index_state)
+    assert before == [["f", "f"]]
+    connection.query("ALTER TABLE invalid_index_rewrite ALTER COLUMN id TYPE bigint")
+    assert connection.query(index_state) == before
+
+
+def verify_column_type_rewrite_failure(server, connection, fault, sqlstate):
+    table = f"{fault}_rewrite"
+    connection.query(f"CREATE TABLE {table} (id integer PRIMARY KEY)")
+    connection.query(f"INSERT INTO {table} VALUES (1), (2)")
+    column_type = (
+        "SELECT a.atttypid FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON a.attrelid=c.oid "
+        f"WHERE c.relname='{table}' AND a.attnum=1"
+    )
+    alter = f"ALTER TABLE {table} ALTER COLUMN id TYPE bigint"
+    cancel = """(prog1 (apply insert args)
+                   (pg::cancel-backend pg::*backend*))"""
+    exhaust_scratch = """(let ((pg::*wal-dirty-resident-limit-pages*
+                                  (if wrote-row 0 pg::*wal-dirty-resident-limit-pages*)))
+                            (prog1 (apply insert args)
+                              (setf wrote-row t)))"""
+    action = cancel if fault == "cancel" else exhaust_scratch
+    server.control(f"""
+        (defparameter pg::*test-original-heapam-insert* (fdefinition 'pg::heapam-insert))
+        (defparameter pg::*test-original-scratch* (fdefinition 'pg::wal-dirty-ensure-spool))
+        (when (string= "{fault}" "scratch")
+          (setf (fdefinition 'pg::wal-dirty-ensure-spool)
+                (lambda (store)
+                  (declare (ignore store))
+                  ;; The isolated fault performs a real write that returns ENOSPC.
+                  (with-open-file (sink #p"/dev/full" :direction :output
+                                        :if-exists :overwrite
+                                        :element-type '(unsigned-byte 8))
+                    (write-byte 0 sink)
+                    (finish-output sink)))))
+        (setf (fdefinition 'pg::heapam-insert)
+              (let ((insert pg::*test-original-heapam-insert*)
+                    (wrote-row nil))
+                (declare (ignorable wrote-row))
+                (lambda (&rest args)
+                  (if (pg::current-relation-replacement (first args) :main)
+                      {action}
+                      (apply insert args)))))
+    """)
+    try:
+        try:
+            connection.query(alter)
+        except WireError as error:
+            assert error.sqlstate == sqlstate, error
+            if fault == "scratch":
+                assert "No space left on device" in str(error), error
+        else:
+            raise AssertionError(f"ALTER TYPE ignored the {fault} fault")
+    finally:
+        server.control("""
+            (setf (fdefinition 'pg::heapam-insert) pg::*test-original-heapam-insert*)
+            (setf (fdefinition 'pg::wal-dirty-ensure-spool) pg::*test-original-scratch*)
+            (makunbound 'pg::*test-original-heapam-insert*)
+            (makunbound 'pg::*test-original-scratch*)
+        """)
+    assert connection.query(column_type) == [["23"]]
+    assert connection.query(f"SELECT id FROM {table} ORDER BY id") == [["1"], ["2"]]
+    connection.query(alter)
+    assert connection.query(column_type) == [["20"]]
+    assert connection.query(f"SELECT id FROM {table} WHERE id=2") == [["2"]]
+
+
+def verify_column_validation_waits(server):
+    with contextlib.closing(Connection(server.port)) as writer, contextlib.closing(
+        Connection(server.port)
+    ) as validator:
+        writer.query("CREATE TABLE validate_evolution (value integer)")
+        writer.query("BEGIN")
+        writer.query("INSERT INTO validate_evolution VALUES (NULL)")
+        alter = "ALTER TABLE validate_evolution ALTER COLUMN value SET NOT NULL"
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            result = worker.submit(validator.query, alter)
+            waiting = False
+            try:
+                deadline = time.monotonic() + 5
+                while not result.done() and time.monotonic() < deadline:
+                    observed = server.control(
+                        '(format t "~&COLUMN-VALIDATION-WAIT=~a~%" '
+                        '(or (sb-thread:with-mutex (pg::*schema-lock-mutex*) '
+                        '(plusp pg::*schema-write-lock-waiters*)) '
+                        '(sb-thread:with-mutex (pg::*relation-lock-mutex*) '
+                        '(plusp (hash-table-count pg::*relation-wait-dependencies*)))))'
+                    )
+                    if "COLUMN-VALIDATION-WAIT=T" in observed:
+                        waiting = True
+                        break
+            finally:
+                writer.query("COMMIT")
+            assert waiting, "SET NOT NULL did not wait for the earlier writer"
+            try:
+                result.result(timeout=10)
+            except WireError as error:
+                assert error.sqlstate == "23502", error
+            else:
+                raise AssertionError("validation missed the NULL committed by the earlier writer")
+
+        writer.query("UPDATE validate_evolution SET value=7")
+        writer.query("SET statement_timeout = '200ms'")
+        validator.query("BEGIN")
+        validator.query(alter)
+        try:
+            writer.query("INSERT INTO validate_evolution VALUES (NULL)")
+        except WireError as error:
+            assert error.sqlstate == "57014", error
+        else:
+            raise AssertionError("a writer crossed the validation gate before commit")
+        finally:
+            validator.query("COMMIT")
+        writer.query("RESET statement_timeout")
+        try:
+            writer.query("INSERT INTO validate_evolution VALUES (NULL)")
+        except WireError as error:
+            assert error.sqlstate == "23502", error
+        else:
+            raise AssertionError("the committed descriptor accepted a NULL")
+
+
+def verify_logical_column_type_rewrite():
+    source, target = OwnedLisp(), OwnedLisp()
+    try:
+        source.start()
+        target.start()
+        with contextlib.closing(Connection(source.port)) as writer, contextlib.closing(
+            Connection(target.port)
+        ) as reader:
+            writer.query("CREATE TABLE logical_retype (discarded text, id integer PRIMARY KEY, code text)")
+            writer.query("ALTER TABLE logical_retype ALTER COLUMN discarded SET STORAGE EXTERNAL")
+            writer.query("INSERT INTO logical_retype VALUES ('discarded',1,'42')")
+            writer.query("ALTER TABLE logical_retype DROP COLUMN discarded")
+            writer.query("CREATE PUBLICATION logical_retype_pub FOR TABLE logical_retype")
+            assert writer.query(
+                "SELECT attrs::text FROM pg_get_publication_tables('logical_retype_pub')"
+            ) == [["2 3"]]
+            subscriber = Path(__file__).resolve().parents[1] / "pg-lisp-subscribe"
+            with (target.root / "subscriber.log").open("w") as log, subprocess.Popen(
+                [str(subscriber), "--slot", "logical_retype_slot", "--table", "logical_retype",
+                 "--source-port", str(source.port), "--target-port", str(target.port)],
+                stdout=log, stderr=subprocess.STDOUT,
+            ) as worker:
+                def await_rows(connection, sql, expected):
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and worker.poll() is None:
+                        try:
+                            if connection.query(sql) == expected:
+                                return
+                        except WireError as error:
+                            assert error.sqlstate == "42P01", error
+                        time.sleep(0.05)
+                    raise AssertionError((expected, (target.root / "subscriber.log").read_text()))
+
+                rows = "SELECT id, code FROM logical_retype ORDER BY id"
+                try:
+                    await_rows(reader, rows, [["1", "42"]])
+                    await_rows(writer,
+                               "SELECT plugin, confirmed_flush_lsn IS NOT NULL FROM pg_replication_slots "
+                               "WHERE slot_name='logical_retype_slot'",
+                               [["pg_lisp_transactional", "t"]])
+                    try:
+                        writer.query(
+                            "ALTER TABLE logical_retype ALTER COLUMN id TYPE bigint USING txid_current()"
+                        )
+                    except WireError as error:
+                        assert error.sqlstate == "42P17" and "IMMUTABLE" in str(error), error
+                    else:
+                        raise AssertionError("ALTER TYPE accepted a transaction-dependent expression")
+                    writer.query("SET datestyle = 'ISO, DMY'")
+                    try:
+                        writer.query(
+                            "ALTER TABLE logical_retype ALTER COLUMN id TYPE bigint USING "
+                            "CASE WHEN '01/02/2000'::date = '2000-02-01'::date THEN 1 ELSE 2 END"
+                        )
+                    except WireError as error:
+                        assert error.sqlstate == "0A000" and "temporal literals" in str(error), error
+                    else:
+                        raise AssertionError("ALTER TYPE accepted a session-dependent literal")
+                    finally:
+                        writer.query("RESET datestyle")
+                    writer.query("BEGIN")
+                    writer.query("INSERT INTO logical_retype VALUES (2,'43')")
+                    writer.query(
+                        "ALTER TABLE logical_retype ALTER COLUMN code TYPE integer USING code::integer"
+                    )
+                    writer.query("INSERT INTO logical_retype VALUES (3,44)")
+                    writer.query("UPDATE logical_retype SET code=45 WHERE id=3")
+                    writer.query("DELETE FROM logical_retype WHERE id=1")
+                    writer.query("COMMIT")
+                    await_rows(reader, rows, [["2", "43"], ["3", "45"]])
+                    assert reader.query(
+                        "SELECT a.atttypid FROM pg_catalog.pg_attribute a "
+                        "JOIN pg_catalog.pg_class c ON a.attrelid=c.oid "
+                        "WHERE c.relname='logical_retype' AND a.attname='code'"
+                    ) == [["23"]]
+                finally:
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        worker.wait()
+    finally:
+        target.stop()
+        source.stop()
+
+
+
 def main():
     server = OwnedLisp()
     try:
@@ -801,11 +1254,18 @@ def main():
         verify_indexes(server)
         verify_constraint_indexes(server)
         with contextlib.closing(Connection(server.port)) as connection:
+            verify_column_addition(connection)
+            verify_column_drop(connection)
+            verify_column_type_rewrite(connection)
+            verify_column_type_rewrite_invalid_index(connection)
+            verify_column_type_rewrite_failure(server, connection, "cancel", "57014")
+            verify_column_type_rewrite_failure(server, connection, "scratch", "58030")
             verify_implicit_catalog_block(connection)
             verify_expression_index(connection)
             verify_expression_index_plan(connection)
             verify_partial_range_index(connection)
             verify_expression_index_rebind(server, connection)
+        verify_column_validation_waits(server)
         verify_new_logical_interest(server)
         verify_first_slot_activation_during_ddl(server)
         verify_net_zero_ddl_slot_admission(server)
@@ -826,6 +1286,9 @@ def main():
             verify_committed(connection)
             verify_committed_index(connection)
             verify_committed_constraints(connection)
+            verify_restored_column_addition(connection)
+            verify_restored_column_drop(connection)
+            verify_restored_column_type_rewrite(connection)
             verify_restored_expression_index(connection)
             assert connection.query("SELECT id FROM implicit_heap") == [["9"]]
             absent(connection, "implicit_abort")
@@ -835,6 +1298,7 @@ def main():
             server, "after-catalog-transaction-wal-flush", "durable_heap", True
         )
         verify_expression_index_crash_boundaries(server)
+        verify_logical_column_type_rewrite()
     finally:
         server.stop()
         shutil.rmtree(server.root)

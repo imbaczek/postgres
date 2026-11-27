@@ -18,16 +18,22 @@
              (not (and (member source '(:float4 :float8))
                        (member target '(:text :varchar :name))))))))
 
-(defun validate-index-expression (expression context note-column)
+(defun validate-index-expression (expression context note-column &key replay-sql-p)
   "Verify supported immutable nodes and report referenced table attribute numbers."
   (flet ((visit (node walk)
            (declare (ignore walk))
            (let ((tag (first node)))
              (case tag
                (:col (funcall note-column (second node)))
-               ((:const :bool :scalar-array-const :not :is-null :is-bool :and :or
-                 :case :array :coalesce :array-length :array-subscript :array-slice
-                 :unary :concat :in :join-relabel) nil)
+               (:const
+                ;; Analysis can fold a literal cast using the current DateStyle,
+                ;; TimeZone, or clock before the resolved cast is checked below.
+                (when (and replay-sql-p
+                           (member (expr-type node) '(:date :time :timetz :timestamp :timestamptz :interval)))
+                  (ereport "0A000" "temporal literals in ~a cannot be replayed from SQL" context)))
+               ((:bool :scalar-array-const :not :is-null :is-bool :and :or
+                       :case :array :coalesce :array-length :array-subscript :array-slice
+                       :unary :concat :in :join-relabel) nil)
                (:func
                 (unless (eq :immutable (scalar-builtin-family-volatility (second node)))
                   (ereport "42P17" "functions in ~a must be marked IMMUTABLE" context)))

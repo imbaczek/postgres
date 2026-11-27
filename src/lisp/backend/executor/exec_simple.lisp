@@ -1082,8 +1082,7 @@ before this removal horizon is captured."
           for page = (buf-read heap-relfilenode block)
           when page
             do (do-live-page-items (page offnum off len)
-                 (let ((tuple (heapam-get-tuple heap-relfilenode block offnum
-                                                columns)))
+                 (let ((tuple (heapam-deform-page-item page block offnum off len columns)))
                    (when (and tuple
                               (not (tuple-prunable-p (htup-xmin tuple)
                                                      (htup-xmax tuple)
@@ -2113,13 +2112,20 @@ completion after success; anonymous source cannot inherit Bind parameters."
       (execute-do-statement stream block))
     (send-command-complete stream "DO")))
 
+(defun column-evolution-ddl-p (ast)
+  (and (eq :alter-table (getf ast :type))
+       (flet ((supported-action-p (action)
+                (member (getf action :action) '(:add-column :drop-column :rename-column :set-not-null :drop-not-null :alter-column-type))))
+         (or (supported-action-p ast) (some #'supported-action-p (getf ast :actions))))))
+
 (defun stageable-catalog-ddl-p (ast)
-  (and (member (getf ast :type) '(:create-table :drop-table :create-index :drop-index))
-       (not (getf ast :concurrently))))
+  (or (column-evolution-ddl-p ast)
+      (and (member (getf ast :type) '(:create-table :drop-table :create-index :drop-index))
+           (not (getf ast :concurrently)))))
 
 (defun staged-catalog-ddl-p (ast)
   (and (stageable-catalog-ddl-p ast)
-       (or (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
+       (or (column-evolution-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
 
 (defun append-staged-transaction-ddl (transaction ast)
   "Append a cooked operation beside the surrounding row changes."
@@ -2258,6 +2264,349 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
            (send-notice stream (format nil "relation ~s already exists, skipping" name) "NOTICE" "42P07"))
           (t (ereport "42P07" "relation ~s already exists" name)))
     (send-command-complete stream "CREATE TABLE")))
+
+(defun make-added-column (definition attnum)
+  "Cook the insert default and freeze its assignment value for older tuples."
+  (let ((column (make-pg-column :name (getf definition :name)
+                                :type (getf definition :type)
+                                :typmod (getf definition :typmod)
+                                :attnum attnum))
+        (raw-default (getf definition :default-expression)))
+    (when raw-default
+      (let* ((cooked (cook-column-default raw-default column))
+             (folded (fold-column-default cooked)))
+        (unless (member (first folded) '(:const :bool :scalar-array-const))
+          (ereport "0A000" "ADD COLUMN requires a default that folds to an immutable constant"))
+        (setf (pg-column-default-expression column) cooked
+              (pg-column-default-sql column)
+              (canonical-stored-expression cooked (getf definition :default-sql) raw-default nil)
+              (pg-column-missing-value column) (second folded))))
+    column))
+
+(defun admit-staged-column-evolution (transaction)
+  (admit-staged-catalog-change transaction)
+  (when (catalog-transaction-capture-ddl-p transaction)
+    (ereport "0A000" "column evolution cannot be applied by the current logical replication protocol")))
+
+(defun prepare-staged-column-addition (transaction table ast)
+  "Build a detached descriptor whose existing column slots keep their identities."
+  (let* ((definition (getf ast :column-definition))
+         (name (getf definition :name))
+         (columns (pg-class-columns table)))
+    (when (find name columns :key #'pg-column-name :test #'string=)
+      (if (getf ast :column-if-not-exists)
+          (return-from prepare-staged-column-addition nil)
+          (ereport "42701" "column ~s already exists" name)))
+    (when (or (getf ast :column-keys) (getf definition :checks)
+              (getf definition :notnull))
+      (ereport "0A000" "ADD COLUMN currently requires a nullable column without constraints"))
+    (admit-staged-column-evolution transaction)
+    (let ((replacement (copy-pg-class table)))
+      (setf (pg-class-columns replacement)
+            (concatenate 'vector columns
+                         (vector (make-added-column definition (1+ (length columns))))))
+      replacement)))
+
+(defun stored-expression-references-attnum-p (expression attnum)
+  "Find a cooked column reference for this table's physical attribute number."
+  (and (consp expression)
+       (or (and (eq (first expression) :col) (eql (second expression) attnum))
+           (stored-expression-references-attnum-p (car expression) attnum)
+           (stored-expression-references-attnum-p (cdr expression) attnum))))
+
+(defmacro with-copied-column-descriptor ((replacement column) table original &body body)
+  "Run BODY with one detached column installed in its original physical slot."
+  (let ((columns (gensym "COLUMNS-")))
+    `(let* ((,replacement (copy-pg-class ,table))
+            (,columns (copy-seq (pg-class-columns ,replacement)))
+            (,column (copy-pg-column ,original)))
+       (setf (aref ,columns (1- (pg-column-attnum ,column))) ,column
+             (pg-class-columns ,replacement) ,columns)
+       ,@body)))
+
+(defun prepare-staged-column-rename (transaction table ast)
+  "Rename the catalog slot and refresh any CHECK definition that names it."
+  (let ((original (resolve-column-or-error table (getf ast :column)))
+        (new-name (getf ast :new-name)))
+    (when (find-column table new-name)
+      (ereport "42701" "column ~s already exists" new-name))
+    (when (catalog-explicit-publication-table-p (catalog-transaction-database transaction) table)
+      (ereport "0A000" "RENAME COLUMN cannot yet update explicit publication metadata"))
+    (admit-staged-column-evolution transaction)
+    (with-copied-column-descriptor (replacement column) table original
+      (setf (pg-column-name column) new-name
+            (pg-class-checks replacement)
+            (loop for check in (pg-class-checks table)
+                  for expression = (getf check :expression)
+                  collect (if (stored-expression-references-attnum-p expression (pg-column-attnum column))
+                              (let ((copy (copy-list check)))
+                                (setf (getf copy :sql)
+                                      (catalog-canonical-expression-sql expression replacement))
+                                copy)
+                              check)))
+      replacement)))
+
+(defun prepare-staged-column-not-null (transaction table ast)
+  "Return a replacement descriptor and the attribute that needs validation."
+  (let* ((name (getf ast :column))
+         (original (resolve-column-or-error table name))
+         (required-p (eq (getf ast :action) :set-not-null)))
+    (let ((attnum (pg-column-attnum original)))
+      (when (eql required-p (pg-column-notnull original))
+        (return-from prepare-staged-column-not-null nil))
+      (when (and (not required-p)
+                 (some (lambda (index)
+                         (and (pg-index-primary-p index)
+                              (member attnum (pg-index-columns index))))
+                       (table-indexes table)))
+        (ereport "42P16" "column ~s is in a primary key" name))
+      (admit-staged-column-evolution transaction)
+      (with-copied-column-descriptor (replacement column) table original
+        (setf (pg-column-notnull column) required-p)
+        (values replacement (and required-p attnum))))))
+
+(defun reject-drop-column-publication-dependency (transaction table column cascade-p)
+  "Reject referenced publication filters until they can join catalog staging."
+  (let ((database (catalog-transaction-database transaction)))
+    (loop for publication being the hash-values of (catalog-transaction-publications transaction database)
+          do (dolist (entry (pg-publication-tables publication))
+               (let ((filter (getf entry :filter)))
+                 (when (and filter (equal (getf entry :name) (pg-class-name table))
+                            (stored-expression-references-attnum-p
+                             (analyze-expr filter table) (pg-column-attnum column)))
+                   (if cascade-p
+                       (catalog-transaction-remove-publication-member
+                        transaction publication (pg-class-name table))
+                       (ereport "2BP01" "publication ~s depends on column ~s"
+                                (pg-publication-name publication) (pg-column-name column)))))))))
+
+(defun prepare-staged-column-drop (transaction table ast)
+  "Keep the physical layout and retire the dropped attribute's owned dependencies."
+  (let* ((name (getf ast :column))
+         (original (find-column table name)))
+    (unless original
+      (if (getf ast :column-if-exists)
+          (return-from prepare-staged-column-drop nil)
+          (ereport "42703" "column ~s does not exist" name)))
+    (admit-staged-column-evolution transaction)
+    (when (logical-capture-xid-needed-p (backend-xid *backend*))
+      (ereport "0A000" "DROP COLUMN requires a logical protocol that can project dropped attributes"))
+    (reject-drop-column-publication-dependency transaction table original (getf ast :cascade))
+    (let ((attnum (pg-column-attnum original)))
+      (dolist (index (table-indexes table))
+        (when (member attnum (or (pg-index-referenced-columns index) (pg-index-columns index)))
+          (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
+      (with-copied-column-descriptor (replacement column) table original
+        (setf (pg-column-name column) (format nil "........pg.dropped.~d........" attnum)
+              (pg-column-dropped-p column) t
+              (pg-column-notnull column) nil
+              (pg-column-default-expression column) nil
+              (pg-column-default-sql column) nil
+              (pg-column-default-sequence-name column) nil
+              (pg-column-missing-value column) +null+
+              (pg-class-statistics replacement) nil
+              (pg-class-checks replacement)
+              (remove-if (lambda (check)
+                           (stored-expression-references-attnum-p (getf check :expression) attnum))
+                         (pg-class-checks table)))
+        replacement))))
+
+(defun column-evolution-action-pass (action)
+  "Use PostgreSQL's ALTER TABLE catalog pass order for column actions."
+  (case (getf action :action)
+    ((:drop-column :drop-not-null :drop-default) 0)
+    (:add-column 1)
+    (:set-not-null 2)
+    (:set-default 3)
+    (otherwise
+     (ereport "0A000" "unsupported action in a multi-action column ALTER TABLE"))))
+
+(defun prepare-staged-column-default (transaction table ast)
+  "Change the insert default without changing the missing datum for existing tuples."
+  (let ((original (resolve-column-or-error table (getf ast :column))))
+    (admit-staged-column-evolution transaction)
+    (with-copied-column-descriptor (replacement column) table original
+      (let* ((raw (getf ast :expression))
+             (cooked (when raw (cook-column-default raw column))))
+        (setf (pg-column-default-expression column) cooked
+              (pg-column-default-sequence-name column) nil
+              (pg-column-default-sql column)
+              (when cooked (canonical-stored-expression cooked (getf ast :sql) raw nil))))
+      replacement)))
+
+(defun prepare-staged-column-actions (transaction table actions)
+  "Apply catalog passes to a detached descriptor and collect final scan requirements."
+  (let ((descriptor table)
+        (validate nil)
+        (skipped nil))
+    (dolist (ast actions)
+      (multiple-value-bind (replacement attnum)
+          (case (getf ast :action)
+            (:add-column (prepare-staged-column-addition transaction descriptor ast))
+            (:drop-column (prepare-staged-column-drop transaction descriptor ast))
+            (:rename-column (prepare-staged-column-rename transaction descriptor ast))
+            ((:set-not-null :drop-not-null)
+             (prepare-staged-column-not-null transaction descriptor ast))
+            ((:set-default :drop-default)
+             (prepare-staged-column-default transaction descriptor ast)))
+        (when attnum (pushnew attnum validate))
+        (cond (replacement (setf descriptor replacement))
+              ((eq :add-column (getf ast :action))
+               (push (getf (getf ast :column-definition) :name) skipped)))))
+    (values descriptor (nreverse validate) (nreverse skipped))))
+
+(defun prepare-column-type-rewrite (transaction source ast)
+  "Reserve a descriptor and index definitions for the supported conversion matrix."
+  (let* ((name (getf ast :column))
+         (old (resolve-column-or-error source name))
+         (target-type (getf ast :target-type))
+         (attnum (pg-column-attnum old))
+         (using (getf ast :using)))
+    (unless (or (and (eq (pg-column-type old) :int4) (eq target-type :int8))
+                (and (eq (pg-column-type old) :text) (eq target-type :int4) using))
+      (ereport "0A000" "column type conversion is outside the supported matrix"))
+    (when (or (pg-column-default-expression old) (pg-column-default-sequence-name old)
+              (some (lambda (check)
+                      (stored-expression-references-attnum-p (getf check :expression) attnum))
+                    (pg-class-checks source)))
+      (ereport "0A000" "ALTER TYPE cannot yet convert a dependent default or CHECK"))
+    (reject-drop-column-publication-dependency transaction source old nil)
+    (admit-staged-catalog-change transaction)
+    (let* ((target (copy-pg-class source))
+           (columns (map 'vector #'copy-pg-column (pg-class-columns source)))
+           (column (aref columns (1- attnum)))
+           (indexes (loop for index in (table-indexes source)
+                          collect (let ((copy (copy-pg-index index)))
+                                    (when (and (index-has-expressions-p index)
+                                               (member attnum (pg-index-referenced-columns index)))
+                                      (ereport "0A000" "ALTER TYPE cannot yet reanalyze a dependent index expression"))
+                                    (setf (pg-index-relfilenode copy) (allocate-oid))
+                                    copy))))
+      (setf (pg-class-relfilenode target) (allocate-oid)
+            (pg-class-toast target) nil
+            (pg-class-statistics target) nil
+            (pg-class-columns target) columns
+            (pg-column-type column) target-type
+            (pg-column-typmod column) (getf ast :target-typmod)
+            (pg-column-storage column) nil)
+      (loop for copy across columns do (setf (pg-column-missing-value copy) +null+))
+      (let ((raw (or using (list :column name))))
+        (validate-stored-expression raw :check source)
+        (let ((expression (analyze-expr raw source)))
+          (validate-index-expression
+           expression "ALTER TYPE USING" (constantly nil)
+           :replay-sql-p (or *applying-transaction-ddl*
+                             (catalog-transaction-capture-ddl-p transaction)))
+          (values target indexes attnum (analyze-subquery-assignment expression column)))))))
+
+(defun copy-column-type-rewrite-rows (source target attnum expression)
+  "Convert visible rows into the transaction's replacement heap and TOAST."
+  (let* ((columns (pg-class-columns target))
+         (toast (pg-class-toast target))
+         (xid (backend-xid *backend*))
+         (cid (backend-command-id *backend*))
+         (protection (statement-protection-snapshot)))
+    (note-backend-command-id-used)
+    (do-table-tuples (tuple source)
+      (let ((values (htup-values (materialize-select-tuple source tuple protection))))
+        (setf (aref values (1- attnum)) (eval-subquery-assignment expression values))
+        (check-not-null values columns)
+        (check-table-constraints target values)
+        (with-btree-relation-locks ((when toast (list (pg-toast-index-relfilenode toast))))
+          (with-write-lock
+            (heapam-insert
+             (pg-class-relfilenode target) columns
+             (toast-externalize-tuple-unlocked toast values columns xid cid) xid cid)))))))
+
+(defun exec-stage-column-type-rewrite (stream ast)
+  "Drain users of the old storage and publish the replacement via catalog WAL."
+  (let* ((transaction (begin-catalog-ddl))
+         (reference (getf ast :table))
+         (source (with-write-lock (lookup-sql-user-relation reference))))
+    (cond
+      (source
+       (acquire-transaction-relation-locks
+        (with-write-lock
+          (append (catalog-relation-storage-nodes source)
+                  (mapcar #'pg-index-relfilenode (table-indexes source)))))
+       (multiple-value-bind (target indexes attnum expression)
+           (with-write-catalog-locks
+             (ensure-current-table source)
+             (reject-logical-transaction-ddl-private-table (pg-class-name source))
+             (check-truncate-table-not-in-use source)
+             (prepare-column-type-rewrite transaction source ast))
+         (catalog-transaction-create-storage (pg-class-relfilenode target) :heap)
+         (create-table-toast-storage target t)
+         ;; Every replacement heap and TOAST tuple carries this transaction's XID.
+         (let ((xid (backend-xid *backend*)))
+           (setf (pg-class-relfrozenxid target) xid)
+           (when (pg-class-toast target)
+             (setf (pg-toast-relfrozenxid (pg-class-toast target)) xid)))
+         (let ((*current-snapshot* (refresh-statement-snapshot)))
+           (copy-column-type-rewrite-rows source target attnum expression)
+           ;; Index validation must see the tuples written by this same command.
+           (let ((*current-snapshot* (copy-snapshot *current-snapshot*)))
+             (incf (snapshot-curcid *current-snapshot*))
+             (dolist (index indexes)
+               (catalog-transaction-create-storage (pg-index-relfilenode index) :btree)
+               (let ((valid-p (pg-index-valid-p index)))
+                 (build-index-entries index target :unique (and valid-p (pg-index-unique-p index))
+                                                   :name (pg-index-name index))
+                 (setf (pg-index-valid-p index) valid-p)))))
+         (with-write-catalog-locks
+           (ensure-current-table source)
+           (catalog-transaction-stage transaction :table (pg-class-name source) target)
+           (dolist (index indexes)
+             (catalog-transaction-stage transaction :index (pg-index-name index) index)))
+         (capture-staged-transaction-ddl (transaction)
+           (list :type :alter-table :table (pg-class-name source) :action :alter-column-type
+                 :column (getf ast :column) :target-type (getf ast :target-type)
+                 :target-typmod (getf ast :target-typmod) :using (getf ast :using)))))
+      ((getf ast :if-exists)
+       (send-notice stream (format nil "relation ~s does not exist, skipping" reference)))
+      (t (ereport "42P01" "relation ~s does not exist" reference))))
+  (send-command-complete stream "ALTER TABLE"))
+
+(defun exec-stage-column-evolution (stream ast)
+  "Retain relation admission through validation and descriptor publication."
+  (when (eq (getf ast :action) :alter-column-type)
+    (return-from exec-stage-column-evolution (exec-stage-column-type-rewrite stream ast)))
+  (let* ((reference (getf ast :table))
+         (actions (if (getf ast :actions)
+                      (stable-sort (copy-list (getf ast :actions)) #'<
+                                   :key #'column-evolution-action-pass)
+                      (list ast)))
+         (transaction (begin-catalog-ddl))
+         (table (with-write-lock (lookup-sql-user-relation reference))))
+    (cond
+      (table
+       (acquire-transaction-relation-locks
+        (with-write-lock
+          (cons (pg-class-relfilenode table)
+                (when (find :drop-column actions :key (lambda (item) (getf item :action)))
+                  (mapcar #'pg-index-relfilenode (table-indexes table))))))
+       (multiple-value-bind (descriptor validate skipped)
+           (with-write-catalog-locks
+             (ensure-current-table table)
+             (check-truncate-table-not-in-use table)
+             (prepare-staged-column-actions transaction table actions))
+         (unless (eq descriptor table)
+           (when validate
+             (let ((*current-snapshot* (refresh-statement-snapshot)))
+               (check-not-null-existing descriptor validate nil)))
+           (when (and (> (length (pg-class-columns descriptor)) (length (pg-class-columns table)))
+                      (null (pg-class-toast descriptor)))
+             (create-table-toast-storage descriptor t))
+           (with-write-catalog-locks
+             (ensure-current-table table)
+             (catalog-transaction-stage transaction :table (pg-class-name table) descriptor)))
+         (dolist (name skipped)
+           (send-notice stream (format nil "column ~s already exists, skipping" name)
+                        "NOTICE" "42701"))))
+      ((getf ast :if-exists)
+       (send-notice stream (format nil "relation ~s does not exist, skipping" reference)))
+      (t (ereport "42P01" "relation ~s does not exist" reference))))
+  (send-command-complete stream "ALTER TABLE"))
 
 (defun exec-stage-drop-table (stream ast)
   "Stage all drops after retaining the heap and dependent storage gates."
@@ -2433,7 +2782,9 @@ without a change; each actual publication captures its own schema precondition."
                                       (exec-stage-drop-index stream ast)
                                       (exec-drop-index stream ast)))
                      (:alter-index (exec-alter-index stream ast))
-                     (:alter-table (exec-alter-table stream ast))
+                     (:alter-table (if (column-evolution-ddl-p ast)
+                                       (exec-stage-column-evolution stream ast)
+                                       (exec-alter-table stream ast)))
                      (t (ereport "0A000" "unsupported statement")))))
             (if (and (ddl-p ast) (not stage-ddl-p))
                 (with-schema-write-lock

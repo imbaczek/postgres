@@ -44,7 +44,13 @@
        (let* ((key (wal-page-key (relation-replacement-relfilenode replacement)
                                  block (relation-replacement-fork replacement)))
               (pages (relation-replacement-pages replacement))
-              (reference (wal-dirty-new-reference key (wal-prepare-dirty-page page owned-p)))
+              (reference
+                (handler-case
+                    (wal-dirty-new-reference key (wal-prepare-dirty-page page owned-p))
+                  (wal-dirty-store-error (condition)
+                    ;; The old reference is still owned and nothing has been published.
+                    ;; Abort the private replacement without fencing shared WAL.
+                    (ereport "58030" "~a" condition))))
               (old (gethash block pages)))
          (setf (gethash block pages) reference
                (relation-replacement-nblocks replacement)

@@ -1413,42 +1413,62 @@ Range and negative checks occur when the LIMIT executes."
           (append (list :type :alter-table :table table :if-exists if-exists)
                   (first actions))))))
 
+(defun parse-alter-column-type (p column)
+  (multiple-value-bind (type typmod) (parse-type p)
+    (list :action :alter-column-type :column column :target-type type :target-typmod typmod
+          :using (when (match-kw p "using") (parse-expr p)))))
+
 (defun parse-alter-table-action (p)
   (cond
     ((match-kw p "alter")
      (match-kw p "column")
      (let ((column (pident p)))
-       (cond ((match-kw p "set")
-              (if (match-kw p "storage")
-                  (list :action :set-storage :column column :storage (pident p))
-                  (progn
-                    (expect-kw p "default")
-                    (multiple-value-bind (expression sql) (parse-stored-expression p)
-                      (list :action :set-default :column column :expression expression :sql sql)))))
+       (cond ((match-kw p "type") (parse-alter-column-type p column))
+             ((match-kw p "set")
+              (cond
+                ((match-kw p "data")
+                 (expect-kw p "type")
+                 (parse-alter-column-type p column))
+                ((match-kw p "storage")
+                 (list :action :set-storage :column column :storage (pident p)))
+                ((match-kw p "not")
+                 (expect-kw p "null")
+                 (list :action :set-not-null :column column))
+                (t
+                 (expect-kw p "default")
+                 (multiple-value-bind (expression sql) (parse-stored-expression p)
+                   (list :action :set-default :column column :expression expression :sql sql)))))
              ((match-kw p "drop")
-              (expect-kw p "default") (list :action :drop-default :column column))
+              (if (match-kw p "not")
+                  (progn (expect-kw p "null") (list :action :drop-not-null :column column))
+                  (progn (expect-kw p "default") (list :action :drop-default :column column))))
              (t (syntax-error p)))))
     ((match-kw p "validate")
      (expect-kw p "constraint")
      (list :action :validate-constraint :constraint-name (pident p)))
     ((match-kw p "rename")
-     (expect-kw p "constraint")
-     (let ((constraint-name (pident p)))
-       (expect-kw p "to")
-       (list :action :rename-constraint
-             :constraint-name constraint-name
-             :new-name (pident p))))
+     (let ((constraint-p (match-kw p "constraint")))
+       (unless constraint-p (match-kw p "column"))
+       (let ((name (pident p)))
+         (expect-kw p "to")
+         (if constraint-p
+             (list :action :rename-constraint :constraint-name name :new-name (pident p))
+             (list :action :rename-column :column name :new-name (pident p))))))
     ((match-kw p "drop")
-     (expect-kw p "constraint")
-     (let ((constraint-if-exists (when (match-kw p "if")
-                                   (expect-kw p "exists")
-                                   t))
-           (constraint-name (pident p)))
-       (match-kw p "restrict")
-       (list
-        :constraint-if-exists constraint-if-exists
-        :action :drop-constraint
-        :constraint-name constraint-name)))
+     (let ((constraint-p (match-kw p "constraint")))
+       (unless constraint-p (match-kw p "column"))
+       (let ((if-exists (when (match-kw p "if")
+                          (expect-kw p "exists")
+                          t))
+             (name (pident p))
+             (cascade-p (match-kw p "cascade")))
+         (unless cascade-p (match-kw p "restrict"))
+         (if constraint-p
+             (progn
+               (when cascade-p (ereport "0A000" "DROP CONSTRAINT CASCADE is not supported"))
+               (list :action :drop-constraint :constraint-name name :constraint-if-exists if-exists))
+             (list :action :drop-column :column name :column-if-exists if-exists
+                   :cascade cascade-p)))))
     ((match-kw p "add")
      (let ((cname nil))
        (when (match-kw p "constraint")
@@ -1485,8 +1505,17 @@ Range and negative checks occur when the LIMIT executes."
                       :columns (with-parens (p) (parse-ident-list p))
                       :constraint-name cname
                       :nulls-not-distinct nulls-not-distinct))))
+         (cname
+          (ereport "0A000" "unsupported ALTER TABLE constraint"))
          (t
-          (ereport "0A000" "unsupported ALTER TABLE action")))))
+          (match-kw p "column")
+          (let ((if-not-exists (when (match-kw p "if")
+                                 (expect-kw p "not")
+                                 (expect-kw p "exists")
+                                 t)))
+            (multiple-value-bind (column keys) (parse-column-def p)
+              (list :action :add-column :column-definition column
+                    :column-keys keys :column-if-not-exists if-not-exists)))))))
     (t
      (ereport "0A000" "unsupported ALTER TABLE action"))))
 

@@ -12,7 +12,9 @@
   default-sequence-name
   default-expression
   default-sql
-  storage)
+  storage
+  (missing-value +null+)
+  dropped-p)
 
 (defun pg-column-effective-storage (column)
   "Return COLUMN's explicit storage policy or its type default."
@@ -272,7 +274,10 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:default-expression pg-column-default-expression :default-expression
                        :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
   (:default-sql pg-column-default-sql :default-sql)
-  (:storage pg-column-storage :storage))
+  (:storage pg-column-storage :storage)
+  (:missing-value pg-column-missing-value :missing-value :default +null+ :omit-default t
+                                                         :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
+  (:dropped pg-column-dropped-p :dropped-p :omit-default t))
 
 (defun catalog-mutation-copy-columns (columns)
   (map 'vector
@@ -1360,7 +1365,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                                     #'string< :key #'pg-index-name)))
          (name (catalog-sql-quote-ident (pg-class-name table)))
          (definitions (append (loop for column across (pg-class-columns table)
-                                    collect (catalog-column-definition-sql column))
+                                    unless (pg-column-dropped-p column)
+                                      collect (catalog-column-definition-sql column))
                               constraints
                               (loop for check in checks when (getf check :validated)
                                     collect (format nil "CONSTRAINT ~a CHECK (~a)"
@@ -1376,7 +1382,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                   name (catalog-sql-quote-ident (getf check :name)) (catalog-check-expression-sql check table))))
       (loop for column across (pg-class-columns table)
             for storage = (pg-column-effective-storage column)
-            unless (char= storage (sql-type-storage-code (pg-column-type column)))
+            unless (or (pg-column-dropped-p column)
+                       (char= storage (sql-type-storage-code (pg-column-type column))))
               do (format stream "; ALTER TABLE ~a ALTER COLUMN ~a SET STORAGE ~a"
                          name (catalog-sql-quote-ident (pg-column-name column))
                          (case storage (#\p "PLAIN") (#\e "EXTERNAL")
@@ -1505,7 +1512,7 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
 
 (defun find-column (class name)
   (loop for col across (pg-class-columns class)
-        when (string= (pg-column-name col) name)
+        when (and (not (pg-column-dropped-p col)) (string= (pg-column-name col) name))
           return col))
 
 (defun find-index-by-oid (oid &optional db)

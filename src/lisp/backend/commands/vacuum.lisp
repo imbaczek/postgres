@@ -216,11 +216,12 @@ implementation's replacement metadata transition atomic as well."
                     (copy-seq (htup-physical-compressed tuple))
                     (make-array (length columns) :initial-element nil))))
     (loop for value across (htup-values tuple) for column across columns for i from 0
-          when (and (heap-external-varlena-p value)
-                    (not (char= (pg-column-effective-storage column) #\p)))
-            do (setf (aref reuse i)
-                     (toast-fetch-compressed-value (pg-class-toast source-table) value snapshot
-                                                   :index-reader #'select-toast-index-reader)))
+          when (pg-column-dropped-p column) do (setf (aref reuse i) nil)
+            else when (and (heap-external-varlena-p value)
+                           (not (char= (pg-column-effective-storage column) #\p)))
+                   do (setf (aref reuse i)
+                            (toast-fetch-compressed-value (pg-class-toast source-table) value snapshot
+                                                          :index-reader #'select-toast-index-reader)))
     (materialize-select-tuple source-table tuple snapshot)
     (if toast
         (with-btree-relation-locks ((list (pg-toast-index-relfilenode toast)))

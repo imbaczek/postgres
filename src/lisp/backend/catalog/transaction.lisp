@@ -12,6 +12,7 @@
   (database nil :read-only t)
   (names (make-hash-table :test #'equal) :read-only t)
   (dependencies (make-hash-table :test #'equalp) :read-only t)
+  (publication-edits (make-hash-table :test #'equal) :read-only t)
   (provisional-nodes (make-hash-table :test #'eql) :read-only t)
   staged-ddl-p
   capture-ddl-p
@@ -205,13 +206,62 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
         (ereport "40001" "sequence ~a referenced by table ~a changed during transaction"
                  (car dependency) name)))))
 
-(defun validate-catalog-table-dependencies (database entry name)
+(defun catalog-transaction-remove-publication-member (transaction publication table-name)
+  "Stage removal of a publication relation dependent on a dropped column."
+  (let* ((edits (catalog-transaction-publication-edits transaction))
+         (name (pg-publication-name publication))
+         (edit (gethash name edits))
+         (replacement (copy-pg-publication publication)))
+    (setf (pg-publication-tables replacement)
+          (remove table-name (pg-publication-tables replacement)
+                  :key (lambda (entry) (getf entry :name)) :test #'string=))
+    (incf (pg-publication-generation replacement))
+    (if edit
+        (setf (third edit) replacement)
+        (setf (gethash name edits)
+              (list publication (pg-publication-generation publication) replacement)))))
+
+(defun catalog-transaction-publications (transaction database)
+  "Return the live publication map or a detached view with staged removals."
+  (let ((live (database-publications database))
+        (edits (and transaction (catalog-transaction-publication-edits transaction))))
+    (if (and edits (plusp (hash-table-count edits)))
+        (let ((view (make-hash-table :test (hash-table-test live) :size (hash-table-count live))))
+          (maphash (lambda (name publication) (setf (gethash name view) publication)) live)
+          (maphash (lambda (name edit) (setf (gethash name view) (third edit))) edits)
+          view)
+        live)))
+
+(defun catalog-publication-filter-column-conflict-p (publications base replacement)
+  "Detect a filter installed while a same-OID descriptor change was private."
+  (loop for publication being the hash-values of publications
+        for entry = (publication-table-entry publication (pg-class-name base))
+        for filter = (getf entry :filter)
+          thereis
+          (when filter
+            (let ((expression (analyze-expr filter base))
+                  (new-columns (pg-class-columns replacement)))
+              (loop for old across (pg-class-columns base)
+                    for slot from 0
+                    for new = (and (< slot (length new-columns)) (aref new-columns slot))
+                      thereis
+                      (and (not (pg-column-dropped-p old))
+                           (or (null new) (pg-column-dropped-p new)
+                               (not (string= (pg-column-name old) (pg-column-name new)))
+                               (not (eq (pg-column-type old) (pg-column-type new)))
+                               (not (eql (pg-column-typmod old) (pg-column-typmod new))))
+                           (stored-expression-references-attnum-p expression (pg-column-attnum old))))))))
+
+(defun validate-catalog-table-dependencies (database publications entry name)
   "Recheck dependencies whose DDL can commit independently of relation admission."
   (let ((base (catalog-transaction-entry-base entry))
         (object (catalog-transaction-entry-object entry)))
-    (when (and base (not (eq base object))
+    (when (and base (or (null object) (/= (pg-class-oid base) (pg-class-oid object)))
                (catalog-explicit-publication-table-p database base))
       (ereport "40001" "publication membership of table ~a changed during transaction" name))
+    (when (and base object (= (pg-class-oid base) (pg-class-oid object))
+               (catalog-publication-filter-column-conflict-p publications base object))
+      (ereport "40001" "publication filter of table ~a changed during transaction" name))
     (validate-catalog-sequence-dependencies
      database name (catalog-transaction-entry-sequence-dependencies entry))))
 
@@ -219,6 +269,13 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
   "Reject conflicts under the catalog lock before publishing any WAL."
   (unless (eq database (catalog-transaction-database transaction))
     (ereport "40001" "database catalog changed during transaction"))
+  (maphash (lambda (name edit)
+             (destructuring-bind (base generation replacement) edit
+               (declare (ignore replacement))
+               (unless (and (eq (gethash name (database-publications database)) base)
+                            (= (pg-publication-generation base) generation))
+                 (ereport "40001" "publication ~a changed during transaction" name))))
+           (catalog-transaction-publication-edits transaction))
   (maphash (lambda (address observation)
              (declare (ignore address))
              (destructuring-bind (name base version) observation
@@ -240,7 +297,8 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
                                transaction (ecase (car key) (:table :index) (:index :table)) name)))
                  (ereport "40001" "catalog name ~a conflicts with another relation" name))
                (when (eq (car key) :table)
-                 (validate-catalog-table-dependencies database entry name))
+                 (validate-catalog-table-dependencies
+                  database (catalog-transaction-publications transaction database) entry name))
                (let ((object (catalog-transaction-entry-object entry)))
                  (when (and (eq (car key) :index) object
                             (not (catalog-index-owner-compatible-p
@@ -302,7 +360,8 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
   (catalog-transaction-validate transaction database)
   (let ((view (copy-database database)))
     (setf (database-tables view) (catalog-transaction-merged-name-map transaction :table)
-          (database-indexes view) (catalog-transaction-merged-name-map transaction :index))
+          (database-indexes view) (catalog-transaction-merged-name-map transaction :index)
+          (database-publications view) (catalog-transaction-publications transaction database))
     (catalog-transaction-adjust-index-membership view transaction)
     view))
 
@@ -400,6 +459,7 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
                    (setf (pg-class-indexes (car update)) (cdr update)))
                  (setf (database-tables database) (database-tables view)
                        (database-indexes database) (database-indexes view)
+                       (database-publications database) (database-publications view)
                        *catalog-oldest-relfrozenxid* oldest
                        *active-xids* (delete xid *active-xids* :test #'eql))
                  (incf *catalog-durable-generation*))

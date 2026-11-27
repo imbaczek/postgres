@@ -1049,6 +1049,15 @@ revalidated by this codec."
                             (member (getf ast :nulls-not-distinct) '(nil t)))
                    '(:type :name :table :columns :index-keys :predicate :unique
                      :if-not-exists :concurrently :nulls-not-distinct))))
+              (:alter-table
+               (when (and (eq (getf ast :action) :alter-column-type)
+                          (stringp (getf ast :table))
+                          (stringp (getf ast :column))
+                          (member (getf ast :target-type) '(:int4 :int8))
+                          (eql (getf ast :target-typmod) -1)
+                          (or (null (getf ast :using))
+                              (logical-proper-nonempty-list-p (getf ast :using))))
+                 '(:type :table :action :column :target-type :target-typmod :using)))
               ((:drop-table :drop-index)
                (let ((names (getf ast :names)))
                  (when (and (logical-proper-nonempty-list-p names) (every #'stringp names))
@@ -1305,19 +1314,42 @@ Other types retain their normal semantic checks and may allocate their values."
       (logical-capture-change *backend* change +max-logical-transaction-bytes+)
       change)))
 
+(defun logical-live-column-slots (table)
+  "Return physical offsets when the logical image needs compaction."
+  (let ((columns (pg-class-columns table)))
+    (when (some #'pg-column-dropped-p columns)
+      (coerce (loop for column across columns for slot from 0
+                    unless (pg-column-dropped-p column) collect slot)
+              'vector))))
+
+(defun logical-project-row (slots row)
+  (if (and slots row)
+      (map 'vector (lambda (slot) (aref row slot)) slots)
+      row))
+
+(defun logical-project-identity (slots keys)
+  (if slots
+      (loop for slot across slots for attnum from 1
+            when (member (1+ slot) keys) collect attnum)
+      keys))
+
 (defun logical-relation-columns (table)
-  "Copy the immutable relation descriptor used by both row and TRUNCATE WAL."
-  (loop for column across (pg-class-columns table)
-        collect (list :attnum (pg-column-attnum column)
-                      :name (copy-seq (pg-column-name column))
-                      :type (pg-column-type column)
-                      :typmod (pg-column-typmod column)
-                      :notnull (pg-column-notnull column))))
+  "Number visible columns consecutively in the logical row descriptor."
+  (loop with attnum = 0
+        for column across (pg-class-columns table)
+        unless (pg-column-dropped-p column)
+          collect (list :attnum (incf attnum)
+                        :name (copy-seq (pg-column-name column))
+                        :type (pg-column-type column)
+                        :typmod (pg-column-typmod column)
+                        :notnull (pg-column-notnull column))))
 
 (defun logical-relation-description (table)
   (list :oid (pg-class-oid table) :name (copy-seq (pg-class-name table))
         :columns (logical-relation-columns table)
-        :key-attnums (copy-list (logical-table-replica-identity table))))
+        :key-attnums (copy-list (logical-project-identity
+                                 (logical-live-column-slots table)
+                                 (logical-table-replica-identity table)))))
 
 (defun logical-capture-row-images (kind keys old-values new-values toast-reuse)
   "Copy SQL images, keeping identity fields and marking proven external reuse."
@@ -1405,7 +1437,9 @@ executor, so capture the same operation before transaction commit."
     (logical-test-failpoint :before-logical-row-encode kind (pg-class-name table))
     (let* ((columns
              (logical-relation-columns table))
-           (key-attnums (logical-table-replica-identity table))
+           (slots (logical-live-column-slots table))
+           (physical-keys (logical-table-replica-identity table))
+           (key-attnums (logical-project-identity slots physical-keys))
            (old-image nil)
            (new-image nil)
            (change (make-logical-change
@@ -1424,15 +1458,19 @@ executor, so capture the same operation before transaction commit."
                          +max-logical-apply-headroom-bytes+
                          0))))
       (multiple-value-setq (old-image new-image)
-        (logical-capture-row-images kind key-attnums old-values new-values toast-reuse))
-      (setf (logical-change-old-values change) old-image
+        (logical-capture-row-images kind physical-keys old-values new-values toast-reuse))
+      (setf old-image (logical-project-row slots old-image)
+            new-image (logical-project-row slots new-image)
+            toast-reuse (logical-project-row slots toast-reuse)
+            (logical-change-old-values change) old-image
             (logical-change-new-values change) new-image)
       (logical-capture-change
        *backend* change limit
        :after-measure (lambda (size)
                         (when (or (logical-full-row-admission-needed-p size table columns toast-reuse)
                                   (logical-array-admission-needed-p size columns old-image new-image))
-                          (let ((full-new (if full-new-values (funcall full-new-values) new-values)))
+                          (let ((full-new (logical-project-row
+                                           slots (if full-new-values (funcall full-new-values) new-values))))
                             (handler-case
                                 (logical-validate-large-row-change change full-new)
                               (logical-transport-frame-overflow ()

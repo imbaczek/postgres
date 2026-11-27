@@ -236,7 +236,9 @@
                       (ereport "42701" "column specified more than once"))
                     (setf attnums (if names
                                       (mapcar (lambda (name) (pg-column-attnum (resolve-column-or-error table name))) names)
-                                      (loop for index from 1 to (length columns) collect index)))
+                                      (loop for column across columns
+                                            unless (pg-column-dropped-p column)
+                                              collect (pg-column-attnum column))))
                     (cond
                       ((getf ast :source)
                        (setf source (prepare-select-internal (getf ast :source) nil))
@@ -709,7 +711,8 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                          (columns (pg-class-columns table)))
     (loop for descriptor across descriptors for i from 0
           for pointer = (aref old-values i)
-          when (and descriptor (heap-external-varlena-p pointer)
+          when (and descriptor (not (pg-column-dropped-p (aref columns i)))
+                    (heap-external-varlena-p pointer)
                     (equalp descriptor (heap-encode-external-varlena pointer)))
             do (unless materialized
                  (let ((*datum-origin-capture* nil))

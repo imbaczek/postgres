@@ -154,13 +154,16 @@ A provisional connection has no SQL role until startup admission succeeds."
   (unless (and (vectorp names) (not (stringp names)))
     (ereport "42804" "publication names must be a text array"))
   (with-write-lock
-    (let ((database (current-database)) (rows nil))
+    (let* ((database (current-database))
+           (publications (catalog-transaction-publications
+                          (and *backend* (backend-catalog-transaction *backend*)) database))
+           (rows nil))
       (when (and relation-p (not (find-table-by-oid relation-id)))
         (return-from publication-table-result-rows nil))
       (when (find +null+ names :test #'eq)
         (ereport "22004" "null array element not allowed"))
       (loop for name across names
-            for publication = (gethash name (database-publications database))
+            for publication = (gethash name publications)
             do (unless (or publication relation-p)
                  (ereport "42704" "publication ~s does not exist" name))
                (when publication
@@ -180,9 +183,10 @@ A provisional connection has no SQL role until startup admission succeeds."
                             :fields +publication-table-result-fields+
                             :values (vector
                                      (pg-publication-oid publication) (pg-class-oid table)
-                                     (if (plusp (length (pg-class-columns table)))
-                                         (map 'vector #'pg-column-attnum (pg-class-columns table))
-                                         +null+)
+                                     (let ((attnums (loop for column across (pg-class-columns table)
+                                                          unless (pg-column-dropped-p column)
+                                                            collect (pg-column-attnum column))))
+                                       (if attnums (coerce attnums 'vector) +null+))
                                      +null+))
                            rows)))))
       (nreverse rows))))
@@ -449,7 +453,7 @@ synchronous_commit. Reject unsupported parameters and other local settings."
                                           ("atttypid" :oid t 3) ("attnum" :int2 t 5)
                                           ("atttypmod" :int4 t 6) ("attnotnull" :bool t 12)
                                           ("attgenerated" :char t 16) ("attisdropped" :bool t 17)
-                                          ("attstorage" :char t 10)))
+                                          ("attstorage" :char t 10) ("atthasmissing" :bool t 14)))
    (make-sql-system-relation-descriptor 1247 "pg_type" #\r 'sql-type-rows
                                         '(("oid" :oid t 1) ("typname" :name t 2)
                                           ("typnamespace" :oid t 3) ("typlen" :int2 t 5)
@@ -778,9 +782,9 @@ Capture policy and keep size once for every row in the snapshot."
                         (char-code (sql-type-alignment-code type))
                         (char-code (sql-type-storage-code type)))))
 
-(defun sql-attribute-row (oid name type number typmod notnull &optional storage)
-  (vector oid name (type-oid type) number (or typmod -1) notnull 0 nil
-          (char-code (or storage (sql-type-storage-code type)))))
+(defun sql-attribute-row (oid name type number typmod notnull &optional storage dropped-p missing-p)
+  (vector oid name (if dropped-p 0 (type-oid type)) number (or typmod -1) notnull 0 dropped-p
+          (char-code (or storage (sql-type-storage-code type))) missing-p))
 
 (defun sql-attribute-rows ()
   "Expose original attribute numbers; virtual executor slots remain dense internally."
@@ -797,7 +801,9 @@ Capture policy and keep size once for every row in the snapshot."
                do (push (sql-attribute-row
                          (pg-class-oid table) (pg-column-name column) (pg-column-type column)
                          (pg-column-attnum column) (pg-column-typmod column)
-                         (pg-column-notnull column) (pg-column-effective-storage column)) rows))
+                         (pg-column-notnull column) (pg-column-effective-storage column)
+                         (pg-column-dropped-p column)
+                         (not (eq (pg-column-missing-value column) +null+))) rows))
          (let ((toast (pg-class-toast table)))
            (when toast
              (dolist (relation (list (cons (pg-toast-oid toast) t)

@@ -2868,18 +2868,37 @@ allocated about 90–102 MB per indexed workload and 537 MB per array workload.
 
 Build on P07 catalog transactions, dependency tracking and descriptor generations.
 
-- [ ] Preserve stable attribute identities and decode older tuples using
+- [x] Preserve stable attribute identities and decode older tuples using
   physical attribute counts and dropped/missing attribute metadata.
-- [ ] Add transactional column rename, nullable ADD COLUMN, immutable constant
+- [x] Add transactional column rename, nullable ADD COLUMN, immutable constant
   missing defaults and dependency-aware DROP COLUMN. Keep stored missing values
   stable across later default changes. Verify rollback, prepared-plan invalidation
   and RESTRICT/CASCADE behavior.
-- [ ] Add SET/DROP NOT NULL and ordered multi-action validation. Prevent
+- [x] Add SET/DROP NOT NULL and ordered multi-action validation. Prevent
   concurrent writes from introducing invalid rows during validation and publish
   the descriptor atomically.
-- [ ] Qualify a bounded ALTER TYPE conversion matrix with USING. Rewrite heap,
+- [x] Qualify a bounded ALTER TYPE conversion matrix with USING. Rewrite heap,
   indexes and TOAST atomically, and verify conversion failure, cancellation,
   disk quota, restart, physical replay and supported logical replication.
+
+ALTER TYPE covers integer to bigint and text to integer with explicit USING.
+Native transactional logical replication carries the rewrite in statement order.
+The publisher rejects schema rewrites with standard slots and rejects USING
+expressions whose evaluation can depend on session settings during logical
+replay. Dependent defaults, CHECK expressions, expression indexes, and
+publication filters still limit eligible conversions.
+
+The transactional catalog and physical reader tests cover cancellation,
+failed conversion and uniqueness checks, crash restart, and standby replay.
+An isolated ext4 project quota forced an actual EDQUOT during private
+scratch writes. The old heap remained readable and retry succeeded after
+lifting the quota.
+
+In three 36,000-row runs, reusing the current heap page during index builds
+saved about 300 MB of allocation for both rewrite conversions. The integer
+and text rewrites still used about 2.7 and 2.6 GB of allocations respectively.
+Peak RSS was about 411 MiB for the Lisp server and 29 MiB for the C session
+backend. Both rewrites remained above the 3× CPU and RSS targets.
 
 ## P10 — Foreign keys
 
