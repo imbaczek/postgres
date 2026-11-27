@@ -154,27 +154,57 @@ def check_repeatable_read_select_bind(server, reader, writer):
     reader.send(b"S")
     assert reader.through(b"Z") == b"I"
     reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
-    server.control("(defvar pg::*bind-test-result-columns* "
-                   "(symbol-function 'pg::extended-select-result-columns))")
+    server.control("(defvar pg::*bind-test-admit-plan* "
+                   "(symbol-function 'pg::call-with-admitted-select-plan))")
     try:
         server.control(
-            "(setf (symbol-function 'pg::extended-select-result-columns) "
-            "(lambda (ast &optional register-p) "
-            "(when register-p "
+            "(setf (symbol-function 'pg::call-with-admitted-select-plan) "
+            "(lambda (plan function) "
             "(assert (pg::backend-transaction-snapshot pg::*backend*)) "
-            "(assert (pg::backend-holds-schema-read-lock-p))) "
-            "(funcall pg::*bind-test-result-columns* ast register-p)))")
+            "(assert (pg::backend-holds-schema-read-lock-p)) "
+            "(funcall pg::*bind-test-admit-plan* plan function)))")
         reader.bind("rr_select", "rr_select_portal")
         reader.send(b"H")
         reader.through(b"2")
     finally:
-        server.control("(setf (symbol-function 'pg::extended-select-result-columns) "
-                       "pg::*bind-test-result-columns*)")
+        server.control("(setf (symbol-function 'pg::call-with-admitted-select-plan) "
+                       "pg::*bind-test-admit-plan*)")
     writer.query("INSERT INTO bind_rr_select VALUES (2)")
     assert reader.execute("rr_select_portal") == ([["1"]], ["SELECT 1"], b"T", [])
     reader.query("COMMIT")
     writer.query("TRUNCATE bind_rr_select")
     assert writer.query("SELECT id FROM bind_rr_select") == []
+
+
+def check_read_committed_bind_after_truncate(server, reader, writer):
+    writer.query("CREATE TABLE bind_rc_select(id int)")
+    writer.query("INSERT INTO bind_rc_select VALUES (1)")
+    reader.prepare("bind_rc_select", bind=False, statement="rc_select")
+    reader.send(b"S")
+    assert reader.through(b"Z") == b"I"
+    writer.query("BEGIN")
+    writer.query("TRUNCATE bind_rc_select")
+    writer.query("INSERT INTO bind_rc_select VALUES (2)")
+    marker = server.root / "bind-rc-before-admission"
+    server.control("(defvar pg::*bind-rc-admit-plan* "
+                   "(symbol-function 'pg::call-with-admitted-select-plan))")
+    try:
+        server.control(
+            "(setf (symbol-function 'pg::call-with-admitted-select-plan) "
+            "(lambda (plan function) "
+            "(assert (null pg::*current-snapshot*)) "
+            f'(with-open-file (marker "{marker}" :direction :output '
+            ':if-exists :supersede) (write-line "waiting" marker)) '
+            "(funcall pg::*bind-rc-admit-plan* plan function)))")
+        reader.bind("rc_select", "rc_select_portal")
+        reader.send(b"H")
+        wire.wait_for_file(marker, server.process)
+        writer.query("COMMIT")
+        reader.through(b"2")
+    finally:
+        server.control("(setf (symbol-function 'pg::call-with-admitted-select-plan) "
+                       "pg::*bind-rc-admit-plan*)")
+    assert reader.execute("rc_select_portal") == ([["2"]], ["SELECT 1"], b"I", [])
 
 
 def check_snapshot_read_only_transition(reader, writer):
@@ -381,6 +411,7 @@ def run():
         check_dml_bind(reader, writer)
         check_repeatable_read_dml_bind(server, reader, writer)
         check_repeatable_read_select_bind(server, reader, writer)
+        check_read_committed_bind_after_truncate(server, reader, writer)
         check_snapshot_read_only_transition(reader, writer)
         check_sorted_volatile_projection(writer)
         check_sorted_file_projection(writer)

@@ -697,26 +697,110 @@ duplicates on either side of an equal separator."
         (btree-scan-push-node cursor level root)))
     cursor))
 
+(defun btree-compare-page-key (page slot logical value-size)
+  "Compare LOGICAL with a stored key and return the offset of its value."
+  (with-live-page-item (page slot start length)
+    (unless (and (>= length (+ 2 value-size))
+                 (<= (page-upper page) start (+ start length) (length page)))
+      (ereport "XX001" "invalid B-tree page entry"))
+    (let* ((field (page-u16 page start))
+           (key-length (logand field #x7fff))
+           (key-start (+ start 2)))
+      (unless (= length (+ 2 key-length value-size))
+        (ereport "XX001" "invalid B-tree page entry"))
+      (values (if (logbitp 15 field)
+                  (key-compare logical
+                               (btree-unpack-key (subseq page start (+ start length)) field))
+                  (compare-btree-key-bytes logical page key-start key-length))
+              (+ key-start key-length)))))
+
+(defun btree-page-key-lower-bound (page logical low high value-size)
+  "Search the ordered slots in [LOW, HIGH). An unused probe requires linear search."
+  (loop while (< low high)
+        for mid = (ash (+ low high) -1)
+        for order = (btree-compare-page-key page mid logical value-size)
+        do (cond ((null order) (return-from btree-page-key-lower-bound nil))
+                 ((plusp order) (setf low (1+ mid)))
+                 (t (setf high mid))))
+  low)
+
+(defun btree-equal-page-leaf-tids (page key)
+  "Find the equal run by key without interpreting or copying earlier entries."
+  (let* ((logical (btree-logical-key key))
+         (count (page-lp-count page))
+         (first (btree-page-key-lower-bound page logical 1 (1+ count) 6)))
+    (flet ((linear-scan ()
+             (loop for slot from 1 to count
+                   for tid = (btree-scan-leaf-tid page slot nil nil key)
+                   when tid collect tid)))
+      (unless first (return-from btree-equal-page-leaf-tids (linear-scan)))
+      (loop for slot from first to count
+            append (multiple-value-bind (order tid) (btree-compare-page-key page slot logical 6)
+                     (cond ((null order) (return-from btree-equal-page-leaf-tids (linear-scan)))
+                           ((zerop order) (list (cons (page-u32 page tid) (page-u16 page (+ tid 4)))))
+                           (t (loop-finish))))))))
+
+(defun btree-equal-page-children-linear (page key)
+  "Find the predecessor and equal separator run when a page contains unused slots."
+  (let ((logical (btree-logical-key key))
+        (previous nil)
+        (selected nil)
+        (equal-run nil)
+        (matches nil))
+    (loop for slot from 1 to (page-lp-count page)
+          do (multiple-value-bind (order position) (btree-compare-page-key page slot logical 4)
+               (when order
+                 (let ((child (page-u32 page position)))
+                   (unless selected (setf selected child))
+                   (cond ((zerop order)
+                          (unless equal-run
+                            (setf equal-run t matches (when previous (list previous))))
+                          (push child matches))
+                         (t
+                          (setf equal-run nil)
+                          (when (plusp order)
+                            (setf selected child matches nil))))
+                   (setf previous child)))))
+    (cond (matches (coerce (nreverse matches) 'simple-vector))
+          (selected (vector selected))
+          (t #()))))
+
+(defun btree-equal-page-children (page key)
+  "Retain the predecessor and every child with an equal separator.
+Only the first separator may be stale after an insert below the old minimum."
+  (let* ((logical (btree-logical-key key))
+         (count (page-lp-count page))
+         (first (btree-page-key-lower-bound page logical 2 (1+ count) 4)))
+    (when (zerop count) (return-from btree-equal-page-children #()))
+    (unless first (return-from btree-equal-page-children (btree-equal-page-children-linear page key)))
+    (multiple-value-bind (order child) (btree-compare-page-key page (1- first) logical 4)
+      (declare (ignore order))
+      (unless child (return-from btree-equal-page-children (btree-equal-page-children-linear page key)))
+      (let ((children (list (page-u32 page child))))
+        (loop for slot from first to count
+              do (multiple-value-bind (order next) (btree-compare-page-key page slot logical 4)
+                   (unless order
+                     (return-from btree-equal-page-children (btree-equal-page-children-linear page key)))
+                   (unless (zerop order) (return))
+                   (push (page-u32 page next) children)))
+        (coerce (nreverse children) 'simple-vector)))))
+
 (defun btree-cursor-push-node (cursor level block)
   (with-buf-read-page (page (btree-equal-cursor-relfilenode cursor) block)
     (unless page
       (ereport "XX000" "index page ~a is missing" block))
     (if (zerop level)
         (let* ((key (btree-equal-cursor-key cursor))
-               (tids (loop for slot from 1 to (page-lp-count page)
-                           for tid = (btree-scan-leaf-tid page slot nil nil key)
-                           when tid collect tid)))
+               (tids (btree-equal-page-leaf-tids page key)))
           (when tids
             (push (make-btree-equal-cursor-frame
                    :level 0 :entries (coerce tids 'simple-vector) :next 0 :end (1- (length tids)))
                   (btree-equal-cursor-stack cursor))))
-        (let ((entries (btree-page-entries page t)))
-          (unless (null entries)
-            (multiple-value-bind (first last)
-                (btree-equal-child-range entries (btree-equal-cursor-key cursor))
-              (push (make-btree-equal-cursor-frame
-                     :level level :entries (coerce entries 'simple-vector) :next first :end last)
-                    (btree-equal-cursor-stack cursor))))))))
+        (let ((children (btree-equal-page-children page (btree-equal-cursor-key cursor))))
+          (when (plusp (length children))
+            (push (make-btree-equal-cursor-frame
+                   :level level :entries children :next 0 :end (1- (length children)))
+                  (btree-equal-cursor-stack cursor)))))))
 
 (defun btree-cursor-next-tid (cursor)
   (loop while (btree-equal-cursor-stack cursor)
@@ -731,7 +815,7 @@ duplicates on either side of an equal separator."
                 (incf (btree-equal-cursor-frame-next frame))
                 (if (zerop level)
                     (return (cons (car entry) (cdr entry)))
-                    (btree-cursor-push-node cursor (1- level) (cdr entry))))))))
+                    (btree-cursor-push-node cursor (1- level) entry)))))))
 
 (defun open-btree-equal-cursor-unlocked (relfilenode key)
   "Start an equality scan under the caller's relation read or write lease."

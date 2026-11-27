@@ -379,12 +379,21 @@ BYTEA vectors match the byte-content values stored in the MCV list."
 (defun index-paths-for-equality (table qual &optional (column-offset 0))
   (multiple-value-bind (attnum value found-p)
       (equality-column-constant qual)
-    (when (and found-p
-               (< column-offset attnum)
-               (<= attnum (+ column-offset
-                             (length (pg-class-columns table)))))
-      (index-paths-for-column table (- attnum column-offset) qual
-                              :value value))))
+    (when found-p
+      (return-from index-paths-for-equality
+        (index-paths-for-column table (- attnum column-offset) qual :value value))))
+  (multiple-value-bind (attnum operator value type parameter) (index-comparison-constant qual)
+    (declare (ignore value))
+    (when (and (eq (first parameter) :parameter) (string= operator "="))
+      (let* ((columns (pg-class-columns table))
+             (local (- attnum column-offset))
+             (column (and (<= 1 local (length columns)) (aref columns (1- local))))
+             (column-type (and column (pg-column-type column))))
+        (when (case column-type
+                ((:text :varchar) (member type '(:text :varchar)))
+                ((:int2 :int4 :int8 :date :time :timestamp :timestamptz :interval :timetz
+                        :numeric :float4 :float8 :bytea :jsonb) (eq type column-type)))
+          (index-paths-for-column table local qual :parameter-expr parameter))))))
 
 (defun index-path-for-equality (table qual &optional (column-offset 0))
   (first (index-paths-for-equality table qual column-offset)))

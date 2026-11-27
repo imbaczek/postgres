@@ -1155,6 +1155,11 @@ throughout replay and shutdown."
     (when (equal (first arguments) "--initdb-native")
       (run-native-initdb (rest arguments)))
     (startup-handle-meta-request arguments))
+  ;; SBCL sizes the default allocation interval from its reserved dynamic
+  ;; space. Bound transient server allocations between collections while
+  ;; preserving a smaller interval already selected by the runtime.
+  (setf (sb-ext:bytes-consed-between-gcs)
+        (min (sb-ext:bytes-consed-between-gcs) (* 128 1024 1024)))
   (multiple-value-bind (host port pgdata control-port control-socket
                         swank-port swank-bind-address temp-file-limit-bytes
                         sort-arena-limit-bytes max-slot-wal-keep-bytes startup-settings startup-native startup-overrides)

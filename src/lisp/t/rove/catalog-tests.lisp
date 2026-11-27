@@ -207,6 +207,37 @@
                       (handler-case (catalog-transaction-validate writer database)
                         (pg-error (condition) (pg-error-sqlstate condition)))))))
 
+(rove:deftest varchar-point-index-accepts-typed-bindings
+    (let* ((database (make-database :oid 5 :name "point_probe"))
+           (column (make-pg-column :name "k" :type :varchar :typmod 131 :attnum 1))
+           (table (make-pg-class :oid 11 :name "keys" :relfilenode 81 :columns (vector column)
+                                 :statistics (make-pg-table-statistics :row-count 2000)))
+           (index (make-pg-index :oid 12 :name "probe" :relfilenode 82
+                                 :table-oid 11 :columns '(1) :unique-p t :valid-p t))
+           (partial (make-pg-index :oid 13 :name "partial_probe" :relfilenode 83
+                                   :table-oid 11 :columns '(1) :valid-p t :predicate '(:const nil :type :bool)))
+           (transaction (make-catalog-transaction database))
+           (*catalog* (make-catalog))
+           (*backend* (make-backend :database "point_probe" :catalog-transaction transaction))
+           (key (make-string 127 :initial-element #\a)))
+      (setf (gethash "point_probe" (catalog-databases *catalog*)) database
+            (gethash "keys" (database-tables database)) table)
+      (catalog-transaction-stage transaction :index "probe" index)
+      (catalog-transaction-stage transaction :index "partial_probe" partial)
+      (dolist (type '(:varchar :text))
+        (let ((*query-parameter-types* (vector type)))
+          (dolist (sql '("SELECT k FROM keys WHERE k = $1" "SELECT k FROM keys WHERE $1 = k"))
+            (let* ((where (analyze-expr (getf (first (parse-statements sql)) :where) table))
+                   (paths (index-paths-for-equality table where))
+                   (path (first paths)))
+              (rove:ok (equal (mapcar #'select-scan-path-index paths) (list index)))
+              (when path
+                (let ((*query-parameter-values* (vector key)))
+                  (rove:ok (equalp (select-scan-index-key table path #())
+                                   (encode-index-key (list key) '(:varchar)))))
+                (let ((*query-parameter-values* (vector +null+)))
+                  (rove:ok (null (select-scan-index-key table path #())))))))))))
+
 (rove:deftest test-catalog-transaction-validates-index-owner-and-namespace
     (let* ((database (make-database :oid 5 :name "overlay"))
            (table (make-pg-class :oid 11 :name "heap" :relfilenode 81
@@ -317,6 +348,32 @@
                           nil)
                  (pg-error (e) (string= (pg-error-sqlstate e) "54000")))
                "an unsplittable entry reports 54000")))
+
+(rove:deftest btree-equality-children-preserve-the-duplicate-boundary
+    (flet ((key (text) (encode-index-key (list text) '(:varchar))))
+      (let* ((entries (loop for word in '("c" "b" "b" "b" "d" "d" "z")
+                            for block from 40 collect (cons (key word) block)))
+             (page (btree-page-build entries t)))
+        ;; The first separator can be stale after an insert below the old minimum.
+        (dolist (probe '("" "a" "b" "c" "d" "e" "z" "zz"))
+          (multiple-value-bind (first last) (btree-equal-child-range entries (key probe))
+            (rove:ok (equalp (btree-equal-page-children page (key probe))
+                             (map 'vector #'cdr (subseq entries first (1+ last))))))))))
+
+(rove:deftest btree-equality-leaf-boundaries
+    (flet ((key (text) (encode-index-key (list text) '(:varchar))))
+      (let* ((entries (loop for word in '("b" "b" "c" "d" "d" "d" "f" "z")
+                            for slot from 1 collect (list (key word) 25 slot)))
+             (page (btree-page-build entries nil))
+             (sparse-page (copy-seq page)))
+        (page-set-lp sparse-page 5 0 +lp-unused+ 0)
+        (dolist (input (list page sparse-page))
+          (dolist (probe '("" "b" "c" "d" "e" "f" "z" "zz"))
+            (let ((key (key probe)))
+              (rove:ok (equal (btree-equal-page-leaf-tids input key)
+                              (loop for slot from 1 to (page-lp-count input)
+                                    for tid = (btree-scan-leaf-tid input slot nil nil key)
+                                    when tid collect tid)))))))))
 
 (rove:deftest ordered-plain-btree-leaf-insert
     (flet ((key (&rest bytes)

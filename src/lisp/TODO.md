@@ -2327,6 +2327,77 @@ single-column wide integer tables. The residual fixture spills wider
 rows and continues to use the general frame. The other holdouts show
 small variations and keep their prior execution paths.
 
+### Random varchar primary-key reads
+
+Run `python3 src/lisp/t/varchar-point-read.py --reference-bin /path/to/pg/bin`
+for the idempotency-key workload. The fixture inserts one million unique
+URL-safe ASCII keys, 60 to 127 characters long, into a `varchar(127)`
+primary key. Each warmed batch checks 20,000 seeded random lookups over
+one persistent connection. Hits fetch and verify an integer payload.
+Misses use keys generated outside the inserted row domain.
+
+The first allocation profile showed a heap scan for the bound equality.
+The planner now uses the existing runtime probe for a compatible
+single-column index. Bind values alone cannot prove a partial-index
+predicate. In the next profile, decoding internal separator entries
+accounted for 32% of sampled allocation. Plain separators are now
+compared in place. The equality cursor still includes the child before
+the first equal separator, where duplicates can survive a split.
+
+| Prepared batch | Hit median s | Miss median s | Hit peak RSS MiB | Hit allocation per lookup |
+| --- | ---: | ---: | ---: | ---: |
+| PostgreSQL C 20devel | 2.946 | 2.701 | 153.6 | unavailable |
+| Lisp with bind equality probe | 7.758 | 7.244 | 936.9 | 95.1 kB |
+| Lisp with in-place separators | 7.176 | 6.972 | 940.1 | 63.1 kB |
+| Lisp with one-plan Bind and startup GC cap | 7.662 | 7.082 | 253.8 | 51.0 kB |
+| Lisp with binary equality searches | 6.354 | 5.829 | 254.1 | 51.1 kB |
+
+RSS is the C query backend or the whole Lisp server. The startup GC
+cap bounds SBCL's allocation interval to 128 MiB and preserves a lower
+runtime-selected value. The uncapped interval on the measured build was
+about 819 MiB. The one-plan Bind validates the Parse signature against
+the execution plan and admits relation readers before capturing the
+read-committed snapshot. This preserves the Bind-time view when a
+concurrent TRUNCATE holds the relation. With planning tracking enabled,
+a completed plan can be counted even if Bind subsequently rejects
+the result descriptor or format. No execution is counted in that case.
+
+The final equality cursor binary-searches ordered leaf keys and
+internal separators. It includes the preceding child at an equal
+internal separator and scans the equal run. A probe of an unused slot
+falls back to linear traversal. Each million-row timing used five
+samples after warming, with every result checked. The harness confirms
+that the prepared query opens an equality index cursor before timing.
+
+Using the faster C baseline above, Lisp hits were 2.16× C elapsed and
+1.65× C peak RSS. Misses were 2.16× elapsed and 1.64× peak RSS. Median
+server CPU was 3.25 s for Lisp hits and 2.91 s for misses, versus
+0.50 s and 0.39 s for C. Lisp allocated 40.3 kB per miss. A second fresh
+C run on the shared host measured 4.166 s for hits and 3.910 s for
+misses with similar peak RSS. The faster denominator gives the
+conservative target comparison.
+
+For holdouts, use `--rows 50000 --reads 3000 --samples 3` with the
+options below. Add `--engine lisp --engine-root /path/to/baseline` to
+compare an earlier checkout. The unprepared baseline was `a06eadacd44`.
+Each table cell reports median elapsed seconds, median server CPU seconds,
+and peak RSS MiB. Allocation is Lisp kilobytes per lookup.
+
+| Holdout | Lookups | C elapsed / CPU / RSS | Lisp elapsed / CPU / RSS | Lisp kB |
+| --- | --- | ---: | ---: | ---: |
+| `--no-prepared` | hits | 0.591 / 0.15 / 40.1 | 1.156 / 0.57 / 229.0 | 43.3 |
+| `--no-prepared` | misses | 0.595 / 0.15 / 40.1 | 1.123 / 0.52 / 201.4 | 33.8 |
+| `--min-length 60 --max-length 60` | hits | 0.507 / 0.09 / 36.0 | 1.086 / 0.54 / 211.7 | 37.3 |
+| `--min-length 60 --max-length 60` | misses | 0.471 / 0.09 / 36.0 | 1.013 / 0.47 / 185.0 | 28.0 |
+| `--min-length 127 --max-length 127 --key-type text` | hits | 0.498 / 0.07 / 43.6 | 1.080 / 0.56 / 232.8 | 44.6 |
+| `--min-length 127 --max-length 127 --key-type text` | misses | 0.478 / 0.07 / 43.6 | 0.955 / 0.48 / 203.9 | 34.6 |
+
+Unprepared hits went from 66.0 to 43.3 kB per lookup, 294.5 to
+229.0 MiB peak RSS, and 0.61 to 0.57 s CPU per batch. The elapsed median
+rose from 1.045 to 1.156 s on this shared host. The smaller fixtures
+produce a much smaller C backend RSS, so their whole-server RSS ratios
+are higher than the primary comparison.
+
 ### Other join paths
 
 Re-run the loop cases with

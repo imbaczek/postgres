@@ -6,8 +6,7 @@
 
 (defstruct extended-portal statement values (executed-p nil)
            (returns-rows-p nil :read-only t)
-           (result-columns nil :read-only t)
-           (result-formats nil :read-only t))
+           result-columns result-formats)
 
 (defstruct extended-select-execution owner plan targets iterator observation queryid (at-end-p nil) (failed-p nil))
 
@@ -247,34 +246,38 @@
              store toplevel query-id ticks (getf ast :normalized-statement-text)))
       (values plan targets columns))))
 
-(defun extended-initialize-select-portal (portal &key snapshot)
+(defun extended-initialize-select-portal (portal &key snapshot result-format-codes)
   "Prepare a SELECT portal and return its result columns.
 The owner retains the plan, relations and snapshot until the portal closes.
 SNAPSHOT is the active simple-query snapshot. Otherwise start the snapshot
-for an extended-protocol portal and check its bound result descriptor."
+for an extended-protocol portal and validate its result against Parse."
   (let* ((statement (extended-portal-statement portal))
          (owner (make-extended-portal-execution-owner portal :suppress-datum-origins t))
          (execution (make-extended-select-execution :owner owner)))
     (with-extended-portal-initialization (portal execution *extended-select-executions*)
       (if snapshot
           (query-execution-owner-pin-snapshot owner snapshot)
-          (progn
-            (recovery-check-statement (extended-statement-ast statement))
-            (query-execution-owner-acquire-snapshot
-             owner (lambda (registration) (statement-start registration nil)))))
+          (recovery-check-statement (extended-statement-ast statement)))
       (call-with-query-execution-owner
        owner
        (lambda ()
          (multiple-value-bind (plan targets columns)
              (prepare-observed-select-result (extended-statement-ast statement) execution)
-           (unless snapshot
-             (check-result-column-shape columns *select-expected-result-columns*))
            (setf (extended-select-execution-plan execution) plan
                  (extended-select-execution-targets execution) targets)
            (call-with-admitted-select-plan
             plan (lambda (relations)
                    (setf (query-execution-owner-binding owner '*subquery-registered-relations*)
                          relations)
+                   (unless snapshot
+                     ;; Wait for recipe-changing writers before taking the RC snapshot.
+                     (query-execution-owner-acquire-snapshot
+                      owner (lambda (registration) (statement-start registration nil)))
+                     (extended-check-result-signature statement columns)
+                     (let ((formats (extended-select-result-formats result-format-codes columns)))
+                       (setf (extended-portal-result-columns portal) columns
+                             (extended-portal-result-formats portal) formats
+                             (query-execution-owner-binding owner '*select-result-formats*) formats)))
                    (retain-query-plan-executor-tables plan relations)))
            columns))))))
 
@@ -859,7 +862,7 @@ Send its row description before execution and close it before reporting completi
       (unless (and (member (length formats) (list 0 1 (length ranges)))
                    (every (lambda (format) (member format '(0 1))) formats))
         (ereport "08P01" "invalid parameter formats"))
-      ;; SELECT metadata can register relation readers before portal startup.
+      ;; Bind admits relation readers before taking a SELECT snapshot.
       ;; Admit the RR horizon first so those readers cannot block TRUNCATE
       ;; while waiting for its schema writer lease. DML in RC still snapshots
       ;; at Execute.
@@ -871,11 +874,12 @@ Send its row description before execution and close it before reporting completi
         (ensure-transaction-snapshot *backend* (backend-command-id *backend*))
         (setf (backend-first-snapshot-set *backend*) t))
       (let* ((returns-rows-p (extended-statement-returns-rows-p statement))
-             (columns (when returns-rows-p
+             (select-p (eq (getf (extended-statement-ast statement) :type) :select))
+             (columns (when (and returns-rows-p (not select-p))
                         (let ((*query-parameter-types* (extended-statement-types statement)))
                           (extended-check-result-signature
                            statement (extended-statement-result-columns (extended-statement-ast statement) t)))))
-             (result-formats (when returns-rows-p (extended-select-result-formats results columns)))
+             (result-formats (when (and returns-rows-p (not select-p)) (extended-select-result-formats results columns)))
              (types (extended-statement-types statement))
              (format-vector (coerce formats 'vector))
              (values (make-array (length ranges))))
@@ -905,8 +909,8 @@ Send its row description before execution and close it before reporting completi
         (let ((bound (make-extended-portal :statement statement :values values
                                            :returns-rows-p returns-rows-p
                                            :result-columns columns :result-formats result-formats)))
-          (cond ((extended-portal-select-p bound)
-                 (extended-initialize-select-portal bound))
+          (cond (select-p
+                 (extended-initialize-select-portal bound :result-format-codes results))
                 ((member (getf (extended-statement-ast statement) :type)
                          '(:insert :update :delete))
                  (extended-initialize-dml-portal bound)))
