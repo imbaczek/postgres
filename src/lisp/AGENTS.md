@@ -4,6 +4,12 @@ Scope: the Common Lisp PostgreSQL-wire server under `src/lisp/`. See the
 `README.md` in this directory for what the server supports and for the
 storage/concurrency rules.
 
+## Private and semi-public information
+
+Get explicit user approval before committing private or semi-public
+information, including links to shared pages. Get separate approval for each
+unique link before including it in a commit.
+
 ## Common Lisp agent prompts
 
 Read the relevant prompts in [`agent-prompts/`](agent-prompts/README.md) when
