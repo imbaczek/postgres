@@ -1468,6 +1468,24 @@
                    (progn (logical-read-value (make-logical-cursor :bytes #(18)) :int4) nil)
                  (error () t)))))
 
+(rove:deftest test-boolean-logical-and-binary-values
+    (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)
+                                :adjustable t :fill-pointer 0)))
+      (dolist (value (list nil t +null+))
+        (logical-write-value buffer :bool value))
+      (let ((cursor (make-logical-cursor :bytes buffer)))
+        (rove:ok (null (logical-read-value cursor :bool)) "native logical FALSE")
+        (rove:ok (eq t (logical-read-value cursor :bool)) "native logical TRUE")
+        (rove:ok (eq +null+ (logical-read-value cursor :bool)) "native logical NULL")))
+  (rove:ok (null (extended-binary-input #(0) :bool 1)))
+  (rove:ok (eq t (extended-binary-input #(255) :bool 1))
+           "boolrecv treats any nonzero byte as TRUE")
+  (loop for value in '(nil t) for octet from 0
+        do (let ((emitted nil))
+             (select-row-binary-write value :bool
+                                      (lambda (bytes) (setf emitted bytes)))
+             (rove:ok (equalp emitted (vector octet))))))
+
 (rove:deftest test-logical-row-column-numbers-are-canonical
     (let* ((change (logical-test-change :update 7 701 :old-values (vector 1 2 +null+)
                                                       :new-values (vector 1 2 +logical-unchanged-toast+)))

@@ -43,13 +43,12 @@
       (rove:ok (equalp (pg-index-predicate decoded) (pg-index-predicate index)))
       (rove:ok (equal '(1 2 3) (pg-index-referenced-columns decoded)))
       (rove:ok (pg-index-unique-p decoded))
-      (rove:ok
-       (equal "42704"
-              (handler-case
-                  (make-analyzed-index-object nil "bad" table
-                                              (first (parse-statements
-                                                      "CREATE INDEX bad ON events ((id > 0))")))
-                (pg-error (condition) (pg-error-sqlstate condition)))))
+      (let ((boolean-index
+              (make-analyzed-index-object nil "bool_idx" table
+                                          (first (parse-statements
+                                                  "CREATE INDEX bool_idx ON events ((id > 0))")))))
+        (rove:ok (equal '(:bool) (index-types boolean-index table)))
+        (rove:ok (equal '(nil) (evaluate-index-key boolean-index #(-1 "name" nil)))))
       (rove:ok (equal '(:oid :text :int4) (index-types decoded table)))
       (rove:ok (not (eq (pg-index-predicate snapshot) (pg-index-predicate index))))
       (rove:ok (not (eq (first (pg-index-expression-keys snapshot))

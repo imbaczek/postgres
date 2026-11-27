@@ -14,8 +14,9 @@
   type slot-name plugin snapshot-action requested-lsn protocol-version options)
 
 (defparameter +logical-replication-types+
-  '(:int2 :int4 :int8 :varchar :text :bytea :json :jsonb :numeric :float4 :float8
-    :date :time :timestamp :timestamptz :interval :timetz :bytea-array :json-array :jsonb-array)
+  '(:bool :uuid :int2 :int4 :int8 :varchar :text :bytea :json :jsonb :numeric :float4 :float8
+    :date :time :timestamp :timestamptz :interval :timetz :bytea-array :json-array :jsonb-array
+    :bool-array :int2-array :int4-array :int8-array :text-array :varchar-array :uuid-array)
   "SQL types supported by the pgoutput row encoder.")
 
 (defun replication-command-words (query)
@@ -437,11 +438,14 @@ feedback message after READ-FRAME returns. Reserved XIDs become NIL."
         ((:varchar :text :json) value)
         (:bytea (sql-bytea-output value))
         (:jsonb (sql-jsonb-output value))
-        ((:bytea-array :json-array :jsonb-array) (sql-array-output value))
+        ((:bytea-array :json-array :jsonb-array :bool-array :int2-array :int4-array :int8-array
+                       :text-array :varchar-array :uuid-array) (sql-array-output value))
         (:numeric (sql-numeric-output value))
         (:date (sql-date-output value))
         (:time (sql-time-output value))
         (:interval (sql-interval-output value))
+        (:bool (if value "t" "f"))
+        (:uuid (sql-uuid-output value))
         (:timetz (sql-timetz-output value))
         (:timestamp (sql-timestamp-output value nil))
         (:timestamptz (sql-timestamp-output value t))

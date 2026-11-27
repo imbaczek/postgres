@@ -464,6 +464,12 @@
                    (make-scalar-builtin :name "length" :argument-types '(:bytea)
                                         :result-type :int4 :volatility :immutable :strict-p t
                                         :evaluator 'length)
+                   (make-scalar-builtin :name "uuid_hash" :argument-types '(:uuid)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-uuid-hash)
+                   (make-scalar-builtin :name "uuid_hash_extended" :argument-types '(:uuid :int8)
+                                        :result-type :int8 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-uuid-hash-extended :implicit-arguments-p t)
                    (make-scalar-builtin :name "octet_length" :argument-types '(:text)
                                         :result-type :int4 :volatility :immutable :strict-p t
                                         :evaluator 'sql-text-octet-length :implicit-arguments-p t)
@@ -756,6 +762,12 @@
                    (make-scalar-builtin :name "array_length" :argument-types '(:anyarray :int4)
                                         :result-type :int4 :volatility :immutable :strict-p t
                                         :evaluator 'sql-array-length :implicit-arguments-p t)
+                   (make-scalar-builtin :name "array_lower" :argument-types '(:anyarray :int4)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-array-lower :implicit-arguments-p t)
+                   (make-scalar-builtin :name "array_upper" :argument-types '(:anyarray :int4)
+                                        :result-type :int4 :volatility :immutable :strict-p t
+                                        :evaluator 'sql-array-upper :implicit-arguments-p t)
                    (make-scalar-builtin :name "array_to_string" :argument-types '(:anyarray :text)
                                         :result-type :text :volatility :stable :strict-p t
                                         :evaluator 'sql-array-to-string :implicit-arguments-p t)
@@ -2108,6 +2120,37 @@ candidate selection."
       (return-from analyze-temporal-arithmetic
         (list :binop operator left right :type (if date-difference :int4 :date) :typmod -1)))))
 
+(defun analyze-array-predicate (operator left right)
+  "Resolve the same-array-type operand pair used by PostgreSQL's array predicates."
+  (when (and (in-unknown-constant-p left) (in-unknown-constant-p right))
+    (report-operator-resolution-error operator (list left right) t))
+  (let ((operands (analyze-comparison-operands left right)))
+    (unless (and (sql-array-element-type (expr-type (first operands)))
+                 (eq (expr-type (first operands)) (expr-type (second operands))))
+      (report-operator-resolution-error operator operands))
+    (list :binop operator (first operands) (second operands) :type :bool :typmod -1)))
+
+(defun sql-array-predicate (operator left right)
+  "Match array_contain_compare: NULL elements never match, and dimensions are ignored."
+  (when (eq (sql-array-element-type-id left) :json)
+    (ereport "42883" "could not identify an equality operator for type json"))
+  (let* ((subset (if (string= operator "@>") right left))
+         (superset (if (string= operator "@>") left right))
+         (candidates (sql-array-elements superset)))
+    (let ((elements (sql-array-elements subset))
+          (overlap-p (string= operator "&&")))
+      (flet ((matches-p (item)
+               (and (not (eq item +null+))
+                    (loop for candidate across candidates for index from 1
+                          when (zerop (logand index 4095)) do (check-for-interrupts)
+                            thereis (and (not (eq candidate +null+))
+                                         (or (eql item candidate)
+                                             (zerop (compare-3way item candidate))))))))
+        (loop for item across elements for index from 1
+              when (zerop (logand index 4095)) do (check-for-interrupts)
+                when (eq (matches-p item) overlap-p) do (return overlap-p)
+                  finally (return (not overlap-p)))))))
+
 (defun analyze-binop-expression (expression scope)
   (let* ((operator (second expression))
          (left (analyze-expr (third expression) scope))
@@ -2129,6 +2172,11 @@ candidate selection."
                             (or (sql-implicit-coercion-p (expr-type right) :text)
                                 (sql-implicit-coercion-p (expr-type right) :text-array))))))
       (return-from analyze-binop-expression (analyze-jsonb-delete operator left right)))
+    (when (or (string= operator "&&")
+              (and (member operator '("@>" "<@") :test #'string=)
+                   (or (sql-array-element-type (expr-type left))
+                       (sql-array-element-type (expr-type right)))))
+      (return-from analyze-binop-expression (analyze-array-predicate operator left right)))
     (when (member operator '("@>" "<@" "?" "?|" "?&") :test #'string=)
       (return-from analyze-binop-expression (analyze-jsonb-predicate operator left right)))
     (when (member operator '("#>" "#>>") :test #'string=)
@@ -3562,6 +3610,7 @@ Stop at the first difference, leaving later field types and counts unchecked."
     ((and (sql-numeric-p a) (sql-numeric-p b))
      (sql-numeric-compare a b))
     ((and (sql-timetz-p a) (sql-timetz-p b)) (sql-timetz-compare a b))
+    ((and (sql-uuid-p a) (sql-uuid-p b)) (sql-uuid-compare a b))
     ((and (sql-interval-p a) (sql-interval-p b))
      (let ((left (sql-interval-comparison-value a)) (right (sql-interval-comparison-value b)))
        (cond ((< left right) -1) ((> left right) 1) (t 0))))
@@ -4057,6 +4106,19 @@ and the selected CASE or COALESCE branch retain origin. Other computations clear
             +null+))
       (if (= dimension 1) (length array) +null+)))
 
+(defun sql-array-lower (array dimension)
+  "Return the requested lower bound or SQL NULL for an absent dimension."
+  (if (sql-array-p array)
+      (let ((bounds (sql-array-lower-bounds array)))
+        (if (<= 1 dimension (length bounds)) (nth (1- dimension) bounds) +null+))
+      (if (= dimension 1) 0 +null+)))
+
+(defun sql-array-upper (array dimension)
+  "Return the requested upper bound, including lower minus one for an empty dimension."
+  (let ((lower (sql-array-lower array dimension)))
+    (if (eq lower +null+) +null+
+        (+ lower (sql-array-length array dimension) -1))))
+
 (defun eval-array-length (expression environment)
   "Evaluate the array-length node retained in stored expressions."
   (sql-strict-let ((array (eval-expr (second expression) environment))
@@ -4190,6 +4252,8 @@ truncate and interpret the result at TYPE's signed width."
     (if (member op '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
         (sql-compare op l r)
         (let ((value (cond ((or (eq l +null+) (eq r +null+)) +null+)
+                           ((and (sql-array-p l) (member op '("@>" "<@" "&&") :test #'string=))
+                            (sql-array-predicate op l r))
                            ((member op '("@>" "<@") :test #'string=)
                             (if (string= op "@>") (sql-jsonb-contains-p l r)
                                 (sql-jsonb-contains-p r l)))

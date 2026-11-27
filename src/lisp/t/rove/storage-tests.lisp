@@ -1,6 +1,42 @@
 ;;;; storage-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest test-boolean-heap-and-index-values
+    (let* ((column (make-pg-column :type :bool))
+           (columns (vector column (make-pg-column :type :int4) column column))
+           (values (vector nil -42 t +null+))
+           (tuple (form-heap-tuple values columns 1 0 0 0 1)))
+      (rove:ok (equalp values (deform-heap-tuple tuple columns))
+               "FALSE, TRUE and NULL survive heap formation with an aligned neighbor")
+      (flet ((key (value) (encode-index-key (list value -42) '(:bool :int4))))
+        (rove:ok (key< (key +null+) (key nil)) "the NULL marker precedes FALSE")
+        (rove:ok (key< (key nil) (key t)) "FALSE precedes TRUE in composite keys"))))
+
+(rove:deftest test-uuid-scalar-and-heap
+    (let* ((canonical "00112233-4455-6677-8899-aabbccddeeff")
+           (a (sql-uuid-input canonical))
+           (b (sql-uuid-input "{0011-2233-4455-66778899AABBCCDDEEFF}"))
+           (higher (sql-uuid-input "00112233445566778899AABBCCDDEF00"))
+           (columns (vector (make-pg-column :type :bool)
+                            (make-pg-column :type :uuid)
+                            (make-pg-column :type :int4)))
+           (tuple (form-heap-tuple (vector nil a 45) columns 1 0 0 0 1))
+           (decoded (aref (deform-heap-tuple tuple columns) 1)))
+      (let* ((spilled (with-output-to-string (stream)
+                        (query-spill-write-value stream (vector a +null+))))
+             (row (query-spill-decode (read-from-string spilled))))
+        (rove:ok (string= canonical (sql-uuid-output (aref row 0))))
+        (rove:ok (eq +null+ (aref row 1))))
+      (fill tuple 0)
+      (rove:ok (string= canonical (sql-uuid-output decoded))
+               "a decoded UUID owns its bytes")
+      (rove:ok (zerop (sql-uuid-compare a b)) "different accepted spellings compare equal")
+      (rove:ok (minusp (sql-uuid-compare b higher)) "UUIDs compare by unsigned octet")
+      (rove:ok (equal (sql-group-value-key a :uuid) (sql-group-value-key b :uuid)))
+      (rove:ok (= (analyze-statistics-value-hash a) (analyze-statistics-value-hash b)))
+      (rove:ok (key< (encode-index-key (list b) '(:uuid))
+                     (encode-index-key (list higher) '(:uuid))))))
+
 (rove:deftest test-btree-scan-boundaries
     (let* ((lower (make-btree-scan-bound :prefix #(2) :inclusive-p nil))
            (upper (make-btree-scan-bound :prefix #(4)))
@@ -993,7 +1029,7 @@
                        (:float4 4 4) (:float8 8 8) (:date 4 4) (:time 8 8)
                        (:timetz 12 8) (:timestamp 8 8) (:timestamptz 8 8) (:interval 16 8)
                        (:bytea nil 4) (:jsonb-array nil 4) (:numeric nil 4)
-                       (:bool nil 1) (:oid8 nil 1) (:int4-array nil 1)))
+                       (:bool 1 1) (:uuid 16 1) (:oid8 nil 1) (:int4-array nil 4) (:int8-array nil 8)))
       (destructuring-bind (type width alignment) fixture
         (let ((column (make-pg-column :type type)))
           (rove:ok (eql width (column-fixed-size column)))
@@ -1768,6 +1804,44 @@
          (encoded (sql-varlena-array-encode empty :bytea)))
     (rove:ok (= (length encoded) 12))
     (rove:ok (equalp #() (sql-array-elements (sql-varlena-array-decode encoded :bytea))))))
+
+(rove:deftest test-stored-common-array-codecs
+    (dolist (case '((:bool "[0:1][-1:0]={{f,NULL},{t,f}}")
+                    (:int2 "{-32768,NULL,32767}")
+                    (:int4 "{-2147483648,NULL,2147483647}")
+                    (:int8 "{-9223372036854775808,NULL,9223372036854775807}")
+                    (:text "{abc,NULL,\"NULL\"}")
+                    (:varchar "{abc,NULL}")
+                    (:uuid "{00000000-0000-0000-0000-0000000000ff,NULL}")))
+      (destructuring-bind (element text) case
+        (let* ((type (sql-array-type element))
+               (array (sql-array-input text element))
+               (payload (sql-varlena-array-encode array element))
+               (decoded (sql-varlena-array-decode payload element))
+               (buffer (make-array 0 :element-type '(unsigned-byte 8)
+                                     :adjustable t :fill-pointer 0)))
+          (rove:ok (string= text (sql-array-output decoded)))
+          (rove:ok (zerop (compare-3way array decoded)))
+          (rove:ok (equal (sql-group-value-key array type) (sql-group-value-key decoded type)))
+          (rove:ok (string= "{}" (sql-array-output
+                                  (sql-varlena-array-decode
+                                   (sql-varlena-array-encode (sql-array-input "{}" element) element)
+                                   element))))
+          (logical-write-value buffer type array)
+          (rove:ok (string= text (sql-array-output
+                                  (logical-read-value (make-logical-cursor :bytes buffer) type))))))))
+
+(rove:deftest test-int8-array-heap-alignment
+    (let* ((columns (vector (make-pg-column :type :int4)
+                            (make-pg-column :type :int8-array)))
+           (array (make-sql-array :element-type-id :int8
+                                  :elements (make-array 14 :initial-element 1)
+                                  :dimensions '(14) :lower-bounds '(1)))
+           (row (vector 1 array))
+           (tuple (form-heap-tuple row columns 1 0 0 0 1)))
+      (rove:ok (zerop (page-u32 tuple 28)) "padding before the double-aligned payload")
+      (rove:ok (= (ash 136 2) (page-u32 tuple 32)) "four-byte ArrayType header")
+      (rove:ok (zerop (compare-3way array (aref (deform-heap-tuple tuple columns) 1))))))
 
 (rove:deftest test-varlena-array-c-arraytype-fixtures
     ;; PostgreSQL 20devel on little-endian x86-64 (MAXALIGN 8): a C helper

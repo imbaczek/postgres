@@ -3,7 +3,7 @@
 (in-package #:pg.sql-types)
 
 (defparameter +sql-expression-types+
-  '((:jsonb 3802 -1) (:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
+  '((:jsonb 3802 -1) (:json 114 -1) (:bytea 17 -1) (:bool 16 1) (:uuid 2950 16) (:timestamptz 1184 8) (:char 18 1) (:name 19 64) (:int8 20 8)
     (:int2 21 2) (:int2vector 22 -1) (:int4 23 4) (:text 25 -1) (:varchar 1043 -1)
     (:bytea-array 1001 -1 :bytea)
     (:json-array 199 -1 :json)
@@ -17,6 +17,7 @@
     (:float4-array 1021 -1 :float4)
     (:float8-array 1022 -1 :float8)
     (:bool-array 1000 -1 :bool)
+    (:uuid-array 2951 -1 :uuid)
     (:char-array 1002 -1 :char)
     (:name-array 1003 -1 :name)
     (:varchar-array 1015 -1 :varchar)
@@ -118,7 +119,7 @@
   (let ((element (sql-array-element-type type)))
     (cond
       (element (if (char= (sql-type-alignment-code element) #\d) #\d #\i))
-      ((member type '(:bool :char :name)) #\c)
+      ((member type '(:bool :char :name :uuid)) #\c)
       ((eq type :int2) #\s)
       ((member type '(:int8 :oid8 :float8 :time :timetz :timestamp :timestamptz
                       :interval :pg-lsn :record)) #\d)

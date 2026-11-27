@@ -224,54 +224,31 @@ Discard the cursor after a read error; the stream may have advanced."
 
 (declaim (notinline logical-fragment-batch-validate-only))
 
-(defun logical-type-code (type)
-  "Map a column type to its logical schema code; text, varchar and json are distinct."
-  (case type
-    (:int4 1)
-    (:int8 2)
-    (:varchar 3)
-    (:numeric 4)
-    (:int2 5)
-    (:float4 6)
-    (:float8 7)
-    (:date 8)
-    (:time 9)
-    (:timestamp 10)
-    (:timestamptz 11)
-    (:interval 12)
-    (:timetz 13)
-    (:text 14)
-    (:bytea 15)
-    (:json 16)
-    (:jsonb 17)
-    (:bytea-array 18)
-    (:json-array 19)
-    (:jsonb-array 20)
-    (otherwise (error "logical replication does not support type ~a" type))))
+(defmacro define-logical-type-codes (&rest entries)
+  "Generate inverse codecs from one declaration of persistent schema type codes."
+  (let ((types (mapcar #'first entries))
+        (codes (mapcar #'second entries)))
+    (unless (and (every #'keywordp types)
+                 (every (lambda (code) (typep code '(integer 1 255))) codes)
+                 (= (length entries) (length (remove-duplicates types)) (length (remove-duplicates codes))))
+      (error "logical column type codes must have unique names and nonzero octets")))
+  `(progn
+     (defun logical-type-code (type)
+       (case type
+         ,@entries
+         (otherwise (error "logical replication does not support type ~a" type))))
+     (defun logical-type-from-code (code)
+       (case code
+         ,@(loop for (type code) in entries collect `(,code ,type))
+         (otherwise (error "invalid logical column type code ~a" code))))))
 
-(defun logical-type-from-code (code)
-  (case code
-    (1 :int4)
-    (2 :int8)
-    (3 :varchar)
-    (4 :numeric)
-    (5 :int2)
-    (6 :float4)
-    (7 :float8)
-    (8 :date)
-    (9 :time)
-    (10 :timestamp)
-    (11 :timestamptz)
-    (12 :interval)
-    (13 :timetz)
-    (14 :text)
-    (15 :bytea)
-    (16 :json)
-    (17 :jsonb)
-    (18 :bytea-array)
-    (19 :json-array)
-    (20 :jsonb-array)
-    (otherwise (error "invalid logical column type code ~a" code))))
+(define-logical-type-codes
+    (:int4 1) (:int8 2) (:varchar 3) (:numeric 4) (:int2 5)
+  (:float4 6) (:float8 7) (:date 8) (:time 9) (:timestamp 10)
+  (:timestamptz 11) (:interval 12) (:timetz 13) (:text 14) (:bytea 15)
+  (:json 16) (:jsonb 17) (:bytea-array 18) (:json-array 19) (:jsonb-array 20)
+  (:bool 21) (:uuid 22) (:bool-array 23) (:int2-array 24) (:int4-array 25)
+  (:int8-array 26) (:text-array 27) (:varchar-array 28) (:uuid-array 29))
 
 (defun logical-kind-code (kind)
   (case kind
@@ -371,6 +348,14 @@ Discard the cursor after a read error; the stream may have advanced."
       (sql-jsonb-write value writer)
       (logical-flush-utf8-output writer))))
 
+(defun logical-array-value-tag (type)
+  "Keep the existing array tags. New types share a tag and validate the payload OID."
+  (case type
+    (:bytea-array 19)
+    (:json-array 20)
+    (:jsonb-array 21)
+    (otherwise (when (heap-varlena-array-element-type type) 24))))
+
 (defun logical-write-value (buffer type value)
   "Encode a value; text, varchar and json share UTF-8 tag 3. Their schema codes
 remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
@@ -378,6 +363,12 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
     ((eq value +logical-unchanged-toast+) (logical-write-u8 buffer 18))
     ((eq value +null+)
      (logical-write-u8 buffer 0))
+    ((eq type :uuid)
+     (logical-write-u8 buffer 23)
+     (logical-write-octets buffer (sql-uuid-bytes value)))
+    ((eq type :bool)
+     (logical-write-u8 buffer 22)
+     (logical-write-u8 buffer (if value 1 0)))
     ((eq type :timetz)
      (logical-write-u8 buffer 13)
      (logical-write-u64 buffer (logand (sql-timetz-microseconds value) #xffffffffffffffff))
@@ -423,7 +414,7 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
      (logical-write-string-u32 buffer (sql-numeric-output value)))
     ((heap-varlena-array-element-type type)
      (let ((payload (sql-varlena-array-encode value (heap-varlena-array-element-type type))))
-       (logical-write-u8 buffer (case type (:bytea-array 19) (:json-array 20) (:jsonb-array 21)))
+       (logical-write-u8 buffer (logical-array-value-tag type))
        (logical-write-u32 buffer (length payload))
        (logical-write-octets buffer payload)))
     ((eq type :jsonb)
@@ -563,8 +554,7 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
                      when (eq value +logical-unchanged-toast+)
                        do (unless (and (eq kind :update) new-p keys
                                        (not (member (getf column :attnum) keys))
-                                       (member (getf column :type) '(:text :varchar :bytea :json :jsonb :numeric
-                                                                     :bytea-array :json-array :jsonb-array)))
+                                       (heap-varlena-type-p (getf column :type)))
                             (error "invalid unchanged TOAST marker")))))
   change)
 
@@ -903,7 +893,7 @@ length-prefixed bytea octets; reject mismatched column types. JSON text is not
 revalidated by this codec."
   (let ((tag (logical-read-u8 cursor)))
     (case tag
-      (18 (unless (member type '(:varchar :text :bytea :json :jsonb :numeric :bytea-array :json-array :jsonb-array))
+      (18 (unless (heap-varlena-type-p type)
             (error "logical unchanged TOAST tag does not match its column type"))
        +logical-unchanged-toast+)
       (0 +null+)
@@ -944,8 +934,8 @@ revalidated by this codec."
        (make-sql-interval (logical-u32-signed (logical-read-u32 cursor))
                           (logical-u32-signed (logical-read-u32 cursor))
                           (logical-u64-signed (logical-read-u64 cursor))))
-      ((19 20 21)
-       (unless (eq type (case tag (19 :bytea-array) (20 :json-array) (21 :jsonb-array)))
+      ((19 20 21 24)
+       (unless (eql tag (logical-array-value-tag type))
          (error "logical value tag does not match its column type"))
        (let ((payload (logical-read-octets cursor (logical-read-u32 cursor))))
          (sql-varlena-array-decode payload (heap-varlena-array-element-type type))))
@@ -970,6 +960,13 @@ revalidated by this codec."
                ((and *logical-event-lease* (eq cursor (logical-event-lease-cursor *logical-event-lease*)))
                 (logical-make-event-slice cursor length type))
                (t (logical-read-octets cursor length)))))
+      (23 (unless (eq type :uuid) (error "logical value tag does not match its column type"))
+       (sql-uuid-from-octets (logical-read-octets cursor +sql-uuid-size+)))
+      (22 (unless (eq type :bool) (error "logical value tag does not match its column type"))
+       (case (logical-read-u8 cursor)
+         (0 nil)
+         (1 t)
+         (otherwise (error "invalid logical boolean value"))))
       (13 (unless (eq type :timetz) (error "logical value tag does not match its column type"))
        (make-sql-timetz (logical-u64-signed (logical-read-u64 cursor))
                         (logical-u32-signed (logical-read-u32 cursor))))
@@ -1346,6 +1343,15 @@ Other types retain their normal semantic checks and may allocate their values."
 
 (declaim (special *logical-admission-binary-bytea* *pgoutput-binary-bytea*))
 
+(defun logical-varlena-text-expansion (type)
+  "Bound the escaped text size by a multiple of the raw payload size, if known."
+  (cond ((member type '(:text :varchar :json :bytea)) 2)
+        ((member type '(:bool-array :int2-array :int4-array :int8-array
+                        :text-array :varchar-array :uuid-array))
+         ;; A bitmap byte can describe eight NULL elements, each rendering as
+         ;; four letters and a comma. Non-NULL elements have a lower ratio.
+         40)))
+
 (defun logical-full-row-admission-needed-p (size table columns toast-reuse)
   "Conservatively include unchanged external values in the full-row bound."
   (or (> size +max-logical-transaction-bytes+)
@@ -1358,11 +1364,35 @@ Other types retain their normal semantic checks and may allocate their values."
                           (ereport "XX001" "external value has no owning TOAST relation"))
                         (multiple-value-bind (stored raw) (toast-pointer-storage-size toast pointer)
                           (declare (ignore stored))
-                          (unless (member (getf column :type) '(:text :varchar :json :bytea))
-                            (return t))
-                          (incf bound (* 2 raw))))
+                          (let ((expansion (logical-varlena-text-expansion (getf column :type))))
+                            (unless expansion (return t))
+                            (incf bound (* expansion raw)))))
                       (when (> bound +max-logical-transaction-bytes+)
                         (return t))))))
+
+(defun logical-array-admission-needed-p (size columns old-image new-image)
+  "Require text preflight when individual array fields might exhaust the budget."
+  (let ((may-expand-p (> (* size 40) +max-logical-transaction-bytes+))
+        (bound size))
+    (dolist (row (list old-image new-image))
+      (when row
+        (loop for column in columns for value across row
+              for type = (getf column :type)
+              when (and (heap-varlena-array-element-type type) (sql-array-p value))
+                do (unless (logical-varlena-text-expansion type)
+                     (return-from logical-array-admission-needed-p t))
+                   (when may-expand-p
+                     (let ((elements (sql-array-elements value)))
+                       ;; The count covers nested delimiters and any fixed scalar
+                       ;; spelling. Text may also need UTF-8 and escaped quotes.
+                       (incf bound (+ 256 (* 64 (length elements))))
+                       (when (member type '(:text-array :varchar-array))
+                         (loop for item across elements for index from 0
+                               do (when (zerop (logand index 4095)) (check-for-interrupts))
+                               when (stringp item) do (incf bound (* 16 (length item)))))
+                       (when (> bound +max-logical-transaction-bytes+)
+                         (return-from logical-array-admission-needed-p t)))))))
+    nil))
 
 (defun logical-note-row-change (kind table &key old-values new-values toast-reuse full-new-values (publication-selection :unknown))
   "Capture a successful executor row operation for its current transaction.
@@ -1401,12 +1431,7 @@ executor, so capture the same operation before transaction commit."
        *backend* change limit
        :after-measure (lambda (size)
                         (when (or (logical-full-row-admission-needed-p size table columns toast-reuse)
-                                  ;; Binary JSONB arrays can expand dramatically when rendered as text.
-                                  (loop for row in (list old-image new-image)
-                                          thereis (and row
-                                                       (loop for column in columns for value across row
-                                                               thereis (and (heap-varlena-array-element-type (getf column :type))
-                                                                            (not (member value (list +null+ +logical-unchanged-toast+) :test #'eq)))))))
+                                  (logical-array-admission-needed-p size columns old-image new-image))
                           (let ((full-new (if full-new-values (funcall full-new-values) new-values)))
                             (handler-case
                                 (logical-validate-large-row-change change full-new)

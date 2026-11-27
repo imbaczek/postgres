@@ -83,6 +83,7 @@
      (:file "utils/adt/float")
      (:file "utils/adt/timezone")
      (:file "utils/adt/datetime")
+     (:file "utils/adt/uuid")
      (:module "access"
       :serial t
       :components
@@ -114,6 +115,7 @@
                    (:file "dependency")
                    (:file "transaction")
                    (:file "namespace")))
+     (:file "utils/adt/array-storage")
      (:module "replication"
       :serial t
       :components ((:file "logical" :pathname "logical-stream")

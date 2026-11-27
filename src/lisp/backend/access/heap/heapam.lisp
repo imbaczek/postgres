@@ -138,15 +138,50 @@
           (or (gethash relfilenode *heap-fsms*)
               (setf (gethash relfilenode *heap-fsms*) fsm))))))
 
+(defmacro define-heap-array-types (&rest elements)
+  "Project the supported array element types into the heap codec's layout tables."
+  (let ((entries
+          (loop for element in elements
+                for array = (or (sql-array-type element)
+                                (error "no SQL array type for ~a" element))
+                collect (list element array (type-oid element)
+                              (sql-expression-type-length element)
+                              (ecase (sql-type-alignment-code array) (#\i 4) (#\d 8))))))
+    `(progn
+       (defun heap-varlena-array-element-type (type)
+         (case type
+           ,@(loop for (element array) in entries collect (list array element))))
+       (defun heap-varlena-alignment (type)
+         (case type
+           ,@(loop for (nil array nil nil alignment) in entries
+                   when (/= alignment 4) collect (list array alignment))
+           (otherwise 4)))
+       (defun sql-array-fixed-element-width (type)
+         (case type
+           ,@(loop for (element nil nil width) in entries
+                   when (plusp width) collect (list element width))))
+       (defun sql-varlena-array-element-oid (type)
+         (ecase type
+           ,@(loop for (element nil oid) in entries collect (list element oid)))))))
+
+(define-heap-array-types :bytea :json :jsonb :bool :int2 :int4 :int8 :text :varchar :uuid)
+
 (defun heap-varlena-type-p (type)
   "Recognize the variable-width types implemented by the physical heap codec."
-  (case type
-    ((:varchar :text :json :jsonb :bytea :numeric :bytea-array :json-array :jsonb-array) t)))
+  (or (member type '(:varchar :text :json :jsonb :bytea :numeric))
+      (heap-varlena-array-element-type type)))
 
-(defun heap-varlena-array-element-type (type)
-  "Return the element type for the supported physical varlena arrays."
-  (when (member type '(:bytea-array :json-array :jsonb-array))
-    (sql-array-element-type type)))
+(defun heap-decode-varlena-payload (payload type)
+  "Interpret already validated inline or detoasted bytes for a stored type."
+  (case type
+    (:bytea payload)
+    (:jsonb (sql-jsonb-from-octets payload))
+    (:numeric (sql-numeric-from-varlena-payload payload))
+    ((:varchar :text :json) (bytes->string payload))
+    (otherwise
+     (let ((element (heap-varlena-array-element-type type)))
+       (unless element (ereport "XX001" "stored value has unsupported type"))
+       (sql-varlena-array-decode payload element)))))
 
 (defmacro define-heap-column-layout (types)
   "Compile registry metadata for the heap codec's fixed-width scalar types."
@@ -156,14 +191,17 @@
          (case type
            ,@(loop for type in types
                    collect (list type (ecase (sql-type-alignment-code type)
-                                        (#\s 2) (#\i 4) (#\d 8))))
-           (otherwise (if (heap-varlena-type-p type) 4 1)))))
+                                        (#\c 1) (#\s 2) (#\i 4) (#\d 8))))
+           (otherwise
+            (if (heap-varlena-type-p type)
+                (heap-varlena-alignment type)
+                1)))))
      (defun column-fixed-size (col)
        (case (pg-column-type col)
          ,@(loop for type in types collect (list type (sql-expression-type-length type)))))))
 
 (define-heap-column-layout
-    (:int2 :int4 :int8 :oid :float4 :float8 :date :time :timetz :timestamp :timestamptz :interval))
+    (:bool :uuid :int2 :int4 :int8 :oid :float4 :float8 :date :time :timetz :timestamp :timestamptz :interval))
 
 (defconstant +vartag-ondisk-oid+ 18)
 
@@ -235,9 +273,10 @@ must remain stable while the layout is used."
                                     (:bytea (check-type v (vector (unsigned-byte 8))) v)
                                     (:jsonb (sql-jsonb-to-octets v))
                                     (:numeric (sql-numeric-to-varlena-payload v))
-                                    ((:bytea-array :json-array :jsonb-array)
-                                     (sql-varlena-array-encode v (heap-varlena-array-element-type type)))
-                                    (otherwise (string->bytes v)))))))
+                                    (otherwise
+                                     (let ((element (heap-varlena-array-element-type type)))
+                                       (if element (sql-varlena-array-encode v element)
+                                           (string->bytes v)))))))))
                   (let* ((data (aref varlena-data i))
                          (header-size (and varlena-p (heap-varlena-header-size v data col))))
                     (when (or (null header-size) (= header-size 4))
@@ -301,6 +340,8 @@ This codec does not create or fetch TOAST data."
                     (page-set-u32 bytes (+ off 12) (logand (sql-interval-months v) #xffffffff)))
                    (:float4 (page-set-u32 bytes off (sql-float-bits v :float4)))
                    (:float8 (page-set-u64 bytes off (sql-float-bits v :float8)))
+                   (:bool (setf (aref bytes off) (if v 1 0)))
+                   (:uuid (sql-uuid-copy-octets v bytes off))
                    (:int2
                     (page-set-u16 bytes off (logand v #xffff)))
                    (:oid
@@ -580,6 +621,8 @@ exclusive end of the tuple. Decoded values do not retain the input page."
                       (setf (aref values i) (sql-float-from-bits (page-u32 bytes cursor) :float4)))
                      (:float8
                       (setf (aref values i) (sql-float-from-bits (page-u64 bytes cursor) :float8)))
+                     (:bool (setf (aref values i) (not (zerop (aref bytes cursor)))))
+                     (:uuid (setf (aref values i) (sql-uuid-from-octets bytes cursor)))
                      (:int2
                       (let ((v (page-u16 bytes cursor)))
                         (when (>= v #x8000) (decf v #x10000))
@@ -619,13 +662,7 @@ exclusive end of the tuple. Decoded values do not retain the input page."
                                                  (setf physical-compressed (make-array natts :initial-element nil)))
                                                (setf (aref physical-compressed i)
                                                      (make-heap-compressed-varlena :payload (subseq bytes (+ cursor 4) end))))
-                                             (setf (aref values i) (case type
-                                                                     (:bytea payload)
-                                                                     (:jsonb (sql-jsonb-from-octets payload))
-                                                                     (:numeric (sql-numeric-from-varlena-payload payload))
-                                                                     ((:bytea-array :json-array :jsonb-array)
-                                                                      (sql-varlena-array-decode payload (heap-varlena-array-element-type type)))
-                                                                     (otherwise (bytes->string payload)))
+                                             (setf (aref values i) (heap-decode-varlena-payload payload type)
                                                    cursor end))))))))))))))
     (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
 

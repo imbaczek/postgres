@@ -1123,7 +1123,13 @@ order, including prefixes, in composite keys."
     (labels ((push-byte (b) (vector-push-extend b out))
              (push-int-be (v bytes)
                (loop for shift from (* 8 (1- bytes)) downto 0 by 8
-                     do (push-byte (ldb (byte 8 shift) v)))))
+                     do (push-byte (ldb (byte 8 shift) v))))
+             (push-terminated-octets (bytes)
+               (loop for byte across bytes
+                     do (push-byte byte)
+                        (when (zerop byte) (push-byte 255)))
+               (push-byte 0)
+               (push-byte 0)))
       (loop for v in values
             for ty in types
             do (cond
@@ -1132,6 +1138,12 @@ order, including prefixes, in composite keys."
                  ((member ty '(:float4 :float8))
                   (push-byte (if (eq ty :float4) 6 7))
                   (push-int-be (sql-float-index-bits v ty) (if (eq ty :float4) 4 8)))
+                 ((eq ty :uuid)
+                  (push-byte 20)
+                  (loop for octet across (sql-uuid-bytes v) do (push-byte octet)))
+                 ((eq ty :bool)
+                  (push-byte 19)
+                  (push-byte (if v 1 0)))
                  ((eq ty :int2)
                   (push-byte 5)
                   (push-int-be (logxor (logand v #xffff) #x8000) 2))
@@ -1196,12 +1208,8 @@ order, including prefixes, in composite keys."
                                (push-byte 2)
                                (progn
                                  (push-byte 1)
-                                 (let ((bytes (if (eq ty :bytea-array) item (encode-jsonb-index-value item))))
-                                   (loop for byte across bytes
-                                         do (if (zerop byte)
-                                                (progn (push-byte 0) (push-byte 255))
-                                                (push-byte byte)))
-                                   (push-byte 0) (push-byte 0)))))
+                                 (push-terminated-octets
+                                  (if (eq ty :bytea-array) item (encode-jsonb-index-value item))))))
                   (push-byte 0)
                   (push-int-be (length (sql-array-dimensions v)) 4)
                   (dolist (dimension (sql-array-dimensions v))
@@ -1214,21 +1222,10 @@ order, including prefixes, in composite keys."
                  ((eq ty :bytea)
                   (check-type v (vector (unsigned-byte 8)))
                   (push-byte 15)
-                  (loop for byte across v
-                        do (if (zerop byte)
-                               (progn (push-byte 0) (push-byte 255))
-                               (push-byte byte)))
-                  (push-byte 0)
-                  (push-byte 0))
+                  (push-terminated-octets v))
                  ((member ty '(:varchar :text))
                   (push-byte 3)
-                  (let ((data (string->bytes v)))
-                    (loop for b across data
-                          do (if (zerop b)
-                                 (progn (push-byte 0) (push-byte 255))
-                                 (push-byte b)))
-                    (push-byte 0)
-                    (push-byte 0)))
+                  (push-terminated-octets (string->bytes v)))
                  (t
                   (ereport "XX000" "unsupported index key type ~a" ty)))))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))

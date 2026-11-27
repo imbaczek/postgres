@@ -1153,6 +1153,7 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
     ((symbolp value)
      (+ 32 (* 2 (length (symbol-name value)))))
     ((sql-jsonb-p value) (+ 32 (query-spill-value-size (sql-jsonb-value value))))
+    ((sql-uuid-p value) (+ 32 (query-spill-value-size (sql-uuid-bytes value))))
     ((sql-decimal-p value) (+ 32 (query-spill-value-size (sql-decimal-coefficient value))))
     ((sql-array-p value)
      (+ 64 (query-spill-value-size (sql-array-element-type-id value))
@@ -1176,6 +1177,8 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   (cond
     ((and (consp value) (eq (first value) :pg-query-spill-jsonb))
      (make-sql-jsonb (query-spill-decode (second value))))
+    ((and (consp value) (eq (first value) :pg-query-spill-uuid))
+     (sql-uuid-input (second value)))
     ((and (consp value) (eq (first value) :pg-query-spill-timetz))
      (make-sql-timetz (second value) (third value)))
     ((and (consp value) (eq (first value) :pg-query-spill-interval))
@@ -1213,7 +1216,7 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
        (loop while (and (consp tail)
                         (not (member (car tail)
                                      '(:pg-query-spill-jsonb :pg-query-spill-timetz
-                                       :pg-query-spill-interval :pg-query-spill-float
+                                       :pg-query-spill-uuid :pg-query-spill-interval :pg-query-spill-float
                                        :pg-query-spill-numeric :pg-query-spill-array
                                        :pg-query-spill-record :pg-query-spill-vector))))
              do (when (zerop (mod count 4096)) (check-for-interrupts))
@@ -1239,6 +1242,8 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
      (write-string "(:pg-query-spill-jsonb " stream)
      (query-spill-write-value stream (sql-jsonb-value value))
      (write-char #\) stream))
+    ((sql-uuid-p value)
+     (format stream "(:pg-query-spill-uuid ~s)" (sql-uuid-output value)))
     ((sql-timetz-p value)
      (format stream "(:pg-query-spill-timetz ~d ~d)" (sql-timetz-microseconds value) (sql-timetz-zone-west value)))
     ((sql-interval-p value)

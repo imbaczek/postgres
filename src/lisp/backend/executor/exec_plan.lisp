@@ -1257,6 +1257,7 @@ as well. A physical ordered limit can use the bounded top-N node."
     ((sql-jsonb-p value) (list :jsonb (sql-jsonb-equality-key value)))
     ((sql-decimal-p value) (sql-numeric-rational value))
     ((floatp value) (sql-float-group-key value))
+    ((sql-uuid-p value) (list :uuid (coerce (sql-uuid-bytes value) 'list)))
     ((sql-interval-p value) (sql-interval-comparison-value value))
     ((sql-timetz-p value) (multiple-value-list (sql-timetz-comparison-values value)))
     ((sql-array-p value)

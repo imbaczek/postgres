@@ -45,7 +45,7 @@
    #:call-with-wal-temp-cleanup-domain #:canonical-next-full-xid #:check-for-interrupts
    #:clog-check-publication-handoff-under-wal-lock #:clog-check-queued-commits-under-wal-lock
    #:clog-complete-reserved-commit-under-wal-lock #:clog-release-unattempted-publication-under-wal-lock
-   #:ereport #:logical-flush-utf8-output #:logical-spool-seal #:logical-utf8-characters
+   #:ereport #:heap-varlena-array-element-type #:logical-flush-utf8-output #:logical-spool-seal #:logical-utf8-characters
    #:logical-utf8-output-stream #:logical-utf8-size #:make-sql-array #:make-sql-interval #:make-sql-timetz
    #:make-wal-owned-spool #:parse-wal-lsn #:pgoutput-string-utf8-size #:physical-fpw-check-fact
    #:physical-fpw-fact-from-state #:physical-fpw-fact-next #:physical-logical-check-fact
@@ -79,7 +79,8 @@
    #:sql-text-array-input #:sql-text-array-output #:sql-time-adjust-typmod #:sql-time-input #:sql-time-output
    #:sql-timestamp-input #:sql-timestamp-output #:sql-timestamp-to-date #:sql-timestamptz-output
    #:sql-timetz-input #:sql-timetz-microseconds #:sql-timetz-output #:sql-timetz-zone-west
-   #:sql-timezone-instant-to-local #:sql-timezone-local-to-instant #:sql-varchar-cast-value #:string->bytes
+   #:sql-timezone-instant-to-local #:sql-timezone-local-to-instant #:sql-uuid-input #:sql-uuid-output #:sql-uuid-from-bytea #:sql-uuid-to-bytea
+   #:sql-varchar-cast-value #:string->bytes
    #:timeline-check-resource-origin #:timeline-read-history #:type-name #:value->text
    #:wal-actual-publication-pressure #:wal-apply-relation-resets #:wal-check-healthy
    #:wal-check-page-publication-owner-under-lock #:wal-check-page-publication-queue-under-lock
@@ -247,10 +248,10 @@
                 #:*backend* #:*sql-array-output-max-bytes* #:+int4-max+ #:+int4-min+ #:+int8-max+ #:+int8-min+
                 #:+max-varlena-array-elements+ #:+null+ #:+sql-microseconds-per-day+ #:authentication-peer-text
                 #:backend-transaction-start-unix #:backend-transaction-start-unix-microseconds
-                #:check-for-interrupts #:ereport #:logical-flush-utf8-output #:logical-utf8-characters
+                #:check-for-interrupts #:ereport #:heap-varlena-array-element-type #:logical-flush-utf8-output #:logical-utf8-characters
                 #:logical-utf8-output-stream #:logical-utf8-size #:make-sql-array #:make-sql-interval
                 #:make-sql-timetz #:parse-wal-lsn #:pgoutput-string-utf8-size #:session-extra-setting-value
-                #:sql-array-dimensions #:sql-array-element-type #:sql-array-element-type-id #:sql-array-elements
+                #:sql-array-dimensions #:sql-array-type #:sql-array-element-type #:sql-array-element-type-id #:sql-array-elements
                 #:sql-array-input #:sql-array-jsonb-count-limit #:sql-array-jsonb-count-stream
                 #:sql-array-lower-bounds #:sql-array-output #:sql-array-p #:sql-array-space-p #:sql-bit-input
                 #:sql-bit-resize #:sql-bit-to-integer #:sql-bytea-concat #:sql-bytea-concat-size
@@ -271,7 +272,8 @@
                 #:sql-time-adjust-typmod #:sql-time-input #:sql-time-output #:sql-timestamp-input
                 #:sql-timestamp-output #:sql-timestamp-to-date #:sql-timestamptz-output #:sql-timetz-input
                 #:sql-timetz-microseconds #:sql-timetz-output #:sql-timetz-zone-west
-                #:sql-timezone-instant-to-local #:sql-timezone-local-to-instant #:sql-varchar-cast-value
+                #:sql-timezone-instant-to-local #:sql-timezone-local-to-instant
+                #:sql-uuid-input #:sql-uuid-output #:sql-uuid-from-bytea #:sql-uuid-to-bytea #:sql-varchar-cast-value
                 #:string->bytes #:type-name #:value->text #:wal-format-lsn)
   (:export
    #:sql-cast-value #:sql-array-input #:value->text #:sql-text-array-output #:sql-name-input))

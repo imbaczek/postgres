@@ -7,6 +7,18 @@
            (raw-query-sublinks-p (car form))
            (raw-query-sublinks-p (cdr form)))))
 
+(defun sql-assignment-coercion-p (source target)
+  "Recognize supported column assignment casts, including element-wise array casts."
+  (or (sql-implicit-coercion-p source target)
+      (and (eq target :date) (member source '(:timestamp :timestamptz)))
+      (and (member source '(:json :jsonb)) (member target '(:json :jsonb)))
+      (member target '(:text :varchar))
+      (and (member target '(:int2 :int4 :int8 :numeric :oid :float4 :float8))
+           (member source '(:int2 :int4 :int8 :numeric :oid :float4 :float8)))
+      (let ((from (sql-array-element-type source))
+            (to (heap-varlena-array-element-type target)))
+        (and from to (sql-assignment-coercion-p from to)))))
+
 (defun analyze-subquery-assignment (expression column)
   (let ((source (expr-type expression))
         (target (pg-column-type column))
@@ -14,16 +26,7 @@
     (when (in-unknown-constant-p expression)
       (setf expression (coerce-in-constant expression target (if (eq target :interval) typmod -1))
             source target))
-    (unless (or (sql-implicit-coercion-p source target)
-                ;; pg_cast marks these explicit temporal conversions as assignment casts.
-                (and (eq target :date) (member source '(:timestamp :timestamptz)))
-                (and (member source '(:json :jsonb))
-                     (member target '(:json :jsonb)))
-                (and (member source '(:json-array :jsonb-array))
-                     (member target '(:json-array :jsonb-array)))
-                (member target '(:text :varchar))
-                (and (member target '(:int2 :int4 :int8 :numeric :oid :float4 :float8))
-                     (member source '(:int2 :int4 :int8 :numeric :oid :float4 :float8))))
+    (unless (sql-assignment-coercion-p source target)
       (ereport "42804" "column \"~a\" is of type ~a but expression is of type ~a"
                (pg-column-name column) target source))
     (list :assignment expression :type target :typmod typmod)))
@@ -55,14 +58,34 @@
                                (analyze-subquery-assignment (analyze-expr raw scope) element-column)
                                :type type :typmod (pg-column-typmod column)))))))))
 
+(defun constrain-varchar-array-assignment (array typmod)
+  "Apply varchar assignment length to every non-NULL element, preserving array bounds."
+  (let ((elements (sql-array-elements array))
+        (adjusted nil))
+    (loop for item across elements for index from 1
+          when (zerop (logand index 4095)) do (check-for-interrupts)
+            unless (eq item +null+)
+              do (let ((value (sql-varchar-assignment-value item typmod)))
+                   (unless (eq item value)
+                     (unless adjusted (setf adjusted (copy-seq elements)))
+                     (setf (aref adjusted (1- index)) value))))
+    (if adjusted
+        (let ((copy (copy-sql-array array)))
+          (setf (sql-array-elements copy) adjusted)
+          copy)
+        array)))
+
 (defun coerce-subquery-assignment-value (expression input-value)
   (let* ((argument (second expression))
          (target (expr-type expression))
          (typmod (expr-typmod expression))
-         (value (pg.sql-runtime:sql-cast-value input-value (expr-type argument) target (if (eq target :varchar) -1 typmod))))
-    (if (and (eq target :varchar) (not (eq value +null+)))
-        (sql-varchar-assignment-value value typmod)
-        value)))
+         (value (pg.sql-runtime:sql-cast-value input-value (expr-type argument) target
+                                               (if (member target '(:varchar :varchar-array)) -1 typmod))))
+    (cond ((eq value +null+) +null+)
+          ((eq target :varchar) (sql-varchar-assignment-value value typmod))
+          ((and (eq target :varchar-array) (>= typmod 4))
+           (constrain-varchar-array-assignment value typmod))
+          (t value))))
 
 (defun eval-subquery-assignment (expression environment)
   (coerce-subquery-assignment-value expression (eval-expr (second expression) environment)))

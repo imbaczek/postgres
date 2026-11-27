@@ -215,6 +215,8 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
                (map 'list #'catalog-expression-to-sexp (sql-array-elements expression))))
         ((typep expression '(vector (unsigned-byte 8)))
          (list :pg-catalog-octets (coerce expression 'list)))
+        ((sql-uuid-p expression)
+         (list :pg-catalog-uuid (sql-uuid-output expression)))
         ((sql-jsonb-p expression)
          (list :pg-catalog-jsonb (sql-jsonb-output expression)))
         ((sql-timetz-p expression)
@@ -241,6 +243,8 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
                          :elements (map 'vector #'catalog-expression-from-sexp (fifth expression))))
         ((and (consp expression) (eq (first expression) :pg-catalog-octets))
          (coerce (second expression) '(vector (unsigned-byte 8))))
+        ((and (consp expression) (eq (first expression) :pg-catalog-uuid))
+         (sql-uuid-input (second expression)))
         ((and (consp expression) (eq (first expression) :pg-catalog-jsonb))
          (sql-jsonb-input (second expression)))
         ((and (consp expression) (eq (first expression) :pg-catalog-timetz))
@@ -1190,9 +1194,11 @@ from advancing the shared WAL generation between a failed save and rollback."
                     (format nil "numeric(~d,~d)" precision scale))))
     (:varchar (let ((length (sql-varchar-typmod-length typmod)))
                 (if length (format nil "varchar(~d)" length) "varchar")))
+    (:varchar-array (concatenate 'string (catalog-expression-type-sql :varchar typmod) "[]"))
     (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
-    ((:int2 :int4 :int8 :float4 :float8 :bool :text :json :jsonb :bytea :name
-            :oid :oid8 :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array)
+    ((:int2 :int4 :int8 :float4 :float8 :bool :uuid :text :json :jsonb :bytea :name
+      :oid :oid8 :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array
+            :bool-array :int2-array :int4-array :int8-array :uuid-array)
      (sql-type-display-name type))
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
 
@@ -1312,8 +1318,9 @@ from advancing the shared WAL generation between a failed save and rollback."
               (case type
                 (:timestamp
                  (concatenate 'string (catalog-expression-type-sql type typmod) " without time zone"))
-                ((:date :interval :timetz :timestamptz :time :float4 :float8 :int2 :int4 :int8
-                  :numeric :text :json :jsonb :bytea :bytea-array :json-array :jsonb-array :varchar)
+                ((:bool :uuid :date :interval :timetz :timestamptz :time :float4 :float8 :int2 :int4 :int8
+                  :numeric :text :json :jsonb :bytea :bytea-array :json-array :jsonb-array :varchar
+                        :bool-array :int2-array :int4-array :int8-array :text-array :varchar-array :uuid-array)
                  (catalog-expression-type-sql type typmod))
                 (otherwise (error "cannot publish unsupported type ~a" type)))))
     (when (pg-column-notnull column) (write-string " NOT NULL" stream))
@@ -1636,7 +1643,7 @@ The segments preserve their storage representation across B-tree page rewrites."
 
 (defun check-index-key-type (type)
   "Reject types whose non-NULL values lack a B-tree key encoding."
-  (unless (member type '(:float4 :float8 :int2 :int4 :int8 :timetz :interval
+  (unless (member type '(:bool :uuid :float4 :float8 :int2 :int4 :int8 :timetz :interval
                          :timestamp :timestamptz :time :date :oid :numeric
                          :bytea-array :jsonb-array :jsonb :bytea :varchar :text))
     (ereport "42704" "data type ~a has no default operator class for access method btree"
@@ -1720,7 +1727,7 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
           for type = (pg-column-type column)
           for typmod = (pg-column-typmod column)
           for varlena-p = (heap-varlena-type-p type)
-          do (setf data-length (align-up data-length (if varlena-p 4 (column-align column))))
+          do (setf data-length (align-up data-length (column-align column)))
              (when varlena-p (setf has-toastable t))
              (let ((size
                      (case type

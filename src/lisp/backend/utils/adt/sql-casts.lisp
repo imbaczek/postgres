@@ -21,8 +21,8 @@
       (and (eq source :jsonb)
            (member target '(:bool :numeric :int2 :int4 :int8 :float4 :float8)))
       (and (member source '(:json :jsonb)) (member target '(:json :jsonb)))
-      (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
-      (and (eq target :bytea) (member source '(:int2 :int4 :int8)))
+      (and (eq source :bytea) (member target '(:int2 :int4 :int8 :uuid)))
+      (and (eq target :bytea) (member source '(:int2 :int4 :int8 :uuid)))
       (and (eq source :int2vector) (sql-array-element-type target)
            (sql-cast-allowed-p :int2 (sql-array-element-type target)))
       (and (sql-array-element-type source) (sql-array-element-type target)
@@ -268,7 +268,8 @@ syntax is checked before the final signed-width range check for TYPE."
 Convert each element using ELEMENT-TYPE and TYPMOD. Explicit bounds must
 match the contents; empty arrays have no dimensions. At most six dimensions
 are supported."
-  (let ((position 0) (size (length text)) (bounds nil) (values nil) (item-count 0))
+  (let ((position 0) (size (length text)) (bounds nil) (values nil) (item-count 0)
+                     (stored-p (heap-varlena-array-element-type (sql-array-type element-type))))
     (labels ((space () (loop while (and (< position size) (sql-array-space-p (char text position)))
                              do (incf position)))
              (peek () (and (< position size) (char text position)))
@@ -293,8 +294,9 @@ are supported."
                        (progn
                          (when (eql (peek) #\{) (fail))
                          (multiple-value-bind (value next) (sql-text-array-element text position)
-                           (when (and (member element-type '(:bytea :json :jsonb))
-                                      (> (incf item-count) +max-varlena-array-elements+))
+                           (incf item-count)
+                           (when (zerop (logand item-count 4095)) (check-for-interrupts))
+                           (when (and stored-p (> item-count +max-varlena-array-elements+))
                              (ereport "54000" "array element count exceeds supported maximum"))
                            (push (sql-cast-value value :text element-type typmod) values)
                            (setf position next))))
@@ -485,8 +487,11 @@ The second value distinguishes a valid NIL result from an unhandled cast."
      (when (eq target :bytea)
        (return-from cast-result
          (cond ((eq source :bytea) value)
+               ((eq source :uuid) (sql-uuid-to-bytea value))
                ((member source '(:int2 :int4 :int8)) (sql-integer-to-bytea value source))
                (t (sql-bytea-input (value->text value source))))))
+     (when (and (eq source :bytea) (eq target :uuid))
+       (return-from cast-result (sql-uuid-from-bytea value)))
      (when (and (eq source :bytea) (member target '(:int2 :int4 :int8)))
        (return-from cast-result (sql-bytea-to-integer value target)))
      (when (and (eq source :bytea) (member target '(:text :varchar :name)))
@@ -523,6 +528,8 @@ The second value distinguishes a valid NIL result from an unhandled cast."
                          :lower-bounds (unless (and (zerop (length value))
                                                     (not (eq (sql-array-element-type target) :int2)))
                                          (list 0)))))
+     (when (and (sql-array-p value) (eq source target) (minusp typmod))
+       (return-from cast-result value))
      (when (sql-array-element-type target)
        (let ((element-type (sql-array-element-type target)))
          (return-from cast-result
@@ -678,6 +685,7 @@ The second value distinguishes a valid NIL result from an unhandled cast."
      (case target
        ((:int4 :int8) (sql-cast-integer-input value target))
        (:bool (sql-cast-boolean-input value))
+       (:uuid (sql-uuid-input value))
        (:date (sql-date-input value nil (sql-session-date-order)
                               (floor (sql-session-local-microseconds) +sql-microseconds-per-day+)))
        (:numeric (sql-numeric-input value))

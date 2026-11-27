@@ -703,7 +703,7 @@ Send its row description before execution and close it before reporting completi
   columns)
 
 (defun extended-binary-type-p (type)
-  (member type '(:text :varchar :bytea :json :jsonb :numeric)))
+  (member type '(:bool :uuid :text :varchar :bytea :json :jsonb :numeric)))
 
 (defun extended-binary-numeric-output (value)
   "Produce numeric_send's network-order base-10000 representation."
@@ -768,6 +768,18 @@ Send its row description before execution and close it before reporting completi
 
 (defun extended-binary-input (bytes type parameter-number)
   (case type
+    (:bool
+     (when (zerop (length bytes))
+       (ereport "08P01" "no data left in message"))
+     (when (> (length bytes) 1)
+       (ereport "22P03" "incorrect binary data format in bind parameter ~d" parameter-number))
+     (not (zerop (aref bytes 0))))
+    (:uuid
+     (when (< (length bytes) +sql-uuid-size+)
+       (ereport "08P01" "insufficient data left in message"))
+     (when (> (length bytes) +sql-uuid-size+)
+       (ereport "22P03" "incorrect binary data format in bind parameter ~d" parameter-number))
+     (sql-uuid-from-octets bytes))
     (:bytea bytes)
     (:numeric (extended-binary-numeric-input bytes parameter-number))
     (otherwise

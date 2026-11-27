@@ -282,6 +282,8 @@ An unexecuted LIMIT does not raise these errors."
          ((:int2 :int4 :int8 :date :time :timestamp :timestamptz) (integerp value))
          (:numeric (sql-numeric-p value))
          (:interval (sql-interval-p value))
+         (:bool (typep value 'boolean))
+         (:uuid (sql-uuid-p value))
          (:timetz (sql-timetz-p value))
          (:float4 (typep value 'single-float))
          (:float8 (typep value 'double-float))
@@ -589,7 +591,7 @@ whose other operand belongs to the already-built outer relation is considered."
          (:int4 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 32))))
          (:int8 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 64))))
          (:numeric (member value-type '(:int2 :int4 :int8 :numeric)))
-         ((:date :time :timestamp :timestamptz :float4 :float8 :bytea :interval :timetz)
+         ((:bool :uuid :date :time :timestamp :timestamptz :float4 :float8 :bytea :interval :timetz)
           (eq value-type index-type))
          ((:text :varchar) (member value-type '(:text :varchar)))
          (otherwise nil))))
@@ -624,7 +626,7 @@ whose other operand belongs to the already-built outer relation is considered."
   (if (sixth comparison)
       (and (eq (fourth comparison) type)
            (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz :numeric
-                          :float4 :float8 :bytea :interval :timetz :text :varchar)))
+                          :float4 :float8 :bytea :interval :timetz :bool :uuid :text :varchar)))
       (index-range-value-p (third comparison) (fourth comparison) type)))
 
 (defun build-select-index-range (equalities endpoints types)
@@ -2144,14 +2146,7 @@ chunk visibility follows the parent and is not independently filtered."
                                                   :descriptor (heap-encode-external-varlena value)))))
                      (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
                        (setf (aref values i)
-                             (case type
-                               ((:varchar :text :json) (bytes->string bytes))
-                               (:bytea bytes)
-                               (:jsonb (sql-jsonb-from-octets bytes))
-                               (:numeric (sql-numeric-from-varlena-payload bytes))
-                               ((:bytea-array :json-array :jsonb-array)
-                                (sql-varlena-array-decode bytes (heap-varlena-array-element-type type)))
-                               (otherwise (ereport "XX001" "external value has unsupported type"))))))))
+                             (heap-decode-varlena-payload bytes type))))))
     tuple))
 
 (defun unchanged-tuple-toast-pointers (tuple assignments &optional table new-values snapshot)
@@ -2434,6 +2429,8 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
   (multiple-value-bind (counting metrics) (logical-encoding-sink limit)
     (flet ((emit (octets) (funcall counting octets) (when sink (funcall sink octets))))
       (case type
+        (:bool (emit (if value #(1) #(0))))
+        (:uuid (emit (sql-uuid-bytes value)))
         (:bytea (select-row-binary-bytea-write value #'emit limit))
         (:numeric (emit (extended-binary-numeric-output value)))
         ((:text :varchar :json :jsonb)

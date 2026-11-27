@@ -2830,16 +2830,39 @@ peaked at about 109 MB RSS, and preserved the catalog generation.
 
 ## P08 — Common stored types
 
-- [ ] Store Boolean columns end to end. Preserve FALSE, TRUE and NULL across
+- [x] Store Boolean columns end to end. Preserve FALSE, TRUE and NULL across
   DML, defaults, checks, indexes, supported COPY paths, rollback and restart.
-- [ ] Add UUID scalar semantics and persistence. Match upstream input,
+- [x] Add UUID scalar semantics and persistence. Match upstream input,
   canonical output, comparison and hashing. Cover heap, indexes, spill,
   text and 16-byte binary wire formats, COPY and supported logical replication.
   Verify indexed and sequential results agree after VACUUM and restart.
-- [ ] Generalize array storage while preserving existing stored array types.
+- [x] Generalize array storage while preserving existing stored array types.
   Add Boolean, integer, text/varchar and UUID arrays. Verify dimensions, lower
   bounds, NULL elements, TOAST and slice updates. Qualify comparison, hashing,
   containment, overlap and each supported transport path.
+
+Common stored arrays use the existing ArrayType framing. The heap uses the
+scalar type's alignment for its array elements and double alignment for
+four-byte `bigint[]` heap datums. Existing bytea, JSON and JSONB array bytes
+and logical type codes remain readable. The new types support text Bind,
+text results, COPY TO and text pgoutput. Boolean and UUID also support
+binary Bind and results. Binary array Bind and results return `0A000`.
+
+The C differential covers mixed types, typed UUID input and hashes, Boolean
+defaults, array bounds and assignments, TOAST, containment and overlap,
+keyless logical capture, and indexed and sequential UUID lookups. It
+checks binary parameter length errors and restarts the native server
+after a process kill to verify the recovered UUID indexes, stored defaults
+and COPY output. Live pgoutput carried the changed values while retaining
+the unchanged TOAST marker for an external `text[]`.
+
+The tuning pass measured 3,200 indexed probes per scalar type and 400
+containment scans per integer array type. Shared array decoding and
+comparison changes reduced CPU on both array holdouts from 1.15 and 1.11 s
+to about 1 s each. The workloads still exceeded the 3× C targets. Native
+CPU was about 3.5–4× for indexed probes and 11× for array scans. Peak
+process RSS was about 9–11× the C session backend's RSS. The native runs
+allocated about 90–102 MB per indexed workload and 537 MB per array workload.
 
 ## P09 — Column schema evolution
 

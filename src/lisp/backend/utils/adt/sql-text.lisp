@@ -147,6 +147,7 @@
     ((member type '(:float4 :float8))
      (sql-float-output v type (if *backend* (parse-integer (session-extra-setting-value "extra_float_digits")) 1)))
     ((eq type :bool) (if v "t" "f"))
+    ((eq type :uuid) (sql-uuid-output v))
     ((eq type :date) (sql-date-output v (sql-session-date-style) (sql-session-date-order)))
     ((eq type :time) (sql-time-output v))
     ((eq type :timetz) (sql-timetz-output v))
