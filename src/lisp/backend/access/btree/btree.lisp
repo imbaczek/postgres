@@ -306,20 +306,9 @@ The nested scopes retain cleanup ownership even if a lease is released early."
 (defun btree-logical-key (key)
   (if (btree-storage-key-p key) (btree-storage-key-logical key) key))
 
-(defun compare-btree-key-bytes (left right right-start right-length)
-  "Compare a logical key with a key stored in a vector slice."
-  (let ((left-length (length left)))
-    (loop for i from 0 below (min left-length right-length)
-          for j from right-start
-          for a = (aref left i)
-          for b = (aref right j)
-          do (cond ((< a b) (return -1))
-                   ((> a b) (return 1)))
-          finally (return (signum (- left-length right-length))))))
-
 (defun key-compare (a b)
   (setf a (btree-logical-key a) b (btree-logical-key b))
-  (compare-btree-key-bytes a b 0 (length b)))
+  (compare-octet-vector-to-span a b 0 (length b)))
 
 (defun key< (a b) (minusp (key-compare a b)))
 (defun key= (a b) (zerop (key-compare a b)))
@@ -566,7 +555,7 @@ below the previous minimum, so examine every entry."
 (defun btree-bound-slice-order (bytes start length bound)
   "Compare the bound prefix with an encoded key slice."
   (let ((prefix (btree-scan-bound-prefix bound)))
-    (compare-btree-key-bytes prefix bytes start (min length (length prefix)))))
+    (compare-octet-vector-to-span prefix bytes start (min length (length prefix)))))
 
 (defun btree-bound-key-order (key bound)
   (let ((bytes (btree-logical-key key)))
@@ -649,8 +638,8 @@ duplicates on either side of an equal separator."
                               (btree-scan-bound-allows-p key upper -1)))
                  (cons (second entry) (third entry)))))
             ((if equality-key
-                 (zerop (compare-btree-key-bytes (btree-logical-key equality-key)
-                                                 page key-start key-length))
+                 (zerop (compare-octet-vector-to-span (btree-logical-key equality-key)
+                                                      page key-start key-length))
                  (and (btree-key-slice-in-scan-p page key-start key-length lower 1)
                       (btree-key-slice-in-scan-p page key-start key-length upper -1)))
              (let ((tid (+ key-start key-length)))
@@ -711,7 +700,7 @@ duplicates on either side of an equal separator."
       (values (if (logbitp 15 field)
                   (key-compare logical
                                (btree-unpack-key (subseq page start (+ start length)) field))
-                  (compare-btree-key-bytes logical page key-start key-length))
+                  (compare-octet-vector-to-span logical page key-start key-length))
               (+ key-start key-length)))))
 
 (defun btree-page-key-lower-bound (page logical low high value-size)
@@ -724,50 +713,51 @@ duplicates on either side of an equal separator."
                  (t (setf high mid))))
   low)
 
-(defun btree-equal-page-leaf-tids (page key)
-  "Find the equal run by key without interpreting or copying earlier entries."
-  (let* ((logical (btree-logical-key key))
-         (count (page-lp-count page))
+(defun btree-equal-page-some-tid (page logical predicate)
+  "Test matching leaf TIDs in order, stopping at the first successful call."
+  (let* ((count (page-lp-count page))
          (first (btree-page-key-lower-bound page logical 1 (1+ count) 6)))
-    (flet ((linear-scan ()
-             (loop for slot from 1 to count
-                   for tid = (btree-scan-leaf-tid page slot nil nil key)
-                   when tid collect tid)))
-      (unless first (return-from btree-equal-page-leaf-tids (linear-scan)))
-      (loop for slot from first to count
-            append (multiple-value-bind (order tid) (btree-compare-page-key page slot logical 6)
-                     (cond ((null order) (return-from btree-equal-page-leaf-tids (linear-scan)))
-                           ((zerop order) (list (cons (page-u32 page tid) (page-u16 page (+ tid 4)))))
-                           (t (loop-finish))))))))
+    (loop for slot from (or first 1) to count
+          do (multiple-value-bind (order offset) (btree-compare-page-key page slot logical 6)
+               (cond ((null order))
+                     ((minusp order) (return nil))
+                     ((and (zerop order)
+                           (funcall predicate (page-u32 page offset) (page-u16 page (+ offset 4))))
+                      (return t)))))))
+
+(defun btree-equal-page-leaf-tids (page key)
+  "Collect equal TIDs for a cursor that can outlive the page handle."
+  (let ((tids nil))
+    (btree-equal-page-some-tid
+     page (btree-logical-key key)
+     (lambda (block offnum)
+       (push (cons block offnum) tids)
+       nil))
+    (nreverse tids)))
 
 (defun btree-equal-page-children-linear (page key)
   "Find the predecessor and equal separator run when a page contains unused slots."
   (let ((logical (btree-logical-key key))
-        (previous nil)
-        (selected nil)
-        (equal-run nil)
-        (matches nil))
+        (predecessor nil)
+        (equal-children nil))
     (loop for slot from 1 to (page-lp-count page)
           do (multiple-value-bind (order position) (btree-compare-page-key page slot logical 4)
                (when order
                  (let ((child (page-u32 page position)))
-                   (unless selected (setf selected child))
-                   (cond ((zerop order)
-                          (unless equal-run
-                            (setf equal-run t matches (when previous (list previous))))
-                          (push child matches))
-                         (t
-                          (setf equal-run nil)
-                          (when (plusp order)
-                            (setf selected child matches nil))))
-                   (setf previous child)))))
-    (cond (matches (coerce (nreverse matches) 'simple-vector))
-          (selected (vector selected))
+                   (cond
+                     ;; The first live separator may be the stale lower fence.
+                     ((or (null predecessor) (plusp order))
+                      (setf predecessor child))
+                     ((zerop order) (push child equal-children))
+                     (t (return)))))))
+    (cond (equal-children (coerce (cons predecessor (nreverse equal-children)) 'simple-vector))
+          (predecessor (vector predecessor))
           (t #()))))
 
-(defun btree-equal-page-children (page key)
+(defun btree-equal-page-children (page key &optional scalar-p)
   "Retain the predecessor and every child with an equal separator.
-Only the first separator may be stale after an insert below the old minimum."
+Only the first separator may be stale after an insert below the old minimum.
+With SCALAR-P, an ordered page with one result can return the block directly."
   (let* ((logical (btree-logical-key key))
          (count (page-lp-count page))
          (first (btree-page-key-lower-bound page logical 2 (1+ count) 4)))
@@ -776,14 +766,17 @@ Only the first separator may be stale after an insert below the old minimum."
     (multiple-value-bind (order child) (btree-compare-page-key page (1- first) logical 4)
       (declare (ignore order))
       (unless child (return-from btree-equal-page-children (btree-equal-page-children-linear page key)))
-      (let ((children (list (page-u32 page child))))
+      (let ((predecessor (page-u32 page child)) (equal-children nil))
         (loop for slot from first to count
               do (multiple-value-bind (order next) (btree-compare-page-key page slot logical 4)
                    (unless order
                      (return-from btree-equal-page-children (btree-equal-page-children-linear page key)))
                    (unless (zerop order) (return))
-                   (push (page-u32 page next) children)))
-        (coerce (nreverse children) 'simple-vector)))))
+                   (push (page-u32 page next) equal-children)))
+        (cond (equal-children
+               (coerce (cons predecessor (nreverse equal-children)) 'simple-vector))
+              (scalar-p predecessor)
+              (t (vector predecessor)))))))
 
 (defun btree-cursor-push-node (cursor level block)
   (with-buf-read-page (page (btree-equal-cursor-relfilenode cursor) block)
@@ -837,6 +830,51 @@ Only the first separator may be stale after an insert below the old minimum."
    relfilenode
    (lambda (lease)
      (funcall function (open-btree-equal-cursor-unlocked relfilenode key) lease))))
+
+(defun call-with-btree-equal-tid-probe (relfilenode function)
+  "Call FUNCTION with a read-only equality probe sharing a read lease.
+The probe takes a key and predicate of block and offset. The lease stabilizes
+the root and last borrowed leaf during the callback."
+  (call-with-btree-relation-read-lease
+   relfilenode
+   (lambda (lease)
+     (declare (ignore lease))
+     (multiple-value-bind (root-level root-block) (btree-read-meta relfilenode)
+       (with-buf-read-page (root relfilenode root-block)
+         (unless root (ereport "XX000" "index page ~a is missing" root-block))
+         (call-with-buf-read-page-cache
+          relfilenode
+          (lambda (read-leaf)
+            (flet ((probe (key predicate)
+                     (let ((logical (btree-logical-key key)))
+                       (labels ((visit-child (level block)
+                                  (if (zerop level)
+                                      (let ((leaf (funcall read-leaf block)))
+                                        (unless leaf
+                                          (ereport "XX000" "index page ~a is missing" block))
+                                        (btree-equal-page-some-tid leaf logical predicate))
+                                      (with-buf-read-page (child relfilenode block)
+                                        (unless child
+                                          (ereport "XX000" "index page ~a is missing" block))
+                                        (visit level child))))
+                                (visit (level page)
+                                  (if (zerop level)
+                                      (btree-equal-page-some-tid page logical predicate)
+                                      (let ((children (btree-equal-page-children page logical t))
+                                            (child-level (1- level)))
+                                        (if (integerp children)
+                                            (visit-child child-level children)
+                                            (loop for block across children
+                                                    thereis (visit-child child-level block)))))))
+                         (visit root-level root)))))
+              (declare (dynamic-extent #'probe))
+              (funcall function #'probe)))))))))
+
+(defun btree-some-equal-tid (relfilenode key predicate)
+  "Test equal TIDs without allocating a resumable cursor."
+  (flet ((search-key (probe) (funcall probe key predicate)))
+    (declare (dynamic-extent #'search-key))
+    (call-with-btree-equal-tid-probe relfilenode #'search-key)))
 
 (defun btree-scan-equal (relfilenode key callback)
   "Stream matching TIDs to CALLBACK until it returns :STOP.
@@ -901,7 +939,7 @@ non-normal pointers."
                  (return-from btree-plain-leaf-insert-slot nil))
                (unless slot
                  (let* ((key-length (- len 8))
-                        (order (compare-btree-key-bytes key page (+ start 2) key-length)))
+                        (order (compare-octet-vector-to-span key page (+ start 2) key-length)))
                    (when (or (minusp order)
                              (and (zerop order)
                                   (let* ((tid (+ start 2 key-length))
@@ -1113,119 +1151,158 @@ Return NIL without changing PAGE when the general rebuild or split is needed."
 
 (declaim (notinline sql-array-elements sql-array-dimensions sql-array-lower-bounds))
 
+(defconstant +btree-text-key-tag+ 3)
+
+(defun encode-index-octet-key (tag octets terminator-width)
+  "Build an exact-size key for one tagged octet value."
+  (let ((key (make-array (+ 1 (length octets) terminator-width)
+                         :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref key 0) tag)
+    (replace key octets :start1 1)
+    key))
+
+(declaim (inline signed-index-bits))
+
+(defun encode-index-inline-text-key (octets)
+  "Encode an already-transcoded singleton text key, or defer zero escaping."
+  (unless (position 0 octets)
+    (encode-index-octet-key +btree-text-key-tag+ octets 2)))
+
+(defun signed-index-bits (value width)
+  (let ((bits (* width 8)))
+    (logxor (ldb (byte bits 0) value) (ash 1 (1- bits)))))
+
+(defun fixed-index-key-component (value type)
+  "Return the tag, ordered bits and byte width of a scalar index component."
+  (case type
+    (:int2 (values 5 (signed-index-bits value 2) 2))
+    (:int4 (values 1 (signed-index-bits value 4) 4))
+    (:int8 (values 2 (signed-index-bits value 8) 8))
+    (:date (values 8 (signed-index-bits value 4) 4))
+    (:time (values 9 (signed-index-bits value 8) 8))
+    (:timestamp (values 10 (signed-index-bits value 8) 8))
+    (:timestamptz (values 11 (signed-index-bits value 8) 8))
+    (:float4 (values 6 (sql-float-index-bits value type) 4))
+    (:float8 (values 7 (sql-float-index-bits value type) 8))
+    (:interval (values 12 (signed-index-bits (sql-interval-comparison-value value) 16) 16))
+    (:oid (check-type value (unsigned-byte 32)) (values 14 value 4))
+    (:bool (values 19 (if value 1 0) 1))))
+
 (defun encode-index-key (values types)
   "Encode index column values so that byte-wise order matches SQL order for
 supported types. Null sorts before any non-null value; ints are sign-flipped.
 Bytea escapes zero octets and uses a zero terminator to preserve lexicographic
 order, including prefixes, in composite keys."
-  (let ((out (make-array 0 :adjustable t :fill-pointer 0
-                           :element-type '(unsigned-byte 8))))
+  (when (and (null (rest values)) (null (rest types)))
+    (let ((value (first values))
+          (type (first types)))
+      (unless (eq value +null+)
+        (multiple-value-bind (tag bits width) (fixed-index-key-component value type)
+          (when tag
+            (let ((key (make-array (1+ width) :element-type '(unsigned-byte 8))))
+              (setf (aref key 0) tag)
+              (loop for offset from 1 to width
+                    for shift from (* 8 (1- width)) downto 0 by 8
+                    do (setf (aref key offset) (ldb (byte 8 shift) bits)))
+              (return-from encode-index-key key)))))
+      (case type
+        (:uuid
+         (when (sql-uuid-p value)
+           (return-from encode-index-key (encode-index-octet-key 20 (sql-uuid-bytes value) 0))))
+        ((:varchar :text)
+         (when (stringp value)
+           (let ((key (encode-index-inline-text-key (string->bytes value))))
+             (when key (return-from encode-index-key key))))))))
+  ;; Reserve one small buffer for common fixed-width keys and their type tag.
+  (let ((out (make-array 17 :adjustable t :fill-pointer 0
+                            :element-type '(unsigned-byte 8))))
     (labels ((push-byte (b) (vector-push-extend b out))
              (push-int-be (v bytes)
                (loop for shift from (* 8 (1- bytes)) downto 0 by 8
                      do (push-byte (ldb (byte 8 shift) v))))
              (push-terminated-octets (bytes)
-               (loop for byte across bytes
-                     do (push-byte byte)
-                        (when (zerop byte) (push-byte 255)))
+               (cond ((position 0 bytes)
+                      (loop for byte across bytes
+                            do (push-byte byte)
+                               (when (zerop byte) (push-byte 255))))
+                     (t
+                      ;; The common text case needs no escaping. Append it as
+                      ;; one contiguous span, including within a composite key.
+                      (let* ((start (fill-pointer out))
+                             (end (+ start (length bytes))))
+                        (when (> (+ end 2) (array-total-size out))
+                          (setf out (adjust-array out (max (+ end 2) (* 2 (array-total-size out))))))
+                        (setf (fill-pointer out) end)
+                        (replace out bytes :start1 start))))
                (push-byte 0)
                (push-byte 0)))
       (loop for v in values
             for ty in types
-            do (cond
-                 ((eq v +null+)
-                  (push-byte 0))
-                 ((member ty '(:float4 :float8))
-                  (push-byte (if (eq ty :float4) 6 7))
-                  (push-int-be (sql-float-index-bits v ty) (if (eq ty :float4) 4 8)))
-                 ((eq ty :uuid)
-                  (push-byte 20)
-                  (loop for octet across (sql-uuid-bytes v) do (push-byte octet)))
-                 ((eq ty :bool)
-                  (push-byte 19)
-                  (push-byte (if v 1 0)))
-                 ((eq ty :int2)
-                  (push-byte 5)
-                  (push-int-be (logxor (logand v #xffff) #x8000) 2))
-                 ((eq ty :timetz)
-                  (push-byte 13)
-                  (multiple-value-bind (utc zone) (sql-timetz-comparison-values v)
-                    (push-int-be (logxor (logand utc #xffffffffffffffff) #x8000000000000000) 8)
-                    (push-int-be (logxor (logand zone #xffffffff) #x80000000) 4)))
-                 ((eq ty :interval)
-                  (push-byte 12)
-                  (push-int-be (logxor (logand (sql-interval-comparison-value v) (1- (ash 1 128)))
-                                       (ash 1 127)) 16))
-                 ((member ty '(:timestamp :timestamptz))
-                  (push-byte (if (eq ty :timestamp) 10 11))
-                  (push-int-be (logxor (logand v #xffffffffffffffff) #x8000000000000000) 8))
-                 ((eq ty :time)
-                  (push-byte 9)
-                  (push-int-be (logxor (logand v #xffffffffffffffff) #x8000000000000000) 8))
-                 ((eq ty :date)
-                  (push-byte 8)
-                  (push-int-be (logxor (logand v #xffffffff) #x80000000) 4))
-                 ((eq ty :oid)
-                  (check-type v (unsigned-byte 32))
-                  (push-byte 14)
-                  (push-int-be v 4))
-                 ((eq ty :int4)
-                  (push-byte 1)
-                  (push-int-be (logxor (logand v #xFFFFFFFF) #x80000000) 4))
-                 ((eq ty :int8)
-                  (push-byte 2)
-                  (push-int-be (logxor (logand v #xFFFFFFFFFFFFFFFF)
-                                       #x8000000000000000)
-                               8))
-                 ((eq ty :numeric)
-                  (push-byte 4)
-                  (cond ((eq v :numeric-negative-infinity) (push-byte 0))
-                        ((eq v :numeric-positive-infinity) (push-byte 4))
-                        ((eq v :numeric-nan) (push-byte 5))
-                        (t
-                         (let* ((coefficient (sql-numeric-coefficient v))
-                                (negative (minusp coefficient)))
-                           (cond ((zerop coefficient) (push-byte 2))
-                                 (t
-                                  (push-byte (if negative 1 3))
-                                  (let* ((digits (format nil "~d" (abs coefficient)))
-                                         (exponent (- (length digits) (sql-numeric-scale v)))
-                                         (end (length digits))
-                                         (biased (logxor (logand exponent #xffffffff) #x80000000)))
-                                    (loop while (and (> end 1) (char= (char digits (1- end)) #\0))
-                                          do (decf end))
-                                    (labels ((ordered-byte (byte)
-                                               (push-byte (if negative (logxor byte #xff) byte))))
-                                      (loop for shift from 24 downto 0 by 8
-                                            do (ordered-byte (ldb (byte 8 shift) biased)))
-                                      (loop for i below end
-                                            do (ordered-byte (1+ (digit-char-p (char digits i)))))
-                                      (ordered-byte 0)))))))))
-                 ((member ty '(:bytea-array :jsonb-array))
-                  (push-byte (if (eq ty :bytea-array) 17 18))
-                  (loop for item across (sql-array-elements v)
-                        do (if (eq item +null+)
-                               (push-byte 2)
-                               (progn
-                                 (push-byte 1)
-                                 (push-terminated-octets
-                                  (if (eq ty :bytea-array) item (encode-jsonb-index-value item))))))
-                  (push-byte 0)
-                  (push-int-be (length (sql-array-dimensions v)) 4)
-                  (dolist (dimension (sql-array-dimensions v))
-                    (push-int-be dimension 4))
-                  (dolist (lower (sql-array-lower-bounds v))
-                    (push-int-be (logxor (logand lower #xffffffff) #x80000000) 4)))
-                 ((eq ty :jsonb)
-                  (push-byte 16)
-                  (loop for byte across (encode-jsonb-index-value v) do (push-byte byte)))
-                 ((eq ty :bytea)
-                  (check-type v (vector (unsigned-byte 8)))
-                  (push-byte 15)
-                  (push-terminated-octets v))
-                 ((member ty '(:varchar :text))
-                  (push-byte 3)
-                  (push-terminated-octets (string->bytes v)))
-                 (t
-                  (ereport "XX000" "unsupported index key type ~a" ty)))))
+            do (multiple-value-bind (tag bits width)
+                   (unless (eq v +null+) (fixed-index-key-component v ty))
+                 (cond
+                   ((eq v +null+)
+                    (push-byte 0))
+                   (tag
+                    (push-byte tag)
+                    (push-int-be bits width))
+                   ((eq ty :uuid)
+                    (push-byte 20)
+                    (loop for octet across (sql-uuid-bytes v) do (push-byte octet)))
+                   ((eq ty :timetz)
+                    (push-byte 13)
+                    (multiple-value-bind (utc zone) (sql-timetz-comparison-values v)
+                      (push-int-be (signed-index-bits utc 8) 8)
+                      (push-int-be (signed-index-bits zone 4) 4)))
+                   ((eq ty :numeric)
+                    (push-byte 4)
+                    (cond ((eq v :numeric-negative-infinity) (push-byte 0))
+                          ((eq v :numeric-positive-infinity) (push-byte 4))
+                          ((eq v :numeric-nan) (push-byte 5))
+                          (t
+                           (let* ((coefficient (sql-numeric-coefficient v))
+                                  (negative (minusp coefficient)))
+                             (cond ((zerop coefficient) (push-byte 2))
+                                   (t
+                                    (push-byte (if negative 1 3))
+                                    (let* ((digits (format nil "~d" (abs coefficient)))
+                                           (exponent (- (length digits) (sql-numeric-scale v)))
+                                           (end (length digits))
+                                           (biased (logxor (logand exponent #xffffffff) #x80000000)))
+                                      (loop while (and (> end 1) (char= (char digits (1- end)) #\0))
+                                            do (decf end))
+                                      (labels ((ordered-byte (byte)
+                                                 (push-byte (if negative (logxor byte #xff) byte))))
+                                        (loop for shift from 24 downto 0 by 8
+                                              do (ordered-byte (ldb (byte 8 shift) biased)))
+                                        (loop for i below end
+                                              do (ordered-byte (1+ (digit-char-p (char digits i)))))
+                                        (ordered-byte 0)))))))))
+                   ((member ty '(:bytea-array :jsonb-array))
+                    (push-byte (if (eq ty :bytea-array) 17 18))
+                    (loop for item across (sql-array-elements v)
+                          do (if (eq item +null+)
+                                 (push-byte 2)
+                                 (progn
+                                   (push-byte 1)
+                                   (push-terminated-octets
+                                    (if (eq ty :bytea-array) item (encode-jsonb-index-value item))))))
+                    (push-byte 0)
+                    (push-int-be (length (sql-array-dimensions v)) 4)
+                    (dolist (dimension (sql-array-dimensions v))
+                      (push-int-be dimension 4))
+                    (dolist (lower (sql-array-lower-bounds v))
+                      (push-int-be (logxor (logand lower #xffffffff) #x80000000) 4)))
+                   ((eq ty :jsonb)
+                    (push-byte 16)
+                    (loop for byte across (encode-jsonb-index-value v) do (push-byte byte)))
+                   ((eq ty :bytea)
+                    (check-type v (vector (unsigned-byte 8)))
+                    (push-byte 15)
+                    (push-terminated-octets v))
+                   ((member ty '(:varchar :text))
+                    (push-byte +btree-text-key-tag+)
+                    (push-terminated-octets (string->bytes v)))
+                   (t
+                    (ereport "XX000" "unsupported index key type ~a" ty))))))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))

@@ -44,33 +44,29 @@ Use PostgreSQL's four-byte varlena header; special numeric values are rejected."
               do (page-set-u16 bytes offset digit))
         bytes))))
 
-(defun sql-numeric-from-packed-octets (bytes)
-  "Decode a complete little-endian finite Numeric with a four-byte header.
-Check lengths, digit range, and precision; reject external, short-varlena and
-special values. Noncanonical zero digits and weights are accepted."
-  (check-type bytes (vector (unsigned-byte 8)))
+(defun sql-numeric-from-packed-payload (bytes start end)
+  "Decode a finite packed Numeric payload bounded by START and END."
   (labels ((bad () (ereport "XX001" "invalid packed numeric")))
-    (unless (and (>= (length bytes) 6)
-                 (= (page-u32 bytes 0) (ash (length bytes) 2)))
+    (unless (<= 0 start (+ start 2) end (length bytes))
       (bad))
-    (let* ((header (page-u16 bytes 4))
+    (let* ((header (page-u16 bytes start))
            (kind (logand header #xc000))
            (short (= kind #x8000))
-           (header-size (if short 6 8)))
+           (digits-start (+ start (if short 2 4))))
       (unless (and (member kind '(#x0000 #x4000 #x8000))
-                   (>= (length bytes) header-size)
-                   (evenp (- (length bytes) header-size)))
+                   (>= end digits-start)
+                   (evenp (- end digits-start)))
         (bad))
       (let* ((negative (if short (logbitp 13 header) (= kind #x4000)))
              (scale (if short (ldb (byte 6 7) header) (logand header #x3fff)))
-             (encoded-weight (if short (logand header #x7f) (page-u16 bytes 6)))
+             (encoded-weight (if short (logand header #x7f) (page-u16 bytes (+ start 2))))
              (weight (if short
                          (if (logbitp 6 encoded-weight) (- encoded-weight 128) encoded-weight)
                          (if (logbitp 15 encoded-weight) (- encoded-weight 65536) encoded-weight)))
-             (count (/ (- (length bytes) header-size) 2))
+             (count (/ (- end digits-start) 2))
              (accumulator 0))
         (dotimes (i count)
-          (let ((digit (page-u16 bytes (+ header-size (* i 2)))))
+          (let ((digit (page-u16 bytes (+ digits-start (* i 2)))))
             (unless (< digit 10000) (bad))
             (setf accumulator (+ (* accumulator 10000) digit))))
         (let* ((decimal-exponent (+ scale (* 4 (- (1+ weight) count))))
@@ -82,6 +78,15 @@ special values. Noncanonical zero digits and weights are accepted."
                        q)
                      (* accumulator (expt 10 decimal-exponent)))))
           (make-sql-decimal (if negative (- coefficient) coefficient) scale))))))
+
+(defun sql-numeric-from-packed-octets (bytes)
+  "Decode finite Numeric with a four-byte header.
+Noncanonical zero digits and weights are accepted."
+  (check-type bytes (vector (unsigned-byte 8)))
+  (unless (and (>= (length bytes) 6)
+               (= (page-u32 bytes 0) (ash (length bytes) 2)))
+    (ereport "XX001" "invalid packed numeric"))
+  (sql-numeric-from-packed-payload bytes 4 (length bytes)))
 
 (defun sql-numeric-to-varlena-payload (value)
   "Encode numeric VALUE without its outer varlena header, including specials."
@@ -95,21 +100,31 @@ special values. Noncanonical zero digits and weights are accepted."
           bytes)
         (subseq (sql-numeric-to-packed-octets value) 4))))
 
-(defun sql-numeric-from-varlena-payload (payload)
-  "Decode finite or special numeric PAYLOAD without an outer varlena header."
+(defun short-numeric-payload-may-match-p (key page start end)
+  "Compare canonical short Numeric payloads with the same display scale.
+Pass unfamiliar layouts through to the ordinary decimal comparator."
+  (let ((digits-start (+ start 2)))
+    (or (< end (+ digits-start 2))
+        (oddp (- end digits-start))
+        (/= (logand (page-u16 page start) #xdf80)
+            (logand (page-u16 key 0) #xdf80))
+        (zerop (page-u16 page digits-start))
+        (zerop (page-u16 page (- end 2)))
+        (and (= (length key) (- end start))
+             (zerop (compare-octet-vector-to-span key page start (- end start)))))))
+
+(defun sql-numeric-from-varlena-payload (payload &key (start 0) (end (length payload)))
+  "Decode finite or special Numeric from an octet span."
   (check-type payload (vector (unsigned-byte 8)))
-  (when (< (length payload) 2) (ereport "XX001" "invalid packed numeric"))
-  (let ((header (page-u16 payload 0)))
-    (when (= (logand header #xc000) #xc000)
-      (unless (= (length payload) 2) (ereport "XX001" "invalid packed numeric"))
-      (return-from sql-numeric-from-varlena-payload
-        (case header
-          (#xc000 :numeric-nan)
-          (#xd000 :numeric-positive-infinity)
-          (#xf000 :numeric-negative-infinity)
-          (otherwise (ereport "XX001" "invalid packed numeric"))))))
-  (let ((bytes (make-array (+ 4 (length payload))
-                           :element-type '(unsigned-byte 8))))
-    (page-set-u32 bytes 0 (ash (length bytes) 2))
-    (replace bytes payload :start1 4)
-    (sql-numeric-from-packed-octets bytes)))
+  (unless (<= 0 start (+ start 2) end (length payload))
+    (ereport "XX001" "invalid packed numeric"))
+  (let ((header (page-u16 payload start)))
+    (if (= (logand header #xc000) #xc000)
+        (progn
+          (unless (= (+ start 2) end) (ereport "XX001" "invalid packed numeric"))
+          (case header
+            (#xc000 :numeric-nan)
+            (#xd000 :numeric-positive-infinity)
+            (#xf000 :numeric-negative-infinity)
+            (otherwise (ereport "XX001" "invalid packed numeric"))))
+        (sql-numeric-from-packed-payload payload start end))))

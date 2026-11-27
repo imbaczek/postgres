@@ -258,6 +258,24 @@ Release HANDLE before reusing SCRATCH. Acquisition holds no lock across use."
               ,@body)
          (sb-sys:without-interrupts (buf-release-page ,handle))))))
 
+(defun call-with-buf-read-page-cache (relfilenode function)
+  "Call FUNCTION with a reader retaining one borrowed page of RELFILENODE.
+The caller establishes that retaining a page across reads satisfies its
+visibility and locking requirements. Readers and pages stay within FUNCTION."
+  (let ((handle (make-buf-page-handle))
+        (cached-block nil))
+    (flet ((read-page (block)
+             (unless (eql block cached-block)
+               (setf cached-block nil)
+               (buf-release-page handle)
+               (when (buf-acquire-read-page handle relfilenode block)
+                 (setf cached-block block)))
+             (buf-page-handle-page handle)))
+      (declare (dynamic-extent #'read-page))
+      (unwind-protect
+           (funcall function #'read-page)
+        (buf-release-page handle)))))
+
 (defun buf-write (relfilenode block page &optional (fork :main) owned-p)
   "Stage PAGE. OWNED-P gives up the private vector at the call boundary."
   (let ((replacement (current-relation-replacement relfilenode fork)))

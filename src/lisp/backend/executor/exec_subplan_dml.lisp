@@ -553,17 +553,79 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                     (and compatible origin)))))
       (values (eval-expr expression environment) nil nil)))
 
+(defun literal-heap-insert-p (prepared table xid)
+  "Batch only literal assignments whose row preparation has no SQL side effects."
+  (let ((rows (getf prepared :rows))
+        (columns (pg-class-columns table))
+        (attnums (getf prepared :attnums)))
+    (and (rest rows)
+         (not (or (getf prepared :insert-source-plan) (getf prepared :conflict)
+                  (getf prepared :returning) (getf prepared :ctes)
+                  (pg-class-checks table) (pg-class-toast table)
+                  (logical-capture-xid-needed-p xid)))
+         (= (length attnums) (length columns))
+         (loop for attnum in attnums for expected from 1 always (= attnum expected))
+         (every (lambda (row)
+                  (and (= (length row) (length columns))
+                       (every (lambda (expression)
+                                (and (consp expression) (eq (first expression) :assignment)
+                                     (immutable-literal-expression-p (second expression))))
+                              row)))
+                rows)
+         (with-write-lock
+           (ensure-current-table table)
+           (null (table-indexes table nil #'pg-index-ready-p))))))
+
+(defun prepare-literal-heap-insert (expressions columns xid cid)
+  "Prepare one inline row without publishing it.
+Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
+  (handler-case
+      (let ((values (map 'vector (lambda (expression) (eval-subquery-assignment expression nil))
+                         expressions)))
+        (check-not-null values columns)
+        (multiple-value-bind (tuple varlena)
+            (form-heap-tuple values columns xid 0 cid 0 0 t)
+          (when (<= (length tuple) +toast-tuple-target+)
+            (list values tuple varlena))))
+    (pg-error (condition)
+      ;; Interrupt delivery may already have consumed the pending request.
+      (when (or (fatal-error-p condition)
+                (not (string= (pg-error-severity condition) "ERROR"))
+                (string= (pg-error-sqlstate condition) "57014"))
+        (error condition))
+      nil)))
+
+(defun insert-literal-heap-batches (table relfilenode xid columns rows scalar inserted)
+  "Write bounded literal batches, using SCALAR for any chunk that cannot batch."
+  (let ((cid (backend-command-id *backend*)))
+    (loop while rows
+          for chunk = (progn
+                        (check-for-interrupts)
+                        (loop repeat 64 while rows collect (pop rows)))
+          for prepared = (loop for expressions in chunk
+                               for row = (prepare-literal-heap-insert expressions columns xid cid)
+                               while row collect row)
+          for tids = (when (= (length prepared) (length chunk))
+                       (with-write-lock
+                         (ensure-current-table table)
+                         (unless (table-indexes table nil #'pg-index-ready-p)
+                           (heapam-insert-formed-tuples relfilenode (mapcar #'second prepared) xid))))
+          do (if tids
+                 (loop for row in prepared for (block . offnum) in tids
+                       do (funcall inserted (first row) (third row) block offnum cid))
+                 (dolist (expressions chunk) (funcall scalar expressions nil))))))
+
 (defun exec-insert-subqueries (stream ast)
   (let ((*datum-origin-capture* nil) (*query-row-origins* nil)
                                      (prepared (dml-execution-preparation ast)))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
-       (declare (ignore rel xid))
        (let ((columns (getf prepared :columns)) (count 0)
                                                 (state (make-hash-table :test #'equal))
                                                 (returning (getf prepared :returning))
                                                 (key-references nil)
+                                                (child-probes (prepare-child-foreign-key-probes table))
                                                 (key-changes nil)
                                                 (parent-references (when (eq :update (getf (getf prepared :conflict) :action))
                                                                      (referencing-foreign-keys table))))
@@ -623,10 +685,11 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                 (values :insert values nil nil block off)))
                         (unless (eq action :nothing)
                           (setf key-changes (nreconc parent-changes key-changes))
-                          (when (pg-class-foreign-keys table)
+                          (when child-probes
                             (setf key-references
                                   (nconc (lock-foreign-key-child-references
-                                          table actual (list block off (backend-command-id *backend*)) old old-own-p)
+                                          table child-probes actual (list block off (backend-command-id *backend*))
+                                          old old-own-p)
                                          key-references)))
                           (incf count)
                           (emit-dml-returning stream returning actual :old-values old :new-values actual))))))))
@@ -643,59 +706,110 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                           (getf prepared :source-assignments))
                                   (car row)))))
                  (let ((*datum-origin-capture* t))
-                   (dolist (row (getf prepared :rows)) (insert-row row nil))))))
+                   (if (literal-heap-insert-p prepared table xid)
+                       (insert-literal-heap-batches
+                        table rel xid columns (getf prepared :rows) #'insert-row
+                        (lambda (values varlena block offnum cid)
+                          (when child-probes
+                            (setf key-references
+                                  (nconc (lock-foreign-key-child-references
+                                          table child-probes values (list block offnum cid) nil nil varlena)
+                                         key-references)))
+                          (incf count)))
+                       (dolist (row (getf prepared :rows)) (insert-row row nil)))))))
          (check-foreign-key-child-references table key-references)
          (check-foreign-key-parent-changes table (nreverse key-changes) t)
          (finish-dml-command stream returning (format nil "INSERT 0 ~a" count) count))))))
 
-(defun exec-delete-subqueries (stream ast)
+(defun delete-cascade-candidates (prepared table relfilenode xid scalar)
+  "Delete leaf cascade rows in bounded page batches, rechecking conflicts with SCALAR."
+  (let ((block nil)
+        (candidates nil)
+        (size 0)
+        (deleted 0)
+        (cid (backend-command-id *backend*))
+        (qualification (let ((where (getf prepared :where)))
+                         (or (prepared-row-qualification where)
+                             (lambda (values) (eval-expr where values))))))
+    (flet ((flush ()
+             (when candidates
+               (check-for-interrupts)
+               (setf candidates (nreverse candidates))
+               (if (heapam-delete-page-candidates relfilenode block candidates xid cid)
+                   (incf deleted size)
+                   (dolist (candidate candidates)
+                     (funcall scalar candidate #() nil nil)))
+               (setf candidates nil size 0))))
+      (heapam-scan
+       relfilenode (pg-class-columns table) *current-snapshot*
+       (lambda (candidate)
+         (let ((candidate-block (htup-block candidate)))
+           (when (or (= size 64) (not (eql block candidate-block)))
+             (flush))
+           (setf block candidate-block)
+           (incf size)
+           (push candidate candidates))
+         nil)
+       :raw-filter (prepared-single-column-heap-filter table (getf prepared :where))
+       :values-filter
+       (lambda (values)
+         (check-for-interrupts)
+         (true-p (funcall qualification values))))
+      (flush))
+    deleted))
+
+(defun exec-delete-subqueries (stream ast &optional cascade-p)
   (let* ((prepared (dml-execution-preparation ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
-       (let ((columns (getf prepared :columns)) (count 0)
-                                                (references (referencing-foreign-keys table))
-                                                (prepared-changes nil)
-                                                (key-changes nil))
+       (let ((columns (getf prepared :columns))
+             (count 0)
+             (references (referencing-foreign-keys table))
+             (prepared-changes nil)
+             (key-changes nil))
          (send-dml-returning-description stream (getf prepared :returning))
-         (stream-joined-dml-candidates
-          prepared table
-          (lambda (candidate source environment modified-p)
-            (declare (ignore environment))
-            (check-for-interrupts)
-            (detach-select-index-scans)
-            (unless modified-p
-              (setf prepared-changes nil)
-              (multiple-value-bind (deleted tuple block off status publications)
-                  (heapam-delete-tid
-                   rel columns (htup-block candidate) (htup-offnum candidate) xid
-                   (backend-command-id *backend*)
-                   ;; Recheck the latest target with the original matched source, like
-                   ;; EPQ's nonlocking source rowmarks.
-                   (lambda (tuple)
-                     (materialize-select-tuple table tuple *current-snapshot*)
-                     (call-with-dml-expression-evaluation
-                      (lambda ()
-                        (or (null where)
-                            (true-p (eval-expr where (concatenate 'vector (htup-values tuple) source)))))))
-                   (lambda () (logical-capture-publications (list table) :delete))
-                   t candidate
-                   (when references
-                     (lambda (tuple)
-                       (setf prepared-changes (lock-foreign-key-parent-change table references tuple)))))
-                (declare (ignore block off))
-                (check-heapam-write-status status)
-                (when deleted
-                  (setf key-changes (nreconc prepared-changes key-changes))
-                  (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
-                  (materialize-select-tuple table tuple *current-snapshot*)
-                  (logical-note-row-change :delete table :old-values (htup-values tuple)
-                                           :publication-selection publications)
-                  (emit-dml-returning stream (getf prepared :returning) (htup-values tuple)
-                                      :old-values (htup-values tuple) :new-values nil :source-values source)
-                  (incf count))
-                deleted))))
+         (flet ((delete-candidate (candidate source environment modified-p)
+                  (declare (ignore environment))
+                  (check-for-interrupts)
+                  (detach-select-index-scans)
+                  (unless modified-p
+                    (setf prepared-changes nil)
+                    (multiple-value-bind (deleted tuple block off status publications)
+                        (heapam-delete-tid
+                         rel columns (htup-block candidate) (htup-offnum candidate) xid
+                         (backend-command-id *backend*)
+                         ;; Recheck the latest target with the original matched source, like
+                         ;; EPQ's nonlocking source rowmarks.
+                         (lambda (tuple)
+                           (materialize-select-tuple table tuple *current-snapshot*)
+                           (call-with-dml-expression-evaluation
+                            (lambda ()
+                              (or (null where)
+                                  (true-p (eval-expr where (concatenate 'vector (htup-values tuple) source)))))))
+                         (lambda () (logical-capture-publications (list table) :delete))
+                         t candidate
+                         (when references
+                           (lambda (tuple)
+                             (setf prepared-changes (lock-foreign-key-parent-change table references tuple)))))
+                      (declare (ignore block off))
+                      (check-heapam-write-status status)
+                      (when deleted
+                        (setf key-changes (nreconc prepared-changes key-changes))
+                        (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
+                        (materialize-select-tuple table tuple *current-snapshot*)
+                        (logical-note-row-change :delete table :old-values (htup-values tuple)
+                                                 :publication-selection publications)
+                        (emit-dml-returning stream (getf prepared :returning) (htup-values tuple)
+                                            :old-values (htup-values tuple) :new-values nil :source-values source)
+                        (incf count))
+                      deleted))))
+           (if (and cascade-p (null references) (null (pg-class-toast table))
+                    (not (logical-capture-xid-needed-p xid)))
+               (let ((batched (delete-cascade-candidates prepared table rel xid #'delete-candidate)))
+                 (incf count batched))
+               (stream-joined-dml-candidates prepared table #'delete-candidate)))
          (check-foreign-key-parent-changes table (nreverse key-changes) nil)
          (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count) count))))))
 
@@ -823,7 +937,8 @@ Assignment evaluation already coerces to the destination typmod and checks origi
      (lambda (table rel xid)
        (let* ((columns (getf prepared :columns)) (count 0)
                                                  (references (referencing-foreign-keys table))
-                                                 (toast-demand (unless (or references (pg-class-foreign-keys table))
+                                                 (child-probes (prepare-child-foreign-key-probes table))
+                                                 (toast-demand (unless (or references child-probes)
                                                                  (simple-update-toast-demand prepared table xid)))
                                                  (prepared-changes nil)
                                                  (key-changes nil)
@@ -870,10 +985,10 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                     (multiple-value-bind (block off)
                         (replace-claimed-dml-tuple table tuple old-block old-offnum xid new sets
                                                    compressed descriptors *current-snapshot* :toast-demand toast-demand)
-                      (when (pg-class-foreign-keys table)
+                      (when child-probes
                         (setf key-references
                               (nconc (lock-foreign-key-child-references
-                                      table new (list block off (backend-command-id *backend*))
+                                      table child-probes new (list block off (backend-command-id *backend*))
                                       (htup-values tuple) (eql (htup-xmin tuple) xid))
                                      key-references))))
                     (emit-dml-returning stream (getf prepared :returning) new

@@ -1121,7 +1121,7 @@ as well. A physical ordered limit can use the bounded top-N node."
 (defun having-gate-value (expression)
   ;; Return VALUE, KNOWN-P.  Unknown leaves never enter EVAL-EXPR.  Boolean
   ;; absorption can nevertheless establish a constant around an opaque call.
-  (when (having-literal-expression-p expression)
+  (when (immutable-literal-expression-p expression)
     (return-from having-gate-value (values (eval-expr expression #()) t)))
   (labels ((constant (value source)
              (list :const value :type (expr-type source) :typmod (expr-typmod source)))
@@ -2998,33 +2998,34 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
        prepared
        (lambda (table node xid)
          (declare (ignore node xid))
-         (send-copy-in-response stream (length attnums))
-         (map-copy-in-text-rows
-          stream (length attnums)
-          (lambda (fields)
-            (check-for-interrupts)
-            (let ((row (make-array (length columns) :initial-element +null+)))
-              (loop for column across columns for attnum from 1
-                    for supplied = (member attnum attnums)
-                    unless (or supplied (pg-column-dropped-p column))
-                      do (setf (aref row (1- attnum)) (coerce-dml-column-default column)))
-              (loop for attnum in attnums for value in fields
-                    for column = (aref columns (1- attnum))
-                    do (setf (aref row (1- attnum))
-                             (if (eq value +null+) +null+
-                                 (coerce-dml-assignment-value value :text (pg-column-type column)
-                                                              (pg-column-typmod column) t))))
-              (check-not-null row columns)
-              (check-table-constraints table row)
-              (multiple-value-bind (block off publications)
-                  (insert-tuple-with-unique table row :publication-kind :insert)
-                (logical-note-row-change :insert table :new-values row :publication-selection publications)
-                (when (pg-class-foreign-keys table)
-                  (setf references (nconc (lock-foreign-key-child-references
-                                           table row (list block off (backend-command-id *backend*)))
-                                          references))))
-              (incf count))))
-         (check-foreign-key-child-references table references)))
+         (let ((child-probes (prepare-child-foreign-key-probes table)))
+           (send-copy-in-response stream (length attnums))
+           (map-copy-in-text-rows
+            stream (length attnums)
+            (lambda (fields)
+              (check-for-interrupts)
+              (let ((row (make-array (length columns) :initial-element +null+)))
+                (loop for column across columns for attnum from 1
+                      for supplied = (member attnum attnums)
+                      unless (or supplied (pg-column-dropped-p column))
+                        do (setf (aref row (1- attnum)) (coerce-dml-column-default column)))
+                (loop for attnum in attnums for value in fields
+                      for column = (aref columns (1- attnum))
+                      do (setf (aref row (1- attnum))
+                               (if (eq value +null+) +null+
+                                   (coerce-dml-assignment-value value :text (pg-column-type column)
+                                                                (pg-column-typmod column) t))))
+                (check-not-null row columns)
+                (check-table-constraints table row)
+                (multiple-value-bind (block off publications)
+                    (insert-tuple-with-unique table row :publication-kind :insert)
+                  (logical-note-row-change :insert table :new-values row :publication-selection publications)
+                  (when child-probes
+                    (setf references (nconc (lock-foreign-key-child-references
+                                             table child-probes row (list block off (backend-command-id *backend*)))
+                                            references))))
+                (incf count))))
+           (check-foreign-key-child-references table references))))
       count)))
 
 (defun exec-copy-to (stream ast)

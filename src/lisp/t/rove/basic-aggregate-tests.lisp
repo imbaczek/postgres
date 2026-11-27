@@ -52,13 +52,13 @@
                              :array-left literal :array-items (list literal)
                              :comparisons (list (list literal literal))
                              :metadata column)))
-      (rove:ok (having-literal-expression-p expression))
+      (rove:ok (immutable-literal-expression-p expression))
       (dolist (option (list (cons :array-left column)
                             (cons :array-items (list column))
                             (cons :comparisons (list (list literal column)))))
         (let ((copy (copy-list expression)))
           (setf (getf (cddddr copy) (car option)) (cdr option))
-          (rove:ok (not (having-literal-expression-p copy)))
+          (rove:ok (not (immutable-literal-expression-p copy)))
           (rove:ok (not (nth-value 1 (having-gate-value (having-gate-skeleton copy)))))))))
 
 (rove:deftest having-case-folding-keeps-branch-metadata-opaque
@@ -73,7 +73,7 @@
       (rove:ok (not (nth-value 1 (having-gate-value skeleton))))
       (setf (caar (second expression)) '(:bool t))
       (rove:ok (not (expression-contains-column-p expression)))
-      (rove:ok (having-literal-expression-p expression))
+      (rove:ok (immutable-literal-expression-p expression))
       (rove:ok (equal (multiple-value-list (having-gate-value expression)) '(t t)))))
 
 (rove:deftest default-folding-preserves-opaque-operand-metadata
@@ -1478,6 +1478,18 @@
       (rove:ok (string= "12:00:00+01" (sql-timetz-output (sql-timetz-input "12:00" -1 zone 1704067200))))
       (rove:ok (string= "12:00:00+02" (sql-timetz-output (sql-timetz-input "12:00" -1 zone 1719835200))))))
 
+(rove:deftest absolute-datetime-input-resolves-only-needed-session-defaults
+    (let ((zone (sql-load-timezone "Europe/Warsaw"))
+          (unexpected (lambda () (error "unexpected session default lookup"))))
+      (rove:ok (= (sql-timestamp-input "2000-01-01 01:00:00+01" -1 t unexpected :mdy unexpected) 0))
+      (rove:ok (= (sql-timestamp-input "2000-01-01 01:00:00" -1 t (lambda () zone) :mdy unexpected)
+                  0))
+      (rove:ok (= (sql-time-input "01:00:00" -1 unexpected) 3600000000))
+      (rove:ok (string= (sql-timetz-output
+                         (sql-timetz-input "01:00:00+01:30" -1 unexpected nil unexpected))
+                        "01:00:00+01:30"))
+      (rove:ok (= (sql-time-input "now" -1 (lambda () 3600000000)) 3600000000))))
+
 (rove:deftest relative-datetime-uses-transaction-instant
     (let* ((zone (sql-load-timezone "Europe/Warsaw"))
            (unix (+ (* (+ (* (sql-tz-days-from-civil 2024 3 30) 86400) 84600) 1000000) 123456))
@@ -1490,6 +1502,20 @@
       (rove:ok (= (- tomorrow today) (* 23 3600000000)))
       (rove:ok (string= "00:30:00.123456+01"
                         (sql-timetz-output (sql-timetz-input "now" -1 zone nil unix))))))
+
+(rove:deftest explicit-interval-units-retain-calendar-fields
+    (dolist (case '(("-2 YRS" -24 0 0)
+                    ("+3 WEEKS" 0 21 0)
+                    ("5 ms" 0 0 5000)
+                    ("-7 usec" 0 0 -7)
+                    ("1 YEAR -2 months 3 weeks -4 DAYS -0.125 seconds +2 ms" 10 17 -123000)
+                    ("+.5 minutes" 0 0 30000000)
+                    ("1.0000006 seconds" 0 0 1000001)))
+      (destructuring-bind (text months days microseconds) case
+        (let ((expected (make-sql-interval months days microseconds)))
+          (rove:ok (equalp (sql-interval-input text) expected))
+          (rove:ok (equalp (sql-interval-input (concatenate 'string " " text " ")) expected)))))
+  (rove:ok (rove:signals (sql-interval-input "1 second 2 secs") 'pg-error)))
 
 (rove:deftest interval-generic-typmod-ddl-roundtrip
     (let* ((typmod (logior (ash 4 16) 3))

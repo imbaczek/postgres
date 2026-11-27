@@ -1847,31 +1847,34 @@ Visit present uppers before lowers and preserve omitted bounds."
     copy))
 
 (defun analyze-cast-expression (expression scope)
-  (let* ((raw (second expression))
-         (target (third expression)) (typmod (fourth expression))
-         (argument
-           (if (and (or (sql-array-element-type target) (eq target :int2vector))
-                    (eq (first raw) :array-literal))
-               (analyze-array-literal raw scope (if (eq target :int2vector) :int2
-                                                    (sql-array-element-type target)))
-               (analyze-expr raw scope)))
-         (source (expr-type argument))
-         (unknown-literal (and (eq (first raw) :const)
-                               (or (stringp (second raw)) (eq (second raw) +null+)))))
-    (sql-expression-type-description target)
-    (unless (or unknown-literal
-                (and (eq target :int2vector) (eq (first raw) :array-literal))
-                (sql-cast-allowed-p source target))
-      (ereport "42846" "cannot cast type ~a to ~a" source target))
-    (cond
-      (unknown-literal
-       (list :const (sql-cast-value (second raw) source target typmod t) :explicit-cast t
-             :type target :typmod typmod))
-      ((and (eq source target) (= typmod -1) (not (eq target :bit)))
-       (when (and (eq (first argument) :const) (member target '(:int2 :int4 :int8)))
-         (sql-cast-value (second argument) source target typmod))
-       argument)
-      (t (list :cast argument :type target :typmod typmod)))))
+  (let ((raw (second expression))
+        (target (third expression))
+        (typmod (fourth expression)))
+    ;; Untyped strings and NULL have a known source type. They do not need
+    ;; an intermediate analyzed constant before the cast can be folded.
+    (when (and (eq (first raw) :const)
+               (or (stringp (second raw)) (eq (second raw) +null+)))
+      (sql-expression-type-description target)
+      (return-from analyze-cast-expression
+        (list :const (sql-cast-value (second raw) :text target typmod t) :explicit-cast t
+              :type target :typmod typmod)))
+    (let* ((int2vector-literal (and (eq target :int2vector) (eq (first raw) :array-literal)))
+           (argument
+             (if (and (or (sql-array-element-type target) int2vector-literal)
+                      (eq (first raw) :array-literal))
+                 (analyze-array-literal raw scope (if int2vector-literal :int2
+                                                      (sql-array-element-type target)))
+                 (analyze-expr raw scope)))
+           (source (expr-type argument)))
+      (sql-expression-type-description target)
+      (unless (or int2vector-literal (sql-cast-allowed-p source target))
+        (ereport "42846" "cannot cast type ~a to ~a" source target))
+      (if (and (eq source target) (= typmod -1) (not (eq target :bit)))
+          (progn
+            (when (and (eq (first argument) :const) (member target '(:int2 :int4 :int8)))
+              (sql-cast-value (second argument) source target typmod))
+            argument)
+          (list :cast argument :type target :typmod typmod)))))
 
 (defun analyze-text-concatenation (left right)
   "Resolve textcat and text/anynonarray overloads without treating arrays as text."
@@ -3713,12 +3716,12 @@ Stop at the first difference, leaving later field types and counts unchecked."
         (a nil)
         (t t)))
 
-(defun sql-in-value (value candidates negated-p)
+(defun sql-in-value (value candidates negated-p &optional projection)
   "Evaluate membership with SQL NULL semantics and a single left-hand value."
   (let ((result
           (loop with null-seen-p = nil
                 for candidate in candidates
-                for match = (sql-compare "=" value candidate)
+                for match = (sql-compare "=" value (if projection (funcall projection candidate) candidate))
                 when (eq match t) return t
                   when (eq match +null+) do (setf null-seen-p t)
                     finally (return (if null-seen-p +null+ nil)))))
@@ -3935,9 +3938,11 @@ the full 64-bit ID as a signed value."
         (negated-p (fourth expr))
         (null-seen-p nil))
     (when array-items
-      (let ((result (sql-in-value
-                     (eval-expr (getf (nthcdr 4 expr) :array-left) env)
-                     (mapcar (lambda (item) (eval-expr item env)) array-items) nil)))
+      (let* ((left (eval-expr (getf (nthcdr 4 expr) :array-left) env))
+             (result (if (every (lambda (item) (eq (first item) :const)) array-items)
+                         (sql-in-value left array-items nil #'second)
+                         (sql-in-value left (mapcar (lambda (item) (eval-expr item env)) array-items)
+                                       nil))))
         (when (eq result t) (return-from eval-in-expression (not negated-p)))
         (when (eq result +null+) (setf null-seen-p t))))
     (dolist (comparison (getf (nthcdr 4 expr) :comparisons))

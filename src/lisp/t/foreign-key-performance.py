@@ -189,11 +189,25 @@ def run_c(binaries, workload, samples):
                            check=True, stdout=subprocess.DEVNULL)
 
 
+def run_comparison(binaries, workload, samples, capture_allocations):
+    run_c(binaries, workload, samples)
+    server = OwnedLisp()
+    try:
+        server.start()
+        run_suite(server.port, server, workload, samples, capture_allocations)
+    finally:
+        server.stop()
+        shutil.rmtree(server.root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--postgres-bin", type=Path, required=True)
     parser.add_argument("--suite", choices=("primary", "width", "work", "holdout"), default="primary")
-    parser.add_argument("--case", help="Run one case in fresh server processes for an isolated RSS comparison")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--case", help="Run one case in fresh server processes")
+    selection.add_argument("--isolate-cases", action="store_true",
+                           help="Start fresh server processes for each case in the suite")
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--skip-allocation", action="store_true")
     args = parser.parse_args()
@@ -202,14 +216,10 @@ def main():
     workload = [case for case in cases(args.suite) if args.case is None or case[0] == args.case]
     if not workload:
         parser.error(f"{args.case!r} is not in the {args.suite} suite")
-    run_c(args.postgres_bin.resolve(), workload, args.samples)
-    server = OwnedLisp()
-    try:
-        server.start()
-        run_suite(server.port, server, workload, args.samples, not args.skip_allocation)
-    finally:
-        server.stop()
-        shutil.rmtree(server.root)
+    workloads = ([case] for case in workload) if args.isolate_cases else (workload,)
+    binaries = args.postgres_bin.resolve()
+    for selected in workloads:
+        run_comparison(binaries, selected, args.samples, not args.skip_allocation)
 
 
 if __name__ == "__main__":

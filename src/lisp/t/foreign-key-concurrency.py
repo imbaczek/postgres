@@ -155,6 +155,129 @@ def verify_parent_changes(server):
                 raise AssertionError(f"child change accepted a missing parent: {statement}")
 
 
+def verify_empty_cascade_does_not_admit_grandchild(server):
+    with contextlib.closing(Connection(server.port)) as parent, contextlib.closing(Connection(server.port)) as ddl:
+        parent.query("CREATE TABLE empty_cascade_parent (id integer PRIMARY KEY)")
+        parent.query(
+            "CREATE TABLE empty_cascade_child (id integer PRIMARY KEY "
+            "REFERENCES empty_cascade_parent ON DELETE CASCADE)"
+        )
+        parent.query(
+            "CREATE TABLE empty_cascade_leaf (id integer "
+            "REFERENCES empty_cascade_child ON DELETE CASCADE)"
+        )
+        parent.query("INSERT INTO empty_cascade_parent VALUES (1)")
+        parent.query("BEGIN")
+        parent.query("DELETE FROM empty_cascade_parent WHERE id=1")
+        ddl.query("SET statement_timeout = '2s'")
+        ddl.query("DROP TABLE empty_cascade_leaf")
+        parent.query("COMMIT")
+
+
+def verify_batched_insert_savepoint(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE batch_parent (id integer PRIMARY KEY)")
+        connection.query("CREATE TABLE batch_child (id integer NOT NULL REFERENCES batch_parent)")
+        rows = ",".join(f"({value})" for value in range(130))
+        connection.query(f"INSERT INTO batch_parent VALUES {rows}")
+        connection.query("BEGIN")
+        connection.query("INSERT INTO batch_child VALUES (0)")
+        connection.query("SAVEPOINT batch_rows")
+        connection.query(f"INSERT INTO batch_child VALUES {rows}")
+        assert connection.query("SELECT count(*) FROM batch_child") == [["131"]]
+        connection.query("ROLLBACK TO batch_rows")
+        assert connection.query("SELECT id FROM batch_child") == [["0"]]
+        connection.query("COMMIT")
+        try:
+            connection.query(f"INSERT INTO batch_child VALUES {rows},(999)")
+        except WireError as error:
+            assert error.sqlstate == "23503", error
+        else:
+            raise AssertionError("batched insert committed a missing foreign key")
+        assert connection.query("SELECT id FROM batch_child") == [["0"]]
+
+
+def verify_batched_cascade_savepoint(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE cascade_batch_parent (id integer PRIMARY KEY)")
+        connection.query(
+            "CREATE TABLE cascade_batch_child (seq integer, parent_id integer "
+            "REFERENCES cascade_batch_parent ON DELETE CASCADE)"
+        )
+        connection.query("INSERT INTO cascade_batch_parent VALUES (1),(2)")
+        rows = ",".join(f"({value},1)" for value in range(250))
+        connection.query(f"INSERT INTO cascade_batch_child VALUES {rows},(250,2)")
+        # Leave a version with aborted xmax to exercise the scalar fallback.
+        connection.query("BEGIN")
+        connection.query("UPDATE cascade_batch_child SET parent_id=2 WHERE seq=70")
+        connection.query("ROLLBACK")
+        connection.query("BEGIN")
+        connection.query("INSERT INTO cascade_batch_child VALUES (251,1)")
+        connection.query("SAVEPOINT before_cascade")
+        connection.query("DELETE FROM cascade_batch_parent WHERE id=1")
+        assert connection.query("SELECT seq FROM cascade_batch_child") == [["250"]]
+        connection.query("ROLLBACK TO before_cascade")
+        assert connection.query("SELECT count(*) FROM cascade_batch_child") == [["252"]]
+        assert connection.query("SELECT parent_id FROM cascade_batch_child WHERE seq=251") == [["1"]]
+        connection.query("DELETE FROM cascade_batch_parent WHERE id=1")
+        connection.query("COMMIT")
+        assert connection.query("SELECT seq FROM cascade_batch_child") == [["250"]]
+
+
+def verify_batched_cascade_rechecks_updated_row(server):
+    with contextlib.closing(Connection(server.port)) as deleter, contextlib.closing(
+        Connection(server.port)
+    ) as updater, ThreadPoolExecutor(max_workers=1) as worker:
+        deleter.query("INSERT INTO cascade_batch_parent VALUES (1)")
+        deleter.query("INSERT INTO cascade_batch_child VALUES (1,1),(2,1),(3,1)")
+        deleter.query("SET application_name = 'test-cascade-batch'")
+        server.control("""
+            (defparameter *test-cascade-batch-original* (fdefinition 'heapam-delete-page-candidates))
+            (defparameter *test-cascade-batch-ready* (sb-thread:make-semaphore))
+            (defparameter *test-cascade-batch-resume* (sb-thread:make-semaphore))
+            (defparameter *test-cascade-batch-paused* nil)
+            (setf (fdefinition 'heapam-delete-page-candidates)
+                  (lambda (node block candidates xid cid)
+                    (when (and (not *test-cascade-batch-paused*)
+                               (equal (backend-application-name *backend*) "test-cascade-batch"))
+                      (setf *test-cascade-batch-paused* t)
+                      (sb-thread:signal-semaphore *test-cascade-batch-ready*)
+                      (assert (sb-thread:wait-on-semaphore *test-cascade-batch-resume* :timeout 10)))
+                    (funcall *test-cascade-batch-original* node block candidates xid cid)))
+        """)
+        deletion = worker.submit(deleter.query, "DELETE FROM cascade_batch_parent WHERE id=1")
+        try:
+            try:
+                assert "\nT\n" in server.control(
+                    "(not (null (sb-thread:wait-on-semaphore *test-cascade-batch-ready* :timeout 5)))"
+                )
+                updater.query("SET statement_timeout = '2s'")
+                updater.query("UPDATE cascade_batch_child SET parent_id=2 WHERE seq=2")
+            finally:
+                server.control("(sb-thread:signal-semaphore *test-cascade-batch-resume*)")
+            deletion.result(timeout=10)
+        finally:
+            server.control("(setf (fdefinition 'heapam-delete-page-candidates) *test-cascade-batch-original*)")
+        assert updater.query("SELECT seq, parent_id FROM cascade_batch_child ORDER BY seq") == [
+            ["2", "2"], ["250", "2"]
+        ]
+
+
+def verify_probe_skips_deleted_versions(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE probe_parent (id varchar(127) PRIMARY KEY)")
+        connection.query("CREATE TABLE probe_child (id varchar(127) REFERENCES probe_parent)")
+        key = "'" + "x" * 127 + "'"
+        connection.query("BEGIN")
+        for _ in range(75):
+            connection.query(f"INSERT INTO probe_parent VALUES ({key})")
+            connection.query(f"DELETE FROM probe_parent WHERE id={key}")
+        connection.query(f"INSERT INTO probe_parent VALUES ({key})")
+        connection.query("COMMIT")
+        connection.query(f"INSERT INTO probe_child VALUES ({key})")
+        assert connection.query("SELECT count(*) FROM probe_child") == [["1"]]
+
+
 def verify_child_parent_races(server):
     with contextlib.closing(Connection(server.port)) as first, contextlib.closing(
         Connection(server.port)
@@ -623,6 +746,9 @@ def verify_recovered_constraint(server):
             ["1", "64000"], ["2", "3"], ["4", "8"]
         ]
         assert connection.query("SELECT id FROM deferred_child ORDER BY id") == [["53"]]
+        assert connection.query("SELECT seq, parent_id FROM cascade_batch_child ORDER BY seq") == [
+            ["2", "2"], ["250", "2"]
+        ]
         assert connection.query(
             "SELECT convalidated FROM pg_constraint WHERE conname='needs_validation'"
         ) == [["t"]]
@@ -681,6 +807,11 @@ if __name__ == "__main__":
         server.start()
         verify_existing_rows_validation(server)
         verify_parent_changes(server)
+        verify_empty_cascade_does_not_admit_grandchild(server)
+        verify_batched_insert_savepoint(server)
+        verify_batched_cascade_savepoint(server)
+        verify_batched_cascade_rechecks_updated_row(server)
+        verify_probe_skips_deleted_versions(server)
         verify_child_parent_races(server)
         verify_composite_self_reference(server)
         verify_inline_create_reference(server)

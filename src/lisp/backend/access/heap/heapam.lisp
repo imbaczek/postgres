@@ -55,13 +55,7 @@
 (defun heap-page-insert-capacity (page)
   "Return free bytes plus one line pointer when LP_UNUSED can be reused."
   (+ (page-free-space page)
-     (if (loop for offnum from 1 to (page-lp-count page)
-                 thereis (multiple-value-bind (off flags len)
-                             (page-get-lp page offnum)
-                           (declare (ignore off len))
-                           (= flags +lp-unused+)))
-         +size-of-item-id+
-         0)))
+     (if (page-first-unused-slot page) +size-of-item-id+ 0)))
 
 (defun heap-fsm-forget (relfilenode)
   (sb-thread:with-mutex (*heap-fsm-lock*)
@@ -291,20 +285,18 @@ must remain stable while the layout is used."
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (values cursor offsets varlena-data infomask)))
 
-(defun form-heap-tuple (values columns xmin xmax cid block off)
+(defun form-heap-tuple (values columns xmin xmax cid block off &optional return-varlena-p)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
 Inline :bytea values are octet vectors copied into the returned tuple; callers
 must keep them stable during this call. :varchar, :text, :json, :jsonb, :bytea and :numeric may instead be
 physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
-This codec does not create or fetch TOAST data."
-  (let* ((natts (length columns))
-         (hoff (heap-tuple-header-size values))
-         (layout (multiple-value-list (heap-tuple-layout values columns)))
-         (cursor (first layout))
-         (offsets (second layout))
-         (varlena-data (third layout))
-         (infomask (fourth layout)))
-    (let ((bytes (make-array cursor :element-type '(unsigned-byte 8)
+This codec does not create or fetch TOAST data. RETURN-VARLENA-P also returns
+the encoded varlena payloads for reuse within this row."
+  (multiple-value-bind (cursor offsets varlena-data infomask)
+      (heap-tuple-layout values columns)
+    (let ((natts (length columns))
+          (hoff (heap-tuple-header-size values))
+          (bytes (make-array cursor :element-type '(unsigned-byte 8)
                                     :initial-element 0)))
       ;; HeapTupleHeaderData stores 32-bit TransactionIds. The allocator keeps
       ;; full XIDs and advances the epoch when these low 32 bits wrap.
@@ -363,7 +355,7 @@ This codec does not create or fetch TOAST data."
                            (page-set-u32 bytes off (logior (ash (+ 4 (length data)) 2)
                                                            (if (heap-compressed-varlena-p v) 2 0)))
                            (replace bytes data :start1 (+ off 4))))))))))
-      bytes)))
+      (if return-varlena-p (values bytes varlena-data) bytes))))
 
 (defun heap-encode-external-varlena (pointer)
   "Return a fresh little-endian physical descriptor, validating field widths.
@@ -553,15 +545,29 @@ reject external and compressed datums and lengths outside BYTES."
   (let ((value (page-u32 bytes offset)))
     (if (logbitp 31 value) (- value #x100000000) value)))
 
+(declaim (inline heap-read-int8))
+
+(defun heap-read-int8 (bytes offset)
+  (let ((bits (page-u64 bytes offset)))
+    (if (logbitp 63 bits) (- bits #x10000000000000000) bits)))
+
 (declaim (inline single-fixed-heap-tuple-offset))
+
+(declaim (inline single-heap-attribute-cursor))
+
+(defun single-heap-attribute-cursor (page start limit infomask)
+  "Return the data cursor of a non-NULL attribute in a singleton tuple."
+  (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length page))
+    (ereport "XX001" "invalid heap tuple bounds"))
+  (let ((cursor (heap-tuple-data-offset page start limit 1 infomask)))
+    (unless (and (logtest infomask +heap-hasnull+)
+                 (logbitp 0 (aref page (+ start +size-of-heap-tuple-header+))))
+      cursor)))
 
 (defun single-fixed-heap-tuple-offset (bytes start limit infomask width alignment)
   "Return the offset of a non-NULL fixed-width attribute in a single-column tuple."
-  (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
-    (ereport "XX001" "invalid heap tuple bounds"))
-  (let ((cursor (heap-tuple-data-offset bytes start limit 1 infomask)))
-    (unless (and (logtest infomask +heap-hasnull+)
-                 (logbitp 0 (aref bytes (+ start +size-of-heap-tuple-header+))))
+  (let ((cursor (single-heap-attribute-cursor bytes start limit infomask)))
+    (when cursor
       (let ((offset (+ start (align-up (- cursor start) alignment))))
         (unless (<= (+ offset width) limit)
           (ereport "XX001" "truncated heap attribute"))
@@ -610,17 +616,14 @@ the input page."
                      (setf cursor (+ start (align-up (- cursor start) (column-align col)))))
                    (heap-decode-case type cursor limit
                      (:timetz
-                      (let ((micros (page-u64 bytes cursor)) (zone (page-u32 bytes (+ cursor 8))))
-                        (when (logbitp 63 micros) (decf micros #x10000000000000000))
-                        (when (logbitp 31 zone) (decf zone #x100000000))
-                        (setf (aref values i) (make-sql-timetz micros zone))))
+                      (setf (aref values i)
+                            (make-sql-timetz (heap-read-int8 bytes cursor)
+                                             (heap-read-int4 bytes (+ cursor 8)))))
                      (:interval
-                      (let ((micros (page-u64 bytes cursor)) (days (page-u32 bytes (+ cursor 8)))
-                                                             (months (page-u32 bytes (+ cursor 12))))
-                        (when (logbitp 63 micros) (decf micros #x10000000000000000))
-                        (when (logbitp 31 days) (decf days #x100000000))
-                        (when (logbitp 31 months) (decf months #x100000000))
-                        (setf (aref values i) (make-sql-interval months days micros))))
+                      (setf (aref values i)
+                            (make-sql-interval (heap-read-int4 bytes (+ cursor 12))
+                                               (heap-read-int4 bytes (+ cursor 8))
+                                               (heap-read-int8 bytes cursor))))
                      (:float4
                       (setf (aref values i) (sql-float-from-bits (page-u32 bytes cursor) :float4)))
                      (:float8
@@ -636,19 +639,19 @@ the input page."
                      ((:int4 :date)
                       (setf (aref values i) (heap-read-int4 bytes cursor)))
                      ((:int8 :time :timestamp :timestamptz)
-                      (let ((v (page-u64 bytes cursor)))
-                        (when (>= v #x8000000000000000)
-                          (decf v #x10000000000000000))
-                        (setf (aref values i) v)))
+                      (setf (aref values i) (heap-read-int8 bytes cursor)))
                      (otherwise
                       (when varlena-p
                         (when (>= cursor limit) (ereport "XX001" "truncated heap attribute"))
                         (if (and (null demand) (null max-varlena-size)
-                                 (member type '(:text :varchar :json))
+                                 (member type '(:text :varchar :json :numeric))
                                  (/= 1 (aref bytes cursor))
                                  (/= 2 (logand 3 (aref bytes cursor))))
                             (multiple-value-bind (start end) (heap-inline-varlena-range bytes cursor limit)
-                              (setf (aref values i) (bytes->string bytes :start start :end end)
+                              (setf (aref values i)
+                                    (if (eq type :numeric)
+                                        (sql-numeric-from-varlena-payload bytes :start start :end end)
+                                        (bytes->string bytes :start start :end end))
                                     cursor end))
                             (multiple-value-bind (physical-end raw-size)
                                 (heap-varlena-physical-end-and-raw-size bytes cursor limit)
@@ -710,37 +713,55 @@ visibility and protect the lifetime of the owning parent separately."
 (defun heap-savepoint-recording-p ()
   (and *backend* (backend-savepoints *backend*) (not *heap-savepoint-undoing-p*)))
 
-(defun publish-heap-insert-page (relfilenode block page offnum xmin)
-  "Publish the page and retain the new tuple identity when undo is active."
+(defmacro publish-heap-page (relfilenode block page &optional owned-p)
+  "Stage a heap page and its visibility-map clear in the same WAL publication."
+  (let ((node (gensym "RELFILENODE-"))
+        (number (gensym "BLOCK-")))
+    `(let ((,node ,relfilenode)
+           (,number ,block))
+       (with-wal-page-batch
+         (buf-write ,node ,number ,page ,@(when owned-p '(:main :take-ownership)))
+         (visibilitymap-clear ,node ,number)))))
+
+(defun publish-heap-insert-page (relfilenode block page offsets xmin)
+  "Publish a page and record one offset or a newest-first list of offsets."
   (flet ((publish ()
-           (with-wal-page-batch
-             (buf-write relfilenode block page :main :take-ownership)
-             (visibilitymap-clear relfilenode block))))
+           (publish-heap-page relfilenode block page t)))
     (if (heap-savepoint-recording-p)
         (sb-sys:without-interrupts
-          (let ((journal (cons (list :insert relfilenode block offnum (xid32-of xmin))
-                               (backend-heap-undo-log *backend*))))
+          (let* ((xid (xid32-of xmin))
+                 (prior (backend-heap-undo-log *backend*))
+                 (journal
+                   (etypecase offsets
+                     (integer (cons (list :insert relfilenode block offsets xid) prior))
+                     (list (nconc (loop for offnum in offsets
+                                        collect (list :insert relfilenode block offnum xid))
+                                  prior)))))
             (publish)
             (setf (backend-heap-undo-log *backend*) journal)))
         (publish)))
   (mark-dirty relfilenode))
+
+(defun heap-page-add-tuple (page tuple block allow-reuse)
+  "Add TUPLE and associate its header with the stable line pointer."
+  (multiple-value-bind (offnum reused-p) (page-add-item page tuple :allow-reuse allow-reuse)
+    (when offnum
+      (let ((offset (page-get-lp page offnum)))
+        (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) block)
+        (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) offnum)))
+    (values offnum reused-p)))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
   (let* ((tuple (form-heap-tuple values columns xmin 0 cid 0 0))
          (fsm (heap-fsm-for-relation relfilenode))
          (required (+ +size-of-item-id+ (maxalign (length tuple)))))
-    (labels ((add-to-page (page block)
-               (let ((offnum (page-add-item page tuple :allow-reuse t)))
+    (labels ((add-to-page (page block allow-reuse)
+               (multiple-value-bind (offnum reused-p)
+                   (heap-page-add-tuple page tuple block allow-reuse)
                  (when offnum
-                   (multiple-value-bind (toff tflags tlen)
-                       (page-get-lp page offnum)
-                     (declare (ignore tflags tlen))
-                     (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+)
-                                   block)
-                     (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
-                                   offnum))
-                   (let ((capacity (heap-page-insert-capacity page)))
+                   (let ((capacity (if reused-p (heap-page-insert-capacity page)
+                                       (page-free-space page))))
                      (publish-heap-insert-page relfilenode block page offnum xmin)
                      (heap-fsm-record-page fsm block capacity)))
                  offnum)))
@@ -748,7 +769,7 @@ visibility and protect the lifetime of the owning parent separately."
             while block
             for page = (buf-read relfilenode block)
             when page
-              do (let ((offnum (add-to-page page block)))
+              do (let ((offnum (add-to-page page block t)))
                    (if offnum
                        (return-from heapam-insert (values block offnum))
                        ;; FSM entries are advisory, like PostgreSQL's. Refresh
@@ -759,27 +780,60 @@ visibility and protect the lifetime of the owning parent separately."
       ;; FSM has no reusable page with enough space, extend the relation.
       (let* ((block (buf-nblocks relfilenode))
              (page (page-init (make-page)))
-             (offnum (page-add-item page tuple :allow-reuse nil)))
+             (offnum (add-to-page page block nil)))
         (unless offnum
           (ereport "54000" "row is too large for a heap page"))
-        (multiple-value-bind (toff tflags tlen) (page-get-lp page offnum)
-          (declare (ignore tflags tlen))
-          (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) block)
-          (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
-        (let ((capacity (heap-page-insert-capacity page)))
-          (publish-heap-insert-page relfilenode block page offnum xmin)
-          (heap-fsm-record-page fsm block capacity))
         (values block offnum)))))
+
+(defun heapam-insert-formed-tuples (relfilenode tuples xmin)
+  "Insert a bounded list of preformed tuples and return their TIDs in input order.
+The caller holds the write lock. Each page remains private until its heap and
+visibility-map changes publish together. As in C heap_multi_insert, the page
+copy and publication are shared across rows, while each row gets a stable TID."
+  (when tuples
+    (let ((fsm (heap-fsm-for-relation relfilenode))
+          (tids nil))
+      (flet ((fill-page (page block allow-reuse)
+               (let ((offsets nil))
+                 (loop while tuples
+                       for tuple = (first tuples)
+                       while (or allow-reuse
+                                 (<= (+ +size-of-item-id+ (maxalign (length tuple)))
+                                     (page-free-space page)))
+                       for offnum = (heap-page-add-tuple page tuple block allow-reuse)
+                       while offnum
+                       do (pop tuples)
+                          (push offnum offsets)
+                          (push (cons block offnum) tids))
+                 (let ((capacity (heap-page-insert-capacity page)))
+                   (when offsets
+                     (publish-heap-insert-page relfilenode block page offsets xmin))
+                   (heap-fsm-record-page fsm block capacity))
+                 offsets)))
+        (loop while tuples
+              for required = (+ +size-of-item-id+ (maxalign (length (first tuples))))
+              for block = (heap-fsm-take-page fsm required)
+              do (if block
+                     (let ((page (buf-read relfilenode block)))
+                       (when page (fill-page page block t)))
+                     (let ((new-block (buf-nblocks relfilenode))
+                           (page (page-init (make-page))))
+                       (unless (fill-page page new-block nil)
+                         (ereport "54000" "row is too large for a heap page"))))))
+      (nreverse tids))))
+
+(defun heap-savepoint-header-entry (relfilenode block offnum page offset)
+  (list :header relfilenode block offnum
+        (page-u32 page (+ offset +heap-tuple-xmin-off+))
+        (page-u32 page (+ offset +heap-tuple-xmax-off+))
+        (page-u32 page (+ offset +heap-tuple-cid-off+))
+        (page-u16 page (+ offset +heap-tuple-infomask-off+))
+        (page-u32 page (+ offset +heap-tuple-ctid-block-off+))
+        (page-u16 page (+ offset +heap-tuple-ctid-offnum-off+))))
 
 (defun note-heap-savepoint-header (relfilenode block offnum page offset)
   (when (heap-savepoint-recording-p)
-    (push (list :header relfilenode block offnum
-                (page-u32 page (+ offset +heap-tuple-xmin-off+))
-                (page-u32 page (+ offset +heap-tuple-xmax-off+))
-                (page-u32 page (+ offset +heap-tuple-cid-off+))
-                (page-u16 page (+ offset +heap-tuple-infomask-off+))
-                (page-u32 page (+ offset +heap-tuple-ctid-block-off+))
-                (page-u16 page (+ offset +heap-tuple-ctid-offnum-off+)))
+    (push (heap-savepoint-header-entry relfilenode block offnum page offset)
           (backend-heap-undo-log *backend*))))
 
 (defmacro with-heap-tuple-edit ((page offset relfilenode block offnum &optional owned-p)
@@ -806,27 +860,72 @@ With OWNED-P, BODY must keep the private page local to the edit."
              (note-heap-savepoint-header ,relfilenode-value ,block-value ,offnum-value ,page ,offset)
              (multiple-value-prog1
                  (progn ,@body)
-               (with-wal-page-batch
-                 (buf-write ,relfilenode-value ,block-value ,page-value
-                            ,@(when owned-p '(:main :take-ownership)))
-                 (visibilitymap-clear ,relfilenode-value ,block-value))
+               (publish-heap-page ,relfilenode-value ,block-value ,page-value ,owned-p)
                (mark-dirty ,relfilenode-value))))))))
 
-(defun heapam-set-xmax (relfilenode block offnum xmax cid)
+(defun write-heap-delete-header (page offset xmax cid)
+  "Set a private tuple header's xmax and command ID before page publication."
   ;; Preserve an own insertion's cmin alongside cmax in the existing CID field.
   ;; The infomask distinguishes the transaction-local combo ID from an ordinary CID.
+  (let* ((mask (page-u16 page (+ offset +heap-tuple-infomask-off+)))
+         (own-insert (= (page-u32 page (+ offset +heap-tuple-xmin-off+)) (xid32-of xmax)))
+         (old-cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
+         (cmin (if (and own-insert (logtest +heap-combo-cid+ mask))
+                   (combo-command-id-values xmax old-cid) old-cid))
+         (stored (if own-insert (make-combo-command-id xmax cmin cid) cid)))
+    (page-set-u32 page (+ offset +heap-tuple-xmax-off+) (xid32-of xmax))
+    (page-set-u32 page (+ offset +heap-tuple-cid-off+) stored)
+    (page-set-u16 page (+ offset +heap-tuple-infomask-off+)
+                  (if own-insert (logior mask +heap-combo-cid+)
+                      (logandc2 mask +heap-combo-cid+)))
+    t))
+
+(defun heapam-set-xmax (relfilenode block offnum xmax cid)
   (with-heap-tuple-edit (page offset relfilenode block offnum :take-ownership)
-    (let* ((mask (page-u16 page (+ offset +heap-tuple-infomask-off+)))
-           (own-insert (= (page-u32 page (+ offset +heap-tuple-xmin-off+)) (xid32-of xmax)))
-           (old-cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
-           (cmin (if (and own-insert (logtest +heap-combo-cid+ mask))
-                     (combo-command-id-values xmax old-cid) old-cid))
-           (stored (if own-insert (make-combo-command-id xmax cmin cid) cid)))
-      (page-set-u32 page (+ offset +heap-tuple-xmax-off+) (xid32-of xmax))
-      (page-set-u32 page (+ offset +heap-tuple-cid-off+) stored)
-      (page-set-u16 page (+ offset +heap-tuple-infomask-off+)
-                    (if own-insert (logior mask +heap-combo-cid+)
-                        (logandc2 mask +heap-combo-cid+)))
+    (write-heap-delete-header page offset xmax cid)))
+
+(defun heap-page-item-visible-p (page offset snapshot &optional committed-xid-cache)
+  (heap-tuple-visible-p
+   (full-xid-from-32 (page-u32 page (+ offset +heap-tuple-xmin-off+)))
+   (full-xid-from-32 (page-u32 page (+ offset +heap-tuple-xmax-off+)))
+   (page-u32 page (+ offset +heap-tuple-cid-off+))
+   snapshot (and *backend* (backend-xid *backend*))
+   (page-u16 page (+ offset +heap-tuple-infomask-off+)) committed-xid-cache))
+
+(defun heapam-delete-page-candidates (relfilenode block candidates xid cid)
+  "Delete qualified same-page CANDIDATES in one publication, or return NIL.
+The statement retains the snapshot that protects candidate TIDs from reuse.
+Its writer admission and logical capture decision must precede this call."
+  (with-write-lock
+    (let ((page (buf-read relfilenode block))
+          (items nil)
+          (committed-xid-cache (list nil)))
+      (unless page (return-from heapam-delete-page-candidates nil))
+      (dolist (candidate candidates)
+        (let ((offnum (htup-offnum candidate)))
+          (unless (with-live-page-item (page offnum offset length)
+                    (unless (and (>= length +size-of-heap-tuple-header+)
+                                 (<= (+ offset length) (length page)))
+                      (ereport "XX001" "invalid heap tuple bounds"))
+                    ;; Leave conflicts, including an aborted xmax, to the scalar
+                    ;; path. No candidate is changed if any one needs rechecking.
+                    (when (and (zerop (page-u32 page (+ offset +heap-tuple-xmax-off+)))
+                               (not (on-conflict-row-lock-owner relfilenode block offnum xid))
+                               (heap-page-item-visible-p page offset *current-snapshot*
+                                                         committed-xid-cache))
+                      (push (cons offnum offset) items)))
+            (return-from heapam-delete-page-candidates nil))))
+      (let* ((recording (heap-savepoint-recording-p))
+             (journal (and recording (backend-heap-undo-log *backend*))))
+        (dolist (item (nreverse items))
+          (when recording
+            (push (heap-savepoint-header-entry relfilenode block (car item) page (cdr item))
+                  journal))
+          (write-heap-delete-header page (cdr item) xid cid))
+        (sb-sys:without-interrupts
+          (publish-heap-page relfilenode block page t)
+          (when recording (setf (backend-heap-undo-log *backend*) journal))
+          (mark-dirty relfilenode)))
       t)))
 
 (defun heapam-set-ctid-unlocked (relfilenode block offnum ctid-block ctid-offnum)
@@ -934,12 +1033,10 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
         (expected-xmin nil)
         (qualified-version (and qualified-tuple (heap-tuple-version-key qualified-tuple)))
         (prepared-version nil)
-        (visited (make-hash-table :test #'equal)))
+        (visited nil))
     (loop
-      (let ((key (cons target-block target-offnum)))
-        (when (gethash key visited)
-          (ereport "XX001" "heap tuple update chain contains a cycle"))
-        (setf (gethash key visited) t))
+      (when (and visited (gethash (cons target-block target-offnum) visited))
+        (ereport "XX001" "heap tuple update chain contains a cycle"))
       (let ((action
               (with-write-lock
                 (let* ((tuple (heapam-get-tuple relfilenode target-block
@@ -992,20 +1089,16 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
                (return (values nil nil nil nil :skip)))
              (when before-claim
                (funcall before-claim tuple)
-               (setf prepared-version qualified-version))
-             (remhash (cons target-block target-offnum) visited)))
+               (setf prepared-version qualified-version))))
           (:prepare-claim
            (funcall before-claim (second action))
-           (setf prepared-version qualified-version)
-           (remhash (cons target-block target-offnum) visited))
+           (setf prepared-version qualified-version))
           (:serialization-update-conflict
            (return (values nil nil nil nil :serialization-update-conflict)))
           (:serialization-delete-conflict
            (return (values nil nil nil nil :serialization-delete-conflict)))
           (:wait
            (wait-for-xid (second action) :recheck-on-wakeup-p t)
-           ;; Revisit this same TID after the writer ends; it is not a chain loop.
-           (remhash (cons target-block target-offnum) visited)
            ;; READ COMMITTED rechecks a row after its conflicting writer ends.
            ;; REPEATABLE READ retains its original horizon and reports a write
            ;; conflict if the waited-for transaction committed the row.
@@ -1015,6 +1108,9 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
              (when *backend*
                (setf (backend-snapshot *backend*) snapshot))))
           (:follow
+           (unless visited
+             (setf visited (make-hash-table :test #'equal)))
+           (setf (gethash (cons target-block target-offnum) visited) t)
            (setf target-block (second action)
                  target-offnum (third action)
                  expected-xmin (fourth action)
@@ -1034,7 +1130,35 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
                         snapshot
                         (and *backend* (backend-xid *backend*)) (htup-infomask tuple)))
 
-(defun heapam-scan-page (page block columns snapshot callback &optional prefilter demand)
+(defun heapam-page-tid-visible-p (page offnum snapshot)
+  "Check a line pointer's MVCC visibility without deforming its key."
+  (when page
+    (with-live-page-item (page offnum offset length)
+      (unless (and (>= length +size-of-heap-tuple-header+)
+                   (<= (+ offset length) (length page)))
+        (ereport "XX001" "invalid heap tuple bounds"))
+      (heap-page-item-visible-p page offset snapshot))))
+
+(defun heapam-tid-visible-p (relfilenode block offnum snapshot)
+  "Check MVCC visibility when the index key is sufficient to identify the row."
+  (with-buf-read-page (page relfilenode block)
+    (heapam-page-tid-visible-p page offnum snapshot)))
+
+(defun heap-single-inline-varlena-matches-p (matches page start limit infomask)
+  "Call MATCHES on an inline varlena payload without decoding the row.
+Return true for external or compressed values so ordinary deformation qualifies them."
+  (let ((cursor (single-heap-attribute-cursor page start limit infomask)))
+    (when cursor
+      (let ((offset (if (and (< cursor limit) (not (zerop (aref page cursor))))
+                        cursor
+                        (+ start (align-up (- cursor start) 4)))))
+        (when (>= offset limit) (ereport "XX001" "truncated heap attribute"))
+        (let ((header (aref page offset)))
+          (or (= header 1) (= (logand header 3) 2)
+              (multiple-value-bind (begin end) (heap-inline-varlena-range page offset limit)
+                (funcall matches page begin end))))))))
+
+(defun heapam-scan-page (page block columns snapshot callback &optional prefilter demand values-filter raw-filter)
   ;; Check visibility from the tuple header before copying or deforming attributes.
   ;; Like page_collect_tuples in src/backend/access/heap/heapam.c, only visible
   ;; tuples proceed through the scan; invisible tuple payloads are never decoded.
@@ -1050,6 +1174,8 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
         (when (and (heap-tuple-visible-p xmin xmax cid snapshot
                                          (and *backend* (backend-xid *backend*)) infomask
                                          committed-xid-cache)
+                   (or (null raw-filter)
+                       (funcall raw-filter page off (+ off len) infomask))
                    (or (null prefilter)
                        (funcall prefilter (deform-heap-tuple page columns :demand demand
                                                                           :start off :limit (+ off len)))))
@@ -1059,23 +1185,26 @@ xmax. It requires OUTSIDE-LOCK-RECHECK-P."
                                 ctid-block ctid-offnum physical-compressed)
               (deform-heap-tuple page columns :start off :limit (+ off len))
             (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
-            (let ((tuple (make-htup :block block :offnum offnum
-                                    :ctid-block ctid-block :ctid-offnum ctid-offnum
-                                    :xmin xmin :xmax xmax :cid cid :infomask infomask
-                                    :values values :physical-compressed physical-compressed)))
-              (when (eq (funcall callback tuple) :stop)
-                (return-from heapam-scan-page :stop)))))))))
+            (when (or (null values-filter) (funcall values-filter values))
+              (let ((tuple (make-htup :block block :offnum offnum
+                                      :ctid-block ctid-block :ctid-offnum ctid-offnum
+                                      :xmin xmin :xmax xmax :cid cid :infomask infomask
+                                      :values values :physical-compressed physical-compressed)))
+                (when (eq (funcall callback tuple) :stop)
+                  (return-from heapam-scan-page :stop))))))))))
 
-(defun heapam-scan (relfilenode columns snapshot callback &key prefilter demand)
+(defun heapam-scan (relfilenode columns snapshot callback &key prefilter demand values-filter raw-filter)
   "Call CALLBACK with each visible HTUP. CALLBACK may return :stop.
 PREFILTER receives values from a narrow deformation using zero-based DEMAND.
-Only tuples passing that predicate are fully deformed and passed to CALLBACK."
+Only tuples passing PREFILTER are fully deformed. VALUES-FILTER tests the full
+value vector before constructing an HTUP. RAW-FILTER can reject a tuple before
+any deformation using its page, bounds, and infomask."
   (let ((nblocks (buf-nblocks relfilenode))
         (handle (make-buf-page-handle)))
     (dotimes (block nblocks)
       (unwind-protect
            (let ((page (buf-acquire-read-page handle relfilenode block)))
-             (when (and page (eq (heapam-scan-page page block columns snapshot callback prefilter demand)
+             (when (and page (eq (heapam-scan-page page block columns snapshot callback prefilter demand values-filter raw-filter)
                                  :stop))
                (return)))
         (sb-sys:without-interrupts (buf-release-page handle)))))

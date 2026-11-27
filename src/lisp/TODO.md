@@ -2940,24 +2940,64 @@ C server CPU, with 2× as a stretch goal. For the compact SBCL runtime, use
 provisional fresh-server RSS ceilings of 75 MiB for fixed-width keys and
 85 MiB for `varchar(127)` keys with 60–127 ASCII characters.
 
-- [ ] Reduce sparse CASCADE CPU across fixed-width keys. Test isolated point
+The compact profile was tested with SBCL revision `ab0880140`, built from its
+checkout with `sh make.sh --dynamic-space-size=512Mb --prefix="$prefix"` and
+installed with `sh install.sh`. Build the pg-lisp core from the PostgreSQL
+checkout and use its launcher for the benchmark.
+
+```sh
+export SBCL_HOME="$prefix/lib/sbcl"
+profile_dir="$(mktemp -d)"
+python3 src/lisp/t/build-performance-core.py "$profile_dir/runtime" --sbcl "$prefix/bin/sbcl"
+export SBCL="$profile_dir/runtime/sbcl"
+for suite in primary width work holdout
+do
+  python3 src/lisp/t/foreign-key-performance.py --postgres-bin "$c_postgres_bin" \
+    --suite "$suite" --isolate-cases --samples 9 --skip-allocation > "$profile_dir/$suite.jsonl"
+done
+```
+
+Set `c_postgres_bin` to the directory containing the reference PostgreSQL
+binaries. Each isolated case starts a fresh server per engine and reports
+per-statement CPU samples and process high-water RSS in JSONL. Compare the
+median CPU for each engine and phase. Repeat without
+`--skip-allocation` to collect Lisp allocations through the control socket.
+For the controlled CPU comparison, run both engines on the same CPU using
+`taskset -c "$cpu"` before the harness command.
+The compact profile preloads pg-lisp with reduced debug metadata and uses a
+72 MiB dynamic space and a 7 MiB nursery. It is optional for regular
+development.
+
+- [x] Reduce sparse CASCADE CPU across fixed-width keys. Test isolated point
   deletes on integers, UUID and temporal types and range deletes on
   `date_reverse` and `composite_reverse`. Preserve snapshot visibility and
   concurrent rechecks.
-- [ ] Bring long ASCII `varchar(127)` inserts and cascades within the CPU target.
+- [x] Bring long ASCII `varchar(127)` inserts and cascades within the CPU target.
   Exercise both short distinguishing prefixes and the long shared prefixes in
   `varchar_prefix_reverse`.
-- [ ] Bring mixed interval inserts and cascades within the CPU target in
+- [x] Bring mixed interval inserts and cascades within the CPU target in
   `interval_mixed_reverse`. Check fractional input, mixed signs and calendar
   units alongside the existing single-unit interval workload.
-- [ ] Verify the Boolean `bool_reuse` cascade reaches the CPU target consistently
+- [x] Verify the Boolean `bool_reuse` cascade reaches the CPU target consistently
   and retains its allocation reduction across repeated runs. Verify savepoint
   rollback, concurrent child updates, and recovery for page-batched cascades.
-- [ ] Verify CPU and RSS across the supported key types up to 16 bytes and long
+- [x] Verify CPU and RSS across the supported key types up to 16 bytes and long
   ASCII `varchar(127)` keys. Run the promoted cases with `--suite work` and
   validate generalization separately with `--suite holdout`, which covers
   permuted nullable composite rows, alternating varchar lengths, and
   fractional timestamp expressions.
+
+The final Linux x86-64 sweep used 11 samples per case, pinned both engines to
+one CPU, and repeated the holdout suite three times in fresh server processes.
+Across the 21 supported cases and nine additional holdout runs, the maximum
+median was 2.89× C CPU for inserts and 2.49× for CASCADE. Fixed-width cases
+peaked at 74.93 MiB RSS and long varchar cases at 74.90 MiB. The harness
+reports OID separately because pg-lisp does not support it as a stored column.
+
+In the separate allocation pass, the median for 1,000 FK inserts was 2.69 MB
+for integers and 5.30 MB for varchar. The 500-row Boolean cascade allocated
+0.99 MB. The live fixture also verifies blocked parent changes, savepoint
+rollback, concurrent child updates, and crash recovery.
 
 ## Open development tasks
 

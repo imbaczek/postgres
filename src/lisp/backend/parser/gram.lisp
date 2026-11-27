@@ -10,17 +10,25 @@
 ;; zero-based cursor into that list.  Parser routines normally leave it at
 ;; the next unconsumed token; advancing beyond :EOF makes PCUR return NIL,
 ;; which PKIND, PVAL, and SYNTAX-ERROR do not accept.
-(defstruct sql-parser
+(defstruct (sql-parser (:constructor make-sql-parser
+                           (&key tokens (pos 0)
+                            &aux (token-vector (coerce tokens 'simple-vector)))))
+  ;; Statement text collection walks token spans through the list. Parser
+  ;; lookahead and backtracking use indexed access without rescanning it.
   tokens
+  (token-vector #() :type simple-vector :read-only t)
   (pos 0))
 
 (defvar *parse-type-modifiers-p* nil
   "Preserve unary plus when parsing type modifier expressions.")
 
-(defun pcur (p)
-  "Return the current token, or NIL past the token list."
+(defun pcur (p &optional (ahead 0))
+  "Return the current token or look ahead AHEAD tokens. Return NIL past the end."
   (declare (type sql-parser p))
-  (nth (sql-parser-pos p) (sql-parser-tokens p)))
+  (let ((tokens (sql-parser-token-vector p))
+        (position (+ (sql-parser-pos p) ahead)))
+    (when (< position (length tokens))
+      (svref tokens position))))
 
 (defun pnext (p)
   "Return the current token and advance the parser."
@@ -749,9 +757,18 @@ Range and negative checks occur when the LIMIT executes."
                 :source source :default-values default-values :on-conflict conflict
                 :returning returning :returning-options options))))))
 
+(defun parse-values-item (p)
+  "Parse a bare literal directly when the next token ends the VALUES item."
+  (if (and (member (pkind p) '(:integer :numeric :string :bit-string :parameter))
+           (let ((next (pcur p 1)))
+             (and next (eq (token-kind next) :punct)
+                  (member (token-value next) '("," ")") :test #'string=))))
+      (parse-primary p)
+      (parse-expr p)))
+
 (defun parse-values-row (p)
   (with-parens (p)
-    (parse-expr-list p)))
+    (loop collect (parse-values-item p) while (match-punct p #\,))))
 
 (defun parse-ident-list (p)
   (loop collect (pident p) while (match-punct p #\,)))
@@ -2057,7 +2074,7 @@ Arithmetic binds more tightly; comparison and boolean operators bind less tightl
 
 (defun parse-call-argument (parser)
   "Parse a positional argument or a named argument using => or :=."
-  (let ((next (nth (1+ (sql-parser-pos parser)) (sql-parser-tokens parser))))
+  (let ((next (pcur parser 1)))
     (if (and (eq (pkind parser) :ident) next
              (eq (token-kind next) :op)
              (member (token-value next) '("=>" ":=") :test #'string=))
@@ -2183,7 +2200,7 @@ WINDOWLESS-P excludes OVER where the FROM grammar requires a plain call."
     ((match-kw p "true") (list :bool t))
     ((match-kw p "false") (list :bool nil))
     ((and (kw-p p "interval")
-          (let ((next (nth (1+ (sql-parser-pos p)) (sql-parser-tokens p))))
+          (let ((next (pcur p 1)))
             (and next (eq (token-kind next) :punct) (string= (token-value next) "("))))
      (pnext p)
      (let ((typmod (parse-interval-typmod p)))
@@ -2192,7 +2209,7 @@ WINDOWLESS-P excludes OVER where the FROM grammar requires a plain call."
     ((and (not (token-quoted-p (pcur p)))
           (or (kw-p p "date") (kw-p p "time") (kw-p p "timestamp") (kw-p p "timestamptz")
               (kw-p p "interval") (kw-p p "uuid"))
-          (eq (token-kind (nth (1+ (sql-parser-pos p)) (sql-parser-tokens p))) :string))
+          (eq (token-kind (pcur p 1)) :string))
      (let ((type (cond ((kw-p p "date") :date) ((kw-p p "time") :time)
                        ((kw-p p "timestamp") :timestamp) ((kw-p p "interval") :interval)
                        ((kw-p p "uuid") :uuid) (t :timestamptz))))

@@ -27,6 +27,34 @@
               (rove:ok (null (resolve-select-index-range table path range #()))))))
         (rove:ok (null (path "SELECT label FROM events WHERE active = $2 AND lower(label) = $1"))))))
 
+(rove:deftest terminated-index-components-retain-their-byte-layout
+    (let* ((text (make-string 127 :initial-element #\x))
+           (octets (make-array 3 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(7 0 8)))
+           (key (encode-index-key (list text octets) '(:varchar :bytea)))
+           (expected (concatenate 'vector #(3) (make-array 127 :initial-element 120)
+                                  #(0 0 15 7 0 255 8 0 0))))
+      (rove:ok (equalp key expected))
+      (rove:ok (equalp (encode-index-key (list text) '(:varchar)) (subseq expected 0 130)))
+      (rove:ok (key< (encode-index-key '("x") '(:varchar))
+                     (encode-index-key (list text) '(:varchar)))))
+  (let* ((uuid (sql-uuid-input "01234567-89ab-cdef-0123-456789abcdef"))
+         (composite (encode-index-key (list uuid 10) '(:uuid :int4))))
+    (rove:ok (equalp (encode-index-key (list uuid) '(:uuid)) (subseq composite 0 17)))))
+
+(rove:deftest fixed-index-components-retain-their-byte-order
+    (dolist (example '((:int2 -2 #(5 127 254))
+                       (:int4 0 #(1 128 0 0 0))
+                       (:int8 -1 #(2 127 255 255 255 255 255 255 255))
+                       (:date 1 #(8 128 0 0 1))
+                       (:bool nil #(19 0))
+                       (:float4 1.0f0 #(6 191 128 0 0))))
+      (destructuring-bind (type datum expected) example
+        (let ((singleton (encode-index-key (list datum) (list type)))
+              (composite (encode-index-key (list datum t) (list type :bool))))
+          (rove:ok (equalp singleton expected))
+          (rove:ok (equalp singleton (subseq composite 0 (length singleton))))))))
+
 (rove:deftest test-expression-index-catalog-roundtrip
     (let* ((table (make-pg-class :oid 101 :name "events"
                                  :columns (vector
@@ -356,8 +384,15 @@
         ;; The first separator can be stale after an insert below the old minimum.
         (dolist (probe '("" "a" "b" "c" "d" "e" "z" "zz"))
           (multiple-value-bind (first last) (btree-equal-child-range entries (key probe))
-            (rove:ok (equalp (btree-equal-page-children page (key probe))
-                             (map 'vector #'cdr (subseq entries first (1+ last))))))))))
+            (let* ((expected (map 'vector #'cdr (subseq entries first (1+ last))))
+                   (scalar-or-vector (btree-equal-page-children page (key probe) t)))
+              (rove:ok (equalp expected (btree-equal-page-children page (key probe))))
+              (rove:ok (equalp (if (= (length expected) 1) (aref expected 0) expected)
+                               scalar-or-vector)))))
+        (page-set-lp page 3 0 +lp-unused+ 0)
+        ;; The unused slot forces a scan through an equal run with a greater suffix.
+        (rove:ok (equalp #(40 41 43) (btree-equal-page-children page (key "b"))))
+        (rove:ok (equalp #(40 41 43) (btree-equal-page-children page (key "b") t))))))
 
 (rove:deftest btree-equality-leaf-boundaries
     (flet ((key (text) (encode-index-key (list text) '(:varchar))))
@@ -373,6 +408,20 @@
                               (loop for slot from 1 to (page-lp-count input)
                                     for tid = (btree-scan-leaf-tid input slot nil nil key)
                                     when tid collect tid)))))))))
+
+(rove:deftest btree-long-key-order-uses-octets-and-length
+    (let* ((key (make-array 65 :element-type '(unsigned-byte 8) :initial-element 128))
+           (page (make-array 68 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (replace page key :start1 3)
+      (rove:ok (zerop (compare-octet-vector-to-span key page 3 65)))
+      (rove:ok (= 1 (compare-octet-vector-to-span key page 3 64)))
+      (rove:ok (= -1 (compare-octet-vector-to-span (subseq key 0 64) page 3 65)))
+      (dolist (offset '(0 7 8 31 32 33 63 64))
+        (dolist (other-byte '(127 129))
+          (setf (aref page (+ offset 3)) other-byte)
+          (rove:ok (= (signum (- 128 other-byte))
+                      (compare-octet-vector-to-span key page 3 65)))
+          (setf (aref page (+ offset 3)) 128)))))
 
 (rove:deftest ordered-plain-btree-leaf-insert
     (flet ((key (&rest bytes)

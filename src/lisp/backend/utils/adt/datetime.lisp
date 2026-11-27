@@ -33,8 +33,40 @@
          (instant (- unix 946684800000000)))
     (if zone (sql-timezone-instant-to-local zone instant) instant)))
 
+(defun sql-ascii-decimal-field (text start end)
+  "Read an unsigned ASCII decimal field without allocating a substring."
+  (loop with value = 0
+        for index from start below end
+        for digit = (- (char-code (char text index)) (char-code #\0))
+        unless (<= 0 digit 9) do (return nil)
+          do (setf value (+ (* value 10) digit))
+        finally (return value)))
+
+(defun sql-validated-date (year month day timestamp-p text)
+  "Validate Gregorian fields and return the date relative to the PostgreSQL epoch."
+  (let ((days (and (<= 1 month 12)
+                   (if (and (= month 2) (zerop (mod year 4))
+                            (or (not (zerop (mod year 100))) (zerop (mod year 400))))
+                       29
+                       (aref #(31 28 31 30 31 30 31 31 30 31 30 31) (1- month))))))
+    (unless (and days (<= 1 day days))
+      (when text (ereport "22008" "date/time field value out of range: ~s" text))
+      (return-from sql-validated-date nil)))
+  (let ((julian (sql-date-to-julian year month day)))
+    (unless (<= (if timestamp-p -23 0) julian 2147483493)
+      (ereport "22008" "date out of range: ~s" text))
+    (- julian +postgres-epoch-julian-day+)))
+
 (defun sql-date-input (text &optional timestamp-p (order :mdy) current-date)
   "Read a PostgreSQL date using the session's numeric field order."
+  (when (and (= (length text) 10) (char= (char text 4) #\-) (char= (char text 7) #\-))
+    (let ((year (sql-ascii-decimal-field text 0 4))
+          (month (sql-ascii-decimal-field text 5 7))
+          (day (sql-ascii-decimal-field text 8 10)))
+      (when (and year month day)
+        (unless (plusp year)
+          (ereport "22008" "date/time field value out of range: ~s" text))
+        (return-from sql-date-input (sql-validated-date year month day timestamp-p text)))))
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (upper (string-upcase input)))
     (cond ((string= upper "INFINITY") (return-from sql-date-input #x7fffffff))
@@ -108,14 +140,7 @@
                   (setf year (- 1 year)))
               ((< (length year-text) 3) (incf year (if (< year 70) 2000 1900)))
               ((zerop year) (ereport "22008" "date/time field value out of range: ~s" text)))
-        (let* ((leap (and (zerop (mod year 4)) (or (not (zerop (mod year 100))) (zerop (mod year 400)))))
-               (days (and (<= 1 month 12) (nth (1- month) (list 31 (if leap 29 28) 31 30 31 30 31 31 30 31 30 31)))))
-          (unless (and days (<= 1 day days))
-            (ereport "22008" "date/time field value out of range: ~s" text)))
-        (let ((julian (sql-date-to-julian year month day)))
-          (unless (<= (if timestamp-p -23 0) julian 2147483493)
-            (ereport "22008" "date out of range: ~s" text))
-          (- julian +postgres-epoch-julian-day+))))))
+        (sql-validated-date year month day timestamp-p text)))))
 
 (defun sql-date-output (value &optional (style :iso) (order :mdy))
   "Format a date in the requested PostgreSQL DateStyle."
@@ -158,14 +183,39 @@
              (rounded (* (signum value) (floor (+ (/ (abs value) scale) 1/2)) scale)))
         rounded)))
 
+(defun sql-validated-clock (hour minute second fraction text)
+  "Convert checked clock fields to microseconds, including the end of the day."
+  (let ((value (+ (* hour 3600000000) (* minute 60000000) (* second 1000000) fraction)))
+    (unless (and (<= 0 hour 24) (<= 0 minute 59) (<= 0 second 60)
+                 (<= 0 value 86400000000))
+      (when text (ereport "22008" "date/time field value out of range: ~s" text))
+      (return-from sql-validated-clock nil))
+    value))
+
+(defun sql-iso-clock-at (text start &optional error-text)
+  "Read an HH:MM:SS field at START without slicing TEXT."
+  (when (and (char= (char text (+ start 2)) #\:)
+             (char= (char text (+ start 5)) #\:))
+    (let ((hour (sql-ascii-decimal-field text start (+ start 2)))
+          (minute (sql-ascii-decimal-field text (+ start 3) (+ start 5)))
+          (second (sql-ascii-decimal-field text (+ start 6) (+ start 8))))
+      (when (and hour minute second)
+        (sql-validated-clock hour minute second 0 error-text)))))
+
 (defun sql-time-input (text typmod &optional current-local-microseconds)
   "Read a colon-separated time into microseconds since midnight."
+  (when (= (length text) 8)
+    (let ((clock (sql-iso-clock-at text 0 text)))
+      (when clock (return-from sql-time-input (sql-time-adjust-typmod clock typmod)))))
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (parts (uiop:split-string input :separator ":")))
     (when (string-equal input "now")
       (return-from sql-time-input
         (sql-time-adjust-typmod
-         (mod (or current-local-microseconds (sql-current-local-microseconds nil nil)) 86400000000) typmod)))
+         (mod (or (if (functionp current-local-microseconds)
+                      (funcall current-local-microseconds)
+                      current-local-microseconds)
+                  (sql-current-local-microseconds nil nil)) 86400000000) typmod)))
     (when (string-equal input "allballs") (return-from sql-time-input 0))
     (unless (and (<= 2 (length parts) 3)
                  (every (lambda (part) (plusp (length part))) parts))
@@ -183,11 +233,7 @@
                                             (fraction (if (and (second split) (plusp (length (second split))))
                                                           (round (* 1000000d0 (sql-float-input (concatenate 'string "0." (second split)) :float8)))
                                                           0)))
-          (let ((value (+ (* hour 3600000000) (* minute 60000000) (* second 1000000) fraction)))
-            (unless (and (<= 0 hour 24) (<= 0 minute 59) (<= 0 second 60)
-                         (<= 0 value 86400000000))
-              (ereport "22008" "date/time field value out of range: ~s" text))
-            (sql-time-adjust-typmod value typmod)))))))
+          (sql-time-adjust-typmod (sql-validated-clock hour minute second fraction text) typmod))))))
 
 (defun sql-time-output (value)
   "Format microseconds since midnight in ISO time notation."
@@ -214,6 +260,21 @@
     (multiple-value-bind (b bz) (sql-timetz-comparison-values right)
       (cond ((< a b) -1) ((> a b) 1) ((< az bz) -1) ((> az bz) 1) (t 0)))))
 
+(defun sql-iso-displacement (text start)
+  "Read the complete numeric or Z suffix at START, or return NIL for fallback."
+  (let ((width (- (length text) start)))
+    (case width
+      (1 (when (char-equal (char text start) #\Z) 0))
+      ((3 6)
+       (when (and (find (char text start) "+-")
+                  (or (= width 3) (char= (char text (+ start 3)) #\:)))
+         (let ((hours (sql-ascii-decimal-field text (1+ start) (+ start 3)))
+               (minutes (if (= width 3) 0
+                            (sql-ascii-decimal-field text (+ start 4) (+ start 6)))))
+           (when (and hours minutes (<= hours 15) (<= minutes 59))
+             (* (if (char= (char text start) #\-) -1 1)
+                (+ (* hours 3600) (* minutes 60))))))))))
+
 (defun sql-timezone-offset-east (zone)
   "Parse a signed numeric zone displacement into seconds east of UTC."
   (unless (and (plusp (length zone)) (find (char zone 0) "+-"))
@@ -234,7 +295,15 @@
 
 (defun sql-timetz-input (text typmod &optional session-zone unix-now unix-microseconds)
   "Read a time with an explicit displacement or the session's reference-date zone."
-  (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
+  (when (> (length text) 8)
+    (let ((offset (sql-iso-displacement text 8))
+          (clock (sql-iso-clock-at text 0)))
+      (when (and offset clock)
+        (return-from sql-timetz-input
+          (make-sql-timetz (sql-time-adjust-typmod clock typmod) (- offset))))))
+  (let* ((session-zone (if (functionp session-zone) (funcall session-zone) session-zone))
+         (unix-microseconds (if (functionp unix-microseconds) (funcall unix-microseconds) unix-microseconds))
+         (input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (reference (or unix-microseconds (and unix-now (* unix-now 1000000))
                         (multiple-value-bind (seconds micros) (sb-ext:get-time-of-day)
                           (+ (* seconds 1000000) micros))))
@@ -304,11 +373,15 @@
               (= (sql-interval-microseconds value) -9223372036854775808)) -1)
         (t nil)))
 
+(declaim (inline sql-interval-comparison-span))
+
+(defun sql-interval-comparison-span (months days microseconds)
+  (+ (* (+ (* months 30) days) +sql-microseconds-per-day+) microseconds))
+
 (defun sql-interval-comparison-value (value)
   "Return PostgreSQL's comparison span, retaining calendar fields in VALUE."
-  (+ (* (+ (* (sql-interval-months value) 30) (sql-interval-days value))
-        +sql-microseconds-per-day+)
-     (sql-interval-microseconds value)))
+  (sql-interval-comparison-span (sql-interval-months value) (sql-interval-days value)
+                                (sql-interval-microseconds value)))
 
 (defun sql-interval-adjust-typmod (interval typmod)
   "Truncate fields and round precision according to the packed PostgreSQL typmod."
@@ -527,31 +600,33 @@
 
 (defun sql-interval-expand-fields (words text typmod)
   "Expand compact year-month, day-clock, and bare interval fields."
-  (setf words
-        (loop for word in words
-              append (let* ((start (if (and (plusp (length word)) (find (char word 0) "+-")) 1 0))
-                            (separator (position #\- word :start start)))
-                       (if (and separator (> separator start)
-                                (every #'digit-char-p (subseq word start separator)))
-                           (let ((tail (subseq word (1+ separator))))
-                             (unless (and (plusp (length tail)) (every #'digit-char-p tail))
-                               (ereport "22007" "invalid input syntax for type interval: ~s" text))
-                             (let* ((year (parse-integer word :end separator))
-                                    (month (parse-integer tail))
-                                    (total (+ (* year 12)
-                                              (* (if (and (plusp start) (char= (char word 0) #\-)) -1 1) month))))
-                               (unless (and (< month 12) (<= -9223372036854775808 total 9223372036854775807))
-                                 (ereport "22015" "interval field value out of range"))
-                               (list (princ-to-string total) "months")))
-                           (list word)))))
-  (setf words
-        (loop for rest on words
-              for word = (first rest)
-              append (if (and (second rest) (find #\: (second rest))
-                              (plusp (length word))
-                              (or (digit-char-p (char word 0)) (find (char word 0) "+-"))
-                              (not (find #\: word)))
-                         (list word "days") (list word))))
+  (when (some (lambda (word) (position #\- word :start 1)) words)
+    (setf words
+          (loop for word in words
+                append (let* ((start (if (and (plusp (length word)) (find (char word 0) "+-")) 1 0))
+                              (separator (position #\- word :start start)))
+                         (if (and separator (> separator start)
+                                  (every #'digit-char-p (subseq word start separator)))
+                             (let ((tail (subseq word (1+ separator))))
+                               (unless (and (plusp (length tail)) (every #'digit-char-p tail))
+                                 (ereport "22007" "invalid input syntax for type interval: ~s" text))
+                               (let* ((year (parse-integer word :end separator))
+                                      (month (parse-integer tail))
+                                      (total (+ (* year 12)
+                                                (* (if (and (plusp start) (char= (char word 0) #\-)) -1 1) month))))
+                                 (unless (and (< month 12) (<= -9223372036854775808 total 9223372036854775807))
+                                   (ereport "22015" "interval field value out of range"))
+                                 (list (princ-to-string total) "months")))
+                             (list word))))))
+  (when (some (lambda (word) (find #\: word)) words)
+    (setf words
+          (loop for rest on words
+                for word = (first rest)
+                append (if (and (second rest) (find #\: (second rest))
+                                (plusp (length word))
+                                (or (digit-char-p (char word 0)) (find (char word 0) "+-"))
+                                (not (find #\: word)))
+                           (list word "days") (list word)))))
   (when (and (= (length words) 1) (not (find #\: (first words))))
     (let* ((range (if (minusp typmod) #x7fff (sql-interval-typmod-range typmod)))
            (unit (cond ((logbitp 12 range) "seconds")
@@ -564,11 +639,108 @@
       (setf words (append words (list unit)))))
   words)
 
+(defparameter *sql-interval-units*
+  '((:year 12 "year" "years" "yr" "yrs")
+    (:month 1 "mon" "mons" "month" "months")
+    (:week 7 "week" "weeks")
+    (:day 1 "day" "days")
+    (:hour 3600000000 "hour" "hours")
+    (:minute 60000000 "minute" "minutes" "min" "mins")
+    (:second 1000000 "second" "seconds" "sec" "secs" "s")
+    (:millisecond 1000 "millisecond" "milliseconds" "ms" "msec" "msecs" "mseconds")
+    (:microsecond 1 "microsecond" "microseconds" "us" "usec" "usecs" "useconds")))
+
+(defparameter *sql-interval-unit-table*
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (entry *sql-interval-units* table)
+      (dolist (alias (cddr entry))
+        (setf (gethash alias table) entry)))))
+
+(defparameter *sql-interval-units-by-length*
+  (let* ((max-length (loop for entry in *sql-interval-units*
+                           maximize (reduce #'max (cddr entry) :key #'length)))
+         (table (make-array (1+ max-length) :initial-element nil)))
+    (dolist (entry *sql-interval-units* table)
+      (dolist (alias (cddr entry))
+        (push (cons alias entry) (aref table (length alias)))))))
+
+(defun sql-interval-unit (text &optional start (end (length text)))
+  "Find a canonical unit and scale in a lowercase token or a source span."
+  (let ((entry (if start
+                   (let ((length (- end start)))
+                     (when (< length (length *sql-interval-units-by-length*))
+                       (cdr (find text (aref *sql-interval-units-by-length* length)
+                                  :key #'car
+                                  :test (lambda (source alias)
+                                          (string-equal source alias :start1 start :end1 end))))))
+                   (gethash text *sql-interval-unit-table*))))
+    (values (first entry) (second entry))))
+
+(defun sql-checked-interval (months days microseconds)
+  "Build an interval whose three independent stored fields fit their SQL types."
+  (unless (and (<= -2147483648 months 2147483647) (<= -2147483648 days 2147483647)
+               (<= -9223372036854775808 microseconds 9223372036854775807))
+    (ereport "22015" "interval field value out of range"))
+  (make-sql-interval months days microseconds))
+
+(defun sql-short-interval-number (word start &optional (end (length word)) (sign-start 0))
+  "Read a short signed decimal as an exact rational, or return NIL."
+  (when (<= 1 (- end start) 19)
+    (let ((value 0) (denominator 1) (point-p nil) (digits 0))
+      (loop for index from start below end
+            for char = (char word index)
+            for digit = (- (char-code char) (char-code #\0))
+            do (cond ((<= 0 digit 9)
+                      (incf digits)
+                      (setf value (+ (* value 10) digit))
+                      (when point-p (setf denominator (* denominator 10))))
+                     ((and (char= char #\.) (not point-p)) (setf point-p t))
+                     (t (return-from sql-short-interval-number nil))))
+      (when (<= 1 digits 18)
+        (/ (if (char= (char word sign-start) #\-) (- value) value) denominator)))))
+
+(defun sql-explicit-unit-interval (text)
+  "Parse short decimal fields with explicit units from spans in TEXT.
+Use the general parser for other layouts, fractional calendar fields, or
+fractions requiring sub-microsecond rounding."
+  (let ((end (length text))
+        (months 0) (days 0) (microseconds 0)
+        (seen nil))
+    (loop for start = 0 then (1+ unit-end)
+          for separator = (position #\Space text :start start)
+          for unit-start = (and separator (1+ separator))
+          for unit-end = (and unit-start (or (position #\Space text :start unit-start) end))
+          do (unless (and separator (< start separator) (< unit-start unit-end))
+               (return-from sql-explicit-unit-interval nil))
+             (multiple-value-bind (unit scale) (sql-interval-unit text unit-start unit-end)
+               (unless (and unit (not (member unit seen)))
+                 (return-from sql-explicit-unit-interval nil))
+               (let* ((sign (char text start))
+                      (digits (if (find sign "+-") (1+ start) start))
+                      (number (sql-short-interval-number text digits separator start)))
+                 (unless number (return-from sql-explicit-unit-interval nil))
+                 (let ((scaled (* number scale)))
+                   (case unit
+                     ((:year :month)
+                      (unless (integerp number) (return-from sql-explicit-unit-interval nil))
+                      (incf months scaled))
+                     ((:week :day)
+                      (unless (integerp number) (return-from sql-explicit-unit-interval nil))
+                      (incf days scaled))
+                     (otherwise
+                      (unless (integerp scaled) (return-from sql-explicit-unit-interval nil))
+                      (incf microseconds scaled)))))
+               (push unit seen))
+          when (= unit-end end)
+            return (sql-checked-interval months days microseconds))))
+
 (defun sql-interval-input (text &optional (typmod -1))
   "Read PostgreSQL unit and clock interval fields into independent calendar units."
+  (let ((explicit (sql-explicit-unit-interval text)))
+    (when explicit (return-from sql-interval-input explicit)))
   (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (words (remove "" (uiop:split-string (string-downcase input) :separator '(#\Space #\Tab #\Newline)) :test #'string=))
-         (months 0) (days 0) (microseconds 0) (ago nil) (seen (make-hash-table :test #'equal)))
+         (months 0) (days 0) (microseconds 0) (ago nil) (seen nil))
     (when (and (plusp (length text)) (char= (char text 0) #\P))
       (return-from sql-interval-input (sql-iso8601-interval-input text)))
     (when (equal words '("infinity")) (return-from sql-interval-input (sql-interval-infinity 1)))
@@ -582,7 +754,10 @@
              (number (word)
                (let* ((start (if (and (plusp (length word)) (find (char word 0) "+-")) 1 0))
                       (digits 0) (dots 0))
-                 (loop for char across (subseq word start)
+                 (let ((short (sql-short-interval-number word start)))
+                   (when short (return-from number short)))
+                 (loop for index from start below (length word)
+                       for char = (char word index)
                        do (cond ((digit-char-p char) (incf digits))
                                 ((char= char #\.) (incf dots))
                                 (t (bad))))
@@ -593,8 +768,8 @@
                      (sql-numeric-rational value))
                  (pg-error () (bad))))
              (mark (unit)
-               (when (gethash unit seen) (bad))
-               (setf (gethash unit seen) t))
+               (when (member unit seen) (bad))
+               (push unit seen))
              (add-scaled (value scale)
                (let* ((whole (truncate value))
                       (scaled (* (float (- value whole) 1d0) scale))
@@ -636,34 +811,20 @@
                    (add-clock word)
                    (if (null words)
                        (if (string= word "0") nil (bad))
-                       (let ((value (number word)) (unit (pop words)))
-                         (mark (cond ((member unit '("year" "years" "yr" "yrs") :test #'string=) :year)
-                                     ((member unit '("mon" "mons" "month" "months") :test #'string=) :month)
-                                     ((member unit '("week" "weeks") :test #'string=) :week)
-                                     ((member unit '("day" "days") :test #'string=) :day)
-                                     ((member unit '("hour" "hours") :test #'string=) :hour)
-                                     ((member unit '("minute" "minutes" "min" "mins") :test #'string=) :minute)
-                                     ((member unit '("second" "seconds" "sec" "secs" "s") :test #'string=) :second)
-                                     ((member unit '("millisecond" "milliseconds" "ms" "msec" "msecs" "mseconds") :test #'string=) :millisecond)
-                                     ((member unit '("microsecond" "microseconds" "us" "usec" "usecs" "useconds") :test #'string=) :microsecond)
-                                     (t (bad))))
-                         (cond ((member unit '("year" "years" "yr" "yrs") :test #'string=)
-                                (let ((whole (truncate value)))
-                                  (incf months (+ (* 12 whole) (round (* 12d0 (float (- value whole) 1d0)))))))
-                               ((member unit '("mon" "mons" "month" "months") :test #'string=) (add-months value))
-                               ((member unit '("week" "weeks") :test #'string=) (add-days (* 7 value)))
-                               ((member unit '("day" "days") :test #'string=) (add-days value))
-                               ((member unit '("hour" "hours") :test #'string=) (add-scaled value 3600000000))
-                               ((member unit '("minute" "minutes" "min" "mins") :test #'string=) (add-scaled value 60000000))
-                               ((member unit '("second" "seconds" "sec" "secs" "s") :test #'string=) (add-scaled value 1000000))
-                               ((member unit '("millisecond" "milliseconds" "ms" "msec" "msecs" "mseconds") :test #'string=) (add-scaled value 1000))
-                               ((member unit '("microsecond" "microseconds" "us" "usec" "usecs" "useconds") :test #'string=) (add-scaled value 1))
-                               (t (bad)))))))
+                       (let ((value (number word)))
+                         (multiple-value-bind (unit scale) (sql-interval-unit (pop words))
+                           (unless unit (bad))
+                           (mark unit)
+                           (case unit
+                             (:year
+                              (let ((whole (truncate value)))
+                                (incf months (+ (* scale whole)
+                                                (round (* scale (float (- value whole) 1d0)))))))
+                             (:month (add-months value))
+                             ((:week :day) (add-days (* scale value)))
+                             (otherwise (add-scaled value scale))))))))
       (when ago (setf months (- months) days (- days) microseconds (- microseconds)))
-      (unless (and (<= -2147483648 months 2147483647) (<= -2147483648 days 2147483647)
-                   (<= -9223372036854775808 microseconds 9223372036854775807))
-        (ereport "22015" "interval field value out of range"))
-      (make-sql-interval months days microseconds))))
+      (sql-checked-interval months days microseconds))))
 
 (defun sql-interval-output (value)
   "Format separate interval months, days and time using postgres IntervalStyle."
@@ -703,9 +864,38 @@
               (second fields) (third fields) (fifth fields) (fourth fields)
               (nthcdr 5 fields)))))
 
+(defun sql-iso-seconds-timestamp (text typmod with-zone session-zone)
+  "Parse a complete ISO timestamp through seconds in place, or return NIL for fallback."
+  (let ((length (length text)))
+    (when (and (member length '(19 20 22 25))
+               (char= (char text 4) #\-) (char= (char text 7) #\-)
+               (find (char text 10) " Tt"))
+      (let ((displacement (if (= length 19) 0 (sql-iso-displacement text 19)))
+            (year (sql-ascii-decimal-field text 0 4))
+            (month (sql-ascii-decimal-field text 5 7))
+            (day (sql-ascii-decimal-field text 8 10))
+            (clock (sql-iso-clock-at text 11)))
+        (when (and displacement year (plusp year) month day clock)
+          (let ((date (sql-validated-date year month day t nil)))
+            (when date
+              (let* ((local (+ (* date +sql-microseconds-per-day+) clock))
+                     (instant
+                       (cond ((not with-zone) local)
+                             ((/= length 19) (- local (* displacement 1000000)))
+                             (session-zone
+                              (let ((zone (if (functionp session-zone) (funcall session-zone) session-zone)))
+                                (if zone (sql-timezone-local-to-instant zone local) local)))
+                             (t local))))
+                (sql-time-adjust-typmod instant typmod)))))))))
+
 (defun sql-timestamp-input (text typmod with-zone &optional session-zone (date-order :mdy) unix-microseconds)
-  "Read an ISO timestamp, interpreting a numeric zone offset when requested."
-  (let* ((input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
+  "Read an ISO timestamp, interpreting a numeric zone offset when requested.
+SESSION-ZONE and UNIX-MICROSECONDS can be providers for the session defaults."
+  (let ((iso (sql-iso-seconds-timestamp text typmod with-zone session-zone)))
+    (when iso (return-from sql-timestamp-input iso)))
+  (let* ((session-zone (if (functionp session-zone) (funcall session-zone) session-zone))
+         (unix-microseconds (if (functionp unix-microseconds) (funcall unix-microseconds) unix-microseconds))
+         (input (string-trim (mapcar #'code-char '(9 10 11 12 13 32)) text))
          (input (or (sql-postgres-timestamp-input-normalize input) input))
          (upper (string-upcase input)))
     (cond ((string= upper "INFINITY") (return-from sql-timestamp-input #x7fffffffffffffff))
@@ -737,13 +927,11 @@
                                             (- (length body) 9)))
                              (space (if colon (position #\Space body :end colon :from-end t) allballs))
                              (tee (and colon
-                                       (position-if (lambda (index)
-                                                      (and (char-equal (char body index) #\T)
-                                                           (plusp index) (digit-char-p (char body (1- index)))
-                                                           (< (1+ index) (length body))
-                                                           (digit-char-p (char body (1+ index)))))
-                                                    (loop for index below colon collect index)
-                                                    :from-end t))))
+                                       (loop for index from (1- colon) downto 1
+                                             when (and (char-equal (char body index) #\T)
+                                                       (digit-char-p (char body (1- index)))
+                                                       (digit-char-p (char body (1+ index))))
+                                               return index))))
                         (cond ((and space tee) (max space tee)) (t (or space tee)))))
            (date-text (if separator (subseq body 0 separator) body))
            (time-text (if separator (string-trim '(#\Space) (subseq body (1+ separator))) "00:00:00"))

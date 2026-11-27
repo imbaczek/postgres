@@ -965,46 +965,89 @@ An omitted column list uses the primary key's order."
                            :initially-deferred-p (getf definition :initially-deferred)
                            :validated-p (not (getf definition :not-valid))))))
 
-(defun foreign-key-child-index-key (constraint parent index row)
-  "Encode a child reference in the parent index domain and key order.
-Return NIL and a reason when the reference is skipped or cannot match."
-  (let* ((child-columns (pg-foreign-key-columns constraint))
-         (values (mapcar (lambda (attnum) (aref row (1- attnum))) child-columns))
+(defstruct child-foreign-key-probe
+  constraint parent index slots types)
+
+(defun prepare-child-foreign-key-probe (constraint parent index)
+  "Map child row slots to the referenced index's physical key order."
+  (let ((child-columns (pg-foreign-key-columns constraint))
+        (parent-columns (pg-foreign-key-referenced-columns constraint)))
+    (make-child-foreign-key-probe
+     :constraint constraint :parent parent :index index
+     :slots (mapcar (lambda (attnum)
+                      (1- (nth (position attnum parent-columns :test #'eql) child-columns)))
+                    (pg-index-columns index))
+     :types (index-types index parent))))
+
+(defun prepare-child-foreign-key-probes (child)
+  "Resolve the counterpart descriptors after the statement has admitted them."
+  (when (pg-class-foreign-keys child)
+    (with-write-lock
+      (loop for constraint in (pg-class-foreign-keys child)
+            for parent = (find-table-by-oid (pg-foreign-key-referenced-table-oid constraint))
+            for index = (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint))
+            collect (prepare-child-foreign-key-probe constraint parent index)))))
+
+(defun child-foreign-key-integer-overflow-p (value type)
+  (case type
+    (:int2 (not (typep value '(signed-byte 16))))
+    (:int4 (not (typep value '(signed-byte 32))))
+    (:int8 (not (typep value '(signed-byte 64))))))
+
+(defun encode-child-foreign-key (probe row &optional varlena columns)
+  "Encode ROW in the referenced index's domain, or return a reason it has no key."
+  (let ((slots (child-foreign-key-probe-slots probe))
+        (types (child-foreign-key-probe-types probe)))
+    (when (and slots (null (rest slots)))
+      (let* ((slot (first slots))
+             (value (aref row slot))
+             (type (first types)))
+        (return-from encode-child-foreign-key
+          (cond ((eq value +null+) (values nil :null))
+                ((child-foreign-key-integer-overflow-p value type) (values nil :out-of-range))
+                (t (values
+                    (or (and varlena (stringp value)
+                             (member type '(:text :varchar))
+                             (member (pg-column-type (aref columns slot)) '(:text :varchar))
+                             (encode-index-inline-text-key (aref varlena slot)))
+                        (encode-index-key (list value) types))
+                    :key)))))))
+  (let* ((values (mapcar (lambda (slot) (aref row slot)) (child-foreign-key-probe-slots probe)))
+         (types (child-foreign-key-probe-types probe))
          (nulls (count +null+ values :test #'eq)))
-    (when (plusp nulls)
-      (return-from foreign-key-child-index-key
-        (values nil (if (and (eq :full (pg-foreign-key-match-type constraint))
-                             (< nulls (length values)))
-                        :mixed-null
-                        :null))))
-    (let* ((mapping (pairlis (pg-foreign-key-referenced-columns constraint) values))
-           (ordered (mapcar (lambda (attnum) (cdr (assoc attnum mapping :test #'eql)))
-                            (pg-index-columns index)))
-           (types (index-types index parent)))
-      (loop for value in ordered for type in types
-            for width = (case type (:int2 16) (:int4 32) (:int8 64))
-            when (and width (not (typep value `(signed-byte ,width))))
-              do (return-from foreign-key-child-index-key (values nil :out-of-range)))
-      (values (encode-index-key ordered types) :key))))
+    (cond ((plusp nulls)
+           (values nil (if (and (< nulls (length values))
+                                (eq :full (pg-foreign-key-match-type
+                                           (child-foreign-key-probe-constraint probe))))
+                           :mixed-null
+                           :null)))
+          ((loop for value in values for type in types
+                   thereis (child-foreign-key-integer-overflow-p value type))
+           (values nil :out-of-range))
+          (t (values (encode-index-key values types) :key)))))
 
-(defun foreign-key-parent-visible-p (parent index key snapshot)
+(defun foreign-key-child-index-key (constraint parent index row)
+  "Encode one child key when no prepared probe is available."
+  (encode-child-foreign-key (prepare-child-foreign-key-probe constraint parent index) row))
+
+(defun foreign-key-parent-visible-p (parent index key snapshot &optional probe read-parent-page)
   "Probe the referenced index for a parent visible to SNAPSHOT."
-  (let ((node (pg-class-relfilenode parent))
-        (columns (pg-class-columns parent)))
-    (btree-scan-equal
-     (pg-index-relfilenode index) key
-     (lambda (tid)
-       (check-for-interrupts)
-       (let ((tuple (heapam-get-tuple node (car tid) (cdr tid) columns)))
-         (when (and tuple (htup-visible-p tuple snapshot))
-           (return-from foreign-key-parent-visible-p t))))))
-  nil)
+  (let ((node (pg-class-relfilenode parent)))
+    (flet ((visible (block offnum)
+             (check-for-interrupts)
+             (if read-parent-page
+                 (heapam-page-tid-visible-p (funcall read-parent-page block) offnum snapshot)
+                 (heapam-tid-visible-p node block offnum snapshot))))
+      (declare (dynamic-extent #'visible))
+      (if probe
+          (funcall probe key #'visible)
+          (btree-some-equal-tid (pg-index-relfilenode index) key #'visible)))))
 
-(defun check-foreign-key-parent (child parent constraint index key latest retained)
+(defun check-foreign-key-parent (child parent constraint index key latest retained &optional probe read-parent-page)
   "Probe under already acquired key grants and the statement's check horizons."
-  (let ((has-parent (foreign-key-parent-visible-p parent index key latest)))
+  (let ((has-parent (foreign-key-parent-visible-p parent index key latest probe read-parent-page)))
     (when retained
-      (let ((previously-visible (foreign-key-parent-visible-p parent index key retained)))
+      (let ((previously-visible (foreign-key-parent-visible-p parent index key retained probe read-parent-page)))
         (when (and previously-visible (not has-parent))
           (ereport "40001" "could not serialize access due to concurrent update"))
         (setf has-parent (and has-parent previously-visible))))
@@ -1012,23 +1055,24 @@ Return NIL and a reason when the reference is skipped or cannot match."
       (ereport "23503" "insert or update on table ~s violates foreign key constraint ~s"
                (pg-class-name child) (pg-foreign-key-name constraint)))))
 
-(defun lock-foreign-key-child-references (child row tid &optional old-row old-own-p)
+(defun lock-foreign-key-child-references (child probes row tid &optional old-row old-own-p varlena)
   "Hold new non-null child references before probing at statement end."
-  (loop for constraint in (pg-class-foreign-keys child)
+  (loop for probe in probes
+        for constraint = (child-foreign-key-probe-constraint probe)
         unless (and old-row (not (and old-own-p (foreign-key-deferred-p constraint)))
-                    (loop for attnum in (pg-foreign-key-columns constraint)
-                          for before = (aref old-row (1- attnum))
-                          for after = (aref row (1- attnum))
+                    (loop for slot in (child-foreign-key-probe-slots probe)
+                          for before = (aref old-row slot)
+                          for after = (aref row slot)
                           always (or (eql before after) (true-p (sql-compare "=" before after)))))
           append
-          (let ((parent (find-table-by-oid (pg-foreign-key-referenced-table-oid constraint)))
-                (index (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint))))
-            (multiple-value-bind (key status) (foreign-key-child-index-key constraint parent index row)
+          (let ((parent (child-foreign-key-probe-parent probe))
+                (index (child-foreign-key-probe-index probe)))
+            (multiple-value-bind (key status) (encode-child-foreign-key probe row varlena (pg-class-columns child))
               (ecase status
                 (:null nil)
                 (:key
-                 (acquire-referenced-key-lock (pg-index-oid index) key :shared)
-                 (list (list parent constraint index key tid)))
+                 (let ((grant (acquire-referenced-key-lock (pg-index-oid index) key :shared)))
+                   (list (list parent constraint index key tid grant))))
                 ((:mixed-null :out-of-range)
                  (cond ((foreign-key-deferred-p constraint)
                         (list (list parent constraint index status tid)))
@@ -1135,21 +1179,46 @@ Return NIL and a reason when the reference is skipped or cannot match."
 (defun check-foreign-key-child-references (child references)
   "Check immediate references under one fresh snapshot after acquiring all key grants."
   (when references
-    (flet ((check-references (latest retained)
-             (dolist (reference references)
-               (destructuring-bind (parent constraint index key tid) reference
-                 (if (foreign-key-deferred-p constraint)
-                     (queue-deferred-foreign-key-check child parent constraint index key tid)
-                     (check-foreign-key-parent child parent constraint index key latest retained))))))
-      (if (every (lambda (reference) (foreign-key-deferred-p (second reference))) references)
-          (check-references nil nil)
-          (let ((cid (1+ (backend-command-id *backend*)))
-                (retained
-                  (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
-                    (copy-snapshot *current-snapshot*))))
-            (when retained (setf (snapshot-curcid retained) cid))
-            (with-fresh-foreign-key-snapshot (latest cid)
-              (check-references latest retained)))))))
+    (let ((checked nil))
+      (labels ((check-reference (reference latest retained probe read-parent-page)
+                 (destructuring-bind (parent constraint index key tid &optional grant) reference
+                   (cond ((foreign-key-deferred-p constraint)
+                          (queue-deferred-foreign-key-check child parent constraint index key tid))
+                         ((not (and grant (gethash grant checked)))
+                          ;; A grant identifies an index and canonical key.
+                          ;; Immediate probes share the same visibility horizons.
+                          (check-foreign-key-parent child parent constraint index key latest retained probe
+                                                    read-parent-page)
+                          (when grant (setf (gethash grant checked) t))))))
+               (check-references (latest retained)
+                 (loop with pending = references
+                       while pending
+                       for index = (third (first pending))
+                       do (if (and (rest pending) (eq index (third (second pending))))
+                              (call-with-btree-equal-tid-probe
+                               (pg-index-relfilenode index)
+                               (lambda (probe)
+                                 ;; The registered snapshots protect heap versions and
+                                 ;; the index lease prevents TID reuse in this chunk.
+                                 (call-with-buf-read-page-cache
+                                  (pg-class-relfilenode (first (first pending)))
+                                  (lambda (read-parent-page)
+                                    ;; Yield the lease between chunks during large COPY.
+                                    (loop repeat 64
+                                          while (and pending (eq index (third (first pending))))
+                                          do (check-reference (pop pending) latest retained
+                                                              probe read-parent-page))))))
+                              (check-reference (pop pending) latest retained nil nil)))))
+        (if (every (lambda (reference) (foreign-key-deferred-p (second reference))) references)
+            (dolist (reference references) (check-reference reference nil nil nil nil))
+            (let ((cid (1+ (backend-command-id *backend*)))
+                  (retained
+                    (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
+                      (copy-snapshot *current-snapshot*))))
+              (setf checked (make-hash-table :test #'eq))
+              (when retained (setf (snapshot-curcid retained) cid))
+              (with-fresh-foreign-key-snapshot (latest cid)
+                (check-references latest retained))))))))
 
 (defun referencing-foreign-keys-locked (parent)
   "Read child constraints in the current catalog view while holding the write lock."
@@ -1188,17 +1257,18 @@ Return NIL and a reason when the reference is skipped or cannot match."
 
 (defun foreign-key-child-visible-p (child parent constraint index key snapshot)
   "Find a referencing row using the same canonical encoding as the parent grant."
-  (let ((demand (cons child (pg-foreign-key-columns constraint))))
+  (let ((demand (cons child (pg-foreign-key-columns constraint)))
+        (probe (prepare-child-foreign-key-probe constraint parent index)))
     (heapam-scan
      (pg-class-relfilenode child) (pg-class-columns child) snapshot
      (lambda (tuple)
        (check-for-interrupts)
        (let ((row (htup-values (materialize-select-tuple child tuple snapshot :demand demand))))
-         (when (equalp key (foreign-key-child-index-key constraint parent index row))
+         (when (equalp key (encode-child-foreign-key probe row))
            (return-from foreign-key-child-visible-p t))))))
   nil)
 
-(defun apply-foreign-key-action (parent child constraint action old new)
+(defun apply-foreign-key-action (parent child constraint action old new &optional additional-old)
   "Run the referential action through ordinary DML in the same transaction."
   (let* ((parent-columns (pg-class-columns parent))
          (child-columns (pg-class-columns child))
@@ -1206,10 +1276,21 @@ Return NIL and a reason when the reference is skipped or cannot match."
          (types (mapcar (lambda (attnum) (pg-column-type (aref parent-columns (1- attnum))))
                         (pg-foreign-key-referenced-columns constraint)))
          (delete-p (and (eq action :cascade) (null new)))
-         (conditions
-           (loop for attnum in attnums for value in old for type in types
-                 collect (list :binop "=" (list :column (pg-column-name (aref child-columns (1- attnum))))
-                               (list :foreign-key-datum value type))))
+         (predicate
+           (if (and additional-old (null (rest attnums))
+                    (eq (first types) (pg-column-type (aref child-columns (1- (first attnums))))))
+               (list :in (list :column (pg-column-name (aref child-columns (1- (first attnums)))))
+                     (loop for key in (cons old additional-old)
+                           collect (list :foreign-key-datum (first key) (first types)))
+                     nil)
+               (flet ((match-key (key)
+                        (reduce (lambda (left right) (list :and left right))
+                                (loop for attnum in attnums for value in key for type in types
+                                      collect (list :binop "="
+                                                    (list :column (pg-column-name (aref child-columns (1- attnum))))
+                                                    (list :foreign-key-datum value type))))))
+                 (reduce (lambda (left right) (list :or left right))
+                         (mapcar #'match-key (cons old additional-old))))))
          (sets
            (unless delete-p
              (loop for attnum in attnums for type in types for position from 0
@@ -1219,7 +1300,7 @@ Return NIL and a reason when the reference is skipped or cannot match."
                                          (:set-null (list :const +null+))
                                          (:set-default (list :default)))))))
          (ast (list :type (if delete-p :delete :update) :table (pg-class-name child)
-                    :where (reduce (lambda (left right) (list :and left right)) conditions)
+                    :where predicate
                     :sets sets)))
     (advance-used-backend-command-id)
     (detach-select-index-scans)
@@ -1231,7 +1312,7 @@ Return NIL and a reason when the reference is skipped or cannot match."
       (with-fresh-foreign-key-snapshot (snapshot (backend-command-id *backend*))
         (note-backend-command-id-used)
         (if delete-p
-            (exec-delete-subqueries (make-broadcast-stream) ast)
+            (exec-delete-subqueries (make-broadcast-stream) ast t)
             (exec-update-subqueries (make-broadcast-stream) ast))))))
 
 (defun reject-referenced-key-change (parent child constraint)
@@ -1246,13 +1327,27 @@ Return NIL and a reason when the reference is skipped or cannot match."
                  (foreign-key-child-visible-p child parent constraint index key latest))
         (reject-referenced-key-change parent child constraint)))))
 
+(defun foreign-key-cascade-group-limit (parent child constraint)
+  "Use a larger bounded group when child matching uses a constant hash lookup."
+  (let ((columns (pg-foreign-key-columns constraint)))
+    (if (null (rest columns))
+        (let ((child-type (pg-column-type (aref (pg-class-columns child) (1- (first columns)))))
+              (parent-type (pg-column-type
+                            (aref (pg-class-columns parent)
+                                  (1- (first (pg-foreign-key-referenced-columns constraint)))))))
+          (if (and (eq child-type parent-type) (hashed-row-membership-type-p child-type))
+              64 16))
+        16)))
+
 (defun check-foreign-key-parent-changes (parent changes update-p)
   "Run referential actions or verify immediate restrictions at statement end."
   (when changes
     (let ((retained
             (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
               (copy-snapshot *current-snapshot*))))
-      (loop for (child constraint index key old new) in changes
+      (loop for pending = changes then (rest pending)
+            while pending
+            for (child constraint index key old new) = (first pending)
             for action = (if update-p (pg-foreign-key-update-action constraint)
                              (pg-foreign-key-delete-action constraint))
             for cid = (1+ (backend-command-id *backend*))
@@ -1260,6 +1355,21 @@ Return NIL and a reason when the reference is skipped or cannot match."
                (cond
                  ((and (eq action :no-action) (foreign-key-deferred-p constraint))
                   (queue-deferred-foreign-key-check child parent constraint index key))
+                 ((and (eq action :cascade) (not update-p) (null retained)
+                       (null (referencing-foreign-keys child)))
+                  ;; Leaf DELETE rechecks child rows under a fresh snapshot.
+                  ;; For chains, avoid admitting downstream tables on a miss.
+                  (let ((additional-old
+                          (when (and (rest pending)
+                                     (not (logical-capture-xid-needed-p (backend-xid *backend*)))
+                                     (with-write-lock
+                                       (null (table-indexes child nil #'pg-index-ready-p))))
+                            (loop repeat (1- (foreign-key-cascade-group-limit parent child constraint))
+                                  for next = (second pending)
+                                  while (and next (eq (first next) child) (eq (second next) constraint))
+                                  collect (fifth next)
+                                  do (pop pending)))))
+                    (apply-foreign-key-action parent child constraint action old new additional-old)))
                  (t
                   (when retained (setf (snapshot-curcid retained) cid))
                   (with-fresh-foreign-key-snapshot (latest cid)
@@ -2641,6 +2751,7 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
 (defun validate-existing-foreign-key (child parent constraint index)
   "Validate a frozen child heap against the referenced index after both writer gates drain."
   (let ((demand (cons child (pg-foreign-key-columns constraint)))
+        (probe (prepare-child-foreign-key-probe constraint parent index))
         (cid (1+ (backend-command-id *backend*))))
     (with-fresh-foreign-key-snapshot (snapshot cid)
       (heapam-scan
@@ -2648,7 +2759,7 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
        (lambda (tuple)
          (check-for-interrupts)
          (let ((row (htup-values (materialize-select-tuple child tuple snapshot :demand demand))))
-           (multiple-value-bind (key status) (foreign-key-child-index-key constraint parent index row)
+           (multiple-value-bind (key status) (encode-child-foreign-key probe row)
              (unless (or (eq status :null)
                          (and (eq status :key) (foreign-key-parent-visible-p parent index key snapshot)))
                (ereport "23503" "insert or update on table ~s violates foreign key constraint ~s"

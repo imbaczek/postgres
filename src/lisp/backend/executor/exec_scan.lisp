@@ -2,7 +2,7 @@
 
 (in-package #:pg)
 
-(defmacro do-table-tuples ((tuple table &key relfilenode prefilter demand) &body body)
+(defmacro do-table-tuples ((tuple table &key relfilenode prefilter demand values-filter raw-filter) &body body)
   "Run BODY for visible tuples in TABLE, checking interrupts per tuple.
 
 An already-bound RELFILENODE may be supplied when relation registration must
@@ -19,7 +19,9 @@ precede scanning. Registration and locking remain the caller's responsibility."
                     (lambda (,tuple)
                       (check-for-interrupts)
                       ,@body)
-                    ,@(when prefilter `(:prefilter ,prefilter :demand ,demand))))))
+                    ,@(when prefilter `(:prefilter ,prefilter :demand ,demand))
+                    ,@(when values-filter `(:values-filter ,values-filter))
+                    ,@(when raw-filter `(:raw-filter ,raw-filter))))))
 
 (defmacro with-registered-relation-access
     ((relfilenodes xid mode) relation-expression validation-form &body body)
@@ -1472,37 +1474,36 @@ Mark direct scalar function sources through their aliases."
   "Determine whether every signature can be folded in a constant gate."
   (eq (scalar-builtin-family-volatility name) :immutable))
 
-(defun having-literal-expression-p (expression)
-  ;; Gate folding accepts only literal inputs and immutable operators/functions.
-  ;; STABLE functions such as current_setting must still run at execution time.
+(defun immutable-literal-expression-p (expression)
+  "Recognize literal-only expressions with immutable operators and functions."
   (and (consp expression)
        (case (first expression)
          ((:const :bool :scalar-array-const) t)
          ((:binop :any :all :unary :cast :not :is-null :is-bool :join-relabel
                   :and :or :concat :array-length :join-coalesce)
-          (every (lambda (position) (having-literal-expression-p (nth position expression)))
+          (every (lambda (position) (immutable-literal-expression-p (nth position expression)))
                  (local-expression-operand-shape (first expression))))
          ((:array :coalesce)
-          (every #'having-literal-expression-p (second expression)))
+          (every #'immutable-literal-expression-p (second expression)))
          (:case
              (not (some-analyzed-case-operand
-                   (lambda (operand) (not (having-literal-expression-p operand)))
+                   (lambda (operand) (not (immutable-literal-expression-p operand)))
                    expression)))
          ((:array-subscript :array-slice) nil)
          (:in
           (not (some-analyzed-in-operand
-                (lambda (operand) (not (having-literal-expression-p operand)))
+                (lambda (operand) (not (immutable-literal-expression-p operand)))
                 expression)))
          (:func
           (and (having-immutable-function-p (second expression))
-               (every #'having-literal-expression-p (third expression))))
+               (every #'immutable-literal-expression-p (third expression))))
          (otherwise nil))))
 
 (defun having-gate-skeleton (expression)
   ;; Retain only the immutable expression structure needed for gate folding.
   ;; Opaque leaves own no Vars, scopes or subplan descriptors. Function argument
   ;; skeletons retain constant errors without ever invoking a nonimmutable call.
-  (when (having-literal-expression-p expression)
+  (when (immutable-literal-expression-p expression)
     (return-from having-gate-skeleton (copy-tree expression)))
   (case (first expression)
     ((:and :or :concat :array-length :join-coalesce :binop :any :all
@@ -2090,6 +2091,10 @@ retain the original cursor and lease. An existing spool keeps its position."
 
 If a later scan fails, earlier completed detachments remain published for their
 scopes to clean up."
+  (when (and (null *select-index-scans*)
+             (null *select-index-lease-groups*)
+             (null *btree-read-leases*))
+    (return-from detach-select-index-scans (values)))
   (check-select-index-scan-ownership)
   (dolist (scan *select-index-scans*) (detach-select-index-scan scan))
   (release-select-index-lease-groups)

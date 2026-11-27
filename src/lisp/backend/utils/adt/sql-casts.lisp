@@ -572,8 +572,8 @@ The second value distinguishes a valid NIL result from an unhandled cast."
        (return-from cast-result
          (if (member source '(:text :varchar :name))
              (sql-timestamp-input value typmod (eq target :timestamptz)
-                                  (sql-session-timezone) (sql-session-date-order)
-                                  (sql-session-unix-microseconds))
+                                  #'sql-session-timezone (sql-session-date-order)
+                                  #'sql-session-unix-microseconds)
              (let* ((local (if (eq source :date) (sql-date-to-timestamp value) value))
                     (timestamp (if (and (eq target :timestamptz) (member source '(:date :timestamp)))
                                    (sql-timezone-local-to-instant (sql-session-timezone) local)
@@ -592,14 +592,14 @@ The second value distinguishes a valid NIL result from an unhandled cast."
        (return-from cast-result (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)))
      (when (eq target :timetz)
        (return-from cast-result
-         (if (member source '(:text :varchar :name)) (sql-timetz-input value typmod (sql-session-timezone)
+         (if (member source '(:text :varchar :name)) (sql-timetz-input value typmod #'sql-session-timezone
                                                                        (when *backend* (backend-transaction-start-unix *backend*))
-                                                                       (sql-session-unix-microseconds))
+                                                                       #'sql-session-unix-microseconds)
              (make-sql-timetz (sql-time-adjust-typmod (sql-timetz-microseconds value) typmod)
                               (sql-timetz-zone-west value)))))
      (when (eq target :time)
        (return-from cast-result
-         (cond ((member source '(:text :varchar :name)) (sql-time-input value typmod (sql-session-local-microseconds)))
+         (cond ((member source '(:text :varchar :name)) (sql-time-input value typmod #'sql-session-local-microseconds))
                ((member source '(:timestamp :timestamptz))
                 (when (member value '(#x7fffffffffffffff -9223372036854775808))
                   (ereport "22008" "cannot convert infinite timestamp to time"))

@@ -44,3 +44,32 @@
              (rove:ok (not (heap-tuple-visible-p xid 0 3 at-delete xid))))
         (forget-combo-command-ids xid))
       (rove:ok (null (gethash xid *combo-command-ids*)))))
+
+(rove:deftest literal-heap-preparation-propagates-interrupts
+    (let* ((*backend* (make-backend :database "postgres"))
+           (columns (vector (make-pg-column :name "n" :attnum 1 :type :numeric)))
+           (assignment '(:assignment (:func "factorial" ((:const 5 :type :int8)) :type :numeric)
+                         :type :numeric :typmod -1)))
+      (flet ((prepared-sqlstate ()
+               (handler-case
+                   (prepare-literal-heap-insert (list assignment) columns 3 0)
+                 (pg-error (condition) (pg-error-sqlstate condition)))))
+        (setf (backend-cancel-pending *backend*) t)
+        (rove:ok (equal "57014" (prepared-sqlstate)))
+        (rove:ok (null (backend-cancel-pending *backend*)))
+        (setf (backend-termination-pending *backend*) t)
+        (rove:ok (equal "57P01" (prepared-sqlstate)))
+        (rove:ok (null (backend-termination-pending *backend*))))))
+
+(rove:deftest literal-heap-text-foreign-key-keeps-index-encoding
+    (dolist (text (list (make-string 127 :initial-element #\a)
+                        "café" (concatenate 'string "a" (string (code-char 0)) "b")))
+      (let* ((columns (vector (make-pg-column :name "id" :attnum 1 :type :varchar)))
+             (probe (make-child-foreign-key-probe :slots '(0) :types '(:text)))
+             (row (vector text)))
+        (multiple-value-bind (tuple varlena) (form-heap-tuple row columns 3 0 0 0 1 t)
+          (rove:ok (equalp (aref varlena 0) (string->bytes text)))
+          (rove:ok (equal (aref (deform-heap-tuple tuple columns) 0) text))
+          (multiple-value-bind (key status) (encode-child-foreign-key probe row varlena columns)
+            (rove:ok (eq status :key))
+            (rove:ok (equalp key (encode-index-key (list text) '(:text)))))))))

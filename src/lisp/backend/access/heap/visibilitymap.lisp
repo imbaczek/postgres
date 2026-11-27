@@ -28,17 +28,19 @@
           0))))
 
 (defun visibilitymap-clear (relfilenode heap-block)
-  "Clear all visibility bits if HEAP-BLOCK already has a VM entry."
+  "Clear set visibility bits without replacing absent or already clear pages."
   (with-wal-page-batch
     (multiple-value-bind (vm-block byte-offset bit-shift)
         (visibilitymap-location heap-block)
-      (when (< vm-block (buf-nblocks relfilenode :visibility))
-        (let ((page (buf-read relfilenode vm-block :visibility)))
-          (when page
-            (let ((mask (ash #b11 bit-shift)))
-              (setf (aref page byte-offset)
-                    (logand (aref page byte-offset) (logxor #xFF mask)))
-              (buf-write relfilenode vm-block page :visibility :take-ownership)))))))
+      (let* ((mask (ash #b11 bit-shift))
+             (replacement
+               (with-buf-read-page (page relfilenode vm-block :visibility)
+                 (when (and page (logtest mask (aref page byte-offset)))
+                   (copy-seq page)))))
+        (when replacement
+          (setf (aref replacement byte-offset)
+                (logandc2 (aref replacement byte-offset) mask))
+          (buf-write relfilenode vm-block replacement :visibility :take-ownership)))))
   (values))
 
 (defun visibilitymap-set-status (relfilenode heap-block status)

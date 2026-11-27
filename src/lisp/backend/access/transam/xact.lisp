@@ -1574,6 +1574,7 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
 
 (defun acquire-referenced-key-lock (index-oid key mode)
   "Hold a shared child probe or exclusive parent mutation lock until XID retirement.
+Return the XID's grant as an identity for coalescing checks within a statement.
 KEY is the packed, canonical B-tree key in the referenced index's column order.
 Call before taking heap, B-tree, catalog or WAL write locks."
   (let ((xid (get-current-xid))
@@ -1591,17 +1592,17 @@ Call before taking heap, B-tree, catalog or WAL write locks."
                                                                    :xid owner :exclusive-p exclusive-p))))
           (cond
             ((and own (or (eq (cdr own) :exclusive) (not exclusive-p)))
-             (return))
+             (return own))
             (blockers (wait-for-relation-dependencies blockers))
             (t
              (sb-sys:without-interrupts
                (if own
                    (setf (cdr own) mode)
                    (let ((owned-key (cons index-oid (copy-seq key))))
+                     (setf own (cons xid mode))
                      (push owned-key (gethash xid *referenced-keys-by-xid*))
-                     (push (cons xid mode) (gethash owned-key *referenced-key-grants*)))))
-             (return)))))))
-  (values))
+                     (push own (gethash owned-key *referenced-key-grants*))))
+               (return own)))))))))
 
 (defun release-referenced-key-locks-under-relation-lock (xid)
   "Remove all grants before waking waiters or retiring XID from the wait graph."

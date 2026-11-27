@@ -13,6 +13,12 @@
 
 (defun scan-quoted-text (sql start delimiter)
   "Return quoted contents and the next position, accepting doubled delimiters."
+  (let* ((input (1+ start))
+         (quote-end (position delimiter sql :start input)))
+    (when (and quote-end
+               (or (= (1+ quote-end) (length sql))
+                   (char/= delimiter (char sql (1+ quote-end)))))
+      (return-from scan-quoted-text (values (subseq sql input quote-end) (1+ quote-end)))))
   (let ((position (1+ start)) (count 0) (end nil))
     ;; Count first so a large literal never needs a growable buffer and copy.
     (loop

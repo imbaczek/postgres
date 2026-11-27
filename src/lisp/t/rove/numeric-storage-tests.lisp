@@ -44,6 +44,26 @@
         (rove:ok (handler-case (progn (sql-numeric-from-packed-octets bad) nil)
                    (error () t))))))
 
+(rove:deftest numeric-payload-decodes-with-page-offsets
+    (dolist (value (list (make-sql-decimal -12345678 4)
+                         (make-sql-decimal 1 70) :numeric-nan))
+      (let* ((payload (sql-numeric-to-varlena-payload value))
+             (end (+ 3 (length payload)))
+             (page (make-array (+ end 4) :element-type '(unsigned-byte 8) :initial-element 255)))
+        (replace page payload :start1 3)
+        (rove:ok (equalp value (sql-numeric-from-varlena-payload page :start 3 :end end)))
+        (rove:ok (rove:signals
+                  (sql-numeric-from-varlena-payload page :start 3 :end (1- end)) 'pg-error)))))
+
+(rove:deftest short-numeric-prefilter-preserves-display-scale-equivalence
+    (let* ((key (sql-numeric-to-varlena-payload (make-sql-decimal 12500 4)))
+           (same-value (sql-numeric-to-varlena-payload (make-sql-decimal 125 2)))
+           (different-value (sql-numeric-to-varlena-payload (make-sql-decimal -12500 4))))
+      (rove:ok (short-numeric-payload-may-match-p key key 0 (length key)))
+      (rove:ok (short-numeric-payload-may-match-p key same-value 0 (length same-value)))
+      (rove:ok (not (short-numeric-payload-may-match-p
+                     key different-value 0 (length different-value))))))
+
 (rove:deftest test-numeric-varlena-tuple
     (let ((columns (vector (make-pg-column :type :int2)
                            (make-pg-column :type :numeric)
