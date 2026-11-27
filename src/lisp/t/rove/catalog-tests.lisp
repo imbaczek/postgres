@@ -937,7 +937,8 @@
               :columns
               (vector (make-pg-column-statistics
                        :null-fraction 0.25d0 :distinct-count 3
-                       :most-common-values '((1 . 0.5d0))))))
+                       :most-common-values '((1 . 0.5d0))
+                       :histogram-bounds '(-9223372036854775808 5 9223372036854775807)))))
            (table (make-pg-class :oid 55 :name "stats" :relfilenode 56
                                  :columns #() :statistics statistics))
            (copy (class-from-sexp (class-to-sexp table)))
@@ -949,7 +950,69 @@
       (rove:ok (= (pg-column-statistics-distinct-count
                    (aref (pg-table-statistics-columns restored) 0))
                   3)
-               "column distinct count persists through the class catalog codec")))
+               "column distinct count persists through the class catalog codec")
+      (rove:ok (equal (pg-column-statistics-histogram-bounds
+                       (aref (pg-table-statistics-columns restored) 0))
+                      '(-9223372036854775808 5 9223372036854775807)))
+      (rove:ok (null (pg-column-statistics-histogram-bounds
+                      (column-statistics-from-sexp '(:null-fraction 0.0d0 :distinct-count 1
+                                                     :most-common-values ((1 . 1.0d0)))))))))
+
+(rove:deftest range-index-cost-uses-nonnull-distribution
+    (let* ((column (make-pg-column :name "k" :type :int8 :attnum 1))
+           (distribution (make-pg-column-statistics :null-fraction 0.1d0
+                                                    :most-common-values '((0 . 0.8d0))
+                                                    :histogram-bounds '(1000 2000)))
+           (stats (make-pg-table-statistics :row-count 1000 :columns (vector distribution)))
+           (table (make-pg-class :columns (vector column) :statistics stats))
+           (index (make-pg-index :columns '(1) :valid-p t))
+           (qual '(:binop ">" (:col 1 :type :int8) (:const 1000 :type :int4)))
+           (path (index-path-for-range table index (index-range-comparisons (list qual) 0))))
+      (rove:ok (eq (select-scan-path-kind path) :index-scan))
+      (rove:ok (= (round (select-scan-path-row-estimate table path)) 100))
+      (rove:ok (= 900 (round (* 1000 (planner-scalar-range-selectivity
+                                      table 1 "<" :numeric-positive-infinity :numeric)))))
+      (rove:ok (zerop (planner-scalar-range-selectivity
+                       table 1 ">" :numeric-positive-infinity :numeric)))
+      (setf (pg-column-statistics-histogram-bounds distribution) nil)
+      (rove:ok (= (round (* 1000 (planner-scalar-range-selectivity table 1 ">" 1000 :int4))) 50))))
+
+(rove:deftest float-range-histogram-interpolates-across-extreme-values
+    (let* ((limit (rational most-positive-double-float))
+           (stats (make-pg-column-statistics :null-fraction 0.0d0
+                                             :histogram-bounds (list (- limit) limit)))
+           (table (make-pg-class :columns (vector (make-pg-column :type :float8 :attnum 1))
+                                 :statistics (make-pg-table-statistics :columns (vector stats)))))
+      (rove:ok (= 0.5d0 (planner-scalar-range-selectivity table 1 "<" 0.0d0 :float8)))
+      (rove:ok (= 0.5d0 (planner-scalar-range-selectivity table 1 ">" 0.0d0 :float8)))))
+
+(rove:deftest histogram-equality-correction-is-monotone-at-bucket-edges
+    (let* ((stats (make-pg-column-statistics :null-fraction 0.0d0
+                                             :distinct-count 3 :histogram-bounds '(0 1 2)))
+           (table (make-pg-class :columns (vector (make-pg-column :type :float8 :attnum 1))
+                                 :statistics (make-pg-table-statistics :columns (vector stats)))))
+      (flet ((estimate (operator value) (planner-scalar-range-selectivity table 1 operator value :float8)))
+        (rove:ok (= 0.0d0 (estimate "<" 0.0d0)))
+        (rove:ok (< (estimate "<=" 0.0d0) (estimate "<=" 0.0001d0)))
+        (rove:ok (< (estimate "<" 0.9999d0) (estimate "<" 1.0d0)))
+        (rove:ok (< (estimate "<" 1.0d0) (estimate "<=" 1.0d0)))
+        (rove:ok (< (estimate ">" 2.0d0) (estimate ">=" 2.0d0))))))
+
+(rove:deftest join-cardinality-fallback-uses-input-size-and-known-null-mass
+    (let* ((column (vector (make-pg-column :type :text :attnum 1)))
+           (skew (make-pg-column-statistics :null-fraction 0.25d0 :distinct-count 2
+                                            :most-common-values '(("common" . 0.5d0))))
+           (left (make-pg-class :columns column))
+           (right (make-pg-class :columns column
+                                 :statistics (make-pg-table-statistics :columns (vector skew))))
+           (relations (list (list :table left) (list :table right)))
+           (join '(:left-width 1 :right-width 1 :qual (:binop "=" (:col 1 :type :text) (:col 2 :type :text)))))
+      (rove:ok (= 0.005d0 (explain-equality-join-selectivity
+                           join '(:seq-scan 0 1) '(:filter nil (:seq-scan 1 2)) relations 1000 40)))
+      (rove:ok (null (explain-equality-join-selectivity
+                      join '(:seq-scan 0 1) '(:seq-scan 1 2) relations 1000 40 t)))
+      (rove:ok (= 0.1875d0 (explain-equality-join-selectivity
+                            join '(:index-scan 0 1) '(:seq-scan 1 2) relations 4 1000)))))
 
 (rove:deftest aggregate-toast-demand-proofs
     (let* ((table (make-pg-class :oid 9001 :columns (vector (make-pg-column :name "id" :type :int4)

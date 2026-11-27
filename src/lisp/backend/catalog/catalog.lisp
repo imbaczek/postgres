@@ -58,7 +58,8 @@
 (defstruct pg-column-statistics
   null-fraction
   distinct-count
-  most-common-values)
+  most-common-values
+  histogram-bounds)
 
 (defstruct pg-table-statistics
   row-count
@@ -311,7 +312,8 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:distinct-count pg-column-statistics-distinct-count :distinct-count)
   (:most-common-values pg-column-statistics-most-common-values
    :most-common-values :encode #'catalog-expression-to-sexp
-                       :decode #'catalog-expression-from-sexp))
+                       :decode #'catalog-expression-from-sexp)
+  (:histogram-bounds pg-column-statistics-histogram-bounds :histogram-bounds :omit-default t))
 
 (define-catalog-codec table-statistics make-pg-table-statistics
   (:row-count pg-table-statistics-row-count :row-count)

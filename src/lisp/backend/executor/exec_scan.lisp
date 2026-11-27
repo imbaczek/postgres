@@ -481,10 +481,10 @@ parameterized IndexScan is rescanned per outer row, as in nodeIndexscan.c."
 
 (defun equality-column-references (qual)
   "Return the two column expressions in a simple equality qual."
-  (when (and (eq (first qual) :binop)
-             (string= (second qual) "=")
-             (eq (first (third qual)) :col)
-             (eq (first (fourth qual)) :col))
+  (when (and (consp qual) (eq (first qual) :binop)
+             (equal (second qual) "=")
+             (consp (third qual)) (eq (first (third qual)) :col)
+             (consp (fourth qual)) (eq (first (fourth qual)) :col))
     (values (third qual) (fourth qual) t)))
 
 (defun index-paths-for-join-equality (table qual outer-width right-offset)
@@ -588,7 +588,8 @@ whose other operand belongs to the already-built outer relation is considered."
          (:int2 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 16))))
          (:int4 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 32))))
          (:int8 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 64))))
-         ((:date :time :timestamp :timestamptz :numeric :float4 :float8 :bytea :interval :timetz)
+         (:numeric (member value-type '(:int2 :int4 :int8 :numeric)))
+         ((:date :time :timestamp :timestamptz :float4 :float8 :bytea :interval :timetz)
           (eq value-type index-type))
          ((:text :varchar) (member value-type '(:text :varchar)))
          (otherwise nil))))
@@ -641,6 +642,166 @@ whose other operand belongs to the already-built outer relation is considered."
        :upper (or upper prefix-bound)
        :equality-count (length prefix)))))
 
+(defun planner-scalar-range-type-p (type)
+  (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz :float4 :float8 :numeric)))
+
+(defun planner-scalar-range-types-compatible-p (column-type value-type)
+  (and (planner-scalar-range-type-p column-type)
+       (or (eq column-type value-type)
+           (and (member column-type '(:int2 :int4 :int8 :numeric))
+                (member value-type '(:int2 :int4 :int8 :numeric))))))
+
+(defun planner-nonfinite-bound-side (value)
+  "Locate a non-finite bound relative to every finite scalar."
+  (case value
+    (:numeric-negative-infinity -1)
+    ((:numeric-positive-infinity :numeric-nan) 1)
+    (otherwise
+     (when (floatp value)
+       (cond ((sb-ext:float-nan-p value) 1)
+             ((sb-ext:float-infinity-p value) (if (minusp value) -1 1)))))))
+
+(defun planner-range-scalar (value)
+  "Map finite sample values to an ordered, catalog-readable number."
+  (cond ((integerp value) (when (<= (integer-length value) 1024) value))
+        ;; Very sparse numerics can encode a large power of ten cheaply.
+        ;; Limit projection work even when the stored datum itself is small.
+        ((and (sql-decimal-p value)
+              (<= (abs (sql-decimal-scale value)) 308)
+              (<= (integer-length (sql-decimal-coefficient value)) 1024))
+         (sql-numeric-rational value))
+        ((and (floatp value)
+              (not (or (sb-ext:float-nan-p value) (sb-ext:float-infinity-p value))))
+         (rational value))))
+
+(defun planner-histogram-endpoint-adjustment (statistics bounds scalar less-p inclusive-p buckets)
+  "Correct the interpolated histogram CDF for the equality mass, as in selfuncs.c.
+Flat buckets already carry point masses, so they use the unadjusted CDF."
+  (let* ((distinct (- (or (pg-column-statistics-distinct-count statistics) 0)
+                      (length (pg-column-statistics-most-common-values statistics))))
+         (low (first bounds))
+         (first-high (second bounds)))
+    (if (and (> distinct 1) (<= low scalar (car (last bounds)))
+             (not (loop for (a b) on bounds while b thereis (= a b))))
+        (let* ((weight (/ 1.0d0 (max distinct buckets)))
+               (first-bin-bonus
+                 (if (< scalar first-high)
+                     (* weight (float (/ (- first-high scalar) (- first-high low)) 1.0d0))
+                     0.0d0))
+               (delta (- first-bin-bonus
+                         (if (if less-p (not inclusive-p) inclusive-p) weight 0.0d0))))
+          (if less-p delta (- delta)))
+        0.0d0)))
+
+(defun planner-scalar-range-selectivity (table attnum operator value value-type
+                                         &optional (scalar (planner-range-scalar value)))
+  "Combine exact sample MCV mass with the remaining histogram distribution."
+  (let* ((statistics (table-statistics-column table attnum))
+         (column-type (pg-column-type (aref (pg-class-columns table) (1- attnum))))
+         (bounds (and statistics (pg-column-statistics-histogram-bounds statistics)))
+         (side (unless scalar (planner-nonfinite-bound-side value))))
+    (when (and statistics (or scalar side)
+               (planner-scalar-range-types-compatible-p column-type value-type))
+      (let* ((less-p (char= (char operator 0) #\<))
+             (inclusive-p (= (length operator) 2))
+             (mcv-mass 0.0d0)
+             (matching-mcv 0.0d0)
+             (buckets (1- (length bounds)))
+             (full-buckets 0)
+             (partial 0.0d0))
+        (declare (type fixnum full-buckets) (type double-float partial))
+        (dolist (entry (pg-column-statistics-most-common-values statistics))
+          (incf mcv-mass (cdr entry))
+          (let* ((key (car entry))
+                 (order (case column-type
+                          (:numeric (sql-numeric-compare key value))
+                          ((:float4 :float8) (sql-float-compare key value))
+                          (otherwise (cond (side (- side))
+                                           ((< key scalar) -1)
+                                           ((> key scalar) 1)
+                                           (t 0))))))
+            (when (or (if less-p (minusp order) (plusp order))
+                      (and inclusive-p (zerop order)))
+              (incf matching-mcv (cdr entry)))))
+        (loop for (low high) on (when scalar bounds) while high
+              do (cond ((= low high)
+                        (when (or (if less-p (< low scalar) (> low scalar))
+                                  (and inclusive-p (= low scalar)))
+                          (incf full-buckets)))
+                       ((if less-p (>= scalar high) (<= scalar low))
+                        (incf full-buckets))
+                       ((< low scalar high)
+                        (let ((distance (if less-p (- scalar low) (- high scalar)))
+                              (width (- high low)))
+                          (setf partial
+                                (if (and (integerp value) (not (eq column-type :numeric)))
+                                    (/ (float distance 1.0d0) width)
+                                    (float (/ distance width) 1.0d0)))))))
+        (+ matching-mcv
+           (* (cond (side (if (if less-p (plusp side) (minusp side)) 1.0d0 0.0d0))
+                    ((plusp buckets)
+                     (min 1.0d0 (max 0.0d0 (+ (/ (+ full-buckets partial) buckets)
+                                              (planner-histogram-endpoint-adjustment
+                                               statistics bounds scalar less-p inclusive-p buckets)))))
+                    (t 0.5d0))
+              (max 0.0d0 (- 1.0d0 (pg-column-statistics-null-fraction statistics) mcv-mass))))))))
+
+(defun planner-scalar-bounds-selectivity (table attnum terms)
+  "Cost the tightest literal bounds on one scalar column.
+As in clausesel.c, combine two sides on the same distribution and add
+back the NULL mass excluded by both comparisons."
+  (let* ((type (pg-column-type (aref (pg-class-columns table) (1- attnum))))
+         (statistics (table-statistics-column table attnum))
+         (lower nil) (upper nil)
+         (lo nil) (hi nil))
+    (unless (planner-scalar-range-type-p type)
+      (return-from planner-scalar-bounds-selectivity nil))
+    (dolist (term terms)
+      (destructuring-bind (column operator value value-type qual parameter) term
+        (declare (ignore qual))
+        (unless (and (= column attnum) (null parameter)
+                     (not (string= operator "="))
+                     (planner-scalar-range-types-compatible-p type value-type))
+          (return-from planner-scalar-bounds-selectivity nil))
+        (let* ((scalar (planner-range-scalar value))
+               (lower-p (char= (char operator 0) #\>))
+               (prior (if lower-p lo hi)))
+          (unless scalar
+            (return-from planner-scalar-bounds-selectivity
+              (when (and (null (rest terms)) (planner-nonfinite-bound-side value))
+                (if (and (string= operator ">")
+                         (or (eq value :numeric-nan)
+                             (and (floatp value) (sb-ext:float-nan-p value))))
+                    0.0d0
+                    (planner-scalar-range-selectivity table attnum operator value value-type scalar)))))
+          (when (or (null prior)
+                    (if lower-p (> scalar prior) (< scalar prior))
+                    (and (= scalar prior) (= (length operator) 1)))
+            (if lower-p (setf lower term lo scalar) (setf upper term hi scalar))))))
+    (flet ((estimate (term scalar)
+             (or (planner-scalar-range-selectivity table attnum (second term)
+                                                   (third term) (fourth term) scalar)
+                 0.333333d0)))
+      (cond
+        ((and lower upper)
+         (progn
+           (cond ((> lo hi) 0.0d0)
+                 ((= lo hi)
+                  (if (= (length (second lower)) (length (second upper)) 2)
+                      (planner-equality-selectivity table attnum (third lower))
+                      0.0d0))
+                 ((null statistics) 0.005d0)
+                 (t
+                  (let* ((overlap (+ (- (+ (estimate lower lo) (estimate upper hi)) 1.0d0)
+                                     (pg-column-statistics-null-fraction statistics)))
+                         (residual (unless (pg-column-statistics-histogram-bounds statistics)
+                                     (max 0.0d0 (- 1.0d0 (pg-column-statistics-null-fraction statistics)
+                                                   (reduce #'+ (pg-column-statistics-most-common-values statistics)
+                                                           :key #'cdr :initial-value 0.0d0))))))
+                    (min 1.0d0 (+ (max 0.0d0 overlap) (* 0.005d0 (or residual 0.0d0)))))))))
+        (lower (estimate lower lo))
+        (upper (estimate upper hi))))))
+
 (defun index-path-for-range (table index comparisons &optional allow-unbounded-p predicate-conjuncts)
   (when (or (pg-index-expression-keys index)
             (not (index-predicate-implied-p (pg-index-predicate index) predicate-conjuncts)))
@@ -671,7 +832,9 @@ whose other operand belongs to the already-built outer relation is considered."
                  (progn
                    (setf endpoints terms)
                    (when terms
-                     (setf selectivity (* selectivity (if (rest terms) 0.1d0 0.333333d0))))
+                     (setf selectivity (* selectivity
+                                          (or (planner-scalar-bounds-selectivity table attnum terms)
+                                              (if (rest terms) 0.1d0 0.333333d0)))))
                    (return))))
     (when (or allow-unbounded-p endpoints (and equalities
                                                (or (rest (pg-index-columns index))
@@ -795,8 +958,88 @@ A parameter may supply a probe value, but cannot prove a predicate bound."
                      (expression-index-equality-path table index conjuncts))
         when path collect path))
 
+(defun planner-equality-filter-selectivity (table attnum type equality comparisons)
+  "Check the known equality value against any additional bounds on its column."
+  (let ((value (third equality)))
+    (unless (indexable-equality-value-p value type)
+      (return-from planner-equality-filter-selectivity nil))
+    (dolist (term comparisons)
+      (unless (eq term equality)
+        (destructuring-bind (column operator bound bound-type . rest) term
+          (declare (ignore column rest))
+          (let ((matches
+                  (if (string= operator "=")
+                      (analyze-statistics-value-equal-p value bound)
+                      (progn
+                        (unless (planner-scalar-range-types-compatible-p type bound-type)
+                          (return-from planner-equality-filter-selectivity nil))
+                        (let ((order (compare-3way value bound)))
+                          (or (if (char= (char operator 0) #\<) (minusp order) (plusp order))
+                              (and (= (length operator) 2) (zerop order))))))))
+            (unless matches (return-from planner-equality-filter-selectivity 0.0d0))))))
+    (planner-equality-selectivity table attnum value)))
+
+(defun planner-column-filter-selectivity (table attnum terms)
+  "Combine predicates on one column before assuming independence across columns."
+  (let* ((column (aref (pg-class-columns table) (1- attnum)))
+         (type (pg-column-type column))
+         (has-null (find :is-null terms :key #'second))
+         (has-not-null (find :is-not-null terms :key #'second))
+         (comparisons (if (or has-null has-not-null)
+                          (remove-if (lambda (term) (keywordp (second term))) terms)
+                          terms))
+         (equality (find "=" comparisons :key #'second :test #'string=)))
+    (cond
+      ((and has-null (or has-not-null comparisons)) 0.0d0)
+      ((null comparisons)
+       (let* ((statistics (table-statistics-column table attnum))
+              (null-fraction (cond ((pg-column-notnull column) 0.0d0)
+                                   (statistics (pg-column-statistics-null-fraction statistics))
+                                   (t 0.005d0))))
+         (if has-null null-fraction (- 1.0d0 null-fraction))))
+      ((find +null+ comparisons :key #'third) 0.0d0)
+      (equality (planner-equality-filter-selectivity table attnum type equality comparisons))
+      (t
+       (or (planner-scalar-bounds-selectivity table attnum comparisons)
+           (let ((term (first comparisons)))
+             (when (and (null (rest comparisons))
+                        (index-range-value-p (third term) (fourth term) type))
+               0.333333d0)))))))
+
+(defun planner-filter-selectivity (table conjuncts)
+  "Estimate supported base predicates, assuming independence across columns."
+  (let ((columns (pg-class-columns table))
+        (groups nil)
+        (selectivity 1.0d0))
+    (dolist (qual conjuncts)
+      (let* ((term (if (and (eq (first qual) :is-null) (eq (first (second qual)) :col))
+                       (list (second (second qual)) (if (third qual) :is-not-null :is-null))
+                       (multiple-value-bind (attnum operator value type parameter)
+                           (index-comparison-constant qual)
+                         (when (and attnum (null parameter))
+                           (list attnum operator value type qual nil)))))
+             (attnum (first term)))
+        (unless (and attnum (<= 1 attnum (length columns)))
+          (return-from planner-filter-selectivity nil))
+        (let ((group (assoc attnum groups)))
+          (if group (push term (cdr group))
+              (push (list attnum term) groups)))))
+    (dolist (group groups selectivity)
+      (let ((estimate (planner-column-filter-selectivity table (car group) (cdr group))))
+        (unless estimate (return-from planner-filter-selectivity nil))
+        (setf selectivity (* selectivity estimate))))))
+
+(defun planner-filter-cpu-cost (rows qual-count)
+  "Charge PostgreSQL's default operator cost per evaluated conjunct."
+  (* 0.0025d0 rows qual-count))
+
+(defun select-scan-filter-cost (table path qual-count)
+  "Cost the scan and the separate filter that rechecks its output."
+  (multiple-value-bind (total rows startup) (select-scan-path-cost table path)
+    (values (+ total (planner-filter-cpu-cost rows qual-count)) rows startup)))
+
 (defun choose-select-scan-path (table where &optional (column-offset 0 join-relation-p))
-  "Choose the lowest-cost SeqScan or equality IndexScan.
+  "Choose the lowest-cost sequential or index scan for the available predicates.
 
 COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
   (let* ((conjuncts (where-conjuncts where))
@@ -807,7 +1050,13 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                         (index-range-paths table conjuncts column-offset (not join-relation-p))
                         (unless (or join-relation-p (null conjuncts))
                           (expression-index-equality-paths table conjuncts))))))
-    (choose-cheapest-select-path table candidates)))
+    (if (and (not join-relation-p) conjuncts)
+        (let ((qual-count (length conjuncts)) (best nil) (best-cost nil))
+          (dolist (path candidates best)
+            (let ((cost (select-scan-filter-cost table path qual-count)))
+              (when (or (null best-cost) (< cost best-cost))
+                (setf best path best-cost cost)))))
+        (choose-cheapest-select-path table candidates))))
 
 (defun index-order-column (entry targets)
   (let ((expression (car entry)))
@@ -849,8 +1098,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
             (select-index-range-backward-p range) backward-p)
       path)))
 
-(defun ordered-select-scan-cost (table path limit residual-p)
-  (multiple-value-bind (total rows startup) (select-scan-path-cost table path)
+(defun ordered-select-scan-cost (table path limit residual-p qual-count)
+  (multiple-value-bind (total rows startup) (select-scan-filter-cost table path qual-count)
     (if (or residual-p (>= limit rows))
         total
         (+ startup (* (- total startup) (/ limit rows))))))
@@ -868,7 +1117,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
            (comparisons (index-range-comparisons conjuncts 0))
            (targets (getf prepared :targets))
            (best fallback)
-           (cost (select-scan-path-cost table fallback)))
+           (qual-count (length conjuncts))
+           (cost (select-scan-filter-cost table fallback qual-count)))
       (dolist (index (table-indexes table) best)
         (when (pg-index-valid-p index)
           (let ((path (index-path-for-range table index comparisons t
@@ -878,7 +1128,8 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                       (ordered-select-scan-cost table path limit
                                                 (let ((bounds (where-conjuncts (select-scan-path-qual path))))
                                                   (some (lambda (qual) (not (member qual bounds :test #'eq)))
-                                                        (where-conjuncts where))))))
+                                                        conjuncts))
+                                                qual-count)))
                 (when (<= candidate-cost cost)
                   (setf best path cost candidate-cost))))))))))
 

@@ -258,41 +258,83 @@ collision test without changing the production hash implementation."
     (materialize-select-tuple table tuple snapshot :demand (cons table (list (1+ index))))
     (aref values index)))
 
+(defun analyze-scalar-histogram (entries value-at mcv)
+  "Build up to 33 finite equidepth bounds over non-MCV sample values."
+  (declare (dynamic-extent value-at))
+  (let ((values (make-array +analyze-sample-size+ :fill-pointer 0)))
+    (dolist (entry entries)
+      (let ((value (funcall value-at (car entry))))
+        (unless (assoc value mcv :test #'analyze-statistics-value-equal-p)
+          (let ((scalar (planner-range-scalar value)))
+            (unless scalar (return-from analyze-scalar-histogram nil))
+            (dotimes (copy (cdr entry))
+              (vector-push scalar values))))))
+    (when (> (length values) 1)
+      (sort values #'<)
+      (let* ((last (1- (length values)))
+             (buckets (min 32 last)))
+        (loop for bucket from 0 to buckets
+              collect (aref values (floor (* bucket last) buckets)))))))
+
+(defun analyze-rank-mcv-candidates (entries value-at special-scalars-p)
+  "Reserve slots within the MCV limit for up to three non-finite scalar values."
+  (declare (dynamic-extent value-at))
+  (let ((common nil) (special nil))
+    (dolist (entry entries)
+      (cond ((and special-scalars-p (planner-nonfinite-bound-side (funcall value-at (car entry))))
+             (push entry special))
+            ((> (cdr entry) 1) (push entry common))))
+    (nconc (nreverse special) (stable-sort (nreverse common) #'> :key #'cdr))))
+
 (defun analyze-physical-column-statistics (table sample index row-count snapshot remaining
                                            &key (value-hash #'analyze-statistics-value-hash))
   "Count values using physical tuple references for representatives.
-REMAINING limits decoded MCV values retained across all columns."
-  (let ((buckets (make-hash-table :test #'equal))
-        (entries nil) (null-count 0) (wide-count 0))
-    (loop for bytes across sample for row-index from 0
-          for value = (analyze-physical-column-value table bytes index snapshot)
-          do (check-for-interrupts)
-             (cond ((eq value +null+) (incf null-count))
-                   ((eq value +analyze-wide-value+) (incf wide-count))
-                   (t (let* ((key (list (if (analyze-byte-vector-p value) :byte-vector :equal)
-                                        (funcall value-hash value)))
-                             (entry (find-if
-                                     (lambda (candidate)
-                                       (analyze-statistics-value-equal-p
-                                        value (analyze-physical-column-value
-                                               table (aref sample (car candidate)) index snapshot)))
-                                     (gethash key buckets))))
-                        (if entry (incf (cdr entry))
-                            (let ((new (cons row-index 1)))
-                              (push new entries)
-                              (push new (gethash key buckets))))))))
-    (let* ((count (length sample))
-           (ordered (nreverse entries))
-           (ranked (stable-sort (remove-if-not (lambda (entry) (> (cdr entry) 1)) (copy-list ordered))
-                                #'> :key #'cdr))
-           (mcv nil))
-      (loop for (row-index . frequency) in ranked for rank from 0 below +analyze-mcv-count+
-            for value = (analyze-physical-column-value table (aref sample row-index) index snapshot)
-            for size = (analyze-value-memory-estimate value)
-            when (<= size (car remaining))
-              do (decf (car remaining) size)
-                 (push (cons value (/ (float frequency 1.0d0) (max 1 count))) mcv))
-      (analyze-finish-column-statistics row-count count null-count wide-count ordered (nreverse mcv)))))
+REMAINING limits decoded distribution values retained across all columns."
+  (let* ((type (pg-column-type (aref (pg-class-columns table) index)))
+         (buckets (make-hash-table :test #'equal))
+         (entries nil) (null-count 0) (wide-count 0)
+         (scalar-sample (when (planner-scalar-range-type-p type)
+                          (make-array (length sample)))))
+    (flet ((value-at (row-index)
+             (if scalar-sample (aref scalar-sample row-index)
+                 (analyze-physical-column-value table (aref sample row-index) index snapshot))))
+      (loop for bytes across sample for row-index from 0
+            for value = (analyze-physical-column-value table bytes index snapshot)
+            do (check-for-interrupts)
+               (when scalar-sample (setf (aref scalar-sample row-index) value))
+               (cond ((eq value +null+) (incf null-count))
+                     ((eq value +analyze-wide-value+) (incf wide-count))
+                     (t (let* ((key (list (if (analyze-byte-vector-p value) :byte-vector :equal)
+                                          (funcall value-hash value)))
+                               (entry (find-if
+                                       (lambda (candidate)
+                                         (analyze-statistics-value-equal-p
+                                          value (value-at (car candidate))))
+                                       (gethash key buckets))))
+                          (if entry (incf (cdr entry))
+                              (let ((new (cons row-index 1)))
+                                (push new entries)
+                                (push new (gethash key buckets))))))))
+      (let* ((count (length sample))
+             (ordered (nreverse entries))
+             (ranked (analyze-rank-mcv-candidates
+                      ordered #'value-at (member type '(:float4 :float8 :numeric))))
+             (mcv nil))
+        (loop for (row-index . frequency) in ranked for rank from 0 below +analyze-mcv-count+
+              for value = (value-at row-index)
+              for size = (analyze-value-memory-estimate value)
+              when (<= size (car remaining))
+                do (decf (car remaining) size)
+                   (push (cons value (/ (float frequency 1.0d0) (max 1 count))) mcv))
+        (setf mcv (nreverse mcv))
+        (let ((statistics (analyze-finish-column-statistics row-count count null-count wide-count ordered mcv)))
+          (when (and scalar-sample (zerop wide-count))
+            (let* ((bounds (analyze-scalar-histogram ordered #'value-at mcv))
+                   (size (analyze-value-memory-estimate bounds)))
+              (when (<= size (car remaining))
+                (decf (car remaining) size)
+                (setf (pg-column-statistics-histogram-bounds statistics) bounds))))
+          statistics)))))
 
 (defun analyze-table-statistics (table relfilenode snapshot)
   "Sample owned physical tuples and derive each column independently."

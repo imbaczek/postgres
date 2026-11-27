@@ -259,7 +259,8 @@ physical two-way nested loop can apply a supported integer equality at the join.
 Use a simple equality with statistics so the estimate has a match rate."
   (let* ((limit (and spill-pages (eq (getf join :type) :inner)
                      (hash-join-streaming-limit prepared)))
-         (selectivity (and limit (explain-equality-join-selectivity join left right relations))))
+         (selectivity (and limit (explain-equality-join-selectivity
+                                  join left right relations left-rows right-rows t))))
     (when (and selectivity (plusp selectivity))
       (let ((candidates (/ limit selectivity)))
         ;; Charge both full scans to both paths. The lazy loop can stop
@@ -467,28 +468,31 @@ sorting and adjacent equality. The remaining key order controls sort priority."
                    keys)
         keys)))
 
+(defun equality-join-key-offsets (join qual compatible-types-p)
+  "Return the two input offsets for a bare column equality with compatible types."
+  (declare (dynamic-extent compatible-types-p))
+  (multiple-value-bind (a b equality-p) (equality-column-references qual)
+    (when (and equality-p (funcall compatible-types-p (expr-type a) (expr-type b)))
+      (let* ((start (if (getf join :reordered)
+                        (getf join :right-offset)
+                        (getf join :left-width)))
+             (end (+ start (getf join :right-width)))
+             (width (+ (getf join :left-width) (getf join :right-width)))
+             (a (1- (second a)))
+             (b (1- (second b))))
+        (when (and (<= 0 a) (< a width) (<= 0 b) (< b width))
+          (cond
+            ((and (not (<= start a (1- end))) (<= start b (1- end)))
+             (cons a (- b start)))
+            ((and (not (<= start b (1- end))) (<= start a (1- end)))
+             (cons b (- a start)))))))))
+
 (defun integer-join-key-offsets (join qual)
-  "Return the two input offsets for a bare integer column equality."
-  (when (and (consp qual) (eq (first qual) :binop) (equal (second qual) "="))
-    (let ((a (third qual))
-          (b (fourth qual)))
-      (when (and (consp a) (eq (first a) :col)
-                 (consp b) (eq (first b) :col)
-                 (member (expr-type a) '(:int2 :int4 :int8))
-                 (member (expr-type b) '(:int2 :int4 :int8)))
-        (let* ((start (if (getf join :reordered)
-                          (getf join :right-offset)
-                          (getf join :left-width)))
-               (end (+ start (getf join :right-width)))
-               (width (+ (getf join :left-width) (getf join :right-width)))
-               (a (1- (second a)))
-               (b (1- (second b))))
-          (when (and (<= 0 a) (< a width) (<= 0 b) (< b width))
-            (cond
-              ((and (not (<= start a (1- end))) (<= start b (1- end)))
-               (cons a (- b start)))
-              ((and (not (<= start b (1- end))) (<= start a (1- end)))
-               (cons b (- a start))))))))))
+  "Recognize signed integer equality for executor paths that require integer keys."
+  (equality-join-key-offsets join qual
+                             (lambda (left right)
+                               (and (member left '(:int2 :int4 :int8))
+                                    (member right '(:int2 :int4 :int8))))))
 
 (defun build-select-plan-tree (prepared physical-p paths)
   (let* ((input (select-plan-input-form prepared physical-p paths))
@@ -693,9 +697,9 @@ comparison, and output tuple. A required internal sort is blocking."
                     (left-unmatched 0.0d0)
                     (right-unmatched
                       (loop for (value . frequency) in right-mcv
-                            unless (assoc value left-mcv) sum frequency)))
+                            unless (assoc value left-mcv :test #'analyze-statistics-value-equal-p) sum frequency)))
     (dolist (entry left-mcv)
-      (let ((match (assoc (car entry) right-mcv)))
+      (let ((match (assoc (car entry) right-mcv :test #'analyze-statistics-value-equal-p)))
         (if match
             (progn (incf matches)
                    (incf matched-product (* (cdr entry) (cdr match))))
@@ -719,27 +723,53 @@ comparison, and output tuple. A required internal sort is blocking."
                      (contribution right-unmatched left-unmatched right-residual left-residual
                                    (pg-column-statistics-distinct-count left-stats) (length left-mcv)))))))))
 
-(defun explain-equality-join-selectivity (join left right relations)
-  "Estimate a bare integer equality from the ANALYZE statistics of two scans."
-  (let ((offsets (integer-join-key-offsets join (getf join :qual))))
-    (when (and offsets (eq (first left) :seq-scan) (eq (first right) :seq-scan))
-      (let* ((left-relation (nth (second left) relations))
-             (right-relation (nth (second right) relations))
-             (left-attnum (- (1+ (car offsets))
-                             (if (getf join :reordered) (getf left-relation :offset 0) 0)))
-             (left-stats (table-statistics-column (getf left-relation :table) left-attnum))
-             (right-stats (table-statistics-column (getf right-relation :table) (1+ (cdr offsets)))))
-        (when (and left-stats right-stats)
-          (let ((left-mcv (pg-column-statistics-most-common-values left-stats))
-                (right-mcv (pg-column-statistics-most-common-values right-stats)))
+(defun planner-join-base-scan (node)
+  "Recognize an input with unchanged base-table column numbering."
+  (loop while (eq (first node) :filter) do (setf node (third node)))
+  (when (member (first node) '(:seq-scan :index-scan)) node))
+
+(defun planner-join-distinct-estimate (statistics rows table)
+  "Use C's default distinct count, capped by a known input cardinality."
+  (max 1 (if statistics
+             (pg-column-statistics-distinct-count statistics)
+             (min 200 (or rows (table-row-estimate table))))))
+
+(defun explain-equality-join-selectivity (join left right relations &optional left-rows right-rows require-statistics-p)
+  "Estimate typed equality without applying a full-table distribution to a filtered input."
+  (let ((offsets (equality-join-key-offsets
+                  join (getf join :qual)
+                  (lambda (left right)
+                    (or (and (eq left right) (hash-join-key-type-p left))
+                        (and (member left '(:int2 :int4 :int8))
+                             (member right '(:int2 :int4 :int8)))
+                        (and (member left '(:text :varchar))
+                             (member right '(:text :varchar))))))))
+    (when offsets
+      (let* ((left-scan (planner-join-base-scan left))
+             (right-scan (planner-join-base-scan right))
+             (left-relation (when left-scan (nth (second left-scan) relations)))
+             (right-relation (when right-scan (nth (second right-scan) relations)))
+             (left-table (getf left-relation :table))
+             (right-table (getf right-relation :table)))
+        (when (and left-table right-table)
+          (let* ((left-attnum (- (1+ (car offsets))
+                                 (if (getf join :reordered) (getf left-relation :offset 0) 0)))
+                 (left-stats (when (eq (first left) :seq-scan)
+                               (table-statistics-column left-table left-attnum)))
+                 (right-stats (when (eq (first right) :seq-scan)
+                                (table-statistics-column right-table (1+ (cdr offsets)))))
+                 (left-mcv (when left-stats (pg-column-statistics-most-common-values left-stats)))
+                 (right-mcv (when right-stats (pg-column-statistics-most-common-values right-stats))))
+            (when (and require-statistics-p (not (and left-stats right-stats)))
+              (return-from explain-equality-join-selectivity nil))
             (if (and left-mcv right-mcv)
                 (explain-equality-join-mcv-selectivity left-stats right-stats left-mcv right-mcv)
-                ;; eqjoinsel_inner in selfuncs.c uses this estimate when
-                ;; it cannot compare common-value lists for both sides.
-                (/ (* (- 1.0d0 (pg-column-statistics-null-fraction left-stats))
-                      (- 1.0d0 (pg-column-statistics-null-fraction right-stats)))
-                   (max 1 (pg-column-statistics-distinct-count left-stats)
-                        (pg-column-statistics-distinct-count right-stats))))))))))
+                ;; eqjoinsel_inner uses the non-NULL fraction of each input and
+                ;; the greater distinct count when paired MCV lists are absent.
+                (/ (* (if left-stats (- 1.0d0 (pg-column-statistics-null-fraction left-stats)) 1.0d0)
+                      (if right-stats (- 1.0d0 (pg-column-statistics-null-fraction right-stats)) 1.0d0))
+                   (max (planner-join-distinct-estimate left-stats left-rows left-table)
+                        (planner-join-distinct-estimate right-stats right-rows right-table))))))))))
 
 (defun explain-hash-join-estimates (node outer inner relations)
   "Estimate input, hash and match work, including spill before the first output."
@@ -750,7 +780,7 @@ comparison, and output tuple. A required internal sort is blocking."
          (inner-cost (plan-node-metadata-estimated-cost inner)))
     (when (and outer-rows inner-rows)
       (let* ((selectivity (or (explain-equality-join-selectivity
-                               join (third node) (fourth node) relations) 0.01d0))
+                               join (third node) (fourth node) relations outer-rows inner-rows) 0.01d0))
              (rows (max (case (getf join :type)
                           (:left outer-rows) (:right inner-rows) (:full (max outer-rows inner-rows)) (t 1))
                         (round (* outer-rows inner-rows selectivity))))
@@ -770,7 +800,7 @@ comparison, and output tuple. A required internal sort is blocking."
             rows)))))
 
 (defun explain-nested-loop-estimates (node outer inner relations)
-  "Estimate independent Cartesian and simple integer equality nested loops."
+  "Estimate independent Cartesian and simple equality nested loops."
   (let* ((join (second node))
          (qual (getf join :qual))
          (left (third node))
@@ -781,7 +811,7 @@ comparison, and output tuple. A required internal sort is blocking."
                (member (getf join :type) '(:inner :cross))
                (not (physical-join-rescans-inner-p join right)))
       (let* ((cartesian-p (or (null qual) (and (eq (first qual) :bool) (eq (second qual) t))))
-             (selectivity (if cartesian-p 1 (explain-equality-join-selectivity join left right relations))))
+             (selectivity (if cartesian-p 1 (explain-equality-join-selectivity join left right relations outer-rows inner-rows))))
         (when selectivity
           (let* ((candidates (* outer-rows inner-rows))
                  (rows (if cartesian-p candidates (max 1 (round (* candidates selectivity)))))
@@ -799,21 +829,26 @@ comparison, and output tuple. A required internal sort is blocking."
                 rows)))))))
 
 (defun explain-scan-filter-estimates (node rows startup total relations)
-  "Estimate one resolved column-equals-literal filter on a sequential scan.
-The scan cost already includes visiting each input. Charge the default
-operator CPU per input, as cost_seqscan does for a simple qualification."
-  (let ((child (third node)))
-    (unless (and rows total (eq (first child) :seq-scan))
-      (return-from explain-scan-filter-estimates nil))
-    (let ((table (explain-sort-input-table child relations)))
-      (multiple-value-bind (attnum literal matched-p)
-          (equality-column-constant (second node))
-        (when (and table matched-p (<= 1 attnum (length (pg-class-columns table))))
-          (let ((column (aref (pg-class-columns table) (1- attnum))))
-            (when (indexable-equality-value-p literal (pg-column-type column))
-              (let ((selectivity (planner-equality-selectivity table attnum literal)))
-                (values (max 1 (round (* rows selectivity)))
-                        startup (+ total (* 0.0025d0 rows)))))))))))
+  "Estimate the separate filter on a base scan and charge its CPU cost."
+  (let* ((child (third node))
+         (kind (first child)))
+    (when (and rows total (member kind '(:seq-scan :index-scan)))
+      (let* ((conjuncts (where-conjuncts (second node)))
+             (indexed-p (eq kind :index-scan))
+             (relation (nth (second child) relations))
+             (table (getf relation :table))
+             (input-rows (if (and table indexed-p (getf relation :path))
+                             (select-scan-path-row-estimate table (getf relation :path))
+                             rows))
+             (covered-p (and indexed-p conjuncts
+                             (subsetp conjuncts (where-conjuncts (fifth child)) :test #'equal)))
+             (selectivity (when (and table (not covered-p))
+                            (planner-filter-selectivity table conjuncts)))
+             (output-rows (cond (covered-p rows)
+                                (selectivity
+                                 (let ((base-rows (if indexed-p (table-row-estimate table) rows)))
+                                   (min rows (max 1 (round (* base-rows selectivity)))))))))
+        (values output-rows startup (+ total (planner-filter-cpu-cost input-rows (length conjuncts))))))))
 
 (defun explain-group-row-estimate (node rows relations)
   "Use the analyzed distinct count for one grouping column of a full heap scan."

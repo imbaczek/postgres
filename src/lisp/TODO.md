@@ -2504,6 +2504,123 @@ allocated 4.4 MB and took 29 ms. Changing only the estimates to force
 the larger build allocated 16.3 MB and took 107 ms. Peak temporary
 space was zero and 119,010 bytes respectively.
 
+## P06 — Planner statistics and costing
+
+ANALYZE already records sampled row count, mean tuple width, NULL
+fractions, distinct counts and up to ten most-common values per
+column. The sample retains at most 300 physical rows and decoded
+distribution values share a table-wide memory budget. The planner
+uses the MCV list for equality, while the previous single-sided range
+estimate assumed one third regardless of the distribution. Join
+estimates use MCV overlap and distinct counts for a simple integer
+equality between full scans. Some filter estimates are computed only
+for EXPLAIN.
+
+Integer-backed scalar columns now retain up to 33 histogram bounds
+over the sample values outside the MCV list. Catalog images without
+histograms remain readable. ANALYZE caches decoded integer samples
+while processing one column and charges the retained bounds to the
+existing metadata budget. A single literal inequality uses the
+histogram for non-MCV, non-NULL mass and checks MCVs separately.
+The planner applies this estimate to B-tree range costing and to
+standalone sequential-filter row estimates. As in PostgreSQL C
+`scalarineqsel`, the estimate uses half the residual mass when
+statistics exist without a histogram. The no-statistics default
+remains one third.
+
+Run `python3 src/lisp/t/planner-statistics.py --reference-bin /path/to/pg/bin`
+for the skewed integer differential. Lisp estimated 40 rows for the
+rare tail and 240 for its complement. Both were exact on this fixture.
+PostgreSQL C estimates were within one row of the actual counts.
+
+The same harness accepts `--analyze-memory` and an optional
+`--engine-root /path/to/baseline`. For batches of 15 ANALYZE calls
+on 36,000 rows, allocation fell from 45.65 to 44.56 MB, median CPU
+from 390 to 380 ms, and peak whole-server RSS from 148.7 to 143.6 MiB
+relative to `153c1ed0f5d`.
+
+Range costing now groups literal inequalities on one integer-backed
+column, selects the tightest bound on each side, and combines the
+two selectivities with the NULL correction from C's `clausesel.c`.
+EXPLAIN carries the index row estimate through a filter when the
+index condition covers the entire filter. The differential exercises
+the interior of a histogram bucket, repeated one-sided predicates,
+an empty range, and an actual Index Scan with a one-row estimate.
+
+The equality-join estimator now uses the existing typed ANALYZE
+equality semantics for MCV matches on full scans. The varchar and
+numeric differential fixtures each estimated 6,800 rows, matching
+actual output and PostgreSQL C. The numeric fixture uses different
+decimal scales on each side.
+
+Run the same harness with `--range-planning-memory` or
+`--join-planning-memory` for batches of 600 EXPLAIN calls. Against
+`153c1ed0f5d`, range allocation rose from 15.59 to 18.36 MB, peak
+RSS from 114.2 to 116.8 MiB, and median CPU stayed at 90 ms. The
+allocation profile was dominated by JSON rendering and plan
+bookkeeping. Range interpolation counts full buckets as integers
+and only computes a fraction for the bin containing the constant.
+Typed join allocation rose from 26.09 to 26.41 MB, peak RSS from
+124.3 to 124.7 MiB, and median CPU from 100 to 110 ms.
+
+Standalone scan selection and EXPLAIN now charge filter CPU per input
+row using the same function. EXPLAIN uses the fractional candidate
+estimate for index recheck cost and caps residual filter output at
+the index input estimate. Filter selectivity groups predicates by
+column. NULL tests on a range column share the same non-NULL mass,
+and predicates on separate columns assume independence. A sequential
+filter can estimate a comparable literal outside the indexed key
+width. The differential checks a three-conjunct mixed filter, an
+out-of-range bigint bound on int4, and a displayed 0.75 cost increment
+for rechecking 300 rows against one predicate.
+
+Finite float4, float8, and bounded numeric samples now produce
+histograms as well. Bounds use exact rational scalars so interpolation
+works across very large finite floats and retains decimal ordering.
+Numeric projection limits coefficient and scale work. NaN and both
+infinities get priority within the existing ten MCV slots, even for
+sample singletons. That preserves the finite histogram and uses SQL
+ordering for non-finite comparisons. Interpolation applies the
+residual equality correction continuously to keep the CDF monotone.
+Histograms with flat buckets retain the observed point masses.
+The differential checks signed zero, all three non-finite values,
+and actual indexed float4, float8, and numeric ranges.
+
+For ANALYZE allocation holdouts, use `--analyze-memory --sample-kind float`
+or `--analyze-memory --sample-kind numeric`. In the 15-call float
+batch, allocation fell from 50.47 to 49.14 MB, CPU stayed at 390 ms,
+and peak RSS rose from 149.8 to 152.0 MiB. The numeric batch went from
+48.92 to 47.41 MB and 148.2 to 147.0 MiB, with CPU at 400 ms. The
+current 600-call range-planning batch used 18.46 MB, 117.0 MiB peak
+RSS, and 100 ms CPU.
+
+Simple equality joins use the greater of the two distinct counts and
+known NULL fractions when paired MCV lists are unavailable. An
+unanalyzed or narrowed base input uses a default of 200 distinct
+values, capped by its estimated rows. Filtered base inputs leave
+full-table MCV frequencies out of this fallback. Derived relations
+and composite or expression keys still use the previous generic
+estimates. The spill-sensitive LIMIT choice requires analyzed
+distributions on both inputs. With ANALYZE only on the left of the
+varchar holdout, Lisp estimated 280 rows and C estimated 1,456, against
+6,800 actual. This fallback supplies a cost input even when its
+independence assumption misses the actual overlap.
+
+Run the same harness with `--execution-memory` to reproduce the
+end-to-end holdouts below. Use `--engine-root` for the baseline
+`153c1ed0f5d`. Each batch checks every result, records selected plan
+nodes, and reports elapsed time, CPU, allocation, and whole-server RSS.
+
+| Holdout | Calls per batch | CPU ms, before → after | Allocation MB, before → after | Peak RSS MiB, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Narrow integer range | 200 | 550 → 50 | 110.01 → 10.34 | 204.27 → 109.49 |
+| Integer range with residual expression | 200 | 560 → 50 | 110.39 → 10.73 | 204.52 → 109.29 |
+| Numeric equality hash join | 30 | 50 → 50 | 16.21 → 16.21 | 114.46 → 114.56 |
+
+Both range holdouts moved from sequential scans to index scans. The
+numeric holdout kept its hash join. Automatic refresh scheduling
+belongs to P15.
+
 ## P07 — Transactional catalog foundation for P04
 
 The catalog tracks relation names in a backend-owned overlay. The owning
