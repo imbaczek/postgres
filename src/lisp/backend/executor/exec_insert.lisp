@@ -47,7 +47,7 @@
   (and unique
        (or (pg-index-nulls-not-distinct-p index) (not (key-has-null-p values)))))
 
-(defun check-unique-indexes (table indexes values exclude-tid)
+(defun check-unique-indexes (table indexes values exclude-tid expression-keys)
   "Return :ok, (:violation . index-name), or (:wait . xid).
 
 Default unique indexes treat NULLs as distinct; NULLS NOT DISTINCT indexes
@@ -57,12 +57,11 @@ mutex for each index in INDEXES."
         (violation nil)
         (my-xid (backend-xid *backend*)))
     (loop for idx in indexes when (pg-index-unique-p idx) do
-      (let* ((types (index-types idx table))
-             (vals (index-values idx values)))
-        (when (index-key-requires-uniqueness-check-p idx vals t)
+      (let ((vals (index-row-key-values idx values expression-keys)))
+        (when (and vals (index-key-requires-uniqueness-check-p idx vals t))
           (let ((tids (btree-search-unlocked
                        (pg-index-relfilenode idx)
-                       (encode-index-key vals types))))
+                       (encode-index-key vals (index-types idx table)))))
             (dolist (tid tids)
               (unless (and exclude-tid
                            (= (car tid) (car exclude-tid))
@@ -106,11 +105,13 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
          (indexes nil)
          (index-relfilenodes nil)
          (toast nil)
-         (toast-node nil))
+         (toast-node nil)
+         (expression-keys nil))
     (detach-select-index-scans)
     (register-relation-writer relfilenode xid)
     (multiple-value-setq (indexes index-relfilenodes toast toast-node)
       (capture-insert-indexes table))
+    (setf expression-keys (prepare-expression-index-row-keys indexes values))
     (loop
       (let ((wait-xid nil))
         (with-btree-relation-locks (index-relfilenodes)
@@ -120,12 +121,12 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                          (eql toast-node (and toast (pg-toast-index-relfilenode toast))))
               (ereport "0A000" "TOAST storage changed during INSERT"))
             (multiple-value-bind (action payload)
-                (when before-check (funcall before-check indexes))
+                (when before-check (funcall before-check indexes expression-keys))
               (when (eq action :conflict)
                 (return-from insert-tuple-with-unique
                   (values nil nil nil :conflict payload)))
               (let ((check (if (eq action :wait) (cons :wait payload)
-                               (check-unique-indexes table indexes values exclude-tid))))
+                               (check-unique-indexes table indexes values exclude-tid expression-keys))))
                 (cond
                   ((eq check :ok)
                    (let* ((columns (pg-class-columns table))
@@ -134,8 +135,10 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                      (multiple-value-bind (block off)
                          (heapam-insert relfilenode columns physical xid cid)
                        (dolist (idx indexes)
-                         (let ((key (index-storage-key idx table (index-values idx values) physical)))
-                           (btree-insert-unlocked (pg-index-relfilenode idx) key block off)))
+                         (let ((key-values (index-row-key-values idx values expression-keys)))
+                           (when key-values
+                             (let ((key (index-storage-key idx table key-values physical)))
+                               (btree-insert-unlocked (pg-index-relfilenode idx) key block off)))))
                        (when on-success (funcall on-success block off))
                        (return-from insert-tuple-with-unique
                          (if publication-kind

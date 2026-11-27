@@ -1,6 +1,64 @@
 ;;;; spill-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest hash-spill-utf8-buffer-boundary
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (multiple-value-bind (path output) (open-query-temp-output nil t)
+          (let* ((prefix (make-string (1- +hash-spill-buffer-bytes+) :initial-element #\a))
+                 (character (code-char #x1f642))
+                 (value (vector "café" "東京" (string character) "quote: \" end")))
+            (write-string prefix output)
+            (write-char character output)
+            (query-spill-write-record output value)
+            (finish-query-temp-stream output t)
+            (let ((input (open-query-temp-input path nil t)))
+              (dotimes (index (length prefix)) (read-char input))
+              (rove:ok (char= character (read-char input)))
+              (unread-char character input)
+              (rove:ok (= (length prefix) (file-position input)))
+              (rove:ok (char= character (read-char input)))
+              (rove:ok (= (+ (length prefix) 4) (file-position input)))
+              (rove:ok (equalp value (query-spill-read-record input)))
+              (rove:ok (eq +query-spill-eof+ (query-spill-read-record input)))
+              (finish-query-temp-stream input t)))))))
+
+(rove:deftest hash-spill-mixed-records
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (multiple-value-bind (path output) (open-query-temp-output nil t)
+          (let ((records (list (list #(-2147483648) nil #(4294967295))
+                               (list #("東京") nil #(17))
+                               (list #(2147483647) nil #(0)))))
+            (dolist (record records) (query-spill-write-record output record))
+            (finish-query-temp-stream output t)
+            (with-query-temp-input (input path nil t)
+              (rove:ok (equalp (first records) (query-spill-read-record input)))
+              (rove:ok (= 9 (file-position input)))
+              (rove:ok (equalp (second records) (query-spill-read-record input)))
+              (rove:ok (equalp (third records) (query-spill-read-record input)))
+              (rove:ok (eq +query-spill-eof+ (query-spill-read-record input)))))))))
+
+(rove:deftest hash-spill-disk-match-map
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (let ((map (make-query-match-map 3 t 10)))
+          (unwind-protect
+               (progn
+                 (rove:ok (= 3 (array-total-size (query-match-map-bytes map))))
+                 (dotimes (index 3) (query-match-map-append map))
+                 (rove:ok (null (query-match-map-io-stream map)))
+                 (query-match-map-mark map 0)
+                 (query-match-map-append map)
+                 (rove:ok (typep (query-match-map-io-stream map) 'hash-spill-match-stream))
+                 (query-match-map-mark map 3)
+                 (query-match-map-finish map)
+                 (rove:ok (query-match-map-matched-p map 0))
+                 (rove:ok (not (query-match-map-matched-p map 1)))
+                 (rove:ok (not (query-match-map-matched-p map 2)))
+                 (rove:ok (query-match-map-matched-p map 3)))
+            (close-query-match-map map))))))
+
 (defun make-rove-row-iterator (rows)
   (make-sql-iterator (lambda () (when rows (values (pop rows) t)))))
 

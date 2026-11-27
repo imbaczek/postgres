@@ -558,11 +558,139 @@ below the previous minimum, so examine every entry."
   (call-with-btree-relation-read-lock
    relfilenode (lambda () (btree-search-unlocked relfilenode key))))
 
+(defstruct btree-scan-bound
+  "An encoded key prefix, with equality defined over all of its components."
+  (prefix nil :read-only t)
+  (inclusive-p t :read-only t))
+
+(defun btree-bound-slice-order (bytes start length bound)
+  "Compare the bound prefix with an encoded key slice."
+  (let ((prefix (btree-scan-bound-prefix bound)))
+    (compare-btree-key-bytes prefix bytes start (min length (length prefix)))))
+
+(defun btree-bound-key-order (key bound)
+  (let ((bytes (btree-logical-key key)))
+    (btree-bound-slice-order bytes 0 (length bytes) bound)))
+
 (defstruct btree-equal-cursor
   relfilenode key stack)
 
 (defstruct btree-equal-cursor-frame
   level entries (next 0) (end -1))
+
+(defstruct btree-scan-frame
+  level entries page next end)
+
+(defstruct btree-scan-cursor
+  relfilenode lower upper (step 1 :type (member -1 1)) stack)
+
+(defun btree-scan-child-range (entries lower upper)
+  "Retain children whose separator interval might intersect the scan.
+The first child's separator can be stale. Inclusive endpoints can border
+duplicates on either side of an equal separator."
+  (let ((first 0)
+        (last (1- (length entries))))
+    (when lower
+      (loop for child from 1 below (length entries)
+            for order = (btree-bound-key-order (car (aref entries child)) lower)
+            while (or (plusp order) (and (zerop order) (not (btree-scan-bound-inclusive-p lower))))
+            do (setf first child)))
+    (when upper
+      (loop for child from 1 below (length entries)
+            for order = (btree-bound-key-order (car (aref entries child)) upper)
+            when (or (minusp order) (and (zerop order) (not (btree-scan-bound-inclusive-p upper))))
+              do (setf last (1- child))
+                 (return)))
+    (values first last)))
+
+(defun btree-scan-push-node (cursor level block)
+  (check-for-interrupts)
+  (with-buf-read-page (page (btree-scan-cursor-relfilenode cursor) block)
+    (unless page (ereport "XX001" "index page ~a is missing" block))
+    (let ((entries (when (plusp level) (coerce (btree-page-entries page t) 'simple-vector))))
+      (multiple-value-bind (first last)
+          (if (zerop level)
+              (values 1 (page-lp-count page))
+              (btree-scan-child-range entries (btree-scan-cursor-lower cursor)
+                                      (btree-scan-cursor-upper cursor)))
+        (when (<= first last)
+          (when (minusp (btree-scan-cursor-step cursor))
+            (rotatef first last))
+          ;; Keep an immutable leaf image without retaining a buffer pin.
+          (push (make-btree-scan-frame :level level :entries entries :next first :end last
+                                       :page (when (zerop level) (copy-seq page)))
+                (btree-scan-cursor-stack cursor)))))))
+
+(defun btree-scan-bound-allows-p (key bound direction)
+  (let ((bytes (btree-logical-key key)))
+    (btree-key-slice-in-scan-p bytes 0 (length bytes) bound direction)))
+
+(defun btree-key-slice-in-scan-p (bytes start length bound direction)
+  (or (null bound)
+      (let ((order (* direction (btree-bound-slice-order bytes start length bound))))
+        (or (minusp order)
+            (and (zerop order) (btree-scan-bound-inclusive-p bound))))))
+
+(defun btree-scan-leaf-tid (page slot lower upper)
+  (with-live-page-item (page slot start length)
+    (unless (and (>= length 8) (<= (page-upper page) start (+ start length) (length page)))
+      (ereport "XX001" "invalid index leaf entry"))
+    (let* ((field (page-u16 page start))
+           (key-length (logand field #x7fff))
+           (key-start (+ start 2))
+           (end (+ start length)))
+      (unless (= length (+ key-length 8)) (ereport "XX001" "invalid index leaf entry"))
+      (cond ((logbitp 15 field)
+             (let* ((entry (decode-leaf-entry (subseq page start end)))
+                    (key (first entry)))
+               (when (and (btree-scan-bound-allows-p key lower 1)
+                          (btree-scan-bound-allows-p key upper -1))
+                 (cons (second entry) (third entry)))))
+            ((and (btree-key-slice-in-scan-p page key-start key-length lower 1)
+                  (btree-key-slice-in-scan-p page key-start key-length upper -1))
+             (let ((tid (+ key-start key-length)))
+               (cons (page-u32 page tid) (page-u16 page (+ tid 4)))))))))
+
+(defun btree-scan-next-tid (cursor)
+  "Yield one in-range heap TID while the caller holds the relation lease."
+  (let ((step (btree-scan-cursor-step cursor)))
+    (loop for frame = (first (btree-scan-cursor-stack cursor))
+          while frame
+          for position = (btree-scan-frame-next frame)
+          for level = (btree-scan-frame-level frame)
+          do (if (plusp (* step (- position (btree-scan-frame-end frame))))
+                 (pop (btree-scan-cursor-stack cursor))
+                 (progn
+                   (incf (btree-scan-frame-next frame) step)
+                   (if (plusp level)
+                       (btree-scan-push-node cursor (1- level)
+                                             (cdr (aref (btree-scan-frame-entries frame) position)))
+                       (let ((tid (btree-scan-leaf-tid (btree-scan-frame-page frame) position
+                                                       (btree-scan-cursor-lower cursor)
+                                                       (btree-scan-cursor-upper cursor))))
+                         (when tid (return tid)))))))))
+
+(defun btree-scan-empty-p (lower upper)
+  "Detect crossing endpoints, taking inclusive suffixes into account."
+  (when (and lower upper)
+    (let ((low-key (btree-scan-bound-prefix lower))
+          (high-key (btree-scan-bound-prefix upper)))
+      (case (key-compare low-key high-key)
+        (-1 (and (not (btree-scan-bound-inclusive-p lower))
+                 (zerop (btree-bound-key-order high-key lower))))
+        (0 (not (and (btree-scan-bound-inclusive-p lower)
+                     (btree-scan-bound-inclusive-p upper))))
+        (1 (or (not (btree-scan-bound-inclusive-p upper))
+               (not (zerop (btree-bound-key-order low-key upper)))))))))
+
+(defun open-btree-scan-cursor-unlocked (relfilenode lower upper &key backward-p)
+  "Open a prefix-bounded scan under the caller's relation read lease."
+  (let ((cursor (make-btree-scan-cursor :relfilenode relfilenode :lower lower :upper upper
+                                        :step (if backward-p -1 1))))
+    (unless (btree-scan-empty-p lower upper)
+      (multiple-value-bind (level root) (btree-read-meta relfilenode)
+        (btree-scan-push-node cursor level root)))
+    cursor))
 
 (defun btree-cursor-push-node (cursor level block)
   (with-buf-read-page (page (btree-equal-cursor-relfilenode cursor) block)

@@ -270,12 +270,18 @@ logical catalog horizons covered by replay."
   (multiple-value-bind (data catalog) (wal-physical-feedback-horizons xmin :include-senders include-senders)
     (if (and include-catalog catalog) (min data catalog) data)))
 
+(defun wal-transactional-ddl-slot-plugin-p (plugin)
+  (equal plugin "pg_lisp_transactional"))
+
+(defun wal-native-slot-plugin-p (plugin)
+  "Whether PLUGIN uses the private native logical protocol."
+  (or (equal plugin "pg_lisp") (wal-transactional-ddl-slot-plugin-p plugin)))
+
 (defun wal-valid-slot-plugin-state-p (plugin database-oid confirmed-flush-lsn)
   "A standard slot must be database-bound and confirmed in its first durable image."
-  (and (stringp plugin)
-       (member plugin '("pg_lisp" "pgoutput") :test #'string=)
-       (or (string= plugin "pg_lisp")
-           (and database-oid confirmed-flush-lsn))))
+  (or (equal plugin "pg_lisp")
+      (and (wal-transactional-ddl-slot-plugin-p plugin) database-oid)
+      (and (equal plugin "pgoutput") database-oid confirmed-flush-lsn)))
 
 (defvar *wal-lock* (sb-thread:make-mutex :name "pg wal and page cache lock"))
 (defvar *wal-page-cache* (make-hash-table :test #'equal))
@@ -745,6 +751,13 @@ OWNED-P transfers the caller's private PAGE. Otherwise copy PAGE first."
 
 (defun wal-dirty-checksum (key page)
   "Bind scratch bytes to the exact relation, fork and block."
+  (let ((table *wal-crc32-table*))
+    (when (and (typep page '(simple-array (unsigned-byte 8) (*)))
+               (= (length page) +blcksz+)
+               (typep table '(simple-array (unsigned-byte 32) (256))))
+      (return-from wal-dirty-checksum
+        (wal-crc32-typed-range page 0 +blcksz+ table
+                               (wal-page-identity-crc-seed table (first key) (third key) (second key) t)))))
   (let ((bytes (make-array (+ 12 +blcksz+) :element-type '(unsigned-byte 8))))
     (wal-set-u32 bytes 0 (first key))
     (wal-set-u32 bytes 4 (wal-page-fork-id (second key)))

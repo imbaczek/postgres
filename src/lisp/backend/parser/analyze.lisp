@@ -606,6 +606,9 @@
                                         :volatility :stable :strict-p t :evaluator 'sql-version)
                    (make-scalar-builtin :name "pg_lisp_runtime" :result-type :text
                                         :volatility :stable :strict-p t :evaluator 'sql-lisp-runtime)
+                   (make-scalar-builtin :name "pg_lisp_transactional_ddl_supported" :result-type :bool
+                                        :volatility :stable :strict-p t
+                                        :evaluator 'sql-logical-transactional-ddl-supported)
                    ;; Keep the native cluster identity's planner classification open.
                    (make-scalar-builtin :name "pg_lisp_cluster_identity" :result-type :varchar
                                         :strict-p t :evaluator 'sql-cluster-identity)
@@ -3306,7 +3309,15 @@ still requires deferred sort projection."
                               (nth-value 1 (selected-order-target-position item targets)))
                           expression
                           (rewrite-aggregate-columns expression group-keys scope))
-                      (getf item :desc)) result))))))
+                      (analyzed-order-direction item)) result))))))
+
+(defun analyzed-order-direction (item)
+  "Keep default ordering compact and mark explicit nondefault NULL placement."
+  (let ((descending-p (getf item :desc)))
+    (case (getf item :nulls)
+      (:first (if descending-p t :asc-nulls-first))
+      (:last (when descending-p :desc-nulls-last))
+      (otherwise descending-p))))
 
 (defun analyze-order (order table targets)
   ;; Earlier hidden ORDER targets also participate in SQL99 expression matching.
@@ -3324,7 +3335,7 @@ still requires deferred sort projection."
                                               :test #'eq)))
         (unless duplicate
           (push (list :expr expression) seen)
-          (push (cons expression (getf item :desc)) result))))))
+          (push (cons expression (analyzed-order-direction item)) result))))))
 
 (defun sql-type-category (type)
   (cond ((member type '(:int2 :int4 :int8 :oid :oid8 :numeric :float4 :float8)) :numeric)
@@ -3416,7 +3427,7 @@ still requires deferred sort projection."
            (ereport "0A000" "only result column names can be used in UNION ORDER BY")))
        (when (member (getf (nth position targets) :type) '(:json :json-array))
          (json-equality-or-order-error (getf (nth position targets) :type) t))
-       (cons (getf (nth position targets) :expr) (getf item :desc))))
+       (cons (getf (nth position targets) :expr) (analyzed-order-direction item))))
    order))
 
 (defun selected-expression-equal-p (left right)
@@ -3481,7 +3492,7 @@ still requires deferred sort projection."
         for position = (distinct-order-target-position item scope targets aggregate-p group-keys descriptors)
         for target = (nth position targets)
         collect (cons (projected-target-ref target (1+ position))
-                      (getf item :desc))))
+                      (analyzed-order-direction item))))
 
 ;;; ---- evaluation ----
 
@@ -3811,6 +3822,10 @@ the full 64-bit ID as a signed value."
 
 (defun sql-cluster-identity ()
   (catalog-cluster-identity *catalog*))
+
+(defun sql-logical-transactional-ddl-supported ()
+  "Advertise support for applying native mixed logical transactions."
+  t)
 
 (defun sql-current-database ()
   (backend-database *backend*))

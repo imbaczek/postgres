@@ -1318,6 +1318,14 @@
                           (error () t)))
                (rove:ok (zerop queries))
                (setf (aref begin 8) 100)
+               (when (eq mode :private)
+                 (setf (logical-subscription-runtime-current-lsn runtime) 100)
+                 (rove:ok (rove:signals
+                           (logical-pgoutput-apply-operation runtime
+                                                             (logical-pgoutput-read-operation runtime begin))
+                           'error))
+                 (rove:ok (zerop queries))
+                 (setf (logical-subscription-runtime-current-lsn runtime) 0))
                (logical-pgoutput-apply-operation
                 runtime (logical-pgoutput-read-operation runtime begin))
                (rove:ok (= queries 1))
@@ -1327,6 +1335,13 @@
                           (error () t)))
                (rove:ok (zerop commits))
                (setf (aref commit 9) 100)
+               (when (eq mode :private)
+                 (rove:ok (rove:signals
+                           (logical-pgoutput-apply-operation runtime
+                                                             (logical-pgoutput-read-operation runtime commit))
+                           'error))
+                 (rove:ok (zerop commits))
+                 (setf (aref commit 17) 100))
                (logical-pgoutput-apply-operation
                 runtime (logical-pgoutput-read-operation runtime commit))
                (rove:ok (= commits 1)))
@@ -6243,6 +6258,95 @@
       (rove:ok (handler-case (progn (logical-fragment-batch-finish batch 6) nil)
                  (error () t)))
       (logical-fragment-batch-finish batch 5)))
+
+(rove:deftest transactional-ddl-fragments-require-catalog-terminal
+    (let* ((ast '(:type :create-index :name "items_ix" :table "items" :columns ("id")))
+           (envelope (catalog-readable-data-string (list :version 1 :database-oid 7 :ast ast)))
+           (ddl (make-logical-change :kind :transaction-ddl :database-oid 7 :event-payload envelope))
+           (shape '(:tables nil :indexes nil :sequences nil))
+           (footer (logical-encode-change
+                    (make-logical-change :kind :transaction-ddl :database-oid 7
+                                         :event-payload (logical-encode-transaction-schema 7 shape shape))))
+           (events (list (logical-encode-change
+                          (logical-test-change :insert 7 701 :new-values #(1 2 "before")))
+                         (logical-encode-change ddl)
+                         (logical-encode-change
+                          (logical-test-change :delete 7 701 :old-values #(1 2 "before")))
+                         footer))
+           (plan (logical-plan-event-fragments events 100 10000))
+           (records (loop for fragment in plan for index from 0
+                          collect (make-wal-record :type +wal-record-logical-changes+ :xid 88
+                                                   :payload (logical-encode-fragment index (length plan) fragment))))
+           (catalog (wal-encode-catalog-payload (string->bytes "new") nil))
+           (chunk (make-wal-record :type +wal-record-catalog-chunk+ :xid 0
+                                   :payload (wal-encode-catalog-chunk-payload catalog 0 1)))
+           (ordinary (make-wal-record :type +wal-record-commit+ :xid 88 :end 100
+                                      :payload (wal-encode-commit-timestamp 94)))
+           (mixed (make-wal-record :type +wal-record-catalog-transaction-commit+ :xid 88 :end 200
+                                   :payload (wal-encode-catalog-transaction-commit 95 catalog)))
+           (directory (merge-pathnames
+                       (format nil "pg-transaction-ddl-reader-~d-~d/" (sb-posix:getpid) (random 1000000))
+                       (uiop:temporary-directory)))
+           (*query-temp-directory* directory)
+           (*wal-recovery-group-active* t)
+           (*wal-recovery-logical-xid* nil)
+           (*wal-recovery-logical-chunk-count* nil)
+           (*wal-recovery-logical-next-chunk* 0)
+           (*wal-recovery-logical-bytes* 0))
+      (rove:ok (equal ast (logical-decode-transaction-ddl envelope 7)))
+      (rove:ok (rove:signals (logical-decode-transaction-ddl envelope 8) 'error))
+      (dolist (unsupported '((:type :drop-index :names ("items_ix") :concurrently t)
+                             (:type :drop-index :names ("items_ix") :unknown t)
+                             (:type :create-index :name "items_ix" :table "items")))
+        (rove:ok (rove:signals
+                  (logical-decode-transaction-ddl
+                   (catalog-readable-data-string (list :version 1 :database-oid 7 :ast unsupported)) 7)
+                  'pg-error)))
+      (rove:ok (string= "pg_lisp/transaction-ddl" (pgoutput-message-prefix ddl)))
+      (let ((encoded-ddl (second events)))
+        (rove:ok (rove:signals (logical-decode-catalog-event (logical-wrap-catalog-event 7 encoded-ddl)) 'error))
+        (rove:ok (rove:signals
+                  (wal-decode-logical-change-chunk (logical-encode-chunk 0 1 (list encoded-ddl))) 'error)))
+      (flet ((finish (input)
+               (let* ((batch (make-logical-fragment-batch 10000))
+                      (parts (logical-plan-event-fragments input 10000 10000)))
+                 (loop for part in parts for index from 0
+                       do (logical-fragment-batch-accept
+                           batch 88 (logical-encode-fragment index (length parts) part)))
+                 (logical-fragment-batch-finish batch 88 t))))
+        (rove:ok (rove:signals (finish (butlast events)) 'error))
+        (rove:ok (rove:signals (finish (list footer)) 'error))
+        (rove:ok (rove:signals (finish (append events (list footer))) 'error))
+        (rove:ok (rove:signals (finish (append events (list (first events)))) 'error)))
+      (dolist (record records) (wal-recovery-accept-logical-change-chunk record))
+      (rove:ok (rove:signals (wal-recovery-finish-logical-change-batch 88) 'error))
+      (wal-recovery-finish-logical-change-batch 88 t)
+      (ensure-directories-exist directory)
+      (unwind-protect
+           (call-with-logical-reader-spools
+            (lambda ()
+              (dolist (database-oid '(7 8))
+                (let ((reader (make-logical-reader-state :database-oid database-oid)))
+                  (wal-logical-reader-start-batch reader)
+                  (dolist (record records) (wal-logical-reader-add-chunk reader record))
+                  (rove:ok (rove:signals (wal-logical-reader-finish-batch reader ordinary) 'error))
+                  (wal-logical-reader-note-catalog-chunk reader chunk)
+                  (wal-logical-reader-finish-batch reader mixed)
+                  (let ((transaction (first (logical-reader-state-transactions reader))))
+                    (if (= database-oid 7)
+                        (let ((kinds nil))
+                          (rove:ok (= (logical-transaction-commit-lsn transaction) 200))
+                          (let ((runtime (make-logical-subscription-runtime
+                                          :options (make-logical-subscription-options)
+                                          :transaction-open-p t)))
+                            (rove:ok (equal (list #\M "pg_lisp/transaction-ddl" 200 envelope t)
+                                            (logical-pgoutput-read-operation
+                                             runtime (pgoutput-build-message ddl transaction)))))
+                          (logical-transaction-map-changes
+                           transaction (lambda (change) (push (logical-change-kind change) kinds)))
+                          (rove:ok (equal (nreverse kinds) '(:insert :transaction-ddl :delete :transaction-ddl))))
+                        (rove:ok (null transaction))))))))
+        (uiop:delete-directory-tree directory :validate t))))
 
 (rove:deftest test-logical-fragments-recovery-and-slot-reader
     (let* ((event (logical-encode-change

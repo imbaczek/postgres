@@ -82,8 +82,8 @@
          (values row present origins nil (and present presence))))
      (lambda () (close-sql-iterator input)))))
 
-(defun make-query-replay-store (producer &optional (memory-limit *query-work-memory-bytes*))
-  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit) :capture-origins-p *datum-origin-capture* :capture-presence-p t))
+(defun make-query-replay-store (producer &optional (memory-limit (effective-query-work-memory-bytes)) hash-spill-p)
+  (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit hash-spill-p) :capture-origins-p *datum-origin-capture* :capture-presence-p t))
 
 (defun close-query-replay-store (store)
   (sb-sys:without-interrupts
@@ -152,13 +152,14 @@ ownership is claimed, close the newly created store."
   (let* ((spool (query-replay-store-spool store))
          (metadata (or (query-replay-store-capture-origins-p store)
                        (query-replay-store-capture-presence-p store)))
-         (copy (copy-query-sort-value
-                (if metadata
+         (value (if metadata
                     (list row
                           (when (query-replay-store-capture-origins-p store)
                             (datum-origins-for-spill origins))
                           (when (query-replay-store-capture-presence-p store) presence))
-                    row))))
+                    row))
+         ;; Disk-only hash partitions encode synchronously and retain no input.
+         (copy (if (query-row-spool-hash-spill-p spool) value (copy-query-sort-value value))))
     (unless (query-row-spool-pathname spool)
       (incf (query-row-spool-memory-bytes spool) 16))
     (query-row-spool-append spool copy)
@@ -198,27 +199,30 @@ matches across replays."
                                (when (query-row-spool-output-stream spool)
                                  (finish-output (query-row-spool-output-stream spool)))
                                (unless input
-                                 (setf input (open-query-temp-input (query-row-spool-pathname spool)))
+                                 (setf input (open-query-temp-input (query-row-spool-pathname spool)
+                                                                    nil (query-row-spool-hash-spill-p spool)))
                                  (dotimes (skip index) (query-spill-read-record input))
                                  (setf offset (file-position input)))
-                               (file-position input offset)
-                               (prog1 (query-spill-read-record input)
-                                 (setf offset (file-position input))))
+                               (if (query-row-spool-sealed-p spool)
+                                   (query-spill-read-record input)
+                                   (progn
+                                     (file-position input offset)
+                                     (prog1 (query-spill-read-record input)
+                                       (setf offset (file-position input))))))
                              (aref (query-replay-store-memory-rows store) index))))
                    (incf index)
                    (let* ((metadata (or (query-replay-store-capture-origins-p store)
                                         (query-replay-store-capture-presence-p store)))
-                          (row (if metadata (first value) value)))
-                     (cond
-                       ((and candidate-p (not (funcall candidate-p row))) (values nil t))
-                       (metadata
-                        (values (copy-query-sort-value row) t
-                                (when (query-replay-store-capture-origins-p store)
-                                  (datum-origins-from-spill (second value)))
-                                nil
-                                (when (query-replay-store-capture-presence-p store)
-                                  (copy-query-sort-value (third value)))))
-                       (t (values (copy-query-sort-value row) t nil nil nil))))))))
+                          (row (if metadata (first value) value))
+                          (disk-p (query-row-spool-pathname spool)))
+                     (if (and candidate-p (not (funcall candidate-p row)))
+                         (values nil t)
+                         (values (if disk-p row (copy-query-sort-value row)) t
+                                 (when (and metadata (query-replay-store-capture-origins-p store))
+                                   (datum-origins-from-spill (second value)))
+                                 nil
+                                 (when (and metadata (query-replay-store-capture-presence-p store))
+                                   (if disk-p (third value) (copy-query-sort-value (third value)))))))))))
            (lambda ()
              (when input (finish-query-temp-stream input nil))
              (setf (query-replay-store-readers store)

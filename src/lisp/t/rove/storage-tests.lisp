@@ -1,6 +1,36 @@
 ;;;; storage-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest test-btree-scan-boundaries
+    (let* ((lower (make-btree-scan-bound :prefix #(2) :inclusive-p nil))
+           (upper (make-btree-scan-bound :prefix #(4)))
+           (entries #((#(9) . 11) (#(2 0) . 12) (#(2 1) . 13)
+                      (#(3) . 14) (#(4 0) . 15) (#(5) . 16)))
+           (leaf (btree-page-build
+                  '((#(2 0) 0 1) (#(3 0) 0 2) (#(4 0) 0 3)
+                    (#(4 1) 0 4) (#(4 2) 0 5) (#(5 0) 0 6)) nil)))
+      (rove:ok (equal '(2 4) (multiple-value-list (btree-scan-child-range entries lower upper)))
+               "an exclusive lower bound skips duplicate-only children")
+      (rove:ok (equal '(0 4) (multiple-value-list
+                              (btree-scan-child-range entries (make-btree-scan-bound :prefix #(2)) upper)))
+               "an inclusive lower bound keeps the preceding child despite its stale separator")
+      (rove:ok (btree-scan-empty-p lower (make-btree-scan-bound :prefix #(2 1)))
+               "an exclusive lower prefix rejects every suffix up to an upper bound inside it")
+      (rove:ok (not (btree-scan-empty-p (make-btree-scan-bound :prefix #(4 1)) upper))
+               "an inclusive upper prefix can contain a longer lower bound")
+      (page-mark-dead leaf 5)
+      (dolist (step '(1 -1))
+        (let* ((last (page-lp-count leaf))
+               (frame (make-btree-scan-frame :level 0 :page leaf
+                                             :next (if (plusp step) 1 last)
+                                             :end (if (plusp step) last 1)))
+               (cursor (make-btree-scan-cursor :lower lower :upper upper
+                                               :step step :stack (list frame))))
+          (rove:ok (equal (if (plusp step) '(2 3 4) '(4 3 2))
+                          (loop for tid = (btree-scan-next-tid cursor)
+                                while tid collect (cdr tid)))
+                   "apply prefix inclusivity in both directions and skip dead slots")))))
+
 (rove:deftest test-live-page-items-stop
     (let ((page (page-init (make-page)))
           (page-evaluations 0)
@@ -87,6 +117,32 @@
       (heapam-scan-page page 0 columns snapshot
                         (lambda (tuple) (push (aref (htup-values tuple) 0) seen)))
       (rove:ok (equal seen '("visible")) "invisible tuple attributes are not read")))
+
+(rove:deftest int4-page-scan-preserves-null-and-visibility
+    (let* ((columns (vector (make-pg-column :name "k" :type :int4 :attnum 1)))
+           (page (page-init (make-page)))
+           (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1))
+           (hidden (form-heap-tuple #(5) columns 100 0 0 0 0)))
+      (setf (aref hidden +heap-tuple-hoff-off+) 0)
+      (page-add-item page hidden)
+      (dolist (key (list -2147483648 +null+ 2147483647))
+        (page-add-item page (form-heap-tuple (vector key) columns +frozen-xid+ 0 0 0 0)))
+      (let ((keys (make-array 1 :element-type '(signed-byte 32)))
+            (seen nil))
+        (map-visible-int4-page-key-batches page snapshot nil (list nil) keys
+                                           (lambda (batch count)
+                                             (rove:ok (= count 1))
+                                             (push (aref batch 0) seen)))
+        (rove:ok (equal (nreverse seen) '(-2147483648 2147483647))))
+      (let ((reader (make-visible-heap-page-iterator page 0 columns snapshot t)))
+        (unwind-protect
+             (progn
+               (dolist (key (list -2147483648 +null+ 2147483647))
+                 (multiple-value-bind (row present) (sql-iterator-next reader)
+                   (rove:ok present)
+                   (rove:ok (equalp row (vector key)))))
+               (rove:ok (not (nth-value 1 (sql-iterator-next reader)))))
+          (close-sql-iterator reader)))))
 
 (rove:deftest test-scan-prefilters-before-full-deformation
     (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
@@ -1489,7 +1545,8 @@
                      (values 0 1)))
              (insert-tuple-with-unique
               table #(7) :before-check
-              (lambda (indexes)
+              (lambda (indexes expression-keys)
+                (declare (ignore expression-keys))
                 (rove:ok (equal indexes (list old-index)))
                 ;; Model a catalog publication after the write captured its locks.
                 (setf (gethash "later" (database-indexes database)) new-index

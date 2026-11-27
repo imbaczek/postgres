@@ -86,6 +86,17 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
     ((eq b +null+) -1)
     (t (compare-3way a b))))
 
+(declaim (inline order-descending-p order-key-compare))
+
+(defun order-descending-p (direction)
+  (or (eq direction t) (eq direction :desc-nulls-last)))
+
+(defun order-key-compare (left right direction)
+  (let ((result (order-compare left right)))
+    (when (and (keywordp direction) (or (eq left +null+) (eq right +null+)))
+      (setf result (- result)))
+    (if (order-descending-p direction) (- result) result)))
+
 (defun select-order-value (expression row)
   ;; Reuse selected projection slots across ordinary, top-N and external sorts.
   (if (eq (first expression) :sort-output)
@@ -93,13 +104,12 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
       (eval-expr expression (cdr row))))
 
 (defun row-less-p (a b order)
-  (loop for (expr . desc) in order
-        do (let* ((va (select-order-value expr a))
-                  (vb (select-order-value expr b))
-                  (c (order-compare va vb)))
-             (unless (zerop c)
-               (return (if desc (> c 0) (< c 0)))))
-        finally (return nil)))
+  (loop for (expr . direction) in order
+        for comparison = (order-key-compare (select-order-value expr a)
+                                            (select-order-value expr b)
+                                            direction)
+        unless (zerop comparison) return (minusp comparison)
+          finally (return nil)))
 
 (defstruct select-top-n-item
   row
@@ -137,13 +147,13 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
 (defun select-top-n-item-less-p (a b order)
   (loop for entry in order
         for position from 0
-        for c = (order-compare (aref (select-top-n-item-keys a) position)
-                               (aref (select-top-n-item-keys b) position))
-        unless (zerop c)
-          return (if (cdr entry) (> c 0) (< c 0))
-        finally
-           (return (< (select-top-n-item-sequence a)
-                      (select-top-n-item-sequence b)))))
+        for comparison = (order-key-compare (aref (select-top-n-item-keys a) position)
+                                            (aref (select-top-n-item-keys b) position)
+                                            (cdr entry))
+        unless (zerop comparison) return (minusp comparison)
+          finally
+             (return (< (select-top-n-item-sequence a)
+                        (select-top-n-item-sequence b)))))
 
 (defun select-top-n-sift-up (heap order index)
   (when (plusp index)
@@ -229,6 +239,7 @@ An unexecuted LIMIT does not raise these errors."
   qual
   key
   parameter-expr
+  range
   selectivity)
 
 (defun where-conjuncts (where)
@@ -324,6 +335,7 @@ BYTEA vectors match the byte-content values stored in the MCV list."
   (when (<= 1 attnum (length (pg-class-columns table)))
     (loop for index in (table-indexes table)
           when (and (pg-index-valid-p index)
+                    (not (index-has-expressions-p index))
                     (= (length (pg-index-columns index)) 1)
                     (= (first (pg-index-columns index)) attnum))
             append
@@ -426,7 +438,7 @@ approximates tuple spool size from relation pages and path selectivity."
                           (or (select-scan-path-selectivity path) 0.1d0)
                           1.0d0))
          (spool-bytes (* 8192 (table-page-estimate table) selectivity))
-         (memory-limit (max 1 *query-work-memory-bytes*)))
+         (memory-limit (max 1 (effective-query-work-memory-bytes))))
     (if (> spool-bytes memory-limit)
         (/ spool-bytes 8192.0d0)
         0.0d0)))
@@ -538,16 +550,314 @@ whose other operand belongs to the already-built outer relation is considered."
                (seq-cost (nested-loop-inner-path-cost table seq outer-rows)))
           (if (< index-cost seq-cost) best-index seq)))))
 
-(defun choose-select-scan-path (table where &optional (column-offset 0))
+(defstruct select-index-range lower upper equality-count runtime-terms ordered-p backward-p)
+
+(defun index-comparison-constant (qual)
+  "Return a column comparison with a constant or runtime probe, column first."
+  (when (eq (first qual) :binop)
+    (let* ((operator (second qual))
+           (left (third qual))
+           (right (fourth qual))
+           (reverse (cdr (assoc operator '(("=" . "=") ("<" . ">") ("<=" . ">=")
+                                           (">" . "<") (">=" . "<="))
+                                :test #'string=))))
+      (when reverse
+        (when (and (not (eq (first left) :col)) (eq (first right) :col))
+          (rotatef left right)
+          (setf operator reverse))
+        (when (eq (first left) :col)
+          (multiple-value-bind (value literal-p) (simple-equality-constant right)
+            (cond (literal-p
+                   (values (second left) operator value (expr-type right)))
+                  ((eq (first right) :parameter)
+                   (values (second left) operator nil (expr-type right) right)))))))))
+
+(defun index-range-value-p (value value-type index-type)
+  (and (indexable-equality-value-p value index-type)
+       (case index-type
+         (:int2 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 16))))
+         (:int4 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 32))))
+         (:int8 (and (member value-type '(:int2 :int4 :int8)) (typep value '(signed-byte 64))))
+         ((:date :time :timestamp :timestamptz :numeric :float4 :float8 :bytea :interval :timetz)
+          (eq value-type index-type))
+         ((:text :varchar) (member value-type '(:text :varchar)))
+         (otherwise nil))))
+
+(defun index-range-comparisons (conjuncts offset)
+  (loop for qual in conjuncts
+        append (multiple-value-bind (attnum operator value type parameter) (index-comparison-constant qual)
+                 (when attnum (list (list (- attnum offset) operator value type qual parameter))))))
+
+(defun tighter-index-scan-bound (candidate bound direction)
+  (if (or (null bound)
+          (let ((order (* direction (key-compare (btree-scan-bound-prefix candidate)
+                                                 (btree-scan-bound-prefix bound)))))
+            (or (plusp order)
+                (and (zerop order) (not (btree-scan-bound-inclusive-p candidate))))))
+      candidate
+      bound))
+
+(defun index-scan-range-endpoints (comparisons prefix types)
+  "Find the tightest endpoints for the first key after the equality prefix."
+  (let ((lower nil) (upper nil))
+    (loop for (nil operator value) in comparisons
+          for bound = (make-btree-scan-bound
+                       :prefix (encode-index-key (append prefix (list value)) types)
+                       :inclusive-p (= (length operator) 2))
+          do (if (string= operator ">" :end1 1)
+                 (setf lower (tighter-index-scan-bound bound lower 1))
+                 (setf upper (tighter-index-scan-bound bound upper -1))))
+    (values lower upper)))
+
+(defun index-comparison-usable-p (comparison type)
+  (if (sixth comparison)
+      (and (eq (fourth comparison) type)
+           (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz :numeric
+                          :float4 :float8 :bytea :interval :timetz :text :varchar)))
+      (index-range-value-p (third comparison) (fourth comparison) type)))
+
+(defun build-select-index-range (equalities endpoints types)
+  (let* ((prefix (mapcar #'third equalities))
+         (prefix-bound (when prefix
+                         (make-btree-scan-bound :prefix (encode-index-key prefix types)))))
+    (multiple-value-bind (lower upper) (index-scan-range-endpoints endpoints prefix types)
+      (make-select-index-range
+       :lower (or lower
+                  (when upper
+                    ;; A strict upper comparison excludes the physical NULL run.
+                    (make-btree-scan-bound :prefix (encode-index-key (append prefix (list +null+)) types)
+                                           :inclusive-p nil))
+                  prefix-bound)
+       :upper (or upper prefix-bound)
+       :equality-count (length prefix)))))
+
+(defun index-path-for-range (table index comparisons &optional allow-unbounded-p predicate-conjuncts)
+  (when (or (pg-index-expression-keys index)
+            (not (index-predicate-implied-p (pg-index-predicate index) predicate-conjuncts)))
+    (return-from index-path-for-range nil))
+  (let ((types (index-types index table))
+        (equalities nil) (endpoints nil) (selectivity 1.0d0))
+    (loop for attnum in (pg-index-columns index)
+          for type in types
+          for terms = (remove-if-not (lambda (term)
+                                       (and (= attnum (first term))
+                                            (index-comparison-usable-p term type)))
+                                     comparisons)
+          for equality = (find "=" terms :test #'string= :key #'second)
+          do (if equality
+                 (progn
+                   (push equality equalities)
+                   (setf selectivity (* selectivity
+                                        (if (sixth equality) 0.1d0
+                                            (planner-equality-selectivity table attnum (third equality))))))
+                 (progn
+                   (setf endpoints terms)
+                   (when terms
+                     (setf selectivity (* selectivity (if (rest terms) 0.1d0 0.333333d0))))
+                   (return))))
+    (when (or allow-unbounded-p endpoints (and equalities (rest (pg-index-columns index))))
+      (let* ((equalities (nreverse equalities))
+             (terms (append equalities endpoints))
+             (quals (mapcar #'fifth terms))
+             (range (if (some #'sixth terms)
+                        (make-select-index-range :equality-count (length equalities) :runtime-terms terms)
+                        (build-select-index-range equalities endpoints types))))
+        (make-select-scan-path
+         :kind :index-scan :index index :qual (when quals (reduce (lambda (a b) (list :and a b)) quals))
+         :range range :selectivity selectivity)))))
+
+(defun index-range-paths (table conjuncts offset allow-partial-p)
+  (let ((indexes (table-indexes table)))
+    ;; A single-column index with only equality terms already has an
+    ;; equality path. Building range comparisons cannot add a candidate.
+    (when (and indexes
+               (or (some (lambda (index) (rest (pg-index-columns index))) indexes)
+                   (some (lambda (qual)
+                           (and (eq (first qual) :binop)
+                                (member (second qual) '("<" "<=" ">" ">=") :test #'equal)))
+                         conjuncts)))
+      (let ((comparisons (index-range-comparisons conjuncts offset)))
+        (when comparisons
+          (loop for index in indexes
+                for path = (when (pg-index-valid-p index)
+                             (index-path-for-range table index comparisons nil
+                                                   (when allow-partial-p conjuncts)))
+                when path collect path))))))
+
+(defun index-conjunct-implies-p (query predicate)
+  "Recognize exact conjuncts and constant bounds on the same column."
+  (or (analyzed-expression-identical-p predicate query)
+      (multiple-value-bind (query-attnum query-op query-value query-type parameter)
+          (index-comparison-constant query)
+        (when (and query-attnum (not parameter) (not (eq query-value +null+)))
+          (cond ((and (eq (first predicate) :is-null) (third predicate)
+                      (eq (first (second predicate)) :col))
+                 (eql query-attnum (second (second predicate))))
+                (t
+                 (multiple-value-bind (attnum op value type predicate-parameter)
+                     (index-comparison-constant predicate)
+                   (when (and (eql attnum query-attnum) (not predicate-parameter)
+                              (eq type query-type)
+                              (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz))
+                              (integerp value) (integerp query-value))
+                     (cond ((string= query-op "=") (eq t (sql-compare op query-value value)))
+                           ((and (char= (char op 0) #\>) (char= (char query-op 0) #\>))
+                            (or (> query-value value)
+                                (and (= query-value value)
+                                     (or (= (length query-op) 1) (= (length op) 2)))))
+                           ((and (char= (char op 0) #\<) (char= (char query-op 0) #\<))
+                            (or (< query-value value)
+                                (and (= query-value value)
+                                     (or (= (length query-op) 1) (= (length op) 2))))))))))))))
+
+(defun index-predicate-implied-p (predicate conjuncts)
+  "Prove each top-level AND term of a stored predicate from a query conjunct."
+  (labels ((implied (term)
+             (if (eq (first term) :and)
+                 (and (implied (second term)) (implied (third term)))
+                 (some (lambda (query) (index-conjunct-implies-p query term)) conjuncts))))
+    (or (null predicate) (implied predicate))))
+
+(defun expression-index-key-equality (key type conjuncts)
+  "Return a constant or typed parameter and its matching equality clause."
+  (flet ((match (indexed operand)
+           (when (and (eq type (expr-type operand))
+                      (if (integerp key)
+                          (and (eq (first indexed) :col) (eql key (second indexed)))
+                          (analyzed-expression-identical-p key indexed)))
+             (if (eq (first operand) :parameter)
+                 (values nil operand)
+                 (multiple-value-bind (value constant-p) (simple-equality-constant operand)
+                   (when (and constant-p (indexable-equality-value-p value type))
+                     value))))))
+    (dolist (qual conjuncts)
+      (when (and (eq (first qual) :binop) (string= (second qual) "="))
+        (multiple-value-bind (value parameter) (match (third qual) (fourth qual))
+          (unless (or value parameter)
+            (multiple-value-setq (value parameter) (match (fourth qual) (third qual))))
+          (when (or value parameter) (return (values value qual parameter))))))))
+
+(defun expression-index-equality-path (table index conjuncts)
+  "Match every ordered key after proving the index predicate.
+A parameter may supply a probe value, but cannot prove a predicate bound."
+  (when (index-predicate-implied-p (pg-index-predicate index) conjuncts)
+    (let ((types (index-types index table))
+          (unique-p (pg-index-unique-p index))
+          (selectivity 0.005d0)
+          (terms nil) (runtime-p nil))
+      (loop for key in (index-key-specifications index)
+            for type in types
+            do (multiple-value-bind (value qual parameter)
+                   (expression-index-key-equality key type conjuncts)
+                 (unless qual (return-from expression-index-equality-path nil))
+                 (when parameter (setf runtime-p t))
+                 (when (and (not unique-p) (integerp key) (null parameter))
+                   (setf selectivity (min selectivity (planner-equality-selectivity table key value))))
+                 (push (list nil "=" value type qual parameter) terms)))
+      (when terms
+        (setf terms (nreverse terms))
+        (make-select-scan-path
+         :kind :index-scan :index index
+         :qual (reduce (lambda (a b) (list :and a b)) (mapcar #'fifth terms))
+         :key (unless runtime-p (encode-index-key (mapcar #'third terms) types))
+         :range (when runtime-p
+                  (make-select-index-range :equality-count (length terms) :runtime-terms terms))
+         :selectivity (if unique-p
+                          (/ 1.0d0 (max 1 (table-row-estimate table)))
+                          selectivity))))))
+
+(defun expression-index-equality-paths (table conjuncts)
+  (loop for index in (table-indexes table)
+        for path = (when (and (pg-index-valid-p index) (index-has-expressions-p index))
+                     (expression-index-equality-path table index conjuncts))
+        when path collect path))
+
+(defun choose-select-scan-path (table where &optional (column-offset 0 join-relation-p))
   "Choose the lowest-cost SeqScan or equality IndexScan.
 
 COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
-  (let ((candidates
-          (cons (make-select-scan-path :kind :seq-scan)
-                (loop for qual in (where-conjuncts where)
-                      append (index-paths-for-equality
-                              table qual column-offset)))))
+  (let* ((conjuncts (where-conjuncts where))
+         (candidates
+           (cons (make-select-scan-path :kind :seq-scan)
+                 (nconc (loop for qual in conjuncts
+                              append (index-paths-for-equality table qual column-offset))
+                        (index-range-paths table conjuncts column-offset (not join-relation-p))
+                        (unless (or join-relation-p (null conjuncts))
+                          (expression-index-equality-paths table conjuncts))))))
     (choose-cheapest-select-path table candidates)))
+
+(defun index-order-column (entry targets)
+  (let ((expression (car entry)))
+    (when (eq (first expression) :sort-output)
+      (setf expression (getf (nth (1- (second expression)) targets) :expr)))
+    (when (eq (first expression) :col) (second expression))))
+
+(defun index-order-column-nonnull-p (table attnum type comparisons)
+  (or (pg-column-notnull (elt (pg-class-columns table) (1- attnum)))
+      (some (lambda (term)
+              (and (= (first term) attnum)
+                   (index-comparison-usable-p term type)))
+            comparisons)))
+
+(defun satisfy-index-order (table path order targets comparisons)
+  "Mark PATH ordered only when its fixed prefix and physical suffix prove ORDER."
+  (let* ((index (select-scan-path-index path))
+         (range (select-scan-path-range path))
+         (columns (pg-index-columns index))
+         (types (index-types index table))
+         (prefix-size (select-index-range-equality-count range))
+         (fixed (subseq columns 0 prefix-size))
+         (required (remove-if (lambda (entry) (member (index-order-column entry targets) fixed))
+                              order))
+         (backward-p (order-descending-p (cdr (first required)))))
+    (when (and (<= (length required) (- (length columns) prefix-size))
+               (loop for entry in required
+                     for attnum in (nthcdr prefix-size columns)
+                     for type in (nthcdr prefix-size types)
+                     always (and (eql attnum (index-order-column entry targets))
+                                 (eql (order-descending-p (cdr entry)) backward-p)
+                                 (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz
+                                                :numeric :text :varchar :bytea))
+                                 ;; Forward is NULLS FIRST and reverse is NULLS LAST.
+                                 ;; SQL's defaults are the opposite in each direction.
+                                 (or (member (cdr entry) '(:asc-nulls-first :desc-nulls-last))
+                                     (index-order-column-nonnull-p table attnum type comparisons)))))
+      (setf (select-index-range-ordered-p range) t
+            (select-index-range-backward-p range) backward-p)
+      path)))
+
+(defun ordered-select-scan-cost (table path limit residual-p)
+  (multiple-value-bind (total rows startup) (select-scan-path-cost table path)
+    (if (or residual-p (>= limit rows))
+        total
+        (+ startup (* (- total startup) (/ limit rows))))))
+
+(defun choose-ordered-limit-scan-path (table prepared fallback)
+  (let ((order (getf prepared :order))
+        (limit (getf prepared :limit)))
+    (unless (and order (typep limit '(integer 0))
+                 (not (or (getf prepared :aggregate-p) (getf prepared :distinct)
+                          (getf prepared :has-having) (getf prepared :windows)
+                          (getf prepared :set-functions))))
+      (return-from choose-ordered-limit-scan-path fallback))
+    (let* ((where (getf prepared :where))
+           (conjuncts (where-conjuncts where))
+           (comparisons (index-range-comparisons conjuncts 0))
+           (targets (getf prepared :targets))
+           (best fallback)
+           (cost (select-scan-path-cost table fallback)))
+      (dolist (index (table-indexes table) best)
+        (when (pg-index-valid-p index)
+          (let ((path (index-path-for-range table index comparisons t
+                                            conjuncts)))
+            (when (and path (satisfy-index-order table path order targets comparisons))
+              (let ((candidate-cost
+                      (ordered-select-scan-cost table path limit
+                                                (let ((bounds (where-conjuncts (select-scan-path-qual path))))
+                                                  (some (lambda (qual) (not (member qual bounds :test #'eq)))
+                                                        (where-conjuncts where))))))
+                (when (<= candidate-cost cost)
+                  (setf best path cost candidate-cost))))))))))
 
 (defun select-relation-columns (relation)
   (when (and (select-relation-origins relation)
@@ -1204,14 +1514,66 @@ registration-to-DDL handoff free of a lock-order inversion."
          (let ((,registered-relations ,relation-list))
            ,@body)))))
 
+(defun resolve-select-index-range (table path range environment)
+  "Evaluate the runtime bounds once for this cursor, including on a rescan."
+  (let ((template (select-index-range-runtime-terms range)))
+    (unless template (return-from resolve-select-index-range range))
+    (let* ((types (index-types (select-scan-path-index path) table))
+           (terms (loop for term in template
+                        for parameter = (sixth term)
+                        collect (if parameter
+                                    (let ((value (eval-expr parameter environment)))
+                                      ;; A strict conjunct with a NULL parameter admits no rows.
+                                      (when (eq value +null+)
+                                        (return-from resolve-select-index-range nil))
+                                      (list (first term) (second term) value))
+                                    term)))
+           (equality-count (select-index-range-equality-count range))
+           (resolved (build-select-index-range (subseq terms 0 equality-count)
+                                               (nthcdr equality-count terms) types)))
+      (setf (select-index-range-backward-p resolved) (select-index-range-backward-p range))
+      resolved)))
+
 (defun select-scan-index-key (table path environment)
   (let ((parameter (select-scan-path-parameter-expr path)))
     (if (null parameter)
-        (select-scan-path-key path)
+        (let ((range (select-scan-path-range path)))
+          (if range (resolve-select-index-range table path range environment)
+              (select-scan-path-key path)))
         (let* ((value (eval-expr parameter environment))
                (types (index-types (select-scan-path-index path) table)))
           (when (indexable-equality-value-p value (first types))
             (encode-index-key (list value) types))))))
+
+(defun open-select-index-cursor-unlocked (node key)
+  (etypecase key
+    (vector (open-btree-equal-cursor-unlocked node key))
+    (select-index-range
+     (open-btree-scan-cursor-unlocked node
+                                      (select-index-range-lower key)
+                                      (select-index-range-upper key)
+                                      :backward-p (select-index-range-backward-p key)))))
+
+(defun call-with-select-btree-cursor (node key function)
+  (etypecase key
+    (vector (call-with-btree-equal-cursor node key function))
+    (select-index-range
+     (call-with-btree-relation-read-lease
+      node (lambda (lease) (funcall function (open-select-index-cursor-unlocked node key) lease))))))
+
+(defun select-index-cursor-next-tid (cursor)
+  (etypecase cursor
+    (btree-equal-cursor (btree-cursor-next-tid cursor))
+    (btree-scan-cursor (btree-scan-next-tid cursor))))
+
+(defun clone-select-index-cursor (cursor)
+  (etypecase cursor
+    (btree-equal-cursor (clone-btree-equal-cursor cursor))
+    (btree-scan-cursor
+     (let ((copy (copy-btree-scan-cursor cursor)))
+       (setf (btree-scan-cursor-stack copy)
+             (mapcar #'copy-btree-scan-frame (btree-scan-cursor-stack cursor)))
+       copy))))
 
 (defstruct select-index-scan
   "A cursor and lease, or a sealed spool of its unread TIDs.
@@ -1357,7 +1719,7 @@ spool delivery without invoking the callback for the remaining tail."
          (lambda (row index)
            (declare (ignore index))
            (funcall callback (cons (aref row 0) (aref row 1)))))))
-    (let ((tid (btree-cursor-next-tid (select-index-scan-cursor scan))))
+    (let ((tid (select-index-cursor-next-tid (select-index-scan-cursor scan))))
       (unless tid (return (values)))
       (when (eq (funcall callback tid) :stop) (return :stop)))))
 
@@ -1366,7 +1728,9 @@ spool delivery without invoking the callback for the remaining tail."
   (unless (and (btree-read-lease-active-p lease)
                (eq (btree-read-lease-thread lease) sb-thread:*current-thread*)
                (eq (btree-read-lease-lock-state lease)
-                   (btree-relation-lock (btree-equal-cursor-relfilenode cursor))))
+                   (btree-relation-lock (etypecase cursor
+                                          (btree-equal-cursor (btree-equal-cursor-relfilenode cursor))
+                                          (btree-scan-cursor (btree-scan-cursor-relfilenode cursor))))))
     (error "index cursor requires its owning read lease"))
   (with-query-temp-files
     (let ((scan (make-select-index-scan :cursor cursor :lease lease)))
@@ -1411,12 +1775,12 @@ spool and clear the cursor before releasing an owned lease. A borrowed lease is
 left to its group. On failure before publication, close the partial spool and
 retain the original cursor and lease. An existing spool keeps its position."
   (unless (select-index-scan-spool scan)
-    (let ((cursor (clone-btree-equal-cursor (select-index-scan-cursor scan)))
+    (let ((cursor (clone-select-index-cursor (select-index-scan-cursor scan)))
           (spool (make-query-row-spool 1))
           (installed nil))
       (unwind-protect
            (progn
-             (loop for tid = (btree-cursor-next-tid cursor)
+             (loop for tid = (select-index-cursor-next-tid cursor)
                    while tid
                    do (check-for-interrupts)
                       (query-row-spool-append spool (vector (car tid) (cdr tid))))
@@ -1595,7 +1959,7 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
       (call-with-current-select-index-domain
        (pg-index-relfilenode idx)
        (lambda ()
-         (call-with-btree-equal-cursor
+         (call-with-select-btree-cursor
           (pg-index-relfilenode idx) key
           (lambda (cursor lease)
             (call-with-select-index-cursor
@@ -1707,12 +2071,12 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
 (defun nested-loop-spool-memory (track-right-p)
   "Reserve half the work memory for right-row matches when the join needs them."
   (max 1 (if track-right-p
-             (floor *query-work-memory-bytes* 2)
-             *query-work-memory-bytes*)))
+             (floor (effective-query-work-memory-bytes) 2)
+             (effective-query-work-memory-bytes))))
 
 (defun nested-loop-match-memory (spool-memory)
   "Use the remaining work memory for the match map, with a one-byte minimum."
-  (max 1 (- *query-work-memory-bytes* spool-memory)))
+  (max 1 (- (effective-query-work-memory-bytes) spool-memory)))
 
 (defun select-write-bytea-text (out bytes format)
   "Write PostgreSQL bytea text without building a value-sized string."

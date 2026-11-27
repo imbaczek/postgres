@@ -4,7 +4,7 @@
 
 (declaim (ftype function wal-validate-logical-binary-capability-under-lock))
 
-(defun wal-admit-transaction-under-lock (xid logical-changes)
+(defun wal-admit-transaction-under-lock (xid logical-changes &optional catalog-payload)
   "Prepare and queue a transaction's pages and CLOG completion under WAL lock.
 Reserve against the planned terminal end before attempting insertion. Publish
 only after the actual end matches, then hand the owner to the FIFO. An
@@ -43,9 +43,15 @@ This helper does not flush the new owner or provide an acceptance receipt."
         (setf forced-p
               (wal-publication-pressure-requires-flush-p publication projection forced-p))
         (when logical-changes (wal-append-logical-changes xid logical-changes))
+        (when catalog-payload
+          (wal-append-catalog-chunks catalog-payload (wal-catalog-chunk-count catalog-payload)))
         (when *wal-output-stream* (finish-output *wal-output-stream*))
         (wal-test-pause :after-page-images)
-        (let* ((payload (wal-encode-commit-timestamp (postgres-current-timestamp)))
+        (let* ((timestamp (postgres-current-timestamp))
+               (type (if catalog-payload +wal-record-catalog-transaction-commit+ +wal-record-commit+))
+               (payload (if catalog-payload
+                            (wal-encode-catalog-transaction-commit timestamp catalog-payload)
+                            (wal-encode-commit-timestamp timestamp)))
                (size (+ +wal-header-size+ (length payload)))
                (planned-end (+ (wal-next-record-start size) size))
                (completion (clog-reserve-commit-under-wal-lock xid planned-end publication)))
@@ -53,7 +59,7 @@ This helper does not flush the new owner or provide an acceptance receipt."
           (wal-test-pause :after-clog-reservation)
           (clog-begin-reserved-commit-under-wal-lock completion publication)
           (wal-test-pause :before-terminal-append)
-          (let ((end (wal-append-record +wal-record-commit+ xid payload)))
+          (let ((end (wal-append-record type xid payload)))
             (clog-publish-reserved-commit-under-wal-lock completion publication end)
             (wal-test-pause :before-page-publication-transfer)
             (wal-publish-page-publication-under-lock publication end)
@@ -63,7 +69,8 @@ This helper does not flush the new owner or provide an acceptance receipt."
 (defun wal-commit-transaction
     (xid after-durable-function &key logical-changes terminal-durable-function
                                   (source-id nil source-id-supplied-p) accepted-function
-                                  (local-durability :flush))
+                                  (local-durability :flush) catalog-payload catalog-create-nodes
+                                  catalog-database-oid catalog-logical-ddl)
   "Publish XID's commit and return its end and immutable historical receipt.
 LOCAL-DURABILITY defaults to :FLUSH. :ASYNC can accept a queued owner
 without flushing when pressure, resets and writer availability permit it. The
@@ -83,6 +90,14 @@ NIL is valid. ACCEPTED-FUNCTION receives the returned receipt under the interrup
 mask and must only latch scalar ownership and receipt state, without allocation,
 I/O or locks. With WAL it runs under the publication fence and WAL mutex."
   (wal-require-local-commit-durability local-durability)
+  (when (and catalog-payload (or (not *wal-ready*) (not (wal-normal-transaction-xid-p xid))))
+    (error "catalog transaction publication requires native WAL and an XID"))
+  (when catalog-create-nodes
+    (unless catalog-payload (error "new catalog forks require a catalog terminal"))
+    (dolist (node catalog-create-nodes)
+      (unless (and (current-relation-replacement node :main)
+                   (not (probe-file (relation-file-path node))))
+        (error "catalog transaction applies an invalid provisional node ~d" node))))
   (when (and *wal-ready* (not source-id-supplied-p))
     (error "WAL commit requires an explicit source identity"))
   (unless (typep source-id '(or symbol integer))
@@ -98,41 +113,65 @@ I/O or locks. With WAL it runs under the publication fence and WAL mutex."
       (let ((receipt (%make-wal-commit-receipt xid source-id nil nil)))
         (when accepted-function (funcall accepted-function receipt))
         (return-from wal-commit-transaction (values nil receipt)))))
-  (let ((commit-lsn nil) (receipt nil))
+  (let ((commit-lsn nil) (receipt nil) (logical-capture-p nil)
+                         (apply-catalog (when catalog-payload (wal-prepare-catalog-record catalog-payload))))
     (sb-sys:without-interrupts
       (with-wal-publication-fence (begin-publication)
         (wal-check-page-publication-queue-under-lock)
         (clog-check-queued-commits-under-wal-lock)
         (wal-validate-logical-binary-capability-under-lock xid)
-        (when (and (fboundp 'transaction-has-relation-replacements-p)
-                   (funcall 'transaction-has-relation-replacements-p
-                            (when (boundp '*backend*) (symbol-value '*backend*))))
-          (wal-settle-page-publications-under-lock)
-          (wal-require-no-pending-storage))
-        (begin-publication)
-        (multiple-value-bind (publication end forced-p)
-            (wal-admit-transaction-under-lock xid logical-changes)
-          (setf commit-lsn end)
-          (if (and (eq :async local-durability)
-                   (not forced-p)
-                   (null (wal-page-publication-resets publication))
-                   (primary-wal-writer-available-under-lock-p))
-              (progn
-                (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn nil))
-                (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-                (clog-accept-publication-under-wal-lock publication)
-                (wal-request-async-flush-under-lock commit-lsn))
-              (progn
-                (wal-flush)
-                (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
-                (wal-drain-page-publication-prefix-under-lock publication :fault-on-first-write t)
-                (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
-                (wal-test-pause :after-wal-flush)
-                (wal-complete-publication-status-under-lock publication)
-                (funcall after-durable-function commit-lsn)
-                (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t)
-                (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t)))))
-        (when accepted-function (funcall accepted-function receipt))))
+        (block publish-commit
+          (when (and catalog-database-oid
+                     (if catalog-logical-ddl
+                         (eq :incompatible (wal-transactional-ddl-mode-under-lock catalog-database-oid))
+                         (wal-logical-catalog-event-needed-under-lock-p catalog-database-oid)))
+            (setf logical-capture-p t)
+            (return-from publish-commit))
+          (when (and (fboundp 'transaction-has-relation-replacements-p)
+                     (funcall 'transaction-has-relation-replacements-p
+                              (when (boundp '*backend*) (symbol-value '*backend*))))
+            (wal-settle-page-publications-under-lock)
+            (wal-require-no-pending-storage))
+          (begin-publication)
+          (multiple-value-bind (publication end forced-p)
+              (if catalog-payload
+                  (wal-admit-transaction-under-lock xid logical-changes catalog-payload)
+                  (wal-admit-transaction-under-lock xid logical-changes))
+            (setf commit-lsn end)
+            (if (and (eq :async local-durability)
+                     (not forced-p)
+                     (null apply-catalog)
+                     (null (wal-page-publication-resets publication))
+                     (primary-wal-writer-available-under-lock-p))
+                (progn
+                  (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn nil))
+                  (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+                  (clog-accept-publication-under-wal-lock publication)
+                  (wal-request-async-flush-under-lock commit-lsn))
+                (progn
+                  (wal-flush)
+                  (when terminal-durable-function (funcall terminal-durable-function commit-lsn))
+                  ;; Ordinary replacement assumes a committed main fork. Newly
+                  ;; reserved nodes cannot exist on disk before this WAL boundary.
+                  (when apply-catalog (wal-test-pause :after-catalog-transaction-wal-flush))
+                  (dolist (node catalog-create-nodes) (smgr-create node))
+                  (wal-drain-page-publication-prefix-under-lock publication :fault-on-first-write t)
+                  (wal-slot-record-xid-commit-under-wal-lock xid commit-lsn)
+                  (wal-test-pause :after-wal-flush)
+                  (wal-complete-publication-status-under-lock publication)
+                  (when apply-catalog
+                    ;; A relation may have page images earlier in the transaction
+                    ;; that drops it. Apply its pages before removing the fork.
+                    (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t)
+                    (incf *wal-catalog-flush-generation*)
+                    (funcall apply-catalog))
+                  (funcall after-durable-function commit-lsn)
+                  (unless apply-catalog
+                    (wal-drain-page-publications-through-under-lock publication :fault-on-first-write t))
+                  (setf receipt (%make-wal-commit-receipt xid source-id commit-lsn t)))))
+          (when accepted-function (funcall accepted-function receipt)))))
+    (when logical-capture-p
+      (ereport "0A000" "transactional DDL requires compatible logical replication slots"))
     (values commit-lsn receipt)))
 
 (defun wal-commit-maintenance ()

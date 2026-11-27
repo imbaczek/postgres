@@ -1751,6 +1751,32 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
     (rove:ok (not (wal-verify-page page 123 4))
              "WAL page checksum detects page damage")))
 
+(rove:deftest seeded-page-checksums-match-buffered-format
+    (let ((page (make-array +blcksz+ :element-type '(unsigned-byte 8)))
+          (relation #xf123abcd)
+          (block #xcd987654))
+      (dotimes (i (length page)) (setf (aref page i) (mod (+ (* i 13) 7) 251)))
+      (let ((original (copy-seq page)))
+        (dolist (fork '(:main :visibility))
+          (let* ((prefix (if (eq fork :main) 8 12))
+                 (legacy (make-array (+ prefix +blcksz+) :element-type '(unsigned-byte 8))))
+            (page-set-u32 legacy 0 relation)
+            (unless (eq fork :main) (page-set-u32 legacy 4 (wal-page-fork-id fork)))
+            (page-set-u32 legacy (- prefix 4) block)
+            (replace legacy page :start1 prefix)
+            (page-set-u16 legacy (+ prefix +pd-checksum-off+) 0)
+            (let ((checksum (logand (wal-crc32 legacy) #xffff)))
+              (rove:ok (= (wal-page-checksum page relation block fork)
+                          (if (<= checksum 3) (+ checksum 4) checksum)))))
+          (let ((legacy (make-array (+ 12 +blcksz+) :element-type '(unsigned-byte 8))))
+            (page-set-u32 legacy 0 relation)
+            (page-set-u32 legacy 4 (wal-page-fork-id fork))
+            (page-set-u32 legacy 8 block)
+            (replace legacy page :start1 12)
+            (rove:ok (= (wal-dirty-checksum (list relation fork block) page)
+                        (wal-crc32 legacy)))))
+        (rove:ok (equalp page original)))))
+
 (rove:deftest test-qualified-page-checksum-control-format
     (let* ((legacy (make-wal-control-metadata 811 +db-shutdowned+ 22))
            (qualified (append legacy (list :page-checksum-version 1)))
@@ -2121,6 +2147,219 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
         (wal-clear-page-cache)
         (smgr-close-all)
         (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-catalog-provisional-storage-is-private-and-selectively-discarded
+    (let* ((directory (merge-pathnames (format nil "pg-catalog-private-~d-~a/"
+                                               (sb-posix:getpid) (gensym))
+                                       (uiop:temporary-directory)))
+           (*pgdata* directory)
+           (*query-temp-directory* directory)
+           (*wal-ready* nil)
+           (*wal-poisoned* nil)
+           (*wal-dirty-store* nil)
+           (*wal-page-cache* (make-hash-table :test #'equal))
+           (*wal-page-cache-xids* (make-hash-table :test #'equal))
+           (*relation-streams* (make-hash-table :test #'equal))
+           (*transaction-relation-replacements* (make-hash-table :test #'eq))
+           (*btree-relation-locks* (make-hash-table :test #'eql))
+           (*backend* (make-backend :xid 44 :catalog-transaction
+                                    (make-catalog-transaction (make-database :oid 1))))
+           (transaction (backend-catalog-transaction *backend*))
+           (other (make-backend))
+           (heap 7311)
+           (index 7312))
+      (ensure-directories-exist (merge-pathnames "base/" directory))
+      (unwind-protect
+           (progn
+             (catalog-transaction-create-storage heap :heap)
+             (buf-extend heap (page-init (make-page)))
+             (catalog-transaction-stage transaction :table "heap"
+                                        (make-pg-class :oid heap :relfilenode heap :name "heap" :columns #()))
+             (catalog-transaction-create-storage index :btree)
+             (catalog-transaction-stage transaction :index "idx"
+                                        (make-pg-index :oid index :relfilenode index :name "idx"
+                                                       :table-oid heap))
+             (rove:ok (= (buf-nblocks heap) 1))
+             (rove:ok (= (buf-nblocks index) 2))
+             (let ((*backend* other))
+               (rove:ok (null (current-relation-replacement heap :main)))
+               (rove:ok (null (current-relation-replacement index :main)))
+               (rove:ok (not (probe-file (relation-file-path heap)))))
+             (rove:ok (not (probe-file (relation-file-path index))))
+             (catalog-transaction-stage transaction :index "idx" nil)
+             (rove:ok (null (current-relation-replacement index :visibility)))
+             (rove:ok (null (current-relation-replacement index :main)))
+             (rove:ok (not (probe-file (relation-file-path index))))
+             (rove:ok (not (member index (backend-dirty-relations *backend*))))
+             (rove:ok (= (buf-nblocks heap) 1)
+                      "dropping provisional storage retains the transaction's other writes")
+             (discard-transaction-replacements *backend*)
+             (rove:ok (not (probe-file (relation-file-path heap)))))
+        (discard-transaction-replacements *backend*)
+        (smgr-close-all)
+        (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(rove:deftest test-live-catalog-commit-publishes-before-reply-wait
+    (call-with-queued-clog-test
+     (lambda ()
+       (let* ((*catalog* (make-catalog :cluster-identity "test"))
+              (*catalog-durable-generation* 0)
+              (*catalog-oldest-relfrozenxid* nil)
+              (*wal-catalog-flush-generation* 0)
+              (database (make-database :oid 100 :name "test"))
+              (table (make-pg-class :oid 7318 :name "heap" :relfilenode 7318 :columns #()))
+              (index (make-pg-index :oid 7319 :name "idx" :relfilenode 7319 :table-oid 7318))
+              (transaction (make-catalog-transaction database))
+              (*backend* (make-backend :xid 44 :database "test" :catalog-transaction transaction))
+              (*active-xids* (list 44 45))
+              (*transaction-relation-replacements* (make-hash-table :test #'eq))
+              (*btree-relation-locks* (make-hash-table :test #'eql))
+              (installed nil))
+         (setf (gethash "test" (catalog-databases *catalog*)) database
+               (gethash "heap" (database-tables database)) table)
+         (ensure-directories-exist (catalog-path))
+         (unwind-protect
+              (progn
+                (smgr-create 7318)
+                (catalog-transaction-create-storage 7319 :btree)
+                (catalog-transaction-stage transaction :index "idx" index)
+                (commit-backend-wal
+                 *backend* 44
+                 (lambda (end)
+                   (let ((*backend* (make-backend :database "test")))
+                     (rove:ok (eq table (lookup-table "heap")))
+                     (rove:ok (eq index (lookup-index "idx")))
+                     (rove:ok (equal (list index) (table-indexes table)))
+                     (sb-thread:with-mutex (*xid-lock*)
+                       (rove:ok (equal '(45) (snapshot-xip (make-snapshot-under-xid-lock 0)))))
+                     (rove:ok (= end *wal-durable-lsn*))
+                     (rove:ok (= 1 *catalog-durable-generation*))
+                     (setf installed t)))
+                 nil nil :flush
+                 (lambda (end)
+                   (declare (ignore end))
+                   (rove:ok (null (gethash "idx" (database-indexes database))))
+                   (rove:ok (member 44 *active-xids*)))
+                 nil)
+                (rove:ok installed))
+           (discard-transaction-replacements *backend*))))))
+
+(rove:deftest test-wal-writer-commits-catalog-and-pages-together
+    (call-with-queued-clog-test
+     (lambda ()
+       (let* ((*backend* (make-backend :xid 44))
+              (*transaction-relation-replacements* (make-hash-table :test #'eq))
+              (*wal-catalog-flush-generation* 0)
+              (old-node 7318)
+              (new-node 7319)
+              (catalog (wal-encode-catalog-payload (string->bytes "new") (list old-node)))
+              (types nil)
+              (callback-end nil))
+         (ensure-directories-exist (catalog-path))
+         (unwind-protect
+              (progn
+                (smgr-create old-node)
+                (buf-extend old-node (page-init (make-page)))
+                (transaction-replace-relation new-node)
+                (buf-extend new-node (page-init (make-page)))
+                (let ((end (wal-commit-transaction 44 (lambda (end) (setf callback-end end))
+                                                   :source-id nil :local-durability :async
+                                                   :terminal-durable-function
+                                                   (lambda (end)
+                                                     (rove:ok (= end *wal-durable-lsn*))
+                                                     (rove:ok (not (probe-file (relation-file-path new-node))))
+                                                     (rove:ok (probe-file (relation-file-path old-node))))
+                                                   :catalog-payload catalog :catalog-create-nodes (list new-node))))
+                  (rove:ok (= end callback-end *wal-durable-lsn*))
+                  (rove:ok (= +clog-committed+ (clog-get 44)))
+                  (rove:ok (equal "new" (uiop:read-file-string (catalog-path))))
+                  (rove:ok (not (probe-file (relation-file-path old-node))))
+                  (rove:ok (not (probe-file (relation-file-path old-node :visibility))))
+                  (rove:ok (= 1 (smgr-nblocks new-node)))
+                  (wal-scan (lambda (record)
+                              (push (wal-record-type record) types)
+                              (when (= (wal-record-end record) end)
+                                (rove:ok (= 44 (wal-record-xid record)))
+                                (rove:ok (integerp (wal-record-commit-timestamp record))))))
+                  (rove:ok (equal (subseq types 0 3)
+                                  (list +wal-record-catalog-transaction-commit+
+                                        +wal-record-catalog-chunk+ +wal-record-pages+)))))
+           (discard-transaction-replacements *backend*))))))
+
+(rove:deftest test-logical-scans-require-a-complete-catalog-transaction-prefix
+    (let* ((catalog (wal-encode-catalog-payload (string->bytes "new") nil))
+           (marker (make-wal-record :type +wal-record-batch-start+ :xid 0 :start 0 :payload #()))
+           (chunk (make-wal-record :type +wal-record-catalog-chunk+ :xid 0
+                                   :payload (wal-encode-catalog-chunk-payload catalog 0 1)))
+           (terminal (make-wal-record :type +wal-record-catalog-transaction-commit+ :xid 44
+                                      :end 200 :payload (wal-encode-catalog-transaction-commit 95 catalog)))
+           (reader (make-logical-reader-state :database-oid 1))
+           (progress (make-logical-slot-startup-progress nil))
+           (*wal-recovery-reservation-batch-clean-p* nil))
+      (labels ((accept-startup (record) (logical-slot-startup-accept-record progress record :ordinary))
+               (rejects-p (function)
+                 (handler-case (progn (funcall function) nil)
+                   (error () t))))
+        (wal-logical-reader-start-batch reader)
+        (accept-startup marker)
+        (rove:ok (rejects-p (lambda () (wal-logical-reader-finish-batch reader terminal))))
+        (rove:ok (rejects-p (lambda () (accept-startup terminal))))
+        (wal-logical-reader-note-catalog-chunk reader chunk)
+        (accept-startup chunk)
+        (wal-logical-reader-finish-batch reader terminal)
+        (accept-startup terminal)
+        (rove:ok (not (logical-reader-state-batch-open-p reader)))
+        (rove:ok (null (logical-slot-startup-progress-batch-start progress))))))
+
+(rove:deftest test-wal-catalog-transaction-applies-only-at-commit
+    (call-with-pending-clog-test
+     (lambda ()
+       (let* ((*relation-streams* (make-hash-table :test #'equal))
+              (*query-temp-directory* *pgdata*)
+              (*wal-checkpoint-lsn* 0)
+              (old-node 7318)
+              (new-node 7319)
+              (xid 44)
+              (cursor 0)
+              (catalog (wal-encode-catalog-payload (string->bytes "new") (list old-node)))
+              (terminal (wal-encode-catalog-transaction-commit -19 catalog)))
+         (ensure-directories-exist (merge-pathnames "base/" *pgdata*))
+         (ensure-directories-exist (catalog-path))
+         (unwind-protect
+              (progn
+                (smgr-create old-node)
+                (wal-apply-catalog-image nil (string->bytes "old"))
+                (with-wal-replay-staging ()
+                  (flet ((replay (type xid payload)
+                           (let ((end (+ cursor +wal-header-size+ (length payload))))
+                             (wal-replay-record (make-wal-record :version +wal-version+ :type type
+                                                                 :xid xid :start cursor :end end
+                                                                 :payload payload))
+                             (setf cursor end))))
+                    (replay +wal-record-batch-start+ 0 #())
+                    (replay +wal-record-relation-reset+ xid (wal-encode-relation-reset new-node :main))
+                    (let* ((image (make-wal-page-image :relfilenode new-node :block 0
+                                                       :page (page-init (make-page))))
+                           (length (wal-page-payload-length (list image))))
+                      (replay +wal-record-pages+ 0
+                              (wal-encode-page-images (list image) (+ cursor +wal-header-size+ length))))
+                    (replay +wal-record-catalog-chunk+ 0 (wal-encode-catalog-chunk-payload catalog 0 1))
+                    (rove:ok (equal "old" (uiop:read-file-string (catalog-path))))
+                    (rove:ok (probe-file (relation-file-path old-node)))
+                    (rove:ok (not (probe-file (relation-file-path new-node))))
+                    (rove:ok (= +clog-in-progress+ (clog-get xid)))
+                    (rove:ok (handler-case
+                                 (progn (replay +wal-record-catalog-transaction-commit+ 45 terminal) nil)
+                               (error () t))
+                             "a mismatched reset must fail before applying the batch")
+                    (replay +wal-record-catalog-transaction-commit+ xid terminal)
+                    (rove:ok (equal "new" (uiop:read-file-string (catalog-path))))
+                    (rove:ok (not (probe-file (relation-file-path old-node))))
+                    (rove:ok (= 1 (smgr-nblocks new-node)))
+                    (rove:ok (= +clog-committed+ (clog-get xid)))
+                    (rove:ok (equal (list 1 (length catalog) -19)
+                                    (multiple-value-list (wal-decode-catalog-transaction-commit terminal)))))))
+           (smgr-close-all))))))
 
 (rove:deftest test-wal-relation-reset-batches
     (let* ((directory (merge-pathnames
@@ -2591,6 +2830,37 @@ Each entry in SEGMENTS contains a segment number followed by its byte vectors."
                       (rove:ok (= 3 (aref before-fault 100)))
                       (rove:ok (= 4 (aref after-fault 100)))
                       (rove:ok (gethash (list node :main 2) *smgr-clean-pages*))))))
+           (smgr-close-all))))))
+
+(rove:deftest reusable-clean-page-stays-out-of-cache
+    (call-with-wal-scan-test-files
+     nil 0
+     (lambda ()
+       (let ((*relation-streams* (make-hash-table :test #'equal))
+             (*wal-ready* nil)
+             (*wal-control-metadata* nil)
+             (node 123)
+             (input (page-init (make-page)))
+             (scratch (make-page))
+             (handle (make-buf-page-handle)))
+         (unwind-protect
+              (progn
+                (smgr-create node)
+                (setf (aref input 100) 1)
+                (smgr-write node 0 input)
+                (setf (aref input 100) 2)
+                (smgr-write node 1 input)
+                (rove:ok (eq scratch (buf-acquire-read-page handle node 0 :main scratch)))
+                (rove:ok (= 1 (aref scratch 100)))
+                (buf-release-page handle)
+                (rove:ok (not (gethash (list node :main 0) *smgr-clean-pages*)))
+                (with-buf-read-page (cached node 0)
+                  (rove:ok (eq cached (buf-acquire-read-page handle node 0 :main scratch)))
+                  (buf-release-page handle)
+                  (rove:ok (eq scratch (buf-acquire-read-page handle node 1 :main scratch)))
+                  (rove:ok (= 2 (aref scratch 100)))
+                  (rove:ok (= 1 (aref cached 100)))))
+           (buf-release-page handle)
            (smgr-close-all))))))
 
 (rove:deftest test-wal-dirty-scratch-corruption-fails-stop

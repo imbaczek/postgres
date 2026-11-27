@@ -191,14 +191,40 @@ Recheck identities after waiting and under catalog locks before changing storage
       (ereport "08P01" "invalid replicated sequence event database"))
     (list :type :apply-sequence-state :state state)))
 
+(defvar *applying-transaction-ddl* nil
+  "True while applying an ordered publisher operation inside the subscriber transaction.")
+
+(defun reject-logical-transaction-ddl-private-table (name)
+  (when (and *applying-transaction-ddl* (logical-private-metadata-table-name-p name))
+    (ereport "42501" "replicated DDL cannot target subscriber metadata relation ~s" name)))
+
+(defun exec-apply-logical-transaction-ddl (stream payload)
+  "Stage an ordered operation or record the schema contract for target commit."
+  (unless (and (backend-explicit *backend*) (eq (backend-state *backend*) :in-progress))
+    (ereport "25001" "transactional logical DDL requires an explicit apply transaction"))
+  (multiple-value-bind (ast contract) (logical-decode-transaction-ddl payload)
+    (let* ((transaction (backend-catalog-transaction *backend*))
+           (state (and transaction (catalog-transaction-logical-apply-state transaction))))
+      (cond
+        (contract
+         (unless (eq state :pending)
+           (ereport "08P01" "unexpected transactional logical DDL schema contract"))
+         (setf (catalog-transaction-logical-apply-state transaction) contract))
+        (ast
+         (when (consp state)
+           (ereport "08P01" "transactional logical DDL follows its schema contract"))
+         (let ((*applying-transaction-ddl* t))
+           (recovery-check-statement ast)
+           (execute-in-transaction (make-broadcast-stream) ast))
+         (setf (catalog-transaction-logical-apply-state
+                (backend-catalog-transaction *backend*)) :pending)))))
+  (send-command-complete stream "APPLY LOGICAL EVENT"))
+
 (defun exec-apply-logical-event (stream command)
   (unless (and *backend*
                (string= (or (backend-application-name *backend*) "")
                         "pg-lisp-subscribe-apply"))
     (ereport "42501" "APPLY LOGICAL EVENT is restricted to the replication worker"))
-  (when (or (backend-explicit *backend*)
-            (not (eq (backend-state *backend*) :idle)))
-    (ereport "25001" "APPLY LOGICAL EVENT cannot run inside a transaction block"))
   (let ((key (getf command :event-key))
         (lsn (getf command :event-lsn))
         (payload (getf command :payload)))
@@ -206,6 +232,11 @@ Recheck identities after waiting and under catalog locks before changing storage
                  (integerp lsn) (<= 1 lsn #xFFFFFFFFFFFFFFFF)
                  (stringp payload))
       (ereport "08P01" "invalid logical replication event envelope"))
+    (when (string= key "transaction-ddl")
+      (return-from exec-apply-logical-event
+        (exec-apply-logical-transaction-ddl stream payload)))
+    (when (or (backend-explicit *backend*) (not (eq (backend-state *backend*) :idle)))
+      (ereport "25001" "APPLY LOGICAL EVENT cannot run inside a transaction block"))
     (sb-thread:with-mutex (*logical-event-apply-lock*)
       (let* ((db (current-database))
              (last-lsn (with-write-lock
@@ -691,15 +722,15 @@ Do not perform wire I/O while restoring transaction state."
       ((and (member name *session-local-setting-names* :test #'string=)
             (getf ast :local-p))
        (if (or *executing-do-p* (backend-explicit *backend*) (backend-implicit-query-block *backend*))
-           (if (string= name "application_name")
-               (session-set-application-name raw-value t)
-               (session-set-synchronous-commit raw-value t))
+           (cond ((string= name "application_name") (session-set-application-name raw-value t))
+                 ((string= name "work_mem") (session-set-work-memory raw-value t))
+                 (t (session-set-synchronous-commit raw-value t)))
            (progn
              (send-notice stream "SET LOCAL can only be used in transaction blocks" "WARNING" "25P01")
              (unless (or (eq raw-value :default) (eq raw-value +null+))
-               (if (string= name "application_name")
-                   (session-application-name-value raw-value)
-                   (session-normalize-synchronous-commit raw-value))))))
+               (cond ((string= name "application_name") (session-application-name-value raw-value))
+                     ((string= name "work_mem") (session-normalize-extra-setting name raw-value))
+                     (t (session-normalize-synchronous-commit raw-value)))))))
       ((session-extra-setting-p name) (session-set-extra-setting name raw-value))
       ((string= name "search_path")
        (set-session-search-path (if (eq raw-value :default) +null+ value)))
@@ -880,28 +911,65 @@ read lease to protect the index lookup."
       (funcall function)
       (call-with-btree-relation-read-lock relfilenode function)))
 
-(defun index-build-key (index table tuple snapshot)
-  "Read only indexed attributes and retain their original compression metadata.
-Save the physical values before materializing external attributes, so the index
-key can preserve the source tuple's eligible compressed representation."
+(defun index-build-predicate-columns (index)
+  "Collect the predicate's attribute dependencies once per heap scan."
+  (let ((predicate (pg-index-predicate index))
+        (columns nil))
+    (when predicate
+      (flet ((visit (node walk)
+               (declare (ignore walk))
+               (when (eq (first node) :col)
+                 (pushnew (second node) columns :test #'eql))
+               nil))
+        (declare (dynamic-extent #'visit))
+        (some-local-plan-expression #'visit predicate)))
+    columns))
+
+(defun index-build-external-attributes-p (values columns)
+  (some (lambda (attnum) (heap-external-varlena-p (aref values (1- attnum)))) columns))
+
+(defun index-build-physical-values (index tuple)
+  "Save compression and external metadata for plain index keys."
+  (let ((values (htup-values tuple))
+        (compressed (htup-physical-compressed tuple))
+        (keys (index-key-specifications index)))
+    (when (some (lambda (key)
+                  (and (integerp key)
+                       (let ((slot (1- key)))
+                         (or (and compressed (aref compressed slot))
+                             (heap-external-varlena-p (aref values slot))))))
+                keys)
+      (let ((physical (copy-seq values)))
+        (when compressed
+          (dolist (key keys)
+            (when (integerp key)
+              (let ((slot (1- key)))
+                (when (aref compressed slot)
+                  (setf (aref physical slot) (aref compressed slot)))))))
+        physical))))
+
+(defun materialize-index-build-attributes (table tuple snapshot columns)
+  (materialize-select-tuple table tuple (statement-protection-snapshot snapshot)
+                            :index-reader #'index-build-toast-reader
+                            :demand (cons table columns) :retain-external-p t))
+
+(defun index-build-key (index table tuple snapshot &optional (predicate-columns (index-build-predicate-columns index)))
+  "Evaluate the predicate before fetching external attributes needed only by the key."
   (let* ((values (htup-values tuple))
-         (columns (pg-index-columns index))
-         (compressed (htup-physical-compressed tuple))
-         (external (some (lambda (attnum)
-                           (heap-external-varlena-p (aref values (1- attnum))))
-                         columns))
-         (physical (when (or external compressed) (copy-seq values))))
-    (when compressed
-      (dolist (attnum columns)
-        (let ((offset (1- attnum)))
-          (when (aref compressed offset)
-            (setf (aref physical offset) (aref compressed offset))))))
-    (when external
-      (materialize-select-tuple table tuple (statement-protection-snapshot snapshot)
-                                :index-reader #'index-build-toast-reader
-                                :demand (cons table columns) :retain-external-p t))
-    (let ((keys (index-values index values)))
-      (values (index-storage-key index table keys physical) keys))))
+         (predicate-external (index-build-external-attributes-p values predicate-columns))
+         ;; A predicate can materialize a plain key column in place.
+         (physical (when predicate-external (index-build-physical-values index tuple))))
+    (when predicate-external
+      (materialize-index-build-attributes table tuple snapshot predicate-columns))
+    (when (index-tuple-qualifies-p index values)
+      (let* ((columns (or (pg-index-referenced-columns index) (pg-index-columns index)))
+             (external (index-build-external-attributes-p values columns)))
+        (when (and (not predicate-external) (or external (htup-physical-compressed tuple)))
+          (setf physical (index-build-physical-values index tuple)))
+        (when external
+          (materialize-index-build-attributes table tuple snapshot columns))
+        (let ((keys (evaluate-index-key index values)))
+          (values (index-storage-key index table keys physical) keys))))))
 
 (defun check-index-build-uniqueness (index table snapshot key name)
   "Reject a conflicting version visible to the build horizon."
@@ -918,15 +986,17 @@ key can preserve the source tuple's eligible compressed representation."
   "Build from one MVCC horizon while table writers still ignore this index."
   (let ((heap (pg-class-relfilenode table))
         (node (pg-index-relfilenode index))
-        (columns (pg-class-columns table)))
+        (columns (pg-class-columns table))
+        (predicate-columns (index-build-predicate-columns index)))
     (heapam-scan
      heap columns snapshot
      (lambda (tuple)
        (check-for-interrupts)
-       (multiple-value-bind (key values) (index-build-key index table tuple snapshot)
-         (when (index-key-requires-uniqueness-check-p index values)
-           (check-index-build-uniqueness index table snapshot key (pg-index-name index)))
-         (btree-insert node key (htup-block tuple) (htup-offnum tuple)))))))
+       (multiple-value-bind (key values) (index-build-key index table tuple snapshot predicate-columns)
+         (when key
+           (when (index-key-requires-uniqueness-check-p index values)
+             (check-index-build-uniqueness index table snapshot key (pg-index-name index)))
+           (btree-insert node key (htup-block tuple) (htup-offnum tuple))))))))
 
 (defun concurrent-index-validation-conflict (table tuple cursor)
   "Return the live conflict or XID wait that can still affect TUPLE's key."
@@ -985,14 +1055,16 @@ Every version visible to BUILT-SNAPSHOT was indexed by the completed build.
 The heap maintenance gate keeps these versions and their index entries stable
 between scans. Checking the original horizon avoids probing the index for
 unchanged rows, even when one key has many entries."
-  (heapam-scan
-   (pg-class-relfilenode table) (pg-class-columns table) snapshot
-   (lambda (tuple)
-     (check-for-interrupts)
-     (unless (htup-visible-p tuple built-snapshot)
-       (multiple-value-bind (key values) (index-build-key index table tuple snapshot)
-         (validate-concurrent-index-tuple index table tuple key
-                                          (index-key-requires-uniqueness-check-p index values)))))))
+  (let ((predicate-columns (index-build-predicate-columns index)))
+    (heapam-scan
+     (pg-class-relfilenode table) (pg-class-columns table) snapshot
+     (lambda (tuple)
+       (check-for-interrupts)
+       (unless (htup-visible-p tuple built-snapshot)
+         (multiple-value-bind (key values) (index-build-key index table tuple snapshot predicate-columns)
+           (when key
+             (validate-concurrent-index-tuple index table tuple key
+                                              (index-key-requires-uniqueness-check-p index values)))))))))
 
 (defun build-index-entries (idx table &key unique name (removal-horizon (vacuum-data-oldest-xmin)))
   "Populate IDX with heap versions retained by REMOVAL-HORIZON.
@@ -1004,7 +1076,8 @@ before this removal horizon is captured."
   (let* ((heap-relfilenode (pg-class-relfilenode table))
          (index-relfilenode (pg-index-relfilenode idx))
          (columns (pg-class-columns table))
-         (snapshot *current-snapshot*))
+         (snapshot *current-snapshot*)
+         (predicate-columns (index-build-predicate-columns idx)))
     (loop for block below (buf-nblocks heap-relfilenode)
           for page = (buf-read heap-relfilenode block)
           when page
@@ -1015,15 +1088,16 @@ before this removal horizon is captured."
                               (not (tuple-prunable-p (htup-xmin tuple)
                                                      (htup-xmax tuple)
                                                      removal-horizon)))
-                     (multiple-value-bind (key vals) (index-build-key idx table tuple snapshot)
+                     (multiple-value-bind (key vals) (index-build-key idx table tuple snapshot predicate-columns)
                        ;; Retain recently dead versions for old snapshots, but
                        ;; don't let those versions create unique violations.
-                       (when (and (index-key-requires-uniqueness-check-p idx vals unique)
-                                  (htup-visible-p tuple snapshot))
-                         (check-index-build-uniqueness idx table snapshot key name))
-                       (btree-insert index-relfilenode key
-                                     (htup-block tuple)
-                                     (htup-offnum tuple)))))))
+                       (when key
+                         (when (and (index-key-requires-uniqueness-check-p idx vals unique)
+                                    (htup-visible-p tuple snapshot))
+                           (check-index-build-uniqueness idx table snapshot key name))
+                         (btree-insert index-relfilenode key
+                                       (htup-block tuple)
+                                       (htup-offnum tuple))))))))
     ;; A missing :VALID field in an older catalog decodes as NIL.  Publish
     ;; the index only after every candidate TID has been inserted.
     (setf (pg-index-valid-p idx) t))
@@ -1042,6 +1116,16 @@ before this removal horizon is captured."
                      "column \"~a\" of relation \"~a\" contains null values"
                      (pg-column-name col)
                      (or constraint-name (pg-class-name table)))))))))
+
+(defun table-constraint-reserved-names (columns constraints)
+  "Collect explicit names that must be preserved during default index naming."
+  (remove nil
+          (append (mapcar (lambda (constraint) (getf constraint :name)) constraints)
+                  (loop for column in columns
+                        append (list* (getf column :primary-name)
+                                      (getf column :unique-name)
+                                      (mapcar (lambda (check) (getf check :name))
+                                              (getf column :checks)))))))
 
 (defun exec-create-table (stream ast)
   (let* ((name (getf ast :name))
@@ -1076,14 +1160,7 @@ before this removal horizon is captured."
                    name)))
       (with-logical-ddl-publication (ast)
         (let* ((*catalog-save-error-after-durable-p* nil)
-               (reserved-names
-                 (remove nil
-                         (append (mapcar (lambda (c) (getf c :name)) constraints)
-                                 (loop for col in cols
-                                       append (list* (getf col :primary-name)
-                                                     (getf col :unique-name)
-                                                     (mapcar (lambda (check) (getf check :name))
-                                                             (getf col :checks)))))))
+               (reserved-names (table-constraint-reserved-names cols constraints))
                (class (create-table* db name cols reserved-names))
                (durable-generation *catalog-durable-generation*)
                (terminal-appended nil))
@@ -1198,6 +1275,25 @@ before this removal horizon is captured."
           append (cons (pg-index-relfilenode index)
                        (when table (list (pg-class-relfilenode table))))))
 
+(defun expression-index-definition-p (ast)
+  (or (getf ast :index-keys) (getf ast :predicate)))
+
+(defun reserve-index-definition-identity (definition)
+  "Reserve one identity for a detached index and its provisional B-tree."
+  (let ((oid (allocate-oid)))
+    (setf (pg-index-oid definition) oid
+          (pg-index-relfilenode definition) oid)
+    definition))
+
+(defun allocate-index-definition (table ast columns)
+  "Analyze a detached index before allocating its persistent storage identity."
+  (let ((name (getf ast :name)))
+    (reserve-index-definition-identity
+     (if (expression-index-definition-p ast)
+         (make-analyzed-index-object nil name table ast)
+         (make-index-object nil name table columns :unique (getf ast :unique)
+                                                   :nulls-not-distinct (getf ast :nulls-not-distinct))))))
+
 (defun exec-create-index (stream ast)
   "Build privately while holding the table gate, then publish the index.
 OID reservation, build, file sync and detached relfile cleanup stay outside the
@@ -1207,9 +1303,9 @@ catalog rollback.
 Release these locks before waiting for commit or sending replies."
   (let* ((*catalog-save-error-after-durable-p* nil)
          (name (getf ast :name))
-         (unique (getf ast :unique))
+         (advanced-p (expression-index-definition-p ast))
          (columns (getf ast :columns))
-         (if-not-exists (getf ast :if-not-exists))
+         (if-not-exists (and (null *logical-event-apply-id*) (getf ast :if-not-exists)))
          (db nil)
          (table nil)
          (existing nil)
@@ -1217,9 +1313,9 @@ Release these locks before waiting for commit or sending replies."
     (with-write-lock
       (setf db (current-database)
             table (resolve-table-or-error (getf ast :table)))
-      (check-index-key-count columns)
+      (unless advanced-p (check-index-key-count columns))
       (setf existing (relation-name-in-use-p db name))
-      (when existing
+      (when (and existing (not advanced-p))
         (let ((attnums (resolve-attnums table columns)))
           (when if-not-exists (check-index-definition table attnums)))))
     (when existing
@@ -1240,27 +1336,23 @@ Release these locks before waiting for commit or sending replies."
         ;; acquired, then persist the reservation before creating the relfile.
         (with-write-catalog-locks
           (ensure-current-table table)
-          (let ((attnums (resolve-attnums table columns)))
+          (let ((attnums (unless advanced-p (resolve-attnums table columns))))
             (setf existing (relation-name-in-use-p db name))
             (when existing
               (if if-not-exists
                   (setf skipped t)
                   (ereport "42P07" "relation \"~a\" already exists" name)))
-            (check-index-definition table attnums)
+            (unless advanced-p (check-index-definition table attnums))
             (unless skipped
-              (setf idx
-                    (make-index-object
-                     (allocate-oid) name table
-                     attnums
-                     :unique unique
-                     :nulls-not-distinct (getf ast :nulls-not-distinct)))
+              (setf idx (allocate-index-definition table ast attnums))
               (save-catalog :applied-logical-event-id nil))))
         (unless skipped
           (handler-case
               (progn
                 (btree-init (pg-index-relfilenode idx))
-                (build-index-entries idx table :unique unique :name name)
+                (build-index-entries idx table :unique (pg-index-unique-p idx) :name name)
                 (fsync-index idx)
+                (wal-test-pause :after-ordinary-index-build)
                 (with-logical-ddl-publication (ast)
                   (ensure-current-table table)
                   (setf existing (relation-name-in-use-p db name))
@@ -1271,13 +1363,14 @@ Release these locks before waiting for commit or sending replies."
                   (let ((durable-generation *catalog-durable-generation*))
                     (handler-case
                         (progn
-                          (unless skipped
-                            (publish-index* db idx table))
-                          (when skipped
-                            (wal-defer-relation-delete
-                             (pg-index-relfilenode idx)))
-                          (save-catalog :final-ddl-p t :logical-event
-                                        (logical-catalog-event-for-ast ast)))
+                          (if skipped
+                              (progn
+                                (wal-defer-relation-delete (pg-index-relfilenode idx))
+                                (save-catalog :final-ddl-p t :applied-logical-event-id nil))
+                              (progn
+                                (publish-index* db idx table)
+                                (save-catalog :final-ddl-p t :logical-event
+                                              (logical-catalog-event-for-ast ast)))))
                       (error (publish-condition)
                         ;; Do not roll back memory if WAL has published this
                         ;; catalog image: later writes must keep maintaining
@@ -1291,13 +1384,12 @@ Release these locks before waiting for commit or sending replies."
                               (remhash name (database-indexes db))
                               (setf (pg-class-indexes table)
                                     (delete (pg-index-oid idx)
-                                            (pg-class-indexes table)))
-                              (setf preserve-relfile t)))
+                                            (pg-class-indexes table)))))
                         (error publish-condition))))))
             (error (condition)
               ;; Before publication, no reader can know this relfilenode, so
               ;; discard its pages together with a catalog save.
-              (unless preserve-relfile
+              (unless (or preserve-relfile *wal-poisoned*)
                 (handler-case
                     (with-write-catalog-locks
                       (wal-defer-relation-delete (pg-index-relfilenode idx))
@@ -1511,12 +1603,12 @@ old identity before publishing the event and replacement catalog object."
   (with-write-catalog-locks
     (ensure-current-table table)
     (let* ((name (getf ast :name))
-           (columns (resolve-attnums table (getf ast :columns))))
-      (check-index-definition table columns)
+           (advanced-p (expression-index-definition-p ast))
+           (columns (unless advanced-p (resolve-attnums table (getf ast :columns)))))
+      (unless advanced-p
+        (check-index-definition table columns))
       (when (concurrent-index-name-available-p database name (getf ast :if-not-exists))
-        (let ((index (make-index-object (allocate-oid) name table columns
-                                        :unique (getf ast :unique)
-                                        :nulls-not-distinct (getf ast :nulls-not-distinct))))
+        (let ((index (allocate-index-definition table ast columns)))
           (setf (pg-index-ready-p index) nil
                 (pg-index-logical-visible-p index) nil)
           (save-catalog :applied-logical-event-id nil)
@@ -1576,12 +1668,14 @@ old identity before publishing the event and replacement catalog object."
   ;; the index valid.  Each published state survives a later phase failure.
   (let ((heap (pg-class-relfilenode table))
         (logical-ast (copy-list ast))
+        (safe-p (not (expression-index-definition-p ast)))
         (*wal-row-page-write-p* nil))
     (remf logical-ast :concurrently)
     (wal-test-pause :after-concurrent-index-unready)
     (wait-for-concurrent-index-users heap)
     (let ((built-snapshot
-            (with-statement-snapshot (snapshot #'capture-concurrent-index-snapshot)
+            (with-statement-snapshot (snapshot (lambda (registration)
+                                                 (capture-concurrent-index-snapshot registration safe-p)))
               (build-concurrent-index index table snapshot)
               snapshot)))
       (wal-test-pause :after-concurrent-index-build)
@@ -1589,7 +1683,8 @@ old identity before publishing the event and replacement catalog object."
       (wal-test-pause :after-concurrent-index-ready)
       (wait-for-concurrent-index-users heap)
       (let ((reference
-              (with-statement-snapshot (snapshot #'capture-concurrent-index-snapshot)
+              (with-statement-snapshot (snapshot (lambda (registration)
+                                                   (capture-concurrent-index-snapshot registration safe-p)))
                 (wal-test-pause :before-concurrent-index-validation)
                 (validate-concurrent-index index table snapshot built-snapshot)
                 snapshot)))
@@ -1601,7 +1696,7 @@ old identity before publishing the event and replacement catalog object."
   (let* ((database (current-database))
          (table (with-write-lock (resolve-table-or-error (getf ast :table))))
          (built nil))
-    (check-index-key-count (getf ast :columns))
+    (check-index-key-count (or (getf ast :index-keys) (getf ast :columns)))
     (with-relation-maintenance-locks ((list (pg-class-relfilenode table)) :concurrent-index)
       (let ((index (reserve-concurrent-index database table ast)))
         (when (and index (install-concurrent-index-definition database table index ast))
@@ -1656,6 +1751,8 @@ old identity before publishing the event and replacement catalog object."
                  index-name (pg-class-name table)))
       (unless (pg-index-unique-p idx)
         (ereport "42809" "\"~a\" is not a unique index" index-name))
+      (when (index-has-expressions-p idx)
+        (ereport "42809" "index ~s has expressions or a predicate" index-name))
       (check-distinct-constraint-columns table (pg-index-columns idx) primary)
       (when primary
         (when (find-if #'pg-index-primary-p (table-indexes table))
@@ -1784,6 +1881,8 @@ old identity before publishing the event and replacement catalog object."
           (ereport "42P16"
                    "multiple primary keys for table \"~a\" are not allowed"
                    (pg-class-name table)))
+        (when (index-has-expressions-p new-idx)
+          (ereport "42809" "index ~s has expressions or a predicate" index-name))
         (check-distinct-constraint-columns table (pg-index-columns new-idx) t)
         (check-not-null-existing table (pg-index-columns new-idx) new-name)
         (when (or (gethash new-name (database-tables db))
@@ -2014,12 +2113,266 @@ completion after success; anonymous source cannot inherit Bind parameters."
       (execute-do-statement stream block))
     (send-command-complete stream "DO")))
 
+(defun stageable-catalog-ddl-p (ast)
+  (and (member (getf ast :type) '(:create-table :drop-table :create-index :drop-index))
+       (not (getf ast :concurrently))))
+
+(defun staged-catalog-ddl-p (ast)
+  (and (stageable-catalog-ddl-p ast)
+       (or (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
+
+(defun append-staged-transaction-ddl (transaction ast)
+  "Append a cooked operation beside the surrounding row changes."
+  (let* ((database-oid (database-oid (catalog-transaction-database transaction)))
+         (change (make-logical-change
+                  :kind :transaction-ddl :database-oid database-oid
+                  :event-payload
+                  (catalog-readable-data-string
+                   (list :version 1 :database-oid database-oid :ast ast)))))
+    (logical-capture-change *backend* change +max-logical-transaction-bytes+)
+    (setf (catalog-transaction-logical-ddl-p transaction) t)))
+
+(defmacro capture-staged-transaction-ddl ((transaction) &body cooked-ast)
+  "Build the replay AST only when this XID captures logical changes. In particular,
+avoid acquiring the catalog read lock or allocating a thunk on the local-only path."
+  (let ((owner (gensym "TRANSACTION-")))
+    `(let ((,owner ,transaction))
+       (when (and (catalog-transaction-capture-ddl-p ,owner)
+                  (logical-note-xid-mutation-needs-capture-p (backend-xid *backend*)))
+         (append-staged-transaction-ddl ,owner (progn ,@cooked-ast))))))
+
+(defun begin-catalog-ddl ()
+  "Retain schema admission and create the transaction-private catalog on demand."
+  (when (or *logical-event-schema-contract* *logical-event-apply-id*)
+    (ereport "0A000" "transactional DDL cannot yet apply a logical catalog event"))
+  (when (backend-final-ddl-committed-p *backend*)
+    (ereport "0A000" "transactional DDL cannot follow separately published catalog changes"))
+  (unless *wal-ready*
+    (ereport "0A000" "transactional catalog changes require native WAL"))
+  (get-current-xid)
+  (release-backend-transaction-schema-lease *backend*)
+  (acquire-transaction-schema-write-lock *backend*)
+  (with-write-catalog-locks
+    (or (backend-catalog-transaction *backend*)
+        (setf (backend-catalog-transaction *backend*) (make-catalog-transaction (current-database))))))
+
+(defun admit-staged-catalog-change (transaction)
+  "Check slot admission under the catalog locks before an effective change.
+The first change chooses the capture mode. Earlier no-ops leave it undecided."
+  (let* ((database (catalog-transaction-database transaction))
+         (mode (sb-thread:with-mutex (*wal-lock*)
+                 (wal-transactional-ddl-mode-under-lock (database-oid database))))
+         (capture-p (if (catalog-transaction-staged-ddl-p transaction)
+                        (catalog-transaction-capture-ddl-p transaction)
+                        (and (eq mode :transactional)
+                             (logical-capture-xid-needed-p (backend-xid *backend*))))))
+    (when (and mode (or (eq mode :incompatible) (not capture-p)))
+      (ereport "0A000" "transactional DDL requires compatible logical replication slots"))
+    (setf (catalog-transaction-capture-ddl-p transaction) capture-p)))
+
+(defun staged-relation-name-in-use-p (transaction name)
+  (or (catalog-transaction-lookup transaction :table name)
+      (catalog-transaction-lookup transaction :index name)
+      (gethash name (database-sequences (catalog-transaction-database transaction)))))
+
+(defun stage-new-table-constraint-indexes (transaction table columns constraints)
+  "Create private empty B-trees for a newly staged table's key constraints."
+  (let* ((database (catalog-transaction-database transaction))
+         (table-name (pg-class-name table))
+         (indexes (remove-if (lambda (constraint) (eq (getf constraint :kind) :check))
+                             constraints))
+         (reserved-names (table-constraint-reserved-names columns constraints))
+         (inline (loop for column in columns
+                       for primary = (getf column :primary)
+                       when (or primary (getf column :unique))
+                         collect (list :kind (if primary :primary :unique)
+                                       :name (getf column (if primary :primary-name :unique-name))
+                                       :columns (list (getf column :name))
+                                       :nulls-not-distinct (and (not primary)
+                                                                (getf column :nulls-not-distinct))))))
+    (when (> (count :primary (append inline indexes) :key (lambda (c) (getf c :kind))) 1)
+      (ereport "42P16" "multiple primary keys for table ~s are not allowed" table-name))
+    (flet ((name-in-use-p (db name)
+             (declare (ignore db))
+             (staged-relation-name-in-use-p transaction name)))
+      (dolist (constraint (append inline indexes))
+        (let ((index
+                (with-write-catalog-locks
+                  (let* ((primary (eq (getf constraint :kind) :primary))
+                         (attnums (resolve-attnums table (getf constraint :columns)))
+                         (name (or (getf constraint :name)
+                                   (if primary
+                                       (generate-index-name database table-name "pkey" reserved-names #'name-in-use-p)
+                                       (generate-unique-index-name database table-name table attnums
+                                                                   reserved-names #'name-in-use-p)))))
+                    (check-distinct-constraint-columns table attnums primary)
+                    (check-index-definition table attnums)
+                    (when (find name (pg-class-checks table)
+                                :key (lambda (check) (getf check :name)) :test #'string=)
+                      (ereport "42710" "constraint ~s for relation ~s already exists" name table-name))
+                    (when (name-in-use-p database name)
+                      (ereport "42P07" "relation ~s already exists" name))
+                    (when primary
+                      (dolist (attnum attnums)
+                        (setf (pg-column-notnull (aref (pg-class-columns table) (1- attnum))) t)))
+                    (make-index-object (allocate-oid) name table attnums
+                                       :unique t :primary primary :constraint t
+                                       :nulls-not-distinct (getf constraint :nulls-not-distinct))))))
+          (catalog-transaction-create-storage (pg-index-relfilenode index) :btree)
+          (setf (pg-index-valid-p index) t)
+          (with-write-catalog-locks
+            (catalog-transaction-stage transaction :index (pg-index-name index) index)))))))
+
+(defun exec-stage-create-table (stream ast)
+  "Create table metadata and storage without publishing either before COMMIT."
+  (let* ((name (getf ast :name))
+         (columns (getf ast :columns))
+         (constraints (getf ast :constraints))
+         (transaction (begin-catalog-ddl))
+         (class nil)
+         (sequence-dependencies nil))
+    (with-write-catalog-locks
+      (reject-logical-transaction-ddl-private-table name)
+      (unless (staged-relation-name-in-use-p transaction name)
+        (admit-staged-catalog-change transaction)
+        (let ((names (mapcar (lambda (column) (getf column :name)) columns)))
+          (unless (= (length names) (length (remove-duplicates names :test #'string=)))
+            (ereport "42701" "column specified more than once")))
+        (setf class (make-table-definition (catalog-transaction-database transaction) name columns))
+        (install-table-expressions class columns constraints)
+        (setf sequence-dependencies
+              (nth-value 1 (catalog-transaction-stage transaction :table name class)))))
+    (cond (class
+           (catalog-transaction-create-storage (pg-class-relfilenode class) :heap)
+           (create-table-toast-storage class t)
+           (when (or (some (lambda (column) (or (getf column :primary) (getf column :unique))) columns)
+                     (some (lambda (constraint) (not (eq :check (getf constraint :kind)))) constraints))
+             (stage-new-table-constraint-indexes transaction class columns constraints))
+           (when *applying-transaction-ddl*
+             (retain-logical-table-sequence-dependencies transaction name sequence-dependencies))
+           (capture-staged-transaction-ddl (transaction)
+             (unless *applying-transaction-ddl*
+               (retain-logical-table-sequence-dependencies transaction name sequence-dependencies))
+             (with-write-lock (first (parse-statements (catalog-table-definition-sql class))))))
+          ((getf ast :if-not-exists)
+           (send-notice stream (format nil "relation ~s already exists, skipping" name) "NOTICE" "42P07"))
+          (t (ereport "42P07" "relation ~s already exists" name)))
+    (send-command-complete stream "CREATE TABLE")))
+
+(defun exec-stage-drop-table (stream ast)
+  "Stage all drops after retaining the heap and dependent storage gates."
+  (let* ((transaction (begin-catalog-ddl))
+         (database (catalog-transaction-database transaction))
+         (targets (with-write-lock
+                    (loop for reference in (remove-duplicates (getf ast :names) :test #'equal :from-end t)
+                          for table = (lookup-sql-user-relation reference)
+                          collect (cons reference table)))))
+    (dolist (target targets)
+      (unless (or (cdr target) (getf ast :if-exists))
+        (ereport "42P01" "table ~s does not exist" (car target))))
+    (let ((tables (remove nil (mapcar #'cdr targets))))
+      (acquire-transaction-relation-locks
+       (with-write-lock
+         (loop for table in tables
+               append (append (catalog-relation-storage-nodes table)
+                              (mapcar #'pg-index-relfilenode (table-indexes table))))))
+      (with-write-catalog-locks
+        (dolist (table tables)
+          (ensure-current-table table)
+          (reject-logical-transaction-ddl-private-table (pg-class-name table))
+          (check-truncate-table-not-in-use table)
+          (when (catalog-explicit-publication-table-p database table)
+            (ereport "0A000" "transactional DROP TABLE does not yet support explicit publication membership")))
+        (when tables (admit-staged-catalog-change transaction))
+        (dolist (table tables)
+          (catalog-transaction-stage transaction :table (pg-class-name table) nil)))
+      (when tables
+        (capture-staged-transaction-ddl (transaction)
+          (list :type :drop-table :names (mapcar #'pg-class-name tables)))))
+    (dolist (target targets)
+      (unless (cdr target)
+        (send-notice stream (format nil "table ~s does not exist, skipping" (car target))))))
+  (send-command-complete stream "DROP TABLE"))
+
+(defun catalog-index-replay-ast (cooked-sql)
+  "Build an effective CREATE INDEX from the canonical catalog definition."
+  (let ((ast (first (parse-statements cooked-sql))))
+    (remf ast :if-not-exists)
+    ast))
+
+(defun exec-stage-create-index (stream ast)
+  "Build an ordinary index in private storage with retained relation admission."
+  (let* ((transaction (begin-catalog-ddl))
+         (table (with-write-lock (resolve-table-or-error (getf ast :table))))
+         (name (getf ast :name))
+         (unique (getf ast :unique))
+         (index nil))
+    (acquire-transaction-relation-locks (list (pg-class-relfilenode table)))
+    (with-write-catalog-locks
+      (ensure-current-table table)
+      (reject-logical-transaction-ddl-private-table (pg-class-name table))
+      (let* ((expression-p (expression-index-definition-p ast))
+             (definition (when expression-p (make-analyzed-index-object nil name table ast)))
+             (attnums (unless expression-p (resolve-attnums table (getf ast :columns)))))
+        (unless expression-p (check-index-definition table attnums))
+        (unless (staged-relation-name-in-use-p transaction name)
+          (admit-staged-catalog-change transaction)
+          (setf index
+                (reserve-index-definition-identity
+                 (or definition
+                     (make-index-object nil name table attnums :unique unique
+                                                               :nulls-not-distinct (getf ast :nulls-not-distinct))))))))
+    (cond (index
+           (let ((*current-snapshot* (refresh-statement-snapshot)))
+             (catalog-transaction-create-storage (pg-index-relfilenode index) :btree)
+             (build-index-entries index table :unique unique :name name))
+           (with-write-catalog-locks
+             (catalog-transaction-stage transaction :index name index))
+           (capture-staged-transaction-ddl (transaction)
+             (catalog-index-replay-ast (catalog-standalone-index-definition-sql index table))))
+          ((getf ast :if-not-exists)
+           (send-notice stream (format nil "relation ~s already exists, skipping" name) "NOTICE" "42P07"))
+          (t (ereport "42P07" "relation ~s already exists" name)))
+    (send-command-complete stream "CREATE INDEX")))
+
+(defun exec-stage-drop-index (stream ast)
+  "Retain admission while staging a drop of index metadata and storage."
+  (let* ((transaction (begin-catalog-ddl))
+         (entries (with-write-lock
+                    (loop for name in (remove-duplicates (getf ast :names) :test #'equal :from-end t)
+                          collect (cons name (lookup-index name))))))
+    (dolist (entry entries)
+      (unless (or (cdr entry) (getf ast :if-exists))
+        (ereport "42704" "index ~s does not exist" (car entry))))
+    (acquire-transaction-relation-locks
+     (with-write-lock (drop-index-relation-lock-set entries #'find-table-by-oid)))
+    (with-write-catalog-locks
+      (loop for (name . index) in entries
+            when index
+              do (refresh-index-ddl-target name index)
+                 (when (pg-index-constraint-owned-p index)
+                   (ereport "2BP01" "cannot drop index ~s because a table constraint requires it" name))
+                 (let ((table (find-table-by-oid (pg-index-table-oid index))))
+                   (reject-logical-transaction-ddl-private-table (pg-class-name table))
+                   (check-truncate-table-not-in-use table)))
+      (when (some #'cdr entries) (admit-staged-catalog-change transaction))
+      (loop for (nil . index) in entries
+            when index do (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
+    (when (some #'cdr entries)
+      (capture-staged-transaction-ddl (transaction)
+        (list :type :drop-index :names (loop for (nil . index) in entries
+                                             when index collect (pg-index-name index)))))
+    (loop for (name . index) in entries
+          unless index do (send-notice stream (format nil "index ~s does not exist, skipping" name))))
+  (send-command-complete stream "DROP INDEX"))
+
 (defun execute-in-transaction-body (stream ast)
   "Execute AST and collect DDL replies through transaction completion.
 Replicated DDL gets a short subscriber preflight even if execution returns
 without a change; each actual publication captures its own schema precondition."
   (let ((implicit (not (or (backend-explicit *backend*)
                            (backend-implicit-query-block *backend*))))
+        (stage-ddl-p (staged-catalog-ddl-p ast))
         (logical-ddl-responses nil)
         (copy-row-count nil)
         (*concurrent-index-snapshot-safe-p*
@@ -2035,9 +2388,11 @@ without a change; each actual publication captures its own schema precondition."
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
     (when (and (catalog-change-p ast) (backend-role-changes *backend*))
       (ereport "0A000" "role changes cannot share a transaction with other catalog changes"))
-    (when (and (catalog-change-p ast) (backend-explicit *backend*))
+    (when (and (catalog-change-p ast) (not stage-ddl-p)
+               (or (backend-explicit *backend*)
+                   (catalog-transaction-has-changes-p (backend-catalog-transaction *backend*))))
       (ereport "0A000"
-               "catalog changes are not supported inside an explicit transaction block"))
+               "this catalog change is not supported inside the current transaction block"))
     (when (member (getf ast :type) '(:create-table :create-sequence))
       (ensure-sql-creation-schema))
     (with-statement-snapshot (snap #'statement-start)
@@ -2057,8 +2412,12 @@ without a change; each actual publication captures its own schema precondition."
                      (:delete (note-backend-command-id-used)
                       (let ((*wal-row-page-write-p* t)) (exec-delete stream ast)))
                      (:truncate (exec-truncate stream ast))
-                     (:create-table (exec-create-table stream ast))
-                     (:drop-table (exec-drop-table stream ast))
+                     (:create-table (if stage-ddl-p
+                                        (exec-stage-create-table stream ast)
+                                        (exec-create-table stream ast)))
+                     (:drop-table (if stage-ddl-p
+                                      (exec-stage-drop-table stream ast)
+                                      (exec-drop-table stream ast)))
                      (:create-sequence (exec-create-sequence stream ast))
                      (:alter-sequence (exec-alter-sequence stream ast))
                      (:apply-sequence-state
@@ -2067,12 +2426,16 @@ without a change; each actual publication captures its own schema precondition."
                      (:create-publication (exec-create-publication stream ast))
                      (:alter-publication (exec-alter-publication stream ast))
                      (:drop-publication (exec-drop-publication stream ast))
-                     (:create-index (exec-create-index stream ast))
-                     (:drop-index (exec-drop-index stream ast))
+                     (:create-index (if stage-ddl-p
+                                        (exec-stage-create-index stream ast)
+                                        (exec-create-index stream ast)))
+                     (:drop-index (if stage-ddl-p
+                                      (exec-stage-drop-index stream ast)
+                                      (exec-drop-index stream ast)))
                      (:alter-index (exec-alter-index stream ast))
                      (:alter-table (exec-alter-table stream ast))
                      (t (ereport "0A000" "unsupported statement")))))
-            (if (ddl-p ast)
+            (if (and (ddl-p ast) (not stage-ddl-p))
                 (with-schema-write-lock
                   (multiple-value-bind (result responses)
                       (call-with-logical-ddl-response-collection
@@ -2139,7 +2502,7 @@ without a change; each actual publication captures its own schema precondition."
   "Run a statement in the current transaction or in an ordinary autocommit scope."
   (when (concurrent-index-ddl-p ast)
     (ereport "25001" "concurrent index commands must run as top-level statements"))
-  (if (ddl-p ast)
+  (if (and (ddl-p ast) (not (staged-catalog-ddl-p ast)))
       (call-with-prepared-final-ddl (lambda () (execute-in-transaction-body stream ast)))
       (execute-in-transaction-body stream ast)))
 
@@ -2172,8 +2535,9 @@ without a change; each actual publication captures its own schema precondition."
 Transaction options and session characteristics are excluded."
   (and (rest statements)
        (every (lambda (statement)
-                (and (member (getf statement :type) '(:select :insert :update :delete :set :reset :show :do
-                                                      :create-role :alter-role :grant-role-function))
+                (and (or (stageable-catalog-ddl-p statement)
+                         (member (getf statement :type) '(:select :insert :update :delete :truncate :set :reset :show :do
+                                                          :create-role :alter-role :grant-role-function)))
                      (not (getf statement :transaction-options-p))
                      (not (getf statement :session-characteristics-p))))
               statements)))

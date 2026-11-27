@@ -1,6 +1,10 @@
 """Exercise concurrent index phase boundaries over the PostgreSQL wire."""
 
 import argparse
+import contextlib
+import os
+import random
+import re
 import runpy
 import struct
 import subprocess
@@ -45,6 +49,22 @@ def index_state(connection, name):
         "WHERE indexrelid=(SELECT oid FROM pg_catalog.pg_class "
         f"WHERE relname='{name}')"
     )
+
+
+def mark_logical_catalog_wal(server):
+    server.control("(defparameter pg::*test-index-catalog-wal-start* "
+                   "(sb-thread:with-mutex (pg::*wal-lock*) pg::*wal-durable-lsn*))")
+
+
+def logical_catalog_records_since_mark(server):
+    output = server.control("""(sb-thread:with-mutex (pg::*wal-lock*)
+      (let ((count 0))
+        (pg::wal-scan (lambda (record)
+                        (when (= (pg::wal-record-type record) pg::+wal-record-logical-catalog-event+)
+                          (incf count)))
+                      pg::*test-index-catalog-wal-start* :end-lsn pg::*wal-durable-lsn*)
+        (format nil "CATALOG-RECORDS=~d" count)))""")
+    return int(re.search(r"CATALOG-RECORDS=(\d+)", output).group(1))
 
 
 def assert_index_key_entries(server, index, key, expected):
@@ -339,7 +359,8 @@ def physical_index_phases():
         connections.extend((builder, standby, observer))
 
         arm_phase(source, unready)
-        builder.send(b"Q", b"CREATE INDEX CONCURRENTLY replay_idx ON replay_rows(id)\0")
+        builder.send(b"Q", b"CREATE UNIQUE INDEX CONCURRENTLY replay_idx "
+                          b"ON replay_rows ((id + 1)) WHERE id > 1000\0")
         wait_for_file(phase_file(source, unready, "paused"), source.process)
         wait_for("standby catalog install",
                  lambda: index_state(observer, "replay_idx") == [["f", "f", "t"]])
@@ -363,6 +384,31 @@ def physical_index_phases():
         wait_for("standby valid index",
                  lambda: index_state(observer, "replay_idx") == [["t", "t", "t"]])
         assert observer.query("SELECT id FROM replay_rows WHERE id=1500") == [["1500"]]
+        indexed = "SELECT id FROM replay_rows WHERE id > 1000 AND id + 1 = 1501"
+        assert "Index Scan using replay_idx" in observer.query("EXPLAIN " + indexed)[0][0]
+        assert observer.query(indexed) == [["1500"]]
+        source_sql.query("BEGIN")
+        source_sql.query("CREATE TABLE replay_mixed (id int)")
+        source_sql.query("INSERT INTO replay_mixed VALUES (7), (11)")
+        for start in range(1000, 2500, 250):
+            rows = ",".join(f"({value})" for value in range(start, start + 250))
+            source_sql.query(f"INSERT INTO replay_mixed VALUES {rows}")
+        source_sql.query("CREATE UNIQUE INDEX replay_mixed_ix ON replay_mixed ((id + 1))")
+        source_sql.query("UPDATE replay_mixed SET id = 13 WHERE id = 11")
+        expect_error(observer, "SELECT id FROM replay_mixed", "42P01")
+        assert index_state(observer, "replay_mixed_ix") == []
+        source_sql.query("COMMIT")
+        position = source_sql.query("SELECT pg_current_wal_flush_lsn()")[0][0]
+        wait_for_query(observer, f"SELECT pg_last_wal_replay_lsn() >= '{position}'::pg_lsn",
+                       [["t"]])
+        assert observer.query("SELECT id FROM replay_mixed WHERE id < 1000 ORDER BY id") == [
+            ["7"], ["13"]
+        ]
+        assert observer.query("SELECT count(*) FROM replay_mixed") == [["1502"]]
+        indexed = "SELECT id FROM replay_mixed WHERE id + 1 = 14"
+        assert "Index Scan using replay_mixed_ix" in observer.query("EXPLAIN " + indexed)[0][0]
+        assert observer.query(indexed) == [["13"]]
+        assert index_state(observer, "replay_mixed_ix") == [["t", "t", "t"]]
         source_sql.query("DROP INDEX CONCURRENTLY replay_idx")
         wait_for("standby index removal", lambda: index_state(observer, "replay_idx") == [])
         print("concurrent index physical replay: PASS")
@@ -452,6 +498,15 @@ def logical_identity_cutover():
         connections.append(connection)
         return connection
 
+    def start_worker(log_name, env=None):
+        with (source.root / log_name).open("wb") as log:
+            return subprocess.Popen(
+                [str(LISP / "pg-lisp-subscribe"), "--slot", "index_phase",
+                 "--source-port", str(source.port), "--target-port", str(target.port),
+                 "--table", "logical_rows"],
+                cwd=LISP, stdout=log, stderr=subprocess.STDOUT, env=env,
+            )
+
     def wait_for_fence():
         wait_for(
             "logical identity writer fence",
@@ -466,17 +521,41 @@ def logical_identity_cutover():
         target.start()
         source_sql, builder, writer = (connect(source) for _ in range(3))
         subscriber = connect(target)
-        source_sql.query("CREATE TABLE logical_rows(a int NOT NULL, b int NOT NULL, v int)")
+        source_sql.query("CREATE TABLE logical_rows(a int NOT NULL, b int NOT NULL, v int, "
+                         "scheduled timestamptz)")
         source_sql.query("CREATE UNIQUE INDEX logical_a ON logical_rows(a)")
-        source_sql.query("INSERT INTO logical_rows VALUES (1,10,100)")
-        with (source.root / "subscription.log").open("wb") as log:
-            worker = subprocess.Popen(
-                [str(LISP / "pg-lisp-subscribe"), "--slot", "index_phase",
-                 "--source-port", str(source.port), "--target-port", str(target.port),
-                 "--table", "logical_rows"],
-                cwd=LISP, stdout=log, stderr=subprocess.STDOUT,
-            )
-        wait_for_query(subscriber, "SELECT a,b,v FROM logical_rows", [["1", "10", "100"]])
+        source_sql.query("INSERT INTO logical_rows VALUES (1,10,100,'2026-01-01 15:00:00+00')")
+        for start in range(3, 2002, 250):
+            rows = ",".join(f"({value},{value + 100},0)" for value in range(start, min(start + 250, 2002)))
+            source_sql.query(f"INSERT INTO logical_rows (a,b,v) VALUES {rows}")
+        worker = start_worker("subscription.log")
+        wait_for_query(subscriber, "SELECT count(*) FROM logical_rows", [["2000"]])
+        first_row = "SELECT a,b,v FROM logical_rows WHERE a=1"
+        assert subscriber.query(first_row) == [["1", "10", "100"]]
+
+        source_sql.query("SET TIME ZONE 'America/New_York'")
+        source_sql.query("CREATE UNIQUE INDEX logical_expr ON logical_rows ((v + 1)) "
+                         "WHERE b > 0 AND scheduled < '2026-01-01 12:00:00'")
+        wait_for("subscriber partial expression index",
+                 lambda: index_state(subscriber, "logical_expr") == [["t", "t", "t"]])
+        source_sql.query("INSERT INTO logical_rows VALUES (2,0,100,'2026-01-01 15:00:00+00')")
+        wait_for_query(subscriber, "SELECT a,v FROM logical_rows WHERE a=2", [["2", "100"]])
+        source_sql.query("DELETE FROM logical_rows WHERE a=2")
+        wait_for_query(subscriber, "SELECT a,v FROM logical_rows WHERE a=2", [])
+        overlapping = "INSERT INTO logical_rows VALUES (2,20,100,'2026-01-01 15:00:00+00')"
+        expect_error(subscriber, overlapping, "23505")
+        source_sql.query("DROP INDEX logical_expr")
+        wait_for("subscriber partial expression index removal",
+                 lambda: index_state(subscriber, "logical_expr") == [])
+        source_sql.query("CREATE UNIQUE INDEX CONCURRENTLY logical_expr ON logical_rows "
+                         "((v + 1)) WHERE b::oid8 > 0::oid8 "
+                         "AND scheduled < '2026-01-01 12:00:00'")
+        wait_for("subscriber concurrent partial expression index",
+                 lambda: index_state(subscriber, "logical_expr") == [["t", "t", "t"]])
+        expect_error(subscriber, overlapping, "23505")
+        source_sql.query("DROP INDEX CONCURRENTLY logical_expr")
+        wait_for("subscriber concurrent partial expression index removal",
+                 lambda: index_state(subscriber, "logical_expr") == [])
 
         arm_phase(source, validated)
         builder.send(b"Q", b"CREATE UNIQUE INDEX CONCURRENTLY logical_b ON logical_rows(b)\0")
@@ -489,7 +568,7 @@ def logical_identity_cutover():
         writer.query("COMMIT")
         finish_utility(builder, b"CREATE INDEX")
         source_sql.query("UPDATE logical_rows SET v=102 WHERE b=10")
-        wait_for_query(subscriber, "SELECT a,b,v FROM logical_rows", [["1", "10", "102"]])
+        wait_for_query(subscriber, first_row, [["1", "10", "102"]])
         assert index_state(subscriber, "logical_b") == [["t", "t", "t"]]
 
         writer.query("BEGIN")
@@ -502,11 +581,110 @@ def logical_identity_cutover():
         wait_for_file(phase_file(source, invalid, "paused"), source.process)
         assert index_state(source_sql, "logical_b") == [["f", "t", "t"]]
         source_sql.query("UPDATE logical_rows SET v=104 WHERE a=1")
-        wait_for_query(subscriber, "SELECT a,b,v FROM logical_rows", [["1", "10", "104"]])
+        wait_for_query(subscriber, first_row, [["1", "10", "104"]])
         assert index_state(subscriber, "logical_b") == []
         phase_file(source, invalid, "resume").touch()
         finish_utility(builder, b"DROP INDEX")
+
+        worker.terminate()
+        worker.wait(timeout=10)
+        progress = ("SELECT source_lsn FROM pg_lisp_subscription_progress "
+                    "WHERE source_slot='index_phase' AND state='ready'")
+        fault = source.root / "mixed-before-commit.marker"
+        worker = start_worker("mixed-before-commit.log", {
+            **os.environ,
+            "PG_LISP_TEST_FAILPOINT": "before-target-commit",
+            "PG_LISP_TEST_FAILPOINT_ACTION": "crash",
+            "PG_LISP_TEST_FAILPOINT_ONCE_FILE": str(fault),
+        })
+        writer.query("BEGIN")
+        writer.query("INSERT INTO logical_rows (a,b,v) VALUES (2,20,200)")
+        writer.query("CREATE UNIQUE INDEX logical_mixed_ix ON logical_rows ((v + 1)) WHERE v > 100")
+        writer.query("UPDATE logical_rows SET v=201 WHERE a=2")
+        assert index_state(subscriber, "logical_mixed_ix") == []
+        assert subscriber.query("SELECT v FROM logical_rows WHERE a=2") == []
+        source_sql.query("CREATE TABLE logical_unrelated (id int)")
+        writer.query("COMMIT")
+        mixed_lsn = source_sql.query("SELECT pg_current_wal_flush_lsn()")[0][0]
+        assert worker.wait(timeout=15) == -9
+        assert fault.is_file()
+        assert subscriber.query(f"SELECT source_lsn::pg_lsn < '{mixed_lsn}'::pg_lsn "
+                                "FROM pg_lisp_subscription_progress "
+                                "WHERE source_slot='index_phase' AND state='ready'") == [["t"]]
+        assert index_state(subscriber, "logical_mixed_ix") == []
+        assert subscriber.query("SELECT v FROM logical_rows WHERE a=2") == []
+        assert subscriber.query("SELECT count(*) FROM logical_unrelated") == [["0"]]
+
+        worker = start_worker("mixed-retry.log")
+        wait_for_query(subscriber, "SELECT v FROM logical_rows WHERE a=2", [["201"]])
+        assert index_state(subscriber, "logical_mixed_ix") == [["t", "t", "t"]]
+        expect_error(subscriber, "INSERT INTO logical_rows (a,b,v) VALUES (3,30,201)", "23505")
+
+        writer.query("BEGIN")
+        writer.query("DROP INDEX logical_mixed_ix")
+        writer.query("DELETE FROM logical_rows WHERE a=2")
+        writer.query("ROLLBACK")
+        source_sql.query("UPDATE logical_rows SET v=105 WHERE a=1")
+        wait_for_query(subscriber, first_row, [["1", "10", "105"]])
+        assert subscriber.query("SELECT v FROM logical_rows WHERE a=2") == [["201"]]
+        assert index_state(subscriber, "logical_mixed_ix") == [["t", "t", "t"]]
+
+        worker.terminate()
+        worker.wait(timeout=10)
+        fault = source.root / "mixed-after-commit.marker"
+        worker = start_worker("mixed-after-commit.log", {
+            **os.environ,
+            "PG_LISP_TEST_FAILPOINT": "after-target-commit-before-feedback",
+            "PG_LISP_TEST_FAILPOINT_ACTION": "crash",
+            "PG_LISP_TEST_FAILPOINT_ONCE_FILE": str(fault),
+        })
+        writer.query("BEGIN")
+        writer.query("DROP TABLE logical_rows")
+        writer.query("CREATE TABLE logical_rows (a int primary key, b int, v int)")
+        writer.query("INSERT INTO logical_rows VALUES (7,8,9)")
+        writer.query("COMMIT")
+        assert worker.wait(timeout=15) == -9
+        assert fault.is_file()
+        assert subscriber.query("SELECT a,b,v FROM logical_rows") == [["7", "8", "9"]]
+        assert index_state(subscriber, "logical_mixed_ix") == []
+        durable_marker = subscriber.query(progress)
+        assert durable_marker
+        subscriber.query("INSERT INTO logical_rows VALUES (8,9,10)")
+        worker = start_worker("mixed-resume.log")
+        source_sql.query("UPDATE logical_rows SET v=11 WHERE a=7")
+        wait_for_query(subscriber, "SELECT a,b,v FROM logical_rows ORDER BY a",
+                       [["7", "8", "11"], ["8", "9", "10"]])
+        assert subscriber.query(progress) != durable_marker
+
+        subscriber.query("CREATE INDEX subscriber_drift ON logical_rows (b)")
+        writer.query("BEGIN")
+        writer.query("CREATE INDEX logical_after_drift ON logical_rows (v)")
+        writer.query("UPDATE logical_rows SET v=12 WHERE a=7")
+        writer.query("COMMIT")
+        drift_lsn = source_sql.query("SELECT pg_current_wal_flush_lsn()")[0][0]
+        assert worker.wait(timeout=15) != 0
+        assert "subscriber schema differs from publisher transaction contract" in (
+            source.root / "mixed-resume.log"
+        ).read_text()
+        assert subscriber.query("SELECT v FROM logical_rows WHERE a=7") == [["11"]]
+        assert index_state(subscriber, "logical_after_drift") == []
+        assert subscriber.query(f"SELECT source_lsn::pg_lsn < '{drift_lsn}'::pg_lsn "
+                                "FROM pg_lisp_subscription_progress "
+                                "WHERE source_slot='index_phase' AND state='ready'") == [["t"]]
+        subscriber.query("DROP INDEX subscriber_drift")
+        worker = start_worker("mixed-drift-retry.log")
+        wait_for_query(subscriber, "SELECT v FROM logical_rows WHERE a=7", [["12"]])
+        assert index_state(subscriber, "logical_after_drift") == [["t", "t", "t"]]
         assert worker.poll() is None
+
+        worker.terminate()
+        worker.wait(timeout=10)
+        target.control('(remhash "pg_lisp_transactional_ddl_supported" pg::*scalar-builtin-descriptors*)')
+        worker = start_worker("incompatible-target.log")
+        assert worker.wait(timeout=15) != 0
+        assert "target cannot apply transactional DDL from the existing source slot" in (
+            source.root / "incompatible-target.log"
+        ).read_text()
         print("concurrent index logical replication: PASS")
     finally:
         for phase in (validated, invalid):
@@ -525,6 +703,222 @@ def logical_identity_cutover():
         print(f"logical artifacts: {source.root}, {target.root}")
 
 
+def logical_legacy_slot_fallback(legacy_endpoint):
+    source, target = OwnedLisp(), OwnedLisp()
+    worker = None
+    try:
+        source.start()
+        target.start()
+        if legacy_endpoint == "source":
+            source.control("(setf (symbol-function 'pg::wal-native-slot-plugin-p) "
+                           "(lambda (plugin) (equal plugin \"pg_lisp\")))")
+        else:
+            target.control('(remhash "pg_lisp_transactional_ddl_supported" pg::*scalar-builtin-descriptors*)')
+        with contextlib.closing(Connection(source.port)) as writer, contextlib.closing(
+            Connection(target.port)
+        ) as subscriber, (source.root / "legacy-worker.log").open("wb") as log:
+            writer.query("CREATE TABLE legacy_rows (id int primary key)")
+            writer.query("INSERT INTO legacy_rows VALUES (1)")
+            command = [str(LISP / "pg-lisp-subscribe"), "--slot", "legacy_worker",
+                       "--source-port", str(source.port), "--target-port", str(target.port),
+                       "--table", "legacy_rows"]
+            worker = subprocess.Popen(command, cwd=LISP, stdout=log, stderr=subprocess.STDOUT)
+            wait_for_query(subscriber, "SELECT id FROM legacy_rows", [["1"]])
+            assert writer.query(
+                "SELECT plugin FROM pg_replication_slots WHERE slot_name='legacy_worker'"
+            ) == [["pg_lisp"]]
+            writer.query("INSERT INTO legacy_rows VALUES (2)")
+            wait_for_query(subscriber, "SELECT id FROM legacy_rows ORDER BY id", [["1"], ["2"]])
+            worker.terminate()
+            worker.wait(timeout=10)
+            worker = subprocess.Popen(command, cwd=LISP, stdout=log, stderr=subprocess.STDOUT)
+            writer.query("INSERT INTO legacy_rows VALUES (3)")
+            wait_for_query(subscriber, "SELECT id FROM legacy_rows ORDER BY id", [["1"], ["2"], ["3"]])
+            assert worker.poll() is None
+    finally:
+        if worker is not None and worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=10)
+        target.stop()
+        source.stop()
+
+
+def run_logical():
+    logical_identity_cutover()
+    logical_legacy_slot_fallback("source")
+    logical_legacy_slot_fallback("target")
+
+
+def expression_create_phases(server, builder, witness):
+    unready = "after-concurrent-index-unready"
+    ready = "after-concurrent-index-ready"
+    witness.query("CREATE TABLE expression_build(id int, label text, active int)")
+    witness.query("INSERT INTO expression_build VALUES (1, 'Alpha', 1), (2, 'ALPHA', 0)")
+    arm_phase(server, unready)
+    builder.send(b"Q", b"CREATE UNIQUE INDEX CONCURRENTLY expression_build_ix "
+                 b"ON expression_build (lower(label)) WHERE active = 1\0")
+    wait_for_file(phase_file(server, unready, "paused"), server.process)
+    assert index_state(witness, "expression_build_ix") == [["f", "f", "t"]]
+    witness.query("INSERT INTO expression_build VALUES (3, 'Beta', 1)")
+    arm_phase(server, ready)
+    release_phase(server, unready)
+    wait_for_file(phase_file(server, ready, "paused"), server.process)
+    assert index_state(witness, "expression_build_ix") == [["f", "t", "t"]]
+    expect_error(witness, "UPDATE expression_build SET active = 1 WHERE id = 2", "23505")
+    witness.query("UPDATE expression_build SET label = 'Gamma' WHERE id = 3")
+    witness.query("INSERT INTO expression_build VALUES (4, 'Beta', 1)")
+    release_phase(server, ready)
+    finish_utility(builder, b"CREATE INDEX")
+    assert index_state(witness, "expression_build_ix") == [["t", "t", "t"]]
+    for label in ("ALPHA", "BETA", "GAMMA"):
+        expect_error(witness, f"INSERT INTO expression_build VALUES (5, '{label}', 1)", "23505")
+    witness.query("INSERT INTO expression_build VALUES (5, 'ALPHA', NULL)")
+
+
+def expression_create_late_logical_interest(server, builder, witness):
+    phase = "after-concurrent-index-validation"
+    ordinary_build = "after-ordinary-index-build"
+    witness.query("CREATE TABLE expression_guard (id int)")
+    witness.query("INSERT INTO expression_guard VALUES (1)")
+    database_oid = int(witness.query(
+        "SELECT oid FROM pg_database WHERE datname = current_database()"
+    )[0][0])
+    arm_phase(server, phase)
+    builder.send(b"Q", b"CREATE INDEX CONCURRENTLY expression_guard_ix "
+                 b"ON expression_guard ((id + 1))\0")
+    wait_for_file(phase_file(server, phase, "paused"), server.process)
+    server.control(
+        "(sb-thread:with-mutex (pg::*write-lock*) "
+        "(pg::wal-register-logical-catalog-event-interest-under-writer-lock "
+        f":concurrent-expression-test {database_oid}))"
+    )
+    try:
+        mark_logical_catalog_wal(server)
+        release_phase(server, phase)
+        finish_utility(builder, b"CREATE INDEX")
+        assert index_state(witness, "expression_guard_ix") == [["t", "t", "t"]]
+        assert logical_catalog_records_since_mark(server) == 1
+        mark_logical_catalog_wal(server)
+        witness.query("CREATE INDEX CONCURRENTLY IF NOT EXISTS expression_guard_ix "
+                      "ON expression_guard ((id + 1))")
+        assert index_state(witness, "expression_guard_ix") == [["t", "t", "t"]]
+        assert logical_catalog_records_since_mark(server) == 0
+
+        arm_phase(server, ordinary_build)
+        builder.send(b"Q", b"CREATE INDEX IF NOT EXISTS expression_name_race "
+                     b"ON expression_guard ((id + 1))\0")
+        wait_for_file(phase_file(server, ordinary_build, "paused"), server.process)
+        witness.query("CREATE TABLE expression_name_race (id int)")
+        mark_logical_catalog_wal(server)
+        release_phase(server, ordinary_build)
+        frames = utility_frames(builder)
+        assert [kind for kind, _ in frames] == [b"N", b"C", b"Z"], frames
+        assert b"C42P07\0" in frames[0][1], frames
+        assert frames[1:] == [(b"C", b"CREATE INDEX\0"), (b"Z", b"I")], frames
+        assert index_state(witness, "expression_name_race") == []
+        assert logical_catalog_records_since_mark(server) == 0
+    finally:
+        release_phase(server, ordinary_build)
+        server.control(
+            "(pg::wal-release-logical-catalog-event-interest :concurrent-expression-test)"
+        )
+    witness.query("DROP INDEX CONCURRENTLY expression_guard_ix")
+    witness.query("INSERT INTO expression_guard VALUES (2)")
+
+
+def expression_build_fetches_only_demanded_toast(server, builder, witness):
+    built = "after-concurrent-index-build"
+    witness.query("CREATE TABLE demand_rows (id int, keep int, payload text)")
+    witness.query("ALTER TABLE demand_rows ALTER COLUMN payload SET STORAGE EXTERNAL")
+    payload = "".join(random.Random(19).choices("0123456789abcdefghijklmnopqrstuvwxyz", k=6400))
+    values = ",".join(f"({i},{int(i == 0)},'{payload}')" for i in range(10))
+    witness.query("INSERT INTO demand_rows VALUES " + values)
+    server.control(
+        "(progn (defparameter pg::*test-build-toast-fetches* 0) "
+        "  (let ((fetch (symbol-function 'pg::toast-fetch-value))) "
+        "    (defparameter pg::*test-original-toast-fetch* fetch) "
+        "    (setf (symbol-function 'pg::toast-fetch-value) "
+        "          (lambda (&rest args) "
+        "            (incf pg::*test-build-toast-fetches*) (apply fetch args)))))"
+    )
+
+    def assert_fetches(expected):
+        response = server.control('(format t "~&FETCHES=~d~%" pg::*test-build-toast-fetches*)')
+        assert f"\nFETCHES={expected}\n" in response, response
+        server.control("(setf pg::*test-build-toast-fetches* 0)")
+
+    try:
+        witness.query("CREATE INDEX demand_idx ON demand_rows ((length(payload) + id)) WHERE keep = 1")
+        assert_fetches(1)
+        assert_index_key_entries(server, "demand_idx", 6400, 1)
+        assert_index_key_entries(server, "demand_idx", 6401, 0)
+        witness.query("DROP INDEX demand_idx")
+        witness.query("CREATE INDEX demand_predicate_idx ON demand_rows ((length(payload) + id)) "
+                      "WHERE length(payload) = 6400 AND keep = 1")
+        # Every row needs the predicate value. The winning row reuses it for its key.
+        assert_fetches(10)
+        assert_index_key_entries(server, "demand_predicate_idx", 6400, 1)
+        assert_index_key_entries(server, "demand_predicate_idx", 6401, 0)
+        witness.query("DROP INDEX demand_predicate_idx")
+        arm_phase(server, built)
+        builder.send(b"Q", b"CREATE INDEX CONCURRENTLY demand_idx "
+                     b"ON demand_rows ((length(payload) + id)) WHERE keep = 1\0")
+        wait_for_file(phase_file(server, built, "paused"), server.process)
+        assert_fetches(1)
+        witness.query(f"INSERT INTO demand_rows VALUES (10,1,'{payload}'),(11,0,'{payload}')")
+        release_phase(server, built)
+        finish_utility(builder, b"CREATE INDEX")
+        assert_fetches(1)
+        assert index_state(witness, "demand_idx") == [["t", "t", "t"]]
+        assert_index_key_entries(server, "demand_idx", 6410, 1)
+        assert_index_key_entries(server, "demand_idx", 6411, 0)
+        witness.query("DROP TABLE demand_rows")
+    finally:
+        release_phase(server, built)
+        server.control(
+            "(progn (setf (symbol-function 'pg::toast-fetch-value) pg::*test-original-toast-fetch*) "
+            "       (setf pg::*wal-test-pause-at* nil) "
+            "       (makunbound 'pg::*test-original-toast-fetch*) "
+            "       (makunbound 'pg::*test-build-toast-fetches*))"
+        )
+
+
+def partial_build_preserves_plain_key_compression(server, connection):
+    connection.query("CREATE TABLE compressed_key_rows (id int, payload text)")
+    fragment = "".join(random.Random(19).choices("abcdefghijklmnopqrstuvwxyz0123456789", k=2100))
+    payload = fragment * 3
+    connection.query(f"INSERT INTO compressed_key_rows VALUES (1,'{payload}')")
+    response = server.control("""
+      (let* ((pg::*backend* (pg::make-backend :database "postgres"))
+             (table (pg::lookup-table "compressed_key_rows"))
+             (tuple (pg::heapam-get-tuple (pg::pg-class-relfilenode table) 0 1 (pg::pg-class-columns table)))
+             (value (aref (pg::htup-values tuple) 1)))
+        (format t "~&EXTERNAL-COMPRESSED=~a~%"
+                (and (pg::heap-external-varlena-p value)
+                     (< (logand (pg::heap-external-varlena-external-info value) #x3fffffff)
+                        (- (pg::heap-external-varlena-raw-size value) 4)))))""")
+    assert "\nEXTERNAL-COMPRESSED=T\n" in response, response
+    # Existing tuples keep compression, but the index build must inherit it.
+    connection.query("ALTER TABLE compressed_key_rows ALTER COLUMN payload SET STORAGE EXTERNAL")
+    for syntax in ("", "CONCURRENTLY "):
+        connection.query(
+            f"CREATE UNIQUE INDEX {syntax}compressed_key_idx ON compressed_key_rows (payload) "
+            "WHERE length(payload) = 6300"
+        )
+        stored = server.control("""
+          (let* ((pg::*backend* (pg::make-backend :database "postgres"))
+                 (index (pg::lookup-index "compressed_key_idx"))
+                 (node (pg::pg-index-relfilenode index)))
+            (pg::with-btree-relation-lock (node)
+              (let ((entries (pg::btree-prefix-entries-unlocked node #())))
+                (format t "~&STORED-COMPRESSED=~a~%"
+                        (and (= 1 (length entries)) (pg::btree-storage-key-p (caar entries)))))))""")
+        assert "\nSTORED-COMPRESSED=T\n" in stored, stored
+        expect_error(connection, f"INSERT INTO compressed_key_rows VALUES (2,'{payload}')", "23505")
+        connection.query("DROP INDEX compressed_key_idx")
+    connection.query("DROP TABLE compressed_key_rows")
+
+
 def run():
     server = OwnedLisp()
     connections = []
@@ -533,9 +927,13 @@ def run():
         for _ in range(4):
             connections.append(Connection(server.port))
         drop_phases(server, *connections[:3])
+        expression_create_phases(server, connections[0], connections[2])
+        expression_create_late_logical_interest(server, connections[0], connections[2])
         create_phases(server, *connections[:3])
         unique_validation_failure(server, connections[0], connections[2])
         validation_accepts_replaced_versions(server, connections[0], connections[2])
+        expression_build_fetches_only_demanded_toast(server, connections[0], connections[2])
+        partial_build_preserves_plain_key_compression(server, connections[2])
         queued_vacuum_does_not_block_validation(server, *connections[:3])
         queued_read_committed_truncate_does_not_block_validation(server, *connections[:3])
         admitted_upsert_survives_invalidation(server, *connections)
@@ -556,4 +954,4 @@ if __name__ == "__main__":
                         choices=("sql", "crash", "physical", "logical"))
     suite = parser.parse_args().suite
     {"sql": run, "crash": crash_and_cancel, "physical": physical_index_phases,
-     "logical": logical_identity_cutover}[suite]()
+     "logical": run_logical}[suite]()

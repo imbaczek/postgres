@@ -72,18 +72,18 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
             ((and (eq fork :visibility) (not (probe-file path))) 0)
             (t (relation-nblocks (smgr-open-locked relfilenode fork)))))))
 
-(defun smgr-read-page (stream block)
+(defun smgr-read-page (stream block &optional scratch)
   (declare (ftype function call-with-backend-io-wait))
-  (call-with-backend-io-wait :data-file-read (lambda () (read-page stream block))))
+  (call-with-backend-io-wait :data-file-read (lambda () (read-page stream block scratch))))
 
-(defun smgr-read-locked (relfilenode block fork)
+(defun smgr-read-locked (relfilenode block fork &optional scratch)
   (declare (ftype function wal-check-read-page))
   (let* ((stream (gethash (list relfilenode fork) *relation-streams*))
-         (page (cond (stream (smgr-read-page stream block))
+         (page (cond (stream (smgr-read-page stream block scratch))
                      ((and (eq fork :visibility)
                            (not (probe-file (relation-file-path relfilenode fork))))
                       nil)
-                     (t (smgr-read-page (smgr-open-locked relfilenode fork) block)))))
+                     (t (smgr-read-page (smgr-open-locked relfilenode fork) block scratch)))))
     (multiple-value-prog1 (wal-check-read-page page relfilenode block)
       (when (and page *statement-resource-usage*)
         (incf (statement-resource-usage-relation-reads *statement-resource-usage*))))))
@@ -119,8 +119,9 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
                 unless (gethash (cdr entry) borrowed-pages) return slot)))))
 
 (defun smgr-read-clean-page-locked (relfilenode block fork incarnation
-                                    verify borrow-lock borrowed-pages)
-  "Return a validated page and whether it is cached. Caller holds *SMGR-LOCK*."
+                                    verify borrow-lock borrowed-pages &optional scratch)
+  "Return a validated page and whether it is cached. Caller holds *SMGR-LOCK*.
+On a miss, a supplied SCRATCH page belongs to the caller and is never cached."
   (declare (ftype function wal-check-read-page))
   (unless (and (= *smgr-clean-limit-pages* (length *smgr-clean-slots*))
                (eq incarnation *smgr-clean-incarnation*)
@@ -140,9 +141,9 @@ REDO permits an existing file and never truncates it, matching smgrcreate redo."
           (when *statement-resource-usage*
             (incf (statement-resource-usage-clean-cache-hits *statement-resource-usage*)))
           (values page t))))
-    (let ((page (funcall verify (smgr-read-locked relfilenode block fork)
+    (let ((page (funcall verify (smgr-read-locked relfilenode block fork scratch)
                          relfilenode block fork)))
-      (when page
+      (when (and page (not scratch))
         (let ((victim (smgr-clean-victim-locked borrow-lock borrowed-pages)))
           (when victim
             (let ((old (aref *smgr-clean-slots* victim))

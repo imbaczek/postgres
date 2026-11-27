@@ -662,7 +662,8 @@ Range and negative checks occur when the LIMIT executes."
 (defun parse-order-list (p &optional call-order-p)
   (loop collect (let* ((start (sql-parser-pos p))
                        (expr (parse-expr p))
-                       (desc nil))
+                       (desc nil)
+                       (nulls nil))
                   (when (and *statement-structural-tokens* (not call-order-p)
                              (eq (first expr) :const) (integerp (second expr)))
                     (loop for token in (nthcdr start (sql-parser-tokens p))
@@ -681,10 +682,12 @@ Range and negative checks occur when the LIMIT executes."
                              (progn
                                (unless (eq (pkind p) :op) (syntax-error p))
                                (pnext p)))))
-                  (when (and call-order-p (match-kw p "nulls"))
-                    (unless (or (match-kw p "first") (match-kw p "last"))
-                      (syntax-error p)))
-                  (list :expr expr :desc desc))
+                  (when (match-kw p "nulls")
+                    (setf nulls (cond ((match-kw p "first") :first)
+                                      ((match-kw p "last") :last)
+                                      (t (syntax-error p)))))
+                  (if nulls (list :expr expr :desc desc :nulls nulls)
+                      (list :expr expr :desc desc)))
         while (match-punct p #\,)))
 
 ;;; ---- INSERT / UPDATE / DELETE ----
@@ -1222,6 +1225,19 @@ Range and negative checks occur when the LIMIT executes."
       (t
        (ereport "0A000" "unsupported table constraint")))))
 
+(defun parse-index-key (p)
+  "Read a column name, a function call, or a parenthesized expression."
+  (if (match-punct p #\()
+      (prog1 (parse-expr p) (expect-punct p #\)))
+      (let ((name (pident p)))
+        (cond ((match-punct p #\.)
+               (let ((function (pident p)))
+                 (expect-punct p #\()
+                 (parse-function-call p function name nil t)))
+              ((match-punct p #\()
+               (parse-function-call p name nil nil t))
+              (t name)))))
+
 (defun parse-create-index (p unique)
   (let ((concurrently (match-kw p "concurrently"))
         (if-not-exists
@@ -1238,7 +1254,7 @@ Range and negative checks occur when the LIMIT executes."
       (expect-punct p #\()
       (let ((cols '()))
         (loop
-          (push (pident p) cols)
+          (push (parse-index-key p) cols)
           (when (match-kw p "asc") nil)
           (when (match-kw p "desc")
             (ereport "0A000" "DESC indexes are not supported"))
@@ -1251,16 +1267,22 @@ Range and negative checks occur when the LIMIT executes."
                     (when (kw-p p "nulls")
                       (ereport "0A000"
                                "NULLS NOT DISTINCT requires a unique index")))))
-          (when (match-kw p "where")
-            (ereport "0A000" "partial indexes are not supported"))
-          (list :type :create-index
-                :name name
-                :concurrently concurrently
-                :table table
-                :columns (nreverse cols)
-                :unique unique
-                :nulls-not-distinct nulls-not-distinct
-                :if-not-exists if-not-exists))))))
+          (let* ((keys (nreverse cols))
+                 (expression-keys-p (some #'consp keys))
+                 (predicate (when (match-kw p "where") (parse-expr p)))
+                 (ast (list :type :create-index
+                            :name name
+                            :concurrently concurrently
+                            :table table
+                            :columns (unless expression-keys-p keys)
+                            :unique unique
+                            :nulls-not-distinct nulls-not-distinct
+                            :if-not-exists if-not-exists)))
+            (when expression-keys-p
+              (setf (getf ast :index-keys) keys))
+            (when predicate
+              (setf (getf ast :predicate) predicate))
+            ast))))))
 
 (defun parse-drop (p)
   (cond
@@ -1560,7 +1582,7 @@ Range and negative checks occur when the LIMIT executes."
       (when session-p (syntax-error p "SESSION and LOCAL are alternatives"))
       (let ((name (parse-setting-name p)))
         (unless (member name *session-local-setting-names* :test #'string-equal)
-          (ereport "0A000" "SET LOCAL is only supported for application_name and synchronous_commit"))
+          (ereport "0A000" "SET LOCAL is unsupported for parameter ~s" name))
         (when (eq (pkind p) :op) (pnext p))
         (match-kw p "to")
         (return-from parse-set

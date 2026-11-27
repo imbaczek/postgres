@@ -111,6 +111,7 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
   "Count visible rows and retain an owned bounded physical tuple reservoir."
   (declare (ignore table))
   (let ((row-count 0)
+        (tuple-bytes 0)
         (sample (make-array +analyze-sample-size+ :adjustable t :fill-pointer 0)))
     (dotimes (block (buf-nblocks relfilenode))
       (check-for-interrupts)
@@ -124,9 +125,10 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
               (when (heap-tuple-visible-p xmin xmax cid snapshot
                                           (and *backend* (backend-xid *backend*)) infomask)
                 (incf row-count)
+                (incf tuple-bytes len)
                 (analyze-add-reservoir-row (subseq page off (+ off len))
                                            row-count sample +analyze-sample-size+)))))))
-    (values row-count (coerce sample 'vector))))
+    (values row-count (coerce sample 'vector) tuple-bytes)))
 
 (defun analyze-estimate-distinct-count (row-count sample-count observed
                                         singleton-count doubleton-count)
@@ -294,7 +296,7 @@ REMAINING limits decoded MCV values retained across all columns."
 
 (defun analyze-table-statistics (table relfilenode snapshot)
   "Sample owned physical tuples and derive each column independently."
-  (multiple-value-bind (row-count sample)
+  (multiple-value-bind (row-count sample tuple-bytes)
       (analyze-sample-visible-rows table relfilenode snapshot)
     (let* ((columns (pg-class-columns table))
            (statistics (make-array (length columns)))
@@ -313,4 +315,6 @@ REMAINING limits decoded MCV values retained across all columns."
                                         (/ (float null-count 1.0d0) (length sample)))
                      :distinct-count 0 :most-common-values nil))
                   (analyze-physical-column-statistics table sample index row-count snapshot remaining))))
-      (make-pg-table-statistics :row-count row-count :sample-count (length sample) :columns statistics))))
+      (make-pg-table-statistics :row-count row-count :sample-count (length sample)
+                                :average-tuple-bytes (when (plusp row-count) (ceiling tuple-bytes row-count))
+                                :columns statistics))))

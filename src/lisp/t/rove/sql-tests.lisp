@@ -1,6 +1,156 @@
 ;;;; sql-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest numeric-hash-join-key-preserves-scale-independent-equality
+    (let ((slots #(0)) (types #(:numeric)))
+      (dolist (pair (list (cons 1 (make-sql-decimal 100 2))
+                          (cons (make-sql-decimal 12 1) (make-sql-decimal 120 2))
+                          (cons :numeric-nan :numeric-nan)))
+        (let ((left (vector (car pair))) (right (vector (cdr pair))))
+          (rove:ok (hash-join-keys-equal-p left right slots slots types))
+          (rove:ok (= (hash-join-row-hash left slots types)
+                      (hash-join-row-hash right slots types)))))))
+
+(rove:deftest join-match-map-caps-the-backing-vector
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (with-query-match-map (map 37)
+          (dotimes (i 37) (query-match-map-append map))
+          (rove:ok (= 37 (array-total-size (query-match-map-bytes map))))
+          (query-match-map-mark map 36)
+          (query-match-map-append map)
+          (rove:ok (query-match-map-pathname map))
+          (query-match-map-finish map)
+          (rove:ok (query-match-map-matched-p map 36))
+          (rove:ok (not (query-match-map-matched-p map 37)))))))
+
+(rove:deftest inner-hash-join-isolates-oversized-build-rows
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (closed 0)
+          (wide (make-string 4096 :initial-element #\x))
+          (matches nil))
+      (with-query-temp-files
+        (flet ((input (rows)
+                 (make-sql-iterator (lambda () (when rows (values (pop rows) t)))
+                                    (lambda () (incf closed)))))
+          (let ((join (make-hash-join-iterator
+                       (input (list #(1) #(2)))
+                       (input (list #(1 "small") (vector 1 wide) #(2 "other")))
+                       #(0) #(0) #(:int4) :memory-limit 256)))
+            (unwind-protect
+                 (map-sql-iterator join (lambda (row) (push (aref row 2) matches)))
+              (close-sql-iterator join)))
+          (close-sql-iterator (make-hash-join-iterator (input nil) (input nil) #(0) #(0) #(:int4))))
+        (rove:ok (null *query-temp-files*)))
+      (rove:ok (equal (sort matches #'string<) (list "other" "small" wide)))
+      (rove:ok (= closed 4))))
+
+(rove:deftest full-hash-join-emits-unmatched-build-rows-per-block
+    (let ((*query-temp-directory* (uiop:temporary-directory))
+          (expected (list (list 0 0 #(101 102)) (list 1 +null+ #(101))
+                          (list 2 +null+ #(101)) (list 3 +null+ #(101))
+                          (list +null+ 10 #(102)) (list +null+ 11 #(102))
+                          (list +null+ 12 #(102)) (list +null+ 13 #(102)))))
+      (dolist (budget '(1 65536))
+        (with-query-temp-files
+          (flet ((input (rows source)
+                   (make-sql-iterator
+                    (lambda () (when rows (values (pop rows) t nil nil (vector source)))))))
+            (let ((join (make-hash-join-iterator
+                         (input (list #(1 0) #(1 1) (vector +null+ 2) #(2 3)) 101)
+                         (input (list #(1 0) #(1 10) #(1 11) (vector +null+ 12) #(3 13)) 102)
+                         #(0) #(0) #(:int4) :memory-limit budget
+                         :preserve-probe-width 2 :preserve-build-width 2
+                         :residual (lambda (row) (= (aref row 1) (aref row 3)))))
+                  (actual nil))
+              (unwind-protect
+                   (map-sql-iterator join
+                                     (lambda (row)
+                                       (push (list (aref row 1) (aref row 3) *query-row-presence*) actual)))
+                (close-sql-iterator join))
+              (rove:ok (= (length actual) (length expected)))
+              (rove:ok (null (set-exclusive-or actual expected :test #'equalp)))
+              (rove:ok (null *query-temp-files*))))))))
+
+(rove:deftest left-hash-join-replays-unmatched-rows-once
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (dolist (budget '(256 65536))
+        (with-query-temp-files
+          (flet ((input (rows)
+                   (make-sql-iterator (lambda () (when rows (values (pop rows) t))))))
+            (let* ((probe (loop for id below 80 collect (vector 1 id)))
+                   (build (loop for id below 16 collect (vector 1 id)))
+                   (join (make-hash-join-iterator
+                          (input (list* (vector +null+ 80) #(2 81) probe))
+                          (input build) #(0) #(0) #(:int4) :memory-limit budget
+                          :preserve-probe-width 2
+                          :residual (lambda (row) (= (aref row 1) (aref row 3)))))
+                   (seen (make-array 82 :initial-element 0)))
+              (unwind-protect
+                   (map-sql-iterator join
+                                     (lambda (row)
+                                       (let ((id (aref row 1)))
+                                         (incf (aref seen id))
+                                         (rove:ok (eql (aref row 3) (if (< id 16) id +null+))))))
+                (close-sql-iterator join))
+              (rove:ok (every (lambda (count) (= count 1)) seen))
+              (rove:ok (null *query-temp-files*))))))))
+
+(rove:deftest inner-hash-join-spills-and-replays-skewed-batches
+    (let ((*query-temp-directory* (uiop:temporary-directory)))
+      (with-query-temp-files
+        (dolist (skewed '(nil t))
+          (let* ((build (loop for n below 35 collect (vector (if skewed 1 (mod n 10)) n)))
+                 (probe (loop for n below 19 collect (vector (if skewed 1 (mod n 10)) n)))
+                 (expected (loop for left in probe append
+                                                   (loop for right in build
+                                                         when (and (= (aref left 0) (aref right 0))
+                                                                   (< (aref left 1) (aref right 1)))
+                                                           collect (+ (* 100 (aref left 1)) (aref right 1)))))
+                 (result nil))
+            (flet ((input (rows source)
+                     (make-sql-iterator
+                      (lambda () (when rows (values (pop rows) t nil nil (vector source)))))))
+              (let ((join (make-hash-join-iterator
+                           (input probe 101) (input build 102) #(0) #(0) #(:int4)
+                           :memory-limit 420 :residual (lambda (row) (< (aref row 1) (aref row 3))))))
+                (unwind-protect
+                     (map-sql-iterator join
+                                       (lambda (row)
+                                         (rove:ok (equalp #(101 102) *query-row-presence*))
+                                         (push (+ (* 100 (aref row 1)) (aref row 3)) result)))
+                  (close-sql-iterator join))))
+            (rove:ok (equal (sort expected #'<) (sort result #'<)))
+            (rove:ok (null *query-temp-files*)))))))
+
+(rove:deftest inner-hash-join-retains-duplicates-and-row-presence
+    (let ((closed 0)
+          (result nil)
+          (*datum-origin-capture* t))
+      (flet ((input (rows source)
+               (make-sql-iterator
+                (lambda ()
+                  (when rows (values (pop rows) t #(nil nil nil) nil (vector source))))
+                (lambda () (incf closed)))))
+        (let ((join (make-hash-join-iterator
+                     (input (list #(1 "a" 12) #(2 "b" 20) (vector +null+ "a" 30)) :probe)
+                     (input (list #(1 "a" 40) #(1 "a" 41) #(1 "A" 50)
+                                  #(2 "b" 60) (vector +null+ "a" 70)) :build)
+                     #(0 1) #(0 1) #(:int4 :text) :memory-limit 4096
+                     :residual (lambda (row) (< (aref row 5) 60)))))
+          (unwind-protect
+               (loop
+                 (multiple-value-bind (row present origins toast presence) (sql-iterator-next join)
+                   (declare (ignore toast))
+                   (unless present (return))
+                   (rove:ok (equalp presence #(:probe :build)))
+                   (rove:ok (= (length origins) 6))
+                   (push (aref row 5) result)))
+            (close-sql-iterator join)
+            (close-sql-iterator join))))
+      (rove:ok (equal '(40 41) (sort result #'<)))
+      (rove:ok (= 2 closed))))
+
 (rove:deftest query-plan-walker-follows-only-declared-child-slots
     (let* ((opaque (list :index-scan 999 :literal))
            (seed (list :scan 1))
@@ -833,6 +983,24 @@
         (rove:ok (eq :failed (statement-observation-terminal-status failed)))
         (finish-statement-observation failed :success)
         (rove:ok (= 1 (length (snapshot-statement-statistics store)))))))
+
+(rove:deftest test-ordered-limit-restores-sort-after-index-replacement
+    (let* ((table (make-pg-class :oid 91011 :name "stale_ordered_table"))
+           (column '(:col 1 :type :int4 :typmod -1))
+           (order (list (cons column t)))
+           (scan (list :index-scan 0 91011 91013 nil nil nil :backward))
+           (target (list :expr column :name "k" :type :int4 :typmod -1))
+           (plan (%make-query-plan :physical (list :limit 2 (list :project (list target) scan)
+                                                   order)))
+           (relations (list (list :table table :path (make-select-scan-path)
+                                  :row-source (lambda () (list #(1) #(8) #(2) #(5))))))
+           (rows nil))
+      (reconcile-query-plan-access-paths plan relations)
+      (rove:ok (eq :top-n (first (query-plan-physical plan))))
+      (rove:ok (eq :seq-scan (first scan)))
+      (map-query-plan-rows plan relations (lambda (row) (push (aref (car row) 0) rows)))
+      (rove:ok (equal '(8 5) (nreverse rows))
+               "stale index admission still sorts the fallback before applying LIMIT")))
 
 (rove:deftest test-explain-timing-off
     (let* ((ast (first (parse-statements "explain (analyze, timing off) select 1")))

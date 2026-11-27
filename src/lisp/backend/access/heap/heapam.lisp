@@ -497,6 +497,34 @@ reject external and compressed datums and lengths outside BYTES."
                      ,@forms
                      (incf ,cursor ,width)))))))
 
+(declaim (inline heap-tuple-data-offset heap-read-int4))
+
+(defun heap-tuple-data-offset (bytes start limit natts infomask)
+  (let ((cursor (+ start (aref bytes (+ start +heap-tuple-hoff-off+)))))
+    (unless (<= (+ start +size-of-heap-tuple-header+) cursor limit)
+      (ereport "XX001" "invalid heap tuple header length"))
+    (when (and (logtest infomask +heap-hasnull+)
+               (> (+ start +size-of-heap-tuple-header+ (ceiling natts 8)) cursor))
+      (ereport "XX001" "truncated heap null bitmap"))
+    cursor))
+
+(defun heap-read-int4 (bytes offset)
+  (let ((value (page-u32 bytes offset)))
+    (if (logbitp 31 value) (- value #x100000000) value)))
+
+(defun single-int4-heap-tuple-value (bytes start limit infomask)
+  "Decode the SQL value of a heap tuple with exactly one int4 column."
+  (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
+    (ereport "XX001" "invalid heap tuple bounds"))
+  (let ((cursor (heap-tuple-data-offset bytes start limit 1 infomask)))
+    (if (and (logtest infomask +heap-hasnull+)
+             (logbitp 0 (aref bytes (+ start +size-of-heap-tuple-header+))))
+        +null+
+        (let ((offset (+ start (align-up (- cursor start) 4))))
+          (unless (<= (+ offset 4) limit)
+            (ereport "XX001" "truncated heap attribute"))
+          (heap-read-int4 bytes offset)))))
+
 (defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value
                                           (start 0) (limit (length bytes)))
   "Return values, XIDs, command ID, infomask, and successor TID.
@@ -514,15 +542,9 @@ exclusive end of the tuple. Decoded values do not retain the input page."
          (ctid-block (page-u32 bytes (+ start +heap-tuple-ctid-block-off+)))
          (ctid-offnum (page-u16 bytes (+ start +heap-tuple-ctid-offnum-off+)))
          (infomask (page-u16 bytes (+ start +heap-tuple-infomask-off+)))
-         (hoff (aref bytes (+ start +heap-tuple-hoff-off+)))
          (values (make-array natts :initial-element +null+))
          (physical-compressed nil)
-         (cursor (+ start hoff)))
-    (unless (<= (+ start +size-of-heap-tuple-header+) cursor limit)
-      (ereport "XX001" "invalid heap tuple header length"))
-    (when (and (logtest infomask +heap-hasnull+)
-               (> (+ start +size-of-heap-tuple-header+ (ceiling natts 8)) cursor))
-      (ereport "XX001" "truncated heap null bitmap"))
+         (cursor (heap-tuple-data-offset bytes start limit natts infomask)))
     (loop for i from 0 below natts
           for col = (aref columns i)
           do (let ((is-null
@@ -559,10 +581,7 @@ exclusive end of the tuple. Decoded values do not retain the input page."
                      (:oid
                       (setf (aref values i) (page-u32 bytes cursor)))
                      ((:int4 :date)
-                      (let ((v (page-u32 bytes cursor)))
-                        (when (>= v #x80000000)
-                          (decf v #x100000000))
-                        (setf (aref values i) v)))
+                      (setf (aref values i) (heap-read-int4 bytes cursor)))
                      ((:int8 :time :timestamp :timestamptz)
                       (let ((v (page-u64 bytes cursor)))
                         (when (>= v #x8000000000000000)

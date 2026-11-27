@@ -113,13 +113,11 @@ Invalid or ambiguous catalog metadata fails closed instead of proving a drop."
 (defun physical-history-accept-terminal (record identity removed)
   (let ((type (wal-record-type record))
         (decoded (wal-recovery-decode-terminal record)))
-    (cond
-      ((= type +wal-record-commit+)
-       (when *physical-history-reset-forks*
-         (dolist (reset *wal-recovery-relation-resets*)
-           (setf (gethash (copy-list (cdr reset)) *physical-history-reset-forks*) t))))
-      ((or (= type +wal-record-catalog+) (= type +wal-record-catalog-commit+))
-       (physical-history-accept-catalog decoded identity removed))))
+    (when (wal-catalog-terminal-type-p type)
+      (physical-history-accept-catalog decoded identity removed))
+    (when (and (wal-transaction-terminal-type-p type) *physical-history-reset-forks*)
+      (dolist (reset *wal-recovery-relation-resets*)
+        (setf (gethash (copy-list (cdr reset)) *physical-history-reset-forks*) t))))
   (wal-recovery-reset-batch nil))
 
 (defun physical-history-validate-pages (record)

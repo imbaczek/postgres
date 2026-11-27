@@ -470,7 +470,8 @@
            (*query-temp-directory* directory)
            (*logical-capture-memory-bytes* 0)
            (bytes (make-array 1 :element-type '(unsigned-byte 8) :initial-element 11))
-           (chunk (make-wal-record :payload (wal-encode-catalog-chunk-payload bytes 0 2))))
+           (chunk (make-wal-record :type +wal-record-catalog-chunk+ :xid 0
+                                   :payload (wal-encode-catalog-chunk-payload bytes 0 2))))
       (unwind-protect
            (dolist (discard-at-marker '(nil t))
              (let ((path nil))
@@ -495,7 +496,8 @@
              (*logical-capture-memory-bytes* 0)
              (*error-output* (make-string-output-stream))
              (bytes (make-array 1 :element-type '(unsigned-byte 8) :initial-element 11))
-             (chunk (make-wal-record :payload (wal-encode-catalog-chunk-payload bytes 0 1))))
+             (chunk (make-wal-record :type +wal-record-catalog-chunk+ :xid 0
+                                     :payload (wal-encode-catalog-chunk-payload bytes 0 1))))
         (unwind-protect
              (with-wal-replay-staging ()
                (wal-recovery-reset-batch t)

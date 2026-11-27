@@ -133,7 +133,6 @@
   (multiple-value-bind (count bytes)
       (wal-decode-next-catalog-chunk record *wal-recovery-group-active*
                                      *wal-recovery-logical-catalog-event-p*
-                                     *wal-recovery-logical-chunk-count*
                                      *wal-recovery-catalog-chunk-count*
                                      *wal-recovery-catalog-next-chunk*)
     (wal-recovery-append-catalog-chunk bytes)
@@ -181,16 +180,22 @@
                                  *wal-recovery-logical-catalog-event-p*
                                  *wal-recovery-logical-chunk-count*)
     (let ((type (wal-record-type record)))
-      (cond
-        ((= type +wal-record-commit+)
-         (wal-recovery-finish-logical-change-batch (wal-record-xid record))
-         decoded)
-        ((= type +wal-record-catalog-commit+)
-         (wal-reassemble-catalog-chunks decoded length))
-        (t decoded)))))
+      (when (wal-transaction-terminal-type-p type)
+        (wal-recovery-finish-logical-change-batch
+         (wal-record-xid record) (= type +wal-record-catalog-transaction-commit+)))
+      (if (or (= type +wal-record-catalog-commit+)
+              (= type +wal-record-catalog-transaction-commit+))
+          (wal-reassemble-catalog-chunks decoded length)
+          decoded))))
 
 (defvar *wal-recovery-required-clog-reset* nil
   "First proven replacement required when startup found a short CLOG file.")
+
+(defun wal-replay-commit-status (record)
+  ;; Leave short CLOG files short until their proven replacement.
+  (unless (and *wal-recovery-required-clog-reset*
+               (< (wal-record-end record) *wal-recovery-required-clog-reset*))
+    (clog-set (wal-record-xid record) 1)))
 
 (defun wal-replay-terminal (record)
   (let* ((type (wal-record-type record))
@@ -199,11 +204,12 @@
      (lambda ()
        (cond
          ((= type +wal-record-commit+)
-          (lambda ()
-            ;; Leave short CLOG files short until their proven replacement.
-            (unless (and *wal-recovery-required-clog-reset*
-                         (< (wal-record-end record) *wal-recovery-required-clog-reset*))
-              (clog-set (wal-record-xid record) 1))))
+          (lambda () (wal-replay-commit-status record)))
+         ((= type +wal-record-catalog-transaction-commit+)
+          (let ((apply-catalog (wal-prepare-catalog-record decoded)))
+            (lambda ()
+              (funcall apply-catalog)
+              (wal-replay-commit-status record))))
          ((or (= type +wal-record-catalog+) (= type +wal-record-catalog-commit+))
           (wal-prepare-catalog-record decoded))
          ((= type +wal-record-clog-reset+)
@@ -212,7 +218,8 @@
           (lambda ()
             (unless (recovery-in-progress-p) (xid-restore-reservation-floor decoded))))
          (t #'values)))
-     (= type +wal-record-catalog-commit+))))
+     (or (= type +wal-record-catalog-commit+)
+         (= type +wal-record-catalog-transaction-commit+)))))
 
 (defun wal-recovery-stage-batch-record (record page-handler)
   "Stage a nonterminal batch record, returning NIL for terminal or unknown types.

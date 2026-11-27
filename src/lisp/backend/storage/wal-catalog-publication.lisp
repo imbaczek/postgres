@@ -25,6 +25,11 @@
   (sb-thread:with-mutex (*wal-lock*)
     *wal-catalog-flush-generation*))
 
+(defun wal-live-logical-slot-for-database-p (slot database-oid)
+  (and (wal-logical-slot-p slot)
+       (eql database-oid (wal-replication-slot-database-oid slot))
+       (not (eq (wal-replication-slot-wal-status slot) :lost))))
+
 (defun wal-logical-catalog-event-needed-under-lock-p (database-oid)
   "Whether a live slot or in-flight snapshot needs DATABASE-OID catalog events.
 
@@ -35,10 +40,22 @@ snapshot capture under *WRITE-LOCK* and durable slot publication."
             *wal-logical-catalog-event-interests*
               thereis (= database-oid interested-database))
       (loop for slot being the hash-values of *wal-replication-slots*
-              thereis (and (wal-logical-slot-p slot) (= database-oid
-                                                        (or (wal-replication-slot-database-oid slot) -1))
-                           (not (eq (wal-replication-slot-wal-status slot)
-                                    :lost))))))
+              thereis (wal-live-logical-slot-for-database-p slot database-oid))))
+
+(defun wal-transactional-ddl-mode-under-lock (database-oid)
+  "Classify durable and provisional interests before staging or publishing DDL."
+  (assert (sb-thread:holding-mutex-p *wal-lock*))
+  (when (loop for oid being the hash-values of *wal-logical-catalog-event-interests*
+                thereis (= oid database-oid))
+    (return-from wal-transactional-ddl-mode-under-lock :incompatible))
+  (let ((capable-p nil))
+    (loop for slot being the hash-values of *wal-replication-slots*
+          when (wal-live-logical-slot-for-database-p slot database-oid)
+            do (unless (wal-transactional-ddl-slot-plugin-p (wal-replication-slot-plugin slot))
+                 (return-from wal-transactional-ddl-mode-under-lock :incompatible))
+               (setf capable-p t))
+    (cond (capable-p :transactional)
+          ((wal-logical-capture-required-under-lock-p) :incompatible))))
 
 (defun wal-register-logical-catalog-event-interest-under-writer-lock
     (registration database-oid)

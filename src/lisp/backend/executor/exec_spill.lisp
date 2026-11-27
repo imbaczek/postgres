@@ -5,6 +5,11 @@
 (defparameter *query-work-memory-bytes* (* 4 1024 1024)
   "Approximate memory budget shared by one executor spool or sort operation.")
 
+(defun effective-query-work-memory-bytes ()
+  "Return the current session workspace budget, in bytes."
+  (let ((kilobytes (and *backend* (gethash "work_mem" (backend-settings *backend*)))))
+    (if kilobytes (* 1024 kilobytes) *query-work-memory-bytes*)))
+
 ;; As in PostgreSQL's temp_file_limit, NIL means unlimited. The command line
 ;; can set a per-query cap; nested spill scopes share one quota.
 (defparameter *query-temp-file-limit-bytes* nil
@@ -998,22 +1003,22 @@ attempt bounded cleanup without replacing an error, FATAL or nonlocal exit."
 The scope entry, not this mapping alone, owns the stream."
   (setf (gethash stream (query-temp-quota-stream-paths *query-temp-quota*)) pathname))
 
-(defun open-and-register-query-temp-file (pathname open-arguments)
-  "Open PATHNAME with ownership reserved before the open.
-
-Publish the actual stream under interrupt masking before fallible registration."
-
+(defun open-and-register-query-temp-file (pathname opener &key creates-p)
+  "Reserve ownership before calling OPENER and publish its stream before registration.
+CREATES-P transfers ownership of the new pathname as well as the stream.
+OPENER owns partial acquisition until it returns a stream."
+  (declare (dynamic-extent opener))
   (ensure-query-temp-acquisition-ready)
   (let ((entry (make-query-temp-stream-entry :pathname pathname))
         (registered-p nil))
     (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
     (sb-sys:without-interrupts
       (unwind-protect
-           (let ((stream (apply #'open pathname open-arguments)))
+           (let ((stream (funcall opener pathname)))
              (when stream
                (setf (query-temp-stream-entry-stream entry) stream
-                     (query-temp-stream-entry-delete-p entry) t)
-               (register-query-temp-file pathname)
+                     (query-temp-stream-entry-delete-p entry) creates-p)
+               (when creates-p (register-query-temp-file pathname))
                (register-query-temp-stream-path stream pathname)
                (setf registered-p t))
              stream)
@@ -1021,44 +1026,49 @@ Publish the actual stream under interrupt masking before fallible registration."
           (abort-query-temp-stream (query-temp-stream-entry-stream entry) pathname)
           (prune-query-temp-stream-entries))))))
 
-(defun open-query-temp-output (&optional bivalent-p)
+(defun open-query-temp-output (&optional bivalent-p hash-spill-p)
   (unless *query-temp-file-scope-active-p*
     (error "Query spill files must be created inside WITH-QUERY-TEMP-FILES"))
   (loop repeat 100
         for pathname = (query-temp-file-pathname)
         for stream = (open-and-register-query-temp-file
                       pathname
-                      (list :direction :output :if-exists nil
-                            :if-does-not-exist :create :external-format :utf-8
-                            :element-type (if bivalent-p :default 'character)))
+                      (lambda (path)
+                        (if hash-spill-p
+                            (open-hash-spill-stream path :output)
+                            (open path :direction :output :if-exists nil
+                                       :if-does-not-exist :create :external-format :utf-8
+                                       :element-type (if bivalent-p :default 'character))))
+                      :creates-p t)
         when stream
           do (return-from open-query-temp-output (values pathname stream)))
   (error "Could not create a unique query spill file"))
 
-(defun open-query-temp-io ()
+(defun open-query-temp-io (&optional hash-spill-p)
   (unless *query-temp-file-scope-active-p*
     (error "Query spill files must be created inside WITH-QUERY-TEMP-FILES"))
   (loop repeat 100
         for pathname = (query-temp-file-pathname)
         for stream = (open-and-register-query-temp-file
                       pathname
-                      '(:direction :io :element-type (unsigned-byte 8)
-                        :if-exists nil :if-does-not-exist :create))
+                      (lambda (path)
+                        (if hash-spill-p
+                            (open-hash-spill-stream path :io)
+                            (open path :direction :io :element-type '(unsigned-byte 8)
+                                       :if-exists nil :if-does-not-exist :create)))
+                      :creates-p t)
         when stream
           do (return-from open-query-temp-io (values pathname stream)))
   (error "Could not create a unique query spill file"))
 
-(defun open-query-temp-input (pathname &optional bivalent-p)
-  "Reserve an entry and publish the input stream before registering its path."
-  (ensure-query-temp-acquisition-ready)
-  (let ((entry (make-query-temp-stream-entry :pathname pathname)))
-    (push entry (query-temp-cleanup-owner-entries *query-temp-cleanup-owner*))
-    (sb-sys:without-interrupts
-      (let ((stream (open pathname :direction :input :external-format :utf-8
-                                   :element-type (if bivalent-p :default 'character))))
-        (setf (query-temp-stream-entry-stream entry) stream)
-        (register-query-temp-stream-path stream pathname)
-        stream))))
+(defun open-query-temp-input (pathname &optional bivalent-p hash-spill-p)
+  (open-and-register-query-temp-file
+   pathname
+   (lambda (path)
+     (if hash-spill-p
+         (open-hash-spill-stream path :input)
+         (open path :direction :input :external-format :utf-8
+                    :element-type (if bivalent-p :default 'character))))))
 
 (defun query-temp-owned-stream-pathname (stream)
   "Find STREAM's path in explicit ownership or the quota lookup."
@@ -1089,7 +1099,7 @@ Normal close errors propagate; a still-open stream remains owned."
              (setf normal-p t))
         (funcall closer normal-p)))))
 
-(defmacro with-query-temp-input ((stream pathname &optional bivalent-p) &body body)
+(defmacro with-query-temp-input ((stream pathname &optional bivalent-p hash-spill-p) &body body)
   "Open an owned input stream for BODY and attempt closure on every exit.
 
 The scope retains ownership if closure cannot be confirmed."
@@ -1098,7 +1108,7 @@ The scope retains ownership if closure cannot be confirmed."
        (call-with-query-temp-stream-cleanup
         (lambda ()
           (sb-sys:without-interrupts
-            (setf ,stream (open-query-temp-input ,pathname ,@(when bivalent-p (list bivalent-p)))))
+            (setf ,stream (open-query-temp-input ,pathname ,bivalent-p ,hash-spill-p)))
           ,@body)
         (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
@@ -1433,12 +1443,42 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
      pathname bytes (query-temp-limited-underlying-stream stream)))
   string)
 
+(defconstant +hash-spill-int32-tag+ 1)
+(defconstant +hash-spill-text-tag+ 2)
+(defconstant +hash-spill-int32-record-bytes+ 9)
+
+(defun try-write-hash-spill-int32-record (stream pathname value)
+  "Encode a single int32 key and its single source identity without Lisp printing.
+The general codec handles other row shapes, NULL keys and datum origins."
+  (when (and (consp value) (consp (cdr value)) (consp (cddr value)) (null (cdddr value))
+             (null (second value)))
+    (let ((row (first value))
+          (presence (third value)))
+      (when (and (typep row '(simple-vector 1)) (typep presence '(simple-vector 1))
+                 (typep (svref row 0) '(signed-byte 32))
+                 (typep (svref presence 0) '(unsigned-byte 32)))
+        (let ((state (hash-spill-state stream)))
+          (query-temp-check-space pathname +hash-spill-int32-record-bytes+)
+          (hash-spill-write-octet stream state +hash-spill-int32-tag+)
+          (write-hash-spill-u32 stream state (ldb (byte 32 0) (svref row 0)))
+          (write-hash-spill-u32 stream state (svref presence 0))
+          (query-temp-account-space pathname +hash-spill-int32-record-bytes+ stream))
+        t))))
+
 (defun query-spill-write-record (stream value)
   (let* ((pathname (query-temp-path-for-stream stream))
-         (output (if pathname
-                     (make-instance 'query-temp-limited-character-stream
-                                    :stream stream :pathname pathname)
-                     stream)))
+         (hash-output-p (typep stream 'hash-spill-output))
+         (output (cond
+                   ((null pathname) stream)
+                   ((and hash-output-p (try-write-hash-spill-int32-record stream pathname value))
+                    (return-from query-spill-write-record nil))
+                   (hash-output-p
+                    (or (hash-spill-quota-writer stream)
+                        (setf (hash-spill-quota-writer stream)
+                              (make-instance 'query-temp-limited-character-stream
+                                             :stream stream :pathname pathname))))
+                   (t (make-instance 'query-temp-limited-character-stream
+                                     :stream stream :pathname pathname)))))
     (let ((*print-pretty* nil)
           (*print-readably* t)
           (*print-circle* t)
@@ -1447,6 +1487,7 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
           (*print-base* 10)
           (*print-radix* nil)
           (*package* (find-package '#:pg)))
+      (when hash-output-p (write-char (code-char +hash-spill-text-tag+) output))
       (query-spill-write-value output value)
       (terpri output))))
 
@@ -1454,24 +1495,45 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
   "Attribute bytes consumed from a spill file to the active execution."
   (declare (dynamic-extent reader))
   (let* ((usage *statement-resource-usage*)
-         (start (when (and usage (typep stream 'file-stream)) (file-position stream))))
+         (start (when (and usage (typep stream '(or file-stream hash-spill-input))) (file-position stream))))
     (multiple-value-prog1 (funcall reader)
       (when start
         (let ((end (file-position stream)))
           (when end
             (incf (statement-resource-usage-spill-read-bytes usage) (- end start))))))))
 
+(defun query-spill-read-text-record (stream)
+  (let ((*read-eval* nil)
+        (*readtable* *query-spill-readtable*)
+        (*package* (find-package '#:pg)))
+    (let ((value (read stream nil +query-spill-eof+)))
+      (if (eq value +query-spill-eof+)
+          +query-spill-eof+
+          (query-spill-decode value)))))
+
+(defun read-hash-spill-record (stream)
+  (let ((tag (loop for character = (read-char stream nil nil)
+                   unless (eql character #\Newline) return (and character (char-code character)))))
+    (cond
+      ((null tag) +query-spill-eof+)
+      ((= tag +hash-spill-int32-tag+)
+       (let* ((state (hash-spill-state stream))
+              (key (read-hash-spill-u32 stream state))
+              (source (read-hash-spill-u32 stream state)))
+         (list (vector (if (logbitp 31 key) (- key (ash 1 32)) key)) nil (vector source))))
+      ((= tag +hash-spill-text-tag+)
+       (let ((value (query-spill-read-text-record stream)))
+         (when (eq value +query-spill-eof+) (error "Truncated text hash spill record"))
+         value))
+      (t (error "Invalid hash spill record tag")))))
+
 (defun query-spill-read-record (stream)
   (call-with-counted-query-spill-read
    stream
    (lambda ()
-     (let ((*read-eval* nil)
-           (*readtable* *query-spill-readtable*)
-           (*package* (find-package '#:pg)))
-       (let ((value (read stream nil +query-spill-eof+)))
-         (if (eq value +query-spill-eof+)
-             +query-spill-eof+
-             (query-spill-decode value)))))))
+     (if (typep stream 'hash-spill-input)
+         (read-hash-spill-record stream)
+         (query-spill-read-text-record stream)))))
 
 ;; A sort run uses bivalent streams so compact and readable records can share
 ;; a file. A compact record starts with its two-byte big-endian total length.
@@ -1623,13 +1685,14 @@ BUFFER is scratch owned by the caller and may be reused after writing."
   (rows nil)
   (count 0)
   (memory-bytes 0)
-  (memory-limit *query-work-memory-bytes*)
+  (memory-limit (effective-query-work-memory-bytes))
   pathname
   output-stream
-  sealed-p)
+  sealed-p
+  hash-spill-p)
 
-(defun make-query-row-spool (&optional (memory-limit *query-work-memory-bytes*))
-  (%make-query-row-spool :memory-limit (max 1 memory-limit)))
+(defun make-query-row-spool (&optional (memory-limit (effective-query-work-memory-bytes)) hash-spill-p)
+  (%make-query-row-spool :memory-limit (max 1 memory-limit) :hash-spill-p hash-spill-p))
 
 (defun query-row-spool-spill (spool)
   "Move buffered rows to a query temporary file.
@@ -1638,7 +1701,7 @@ Publish the pathname and stream with interrupts masked so spool cleanup owns
 both before writing can be interrupted."
   (unless (query-row-spool-output-stream spool)
     (sb-sys:without-interrupts
-      (multiple-value-bind (pathname stream) (open-query-temp-output)
+      (multiple-value-bind (pathname stream) (open-query-temp-output nil (query-row-spool-hash-spill-p spool))
         (setf (query-row-spool-pathname spool) pathname
               (query-row-spool-output-stream spool) stream)))
     (dolist (row (nreverse (query-row-spool-rows spool)))
@@ -1650,10 +1713,13 @@ both before writing can be interrupted."
 (defun query-row-spool-append (spool row)
   (when (query-row-spool-sealed-p spool)
     (error "Cannot append to a sealed query row spool"))
-  (let ((row-bytes (query-spill-record-size row)))
+  (let ((row-bytes (unless (or (query-row-spool-output-stream spool)
+                               (query-row-spool-hash-spill-p spool))
+                     (query-spill-record-size row))))
     (when (and (null (query-row-spool-output-stream spool))
-               (> (+ row-bytes (query-row-spool-memory-bytes spool))
-                  (query-row-spool-memory-limit spool)))
+               (or (query-row-spool-hash-spill-p spool)
+                   (> (+ row-bytes (query-row-spool-memory-bytes spool))
+                      (query-row-spool-memory-limit spool))))
       (query-row-spool-spill spool))
     (if (query-row-spool-output-stream spool)
         (query-spill-write-record (query-row-spool-output-stream spool) row)
@@ -1708,7 +1774,7 @@ both before writing can be interrupted."
         (progn
           (when (query-row-spool-output-stream spool)
             (finish-output (query-row-spool-output-stream spool)))
-          (with-query-temp-input (stream (query-row-spool-pathname spool))
+          (with-query-temp-input (stream (query-row-spool-pathname spool) nil (query-row-spool-hash-spill-p spool))
             (dotimes (index count)
               (check-for-interrupts)
               (let ((row (query-spill-read-record stream)))
@@ -1726,7 +1792,7 @@ both before writing can be interrupted."
   (unless (query-row-spool-sealed-p spool)
     (error "Cannot read an unsealed query row spool"))
   (if (query-row-spool-pathname spool)
-      (with-query-temp-input (stream (query-row-spool-pathname spool))
+      (with-query-temp-input (stream (query-row-spool-pathname spool) nil (query-row-spool-hash-spill-p spool))
         (loop for index from 0
               for row = (query-spill-read-record stream)
               until (eq row +query-spill-eof+)
@@ -1745,21 +1811,26 @@ both before writing can be interrupted."
   (count 0)
   (memory-limit 1)
   pathname
+  hash-spill-p
   io-stream
   (finished-p nil))
 
-(defun make-query-match-map (&optional (memory-limit *query-work-memory-bytes*))
-  (%make-query-match-map :memory-limit (max 1 memory-limit)))
+(defun make-query-match-map (&optional (memory-limit (effective-query-work-memory-bytes)) hash-spill-p expected-count)
+  (let ((limit (max 1 memory-limit)))
+    (%make-query-match-map
+     :memory-limit limit :hash-spill-p hash-spill-p
+     :bytes (make-array (min (or expected-count 0) limit)
+                        :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))))
 
 (defun query-match-map-spill (match-map)
   (unless (query-match-map-io-stream match-map)
-    (multiple-value-bind (pathname stream) (open-query-temp-io)
+    (multiple-value-bind (pathname stream) (open-query-temp-io (query-match-map-hash-spill-p match-map))
       (setf (query-match-map-pathname match-map) pathname
             (query-match-map-io-stream match-map) stream)
       (let* ((bytes (query-match-map-bytes match-map))
              (byte-count (length bytes)))
         (query-temp-check-space pathname byte-count)
-        (loop for byte across bytes do (write-byte byte stream))
+        (write-sequence bytes stream)
         (query-temp-account-space pathname byte-count stream))
       (setf (query-match-map-bytes match-map)
             (make-array 0 :element-type '(unsigned-byte 8)
@@ -1780,7 +1851,14 @@ both before writing can be interrupted."
         (file-position stream (query-match-map-count match-map))
         (write-byte 0 stream)
         (query-temp-account-space pathname 1 stream))
-      (vector-push-extend 0 (query-match-map-bytes match-map)))
+      (let* ((bytes (query-match-map-bytes match-map))
+             (capacity (array-total-size bytes)))
+        ;; Keep the backing vector within the limit as well as its filled prefix.
+        (when (= (fill-pointer bytes) capacity)
+          (setf bytes (adjust-array bytes (min (query-match-map-memory-limit match-map)
+                                               (max 1 (* 2 capacity))))
+                (query-match-map-bytes match-map) bytes))
+        (vector-push 0 bytes)))
   (prog1 (query-match-map-count match-map)
     (incf (query-match-map-count match-map))))
 

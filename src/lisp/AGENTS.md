@@ -785,6 +785,9 @@ this mode.
 - Lock order: acquire B-tree relation mutexes before the global write lock when
   an operation needs both; never wait for a B-tree mutex while holding the global
   write lock. The global write lock still precedes smgr/catalog locks.
+- Preserve range cursor position and direction when detaching under an index
+  read lease. When catalog revalidation replaces a scan that supplied ORDER BY,
+  restore the sort or top-N operation before applying LIMIT.
 - **Compatibility target:** the eventual, far-away goal is byte-for-byte,
   bug-for-bug compatibility with PostgreSQL. When in doubt, port the original
   behavior rather than inventing a simpler one. The MVP subset is a scope

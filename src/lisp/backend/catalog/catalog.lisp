@@ -42,7 +42,10 @@
   name
   relfilenode
   table-oid
-  columns           ; list of attnums
+  columns           ; ordinary keys as attnums
+  expression-keys   ; ordered attnums and analyzed scalar expressions
+  predicate
+  referenced-columns
   unique-p
   primary-p
   constraint-p      ; a table constraint depends on this index
@@ -60,6 +63,7 @@
 (defstruct pg-table-statistics
   row-count
   sample-count
+  average-tuple-bytes
   columns)
 
 (defstruct pg-sequence
@@ -222,6 +226,8 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
            (list :pg-catalog-float type (sql-float-bits expression type))))
         ((sql-decimal-p expression)
          (list :pg-catalog-numeric (sql-decimal-coefficient expression) (sql-decimal-scale expression)))
+        ((and (vectorp expression) (not (stringp expression)))
+         (list :pg-catalog-vector (map 'list #'catalog-expression-to-sexp expression)))
         ((consp expression)
          (cons (catalog-expression-to-sexp (car expression))
                (catalog-expression-to-sexp (cdr expression))))
@@ -244,6 +250,8 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
          (sql-float-from-bits (third expression) (second expression)))
         ((and (consp expression) (eq (first expression) :pg-catalog-numeric))
          (make-sql-decimal (second expression) (third expression)))
+        ((and (consp expression) (eq (first expression) :pg-catalog-vector))
+         (map 'vector #'catalog-expression-from-sexp (second expression)))
         ((consp expression)
          (cons (catalog-expression-from-sexp (car expression))
                (catalog-expression-from-sexp (cdr expression))))
@@ -308,6 +316,7 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
 (define-catalog-codec table-statistics make-pg-table-statistics
   (:row-count pg-table-statistics-row-count :row-count)
   (:sample-count pg-table-statistics-sample-count :sample-count)
+  (:average-tuple-bytes pg-table-statistics-average-tuple-bytes :average-tuple-bytes :omit-default t)
   (:columns pg-table-statistics-columns :columns
             :encode (lambda (columns)
                       (map 'list #'column-statistics-to-sexp columns))
@@ -352,6 +361,14 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:relfilenode pg-index-relfilenode :relfilenode)
   (:table-oid pg-index-table-oid :table-oid)
   (:columns pg-index-columns :columns :snapshot-copy #'copy-list)
+  (:expression-keys pg-index-expression-keys :expression-keys :omit-default t
+                                                              :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp
+                                                              :snapshot-copy #'copy-tree)
+  (:predicate pg-index-predicate :predicate :omit-default t
+                                            :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp
+                                            :snapshot-copy #'copy-tree)
+  (:referenced-columns pg-index-referenced-columns :referenced-columns :omit-default t
+                                                                       :snapshot-copy #'copy-list)
   (:unique pg-index-unique-p :unique-p)
   (:primary pg-index-primary-p :primary-p)
   (:constraint pg-index-constraint-p :constraint-p)
@@ -558,11 +575,12 @@ replacement. The caller holds the catalog writer lock through publication."
         (setf (gethash (pg-role-name role) roles) role
               (gethash (pg-role-oid role) oids) t)))))
 
-(defun catalog-to-sexp (cat)
+(defun catalog-to-sexp (cat &optional view)
   `(:cluster-identity ,(catalog-cluster-identity cat)
     :next-oid ,(catalog-next-oid cat)
     :databases ,(loop for db being the hash-values of (catalog-databases cat)
-                      collect (database-to-sexp db))
+                      collect (database-to-sexp
+                               (if (and view (eql (database-oid db) (database-oid view))) view db)))
     ,@(when (plusp (hash-table-count (catalog-roles cat)))
         (list :roles (loop for role being the hash-values of (catalog-roles cat)
                            collect (catalog-role-to-sexp role))))))
@@ -582,13 +600,14 @@ replacement. The caller holds the catalog writer lock through publication."
 (defun catalog-path ()
   (pgdata-path "global/pg_catalog.dat"))
 
-(defun catalog-image-bytes ()
+(defun catalog-image-bytes (&optional database-view)
+  "Serialize the committed cluster, optionally substituting one detached database."
   (string->bytes
    (with-output-to-string (out)
      (with-standard-io-syntax
        (let ((*print-readably* t)
              (*print-pretty* t))
-         (prin1 (catalog-to-sexp *catalog*) out)
+         (prin1 (catalog-to-sexp *catalog* database-view) out)
          (terpri out))))))
 
 (defvar *catalog-rename-function* nil)
@@ -645,7 +664,7 @@ removed.  Other names and fork types are not selected by this scan."
     (when removed (fsync-directory base)))
   (values))
 
-(defun catalog-compute-oldest-relfrozenxid ()
+(defun catalog-compute-oldest-relfrozenxid (&optional database-view)
   "Return the oldest recorded heap horizon across all databases, or NIL.
 Include each owned TOAST heap because its tuples can retain transaction IDs
 independently of the parent heap.  Like PostgreSQL's vac_update_datfrozenxid,
@@ -665,7 +684,9 @@ cluster-wide minimum directly and skips missing horizons."
               (when (and relfrozenxid
                          (or (null oldest) (< relfrozenxid oldest)))
                 (setf oldest relfrozenxid))))
-          (database-tables database)))
+          (database-tables (if (and database-view
+                                    (eql (database-oid database) (database-oid database-view)))
+                               database-view database))))
        (catalog-databases *catalog*)))
     oldest))
 
@@ -799,8 +820,13 @@ longer contain transaction-status references."
       (subseq name 7)
       name))
 
+(defun lookup-table-by-name (name)
+  (let ((transaction (backend-catalog-transaction *backend*)))
+    (if transaction (catalog-transaction-lookup transaction :table name)
+        (gethash name (database-tables (current-database))))))
+
 (defun lookup-table (name)
-  (gethash (strip-schema name) (database-tables (current-database))))
+  (lookup-table-by-name (strip-schema name)))
 
 (defun ensure-current-table (class)
   "Raise 42P01 when CLASS was dropped or replaced after it was resolved."
@@ -809,7 +835,10 @@ longer contain transaction-status references."
   class)
 
 (defun lookup-index (name)
-  (gethash (strip-schema name) (database-indexes (current-database))))
+  (let ((name (strip-schema name))
+        (transaction (backend-catalog-transaction *backend*)))
+    (if transaction (catalog-transaction-lookup transaction :index name)
+        (gethash name (database-indexes (current-database))))))
 
 (defun lookup-sequence (name)
   (gethash (strip-schema name) (database-sequences (current-database))))
@@ -1069,6 +1098,8 @@ from advancing the shared WAL generation between a failed save and rollback."
   ;; The registry's structure is defined after the catalog loads.
   (declare (special *scalar-builtin-descriptors*)
            (notinline scalar-builtin-implicit-arguments-p))
+  (when (null expression)
+    (return-from catalog-expression-sequence-names nil))
   (let ((names nil))
     (some-local-plan-expression
      (lambda (node walk)
@@ -1159,7 +1190,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                 (if length (format nil "varchar(~d)" length) "varchar")))
     (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     ((:int2 :int4 :int8 :float4 :float8 :bool :text :json :jsonb :bytea :name
-            :oid :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array)
+            :oid :oid8 :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array)
      (sql-type-display-name type))
     (otherwise (ereport "0A000" "cannot serialize stored expression type ~a" type))))
 
@@ -1313,10 +1344,10 @@ from advancing the shared WAL generation between a failed save and rollback."
         (catalog-canonical-expression-sql expression table)
         (getf check :sql))))
 
-(defun catalog-table-definition-sql (table)
+(defun catalog-table-definition-sql (table &optional database)
   (let* ((checks (sort (copy-list (pg-class-checks table)) #'string< :key (lambda (check) (getf check :name))))
          (constraints (mapcar (lambda (index) (catalog-table-constraint-sql index table))
-                              (sort (remove-if-not #'pg-index-constraint-owned-p (table-indexes table))
+                              (sort (remove-if-not #'pg-index-constraint-owned-p (table-indexes table database))
                                     #'string< :key #'pg-index-name)))
          (name (catalog-sql-quote-ident (pg-class-name table)))
          (definitions (append (loop for column across (pg-class-columns table)
@@ -1343,18 +1374,21 @@ from advancing the shared WAL generation between a failed save and rollback."
                                (#\x "EXTENDED") (#\m "MAIN")))))))
 
 (defun catalog-standalone-index-definition-sql (index table)
-  (format nil "CREATE ~aINDEX IF NOT EXISTS ~a ON ~a (~{~a~^, ~})~a"
+  (format nil "CREATE ~aINDEX IF NOT EXISTS ~a ON ~a (~{~a~^, ~})~a~@[ WHERE ~a~]"
           (if (pg-index-unique-p index) "UNIQUE " "")
           (catalog-sql-quote-ident (pg-index-name index))
           (catalog-sql-quote-ident (pg-class-name table))
-          (mapcar (lambda (attnum)
-                    (catalog-sql-quote-ident
-                     (pg-column-name
-                      (aref (pg-class-columns table) (1- attnum)))))
-                  (pg-index-columns index))
+          (mapcar (lambda (key)
+                    (if (integerp key)
+                        (catalog-sql-quote-ident
+                         (pg-column-name (aref (pg-class-columns table) (1- key))))
+                        (format nil "(~a)" (catalog-canonical-expression-sql key table))))
+                  (index-key-specifications index))
           (if (and (pg-index-unique-p index)
                    (pg-index-nulls-not-distinct-p index))
-              " NULLS NOT DISTINCT" "")))
+              " NULLS NOT DISTINCT" "")
+          (when (pg-index-predicate index)
+            (catalog-canonical-expression-sql (pg-index-predicate index) table))))
 
 (defun catalog-sequence-definition-sql (sequence)
   (format nil "CREATE SEQUENCE IF NOT EXISTS ~a INCREMENT BY ~d MINVALUE ~d MAXVALUE ~d START WITH ~d"
@@ -1408,12 +1442,12 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
                     (list :name (pg-class-name table)
                           :sql (concatenate
                                 'string "CREATE TABLE IF NOT EXISTS "
-                                (subseq (catalog-table-definition-sql table)
+                                (subseq (catalog-table-definition-sql table db)
                                         (length "CREATE TABLE ")))))
                   tables)
           :indexes
           (loop for table in tables
-                append (loop for index in (sort (table-indexes table)
+                append (loop for index in (sort (table-indexes table db)
                                                 #'string<
                                                 :key #'pg-index-name)
                              when (and (pg-index-logical-visible-p index)
@@ -1466,28 +1500,44 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
           return col))
 
 (defun find-index-by-oid (oid &optional db)
-  (loop for idx being the hash-values of (database-indexes (or db (current-database)))
-        when (= (pg-index-oid idx) oid)
-          return idx))
+  (let ((transaction (and (null db) (backend-catalog-transaction *backend*))))
+    (if transaction
+        (catalog-transaction-find-by-oid transaction :index oid)
+        (loop for idx being the hash-values of (database-indexes (or db (current-database)))
+              when (= (pg-index-oid idx) oid)
+                return idx))))
 
 (defun find-table-by-oid (oid)
-  (loop for table being the hash-values of (database-tables (current-database))
-        when (= (pg-class-oid table) oid)
-          return table))
+  (let ((transaction (backend-catalog-transaction *backend*)))
+    (if transaction
+        (catalog-transaction-find-by-oid transaction :table oid)
+        (loop for table being the hash-values of (database-tables (current-database))
+              when (= (pg-class-oid table) oid)
+                return table))))
 
 (defun table-indexes (class &optional db predicate)
-  (loop for oid in (pg-class-indexes class)
-        for idx = (find-index-by-oid oid db)
-        when (and idx (or (null predicate) (funcall predicate idx)))
-          collect idx))
+  (let ((transaction (and *backend* (null db) (backend-catalog-transaction *backend*))))
+    (if transaction
+        (catalog-transaction-table-indexes transaction class predicate)
+        (loop for oid in (pg-class-indexes class)
+              for idx = (find-index-by-oid oid db)
+              when (and idx (or (null predicate) (funcall predicate idx)))
+                collect idx))))
 
 (defun ready-unique-indexes (class)
   (table-indexes class nil (lambda (index)
                              (and (pg-index-ready-p index) (pg-index-unique-p index)))))
 
+(defun index-key-specifications (index)
+  "Return plain attribute numbers and analyzed expressions in B-tree order."
+  (or (pg-index-expression-keys index) (pg-index-columns index)))
+
 (defun index-types (idx class)
-  (loop for attnum in (pg-index-columns idx)
-        collect (pg-column-type (aref (pg-class-columns class) (1- attnum)))))
+  (let ((columns (pg-class-columns class)))
+    (loop for key in (index-key-specifications idx)
+          collect (if (integerp key)
+                      (pg-column-type (aref columns (1- key)))
+                      (expr-type key)))))
 
 (defun index-values (idx values)
   (loop for attnum in (pg-index-columns idx)
@@ -1500,18 +1550,23 @@ carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
 (defun index-storage-key (index table values &optional physical-values)
   "Encode VALUES, retaining independently compressed eligible column segments.
 The segments preserve their storage representation across B-tree page rewrites."
+  (let ((keys (pg-index-expression-keys index)))
+    (when (and (consp (first keys)) (null (rest keys)))
+      ;; A computed key has no physical heap segment to preserve.
+      (return-from index-storage-key (encode-index-key values (list (expr-type (first keys)))))))
   (let ((parts nil) (compressed-p nil))
     (loop for value in values
-          for attnum in (pg-index-columns index)
-          for column = (aref (pg-class-columns table) (1- attnum))
-          for raw = (encode-index-key (list value) (list (pg-column-type column)))
-          for physical = (and physical-values (aref physical-values (1- attnum)))
+          for key in (index-key-specifications index)
+          for column = (when (integerp key) (aref (pg-class-columns table) (1- key)))
+          for type = (if column (pg-column-type column) (expr-type key))
+          for raw = (encode-index-key (list value) (list type))
+          for physical = (and column physical-values (aref physical-values (1- key)))
           for inherited-compression-p = (or (heap-compressed-varlena-p physical)
                                             (and (heap-external-varlena-p physical)
                                                  (< (logand (heap-external-varlena-external-info physical) #x3fffffff)
                                                     (- (heap-external-varlena-raw-size physical) 4))))
           for compressed = (and (or inherited-compression-p
-                                    (and (find (pg-column-effective-storage column) "xm")
+                                    (and column (find (pg-column-effective-storage column) "xm")
                                          (not (eq value +null+))
                                          (multiple-value-bind (size offsets payloads mask)
                                              (heap-tuple-layout (vector value) (vector column))
@@ -1551,15 +1606,17 @@ The segments preserve their storage representation across B-tree page rewrites."
   (when (relation-name-in-use-p db name)
     (ereport "42P07" "relation \"~a\" already exists" name)))
 
-(defun generate-index-name (db table-name suffix &optional reserved-names)
+(defun generate-index-name (db table-name suffix &optional reserved-names
+                                                   (name-in-use-p #'relation-name-in-use-p))
   (let ((base (format nil "~a_~a" table-name suffix)))
     (loop for n from 0
           for candidate = (if (zerop n) base (format nil "~a~a" base n))
-          unless (or (relation-name-in-use-p db candidate)
+          unless (or (funcall name-in-use-p db candidate)
                      (member candidate reserved-names :test #'string=))
             return candidate)))
 
-(defun generate-unique-index-name (db table-name table attnums &optional reserved-names)
+(defun generate-unique-index-name (db table-name table attnums &optional reserved-names
+                                                                 (name-in-use-p #'relation-name-in-use-p))
   "Generate PostgreSQL's default unique-constraint name for ATTNUMS."
   (generate-index-name
    db table-name
@@ -1568,29 +1625,39 @@ The segments preserve their storage representation across B-tree page rewrites."
                      (pg-column-name
                       (aref (pg-class-columns table) (1- attnum))))
                    attnums))
-   reserved-names))
+   reserved-names name-in-use-p))
 
 (defun check-index-key-count (columns)
   ;; Match INDEX_MAX_KEYS in pg_config_manual.h, counting repeated positions.
   (when (> (length columns) 32)
     (ereport "54011" "cannot use more than 32 columns in an index")))
 
+(defun check-index-key-type (type)
+  "Reject types whose non-NULL values lack a B-tree key encoding."
+  (unless (member type '(:float4 :float8 :int2 :int4 :int8 :timetz :interval
+                         :timestamp :timestamptz :time :date :oid :numeric
+                         :bytea-array :jsonb-array :jsonb :bytea :varchar :text))
+    (ereport "42704" "data type ~a has no default operator class for access method btree"
+             (if (member type '(:json :json-array)) "json" (string-downcase type)))))
+
 (defun check-index-definition (table cols)
   "Validate supported index attributes before reserving an OID or skipping a name."
   (check-index-key-count cols)
-  (when (some (lambda (attnum)
-                (member (pg-column-type (aref (pg-class-columns table) (1- attnum))) '(:json :json-array)))
-              cols)
-    (ereport "42704" "data type json has no default operator class for access method btree")))
+  (dolist (attnum cols)
+    (check-index-key-type (pg-column-type (aref (pg-class-columns table) (1- attnum))))))
 
 (defun make-index-object (oid name table cols
-                          &key unique primary constraint nulls-not-distinct)
+                          &key unique primary constraint nulls-not-distinct expression-keys
+                            predicate referenced-columns)
   "Create detached INDEX metadata with a previously reserved object ID."
   (make-pg-index :oid oid
                  :name name
                  :relfilenode oid
                  :table-oid (pg-class-oid table)
                  :columns cols
+                 :expression-keys expression-keys
+                 :predicate predicate
+                 :referenced-columns referenced-columns
                  :unique-p unique
                  :primary-p primary
                  :constraint-p constraint
@@ -1673,18 +1740,25 @@ heap tuple exceeding the four-tuples-per-page threshold then warrants TOAST."
                             (maxalign data-length))))
       (and has-toastable (or unknown (> tuple-length threshold))))))
 
-(defun create-table-toast-storage (table)
+(defun create-table-toast-storage (table &optional private-p)
   "Create eligible TABLE's owned TOAST heap and index before publishing them.
 Until both are initialized and the index is fsynced, this function owns their
 cleanup. Once attached, TABLE owns both nodes and catalog save makes that
 ownership durable; table rollback or drop handles their eventual removal."
   (when (toast-table-needed-p (pg-class-columns table))
-    (let* ((heap-oid (allocate-oid))
-           (index-oid (allocate-oid))
+    (let* ((oids (if private-p
+                     (with-write-catalog-locks (list (allocate-oid) (allocate-oid)))
+                     (list (allocate-oid) (allocate-oid))))
+           (heap-oid (first oids))
+           (index-oid (second oids))
            (toast (make-pg-toast :oid heap-oid :relfilenode heap-oid
                                  :index-oid index-oid :index-relfilenode index-oid
                                  :relfrozenxid (next-full-xid)))
            (completed nil))
+      (when private-p
+        (catalog-transaction-create-storage heap-oid :heap)
+        (catalog-transaction-create-storage index-oid :btree)
+        (return-from create-table-toast-storage (setf (pg-class-toast table) toast)))
       (unwind-protect
            (progn
              (smgr-create heap-oid)
@@ -2201,36 +2275,35 @@ partial deletion cannot commit."
         (ereport "XX001" "TOAST chunk disappeared during deletion")))
     (values)))
 
+(defun make-table-definition (database name columns)
+  "Reserve a table identity and build its metadata before creating storage."
+  (dolist (definition columns)
+    (let ((sequence (getf definition :default-sequence-name)))
+      (when sequence
+        (unless (gethash sequence (database-sequences database))
+          (ereport "42P01" "sequence ~s does not exist" sequence))
+        (unless (member (getf definition :type) '(:int4 :int8))
+          (ereport "42804" "sequence default requires an integer column")))))
+  (let ((oid (allocate-oid)))
+    (make-pg-class
+     :oid oid :name name :relfilenode oid :relfrozenxid (next-full-xid)
+     :columns (coerce
+               (loop for definition in columns for attnum from 1
+                     collect (make-pg-column
+                              :name (getf definition :name)
+                              :type (getf definition :type)
+                              :typmod (getf definition :typmod)
+                              :attnum attnum
+                              :notnull (getf definition :notnull)
+                              :default-sequence-name (getf definition :default-sequence-name)))
+               'vector))))
+
 (defun create-table* (db name columns &optional reserved-names)
   "COLUMNS is a list of plists with :name :type :typmod :notnull :primary,
 :unique, and :nulls-not-distinct. Returns the new pg-class."
   (check-new-relation-name db name)
-  (dolist (def columns)
-    (let ((sequence-name (getf def :default-sequence-name)))
-      (when sequence-name
-        (unless (gethash sequence-name (database-sequences db))
-          (ereport "42P01" "sequence \"~a\" does not exist" sequence-name))
-        (unless (member (getf def :type) '(:int4 :int8))
-          (ereport "42804" "sequence default requires an integer column")))))
-  (let* ((oid (allocate-oid))
-         (cols (coerce
-                (loop for def in columns
-                      for i from 1
-                      collect (make-pg-column
-                               :name (getf def :name)
-                               :type (getf def :type)
-                               :typmod (getf def :typmod)
-                               :attnum i
-                               :notnull (getf def :notnull)
-                               :default-sequence-name
-                               (getf def :default-sequence-name)))
-                'vector))
-         (class (make-pg-class :oid oid
-                               :name name
-                               :relfilenode oid
-                               :relfrozenxid (next-full-xid)
-                               :columns cols
-                               :indexes '())))
+  (let* ((class (make-table-definition db name columns))
+         (cols (pg-class-columns class)))
     (setf (gethash name (database-tables db)) class)
     (handler-case
         (progn

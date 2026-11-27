@@ -933,6 +933,27 @@ if [ -n "$(replicated_rows "$SOURCE_PORT")" ] \
     exit 1
 fi
 
+# Replay a partial expression index with row changes on both sides of its DDL.
+sql "$SOURCE_PORT" "BEGIN; INSERT INTO replicated_rows VALUES (80001, 80001, 'before'); CREATE UNIQUE INDEX mixed_expression_idx ON replicated_rows (lower(label)) WHERE id >= 80000; UPDATE replicated_rows SET label = 'after' WHERE id = 80001; COMMIT" >/dev/null
+mixed_expression_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$mixed_expression_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$mixed_expression_barrier"
+for port in "$SOURCE_PORT" "$REPLICA_ONE_PORT" "$REPLICA_TWO_PORT"; do
+    test "$(sql "$port" "SELECT id FROM replicated_rows WHERE lower(label) = 'after' AND id >= 80000")" = 80001
+    test "$(sql "$port" "SELECT count(*) FROM pg_class WHERE relname = 'mixed_expression_idx'")" = 1
+    duplicate_result=$(sql "$port" "BEGIN; INSERT INTO replicated_rows VALUES (80002, 80002, 'AFTER') ON CONFLICT DO NOTHING RETURNING id; ROLLBACK")
+    test -z "$duplicate_result"
+    test "$(sql "$port" "BEGIN; INSERT INTO replicated_rows VALUES (80002, 80002, 'BEFORE') ON CONFLICT DO NOTHING RETURNING id; ROLLBACK")" = 80002
+done
+sql "$SOURCE_PORT" "BEGIN; DROP INDEX mixed_expression_idx; DELETE FROM replicated_rows WHERE id = 80001; COMMIT" >/dev/null
+mixed_expression_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")
+wait_for_lsn_barrier "$REPLICA_ONE_PORT" logical_replica_one "$mixed_expression_barrier"
+wait_for_lsn_barrier "$REPLICA_TWO_PORT" logical_replica_two "$mixed_expression_barrier"
+for port in "$REPLICA_ONE_PORT" "$REPLICA_TWO_PORT"; do
+    test "$(sql "$port" "SELECT count(*) FROM replicated_rows WHERE id = 80001")" = 0
+    test "$(sql "$port" "SELECT count(*) FROM pg_class WHERE relname = 'mixed_expression_idx'")" = 0
+done
+
 # Persist expression ASTs and replay each new CHECK/default catalog action.
 sql "$SOURCE_PORT" "ALTER TABLE bootstrap_constraint_order ALTER a SET DEFAULT '4.5'::numeric; ALTER TABLE bootstrap_constraint_order ADD CONSTRAINT streamed_check CHECK(a<100) NOT VALID; ALTER TABLE bootstrap_constraint_order VALIDATE CONSTRAINT streamed_check; ALTER TABLE bootstrap_constraint_order RENAME CONSTRAINT streamed_check TO renamed_check; ALTER TABLE bootstrap_constraint_order DROP CONSTRAINT renamed_check" >/dev/null
 expression_barrier=$(sql "$SOURCE_PORT" "SELECT pg_current_wal_lsn()")

@@ -58,11 +58,69 @@
                          (second node)))
         (values set-node width calls)))))
 
-(defun make-visible-heap-page-iterator (page block columns snapshot)
+(declaim (inline heap-page-item-visibility))
+
+(defun heap-page-item-visibility (page offset snapshot my-xid committed-xid-cache)
+  (let ((xmin (full-xid-from-32 (page-u32 page (+ offset +heap-tuple-xmin-off+))))
+        (xmax (full-xid-from-32 (page-u32 page (+ offset +heap-tuple-xmax-off+))))
+        (cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
+        (infomask (page-u16 page (+ offset +heap-tuple-infomask-off+))))
+    (values (heap-tuple-visible-p xmin xmax cid snapshot my-xid infomask committed-xid-cache)
+            xmin xmax cid infomask)))
+
+(defun map-visible-int4-page-key-batches (page snapshot my-xid committed-xid-cache keys consume)
+  "Send blocks of visible non-NULL int4 keys through caller-owned KEYS."
+  (declare (type (simple-array (signed-byte 32) (*)) keys)
+           (dynamic-extent consume))
+  (let ((count 0)
+        (visible-count 0)
+        (capacity (length keys)))
+    (declare (type fixnum count visible-count))
+    (do-live-page-items (page offnum offset length)
+      (multiple-value-bind (visible xmin xmax cid infomask)
+          (heap-page-item-visibility page offset snapshot my-xid committed-xid-cache)
+        (declare (ignore xmin xmax cid))
+        (when visible
+          (incf visible-count)
+          (let ((key (single-int4-heap-tuple-value page offset (+ offset length) infomask)))
+            (unless (eq key +null+)
+              (setf (aref keys count) key)
+              (incf count)
+              (when (= count capacity)
+                (funcall consume keys count)
+                (setf count 0)))))))
+    (when (plusp count) (funcall consume keys count))
+    visible-count))
+
+(defun map-visible-int4-heap-key-batches (table snapshot keys consume)
+  "Visit a one-column int4 heap within the caller's relation and snapshot domain.
+KEYS is writable, nonempty workspace. CONSUME may read but must not retain it."
+  (declare (type (simple-array (signed-byte 32) (*)) keys)
+           (dynamic-extent consume))
+  (assert (plusp (length keys)))
+  (let* ((relfilenode (pg-class-relfilenode table))
+         (nblocks (buf-nblocks relfilenode))
+         (my-xid (and *backend* (backend-xid *backend*)))
+         (committed-xid-cache (list nil))
+         (handle (make-buf-page-handle))
+         (scratch (make-page))
+         (visible-count 0))
+    (declare (dynamic-extent committed-xid-cache))
+    (dotimes (block nblocks visible-count)
+      (check-for-interrupts)
+      (unwind-protect
+           (let ((page (buf-acquire-read-page handle relfilenode block :main scratch)))
+             (when page
+               (incf visible-count
+                     (map-visible-int4-page-key-batches page snapshot my-xid committed-xid-cache keys consume))))
+        (buf-release-page handle)))))
+
+(defun make-visible-heap-page-iterator (page block columns snapshot &optional int4-values-p)
   "Visit visible heap tuples from PAGE one at a time.
 
 Check tuple visibility before deforming it, and leave later tuples untouched
-until their next pull.  SNAPSHOT must remain registered for this iterator."
+until their next pull. SNAPSHOT must remain registered for this iterator.
+INT4-VALUES-P returns a one-column SQL row without materializing an HTUP."
   (let ((offnum 0)
         (count (page-lp-count page))
         (committed-xid-cache (list nil)))
@@ -72,15 +130,14 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
              do (check-for-interrupts)
                 (incf offnum)
                 (with-live-page-item (page offnum offset length)
-                  (let ((xmin (full-xid-from-32
-                               (page-u32 page (+ offset +heap-tuple-xmin-off+))))
-                        (xmax (full-xid-from-32
-                               (page-u32 page (+ offset +heap-tuple-xmax-off+))))
-                        (cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
-                        (infomask (page-u16 page (+ offset +heap-tuple-infomask-off+))))
-                    (when (heap-tuple-visible-p xmin xmax cid snapshot
-                                                (and *backend* (backend-xid *backend*)) infomask
-                                                committed-xid-cache)
+                  (multiple-value-bind (visible xmin xmax cid infomask)
+                      (heap-page-item-visibility page offset snapshot
+                                                 (and *backend* (backend-xid *backend*)) committed-xid-cache)
+                    (when visible
+                      (when int4-values-p
+                        (return (values (vector (single-int4-heap-tuple-value
+                                                 page offset (+ offset length) infomask))
+                                        t)))
                       (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
                                             ctid-block ctid-offnum physical-compressed)
                           (deform-heap-tuple page columns :start offset :limit (+ offset length))
@@ -105,7 +162,7 @@ until their next pull.  SNAPSHOT must remain registered for this iterator."
            (call-with-current-select-index-domain
             (pg-index-relfilenode index)
             (lambda ()
-              (call-with-btree-equal-cursor
+              (call-with-select-btree-cursor
                (pg-index-relfilenode index) key
                (lambda (cursor lease)
                  (call-with-select-index-cursor
@@ -145,7 +202,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
                                     when (and lease (btree-read-lease-active-p lease)) return lease)))
                         (unless lease (error "iterator index scan requires an active group lease"))
                         (setf scan (make-select-index-scan
-                                    :cursor (open-btree-equal-cursor-unlocked node key)
+                                    :cursor (open-select-index-cursor-unlocked node key)
                                     :lease lease :borrowed-lease-p t))
                         (push scan *select-index-scans*))))
                    ;; A prior park may have released the surrounding group.
@@ -163,7 +220,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
                  (progn
                    (unless (btree-read-lease-active-p (select-index-scan-lease scan))
                      (error "iterator index scan outlived its group lease"))
-                   (let ((tid (btree-cursor-next-tid (select-index-scan-cursor scan))))
+                   (let ((tid (select-index-cursor-next-tid (select-index-scan-cursor scan))))
                      (if tid
                          (values (vector (car tid) (cdr tid)) t)
                          (progn
@@ -202,6 +259,11 @@ releases it; closing an active scan discards its unread cursor without a copy."
                    (return (values projected-row t projected-origins nil presence)))))))))
      (lambda () (close-sql-iterator tids)))))
 
+(defun single-int4-scan-layout-p (columns)
+  (and (= (length columns) 1)
+       (eq (pg-column-type (aref columns 0)) :int4)
+       (= (column-align (aref columns 0)) 4)))
+
 (defun make-select-scan-iterator (node relations)
   ;; Capture the parameter environment and statement snapshot for this scan's
   ;; lifetime; later outer rows must not change its index key or visibility.
@@ -219,7 +281,10 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (snapshot *current-snapshot*)
          (capture-p *datum-origin-capture*)
          (demand *select-toast-demand*)
-         (slice-plan *select-toast-slice-plan*))
+         (slice-plan *select-toast-slice-plan*)
+         (columns (and table (pg-class-columns table)))
+         (int4-values-p (and (not capture-p) (not slice-plan)
+                             (single-int4-scan-layout-p columns))))
     (when (eq (select-scan-path-kind path) :index-scan)
       (return-from make-select-scan-iterator
         (make-select-index-scan-iterator table path snapshot relation relations
@@ -241,6 +306,9 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (when page-reader
            (multiple-value-bind (tuple present) (sql-iterator-next page-reader)
              (when present
+               (when int4-values-p
+                 (return (values (project-select-scan-row relations relation tuple nil)
+                                 t nil nil presence)))
                (let* ((*datum-origin-capture* capture-p)
                       (values (htup-values tuple))
                       (toast-context
@@ -265,7 +333,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
            (incf block)
            (when page
              (setf page-reader (make-visible-heap-page-iterator
-                                page current (pg-class-columns table) snapshot))))))
+                                page current columns snapshot int4-values-p))))))
      nil
      (lambda ()
        (unwind-protect (close-sql-iterator page-reader)
@@ -750,6 +818,50 @@ separate projection. Closing the result closes the sort and its source."
                         (lambda () (close-input owned))))))
           (unless iterator (close-input input)))))))
 
+(defun make-physical-hash-join-iterator (node relations)
+  (let* ((join (second node))
+         (qual (unless (getf join :hash-qual-covered-p) (getf join :qual)))
+         (build-left-p (getf join :build-left-p))
+         (probe-width (when (member (getf join :type) '(:left :full)) (getf join :right-width)))
+         (build-width (when (member (getf join :type) '(:right :full)) (getf join :left-width)))
+         (metadata (and *query-plan-instrumentation-p* *cte-active-plan*
+                        (gethash node (query-plan-metadata *cte-active-plan*))))
+         ;; A greedy nested-loop base pads its row to query width. Hash join
+         ;; consumes independent scan rows and assembles the source slots itself.
+         (relations (mapcar (lambda (relation)
+                              (if (getf relation :join-order-base)
+                                  (let ((copy (copy-list relation)))
+                                    (setf (getf copy :join-order-base) nil)
+                                    copy)
+                                  relation))
+                            relations))
+         (probe (make-physical-plan-iterator (if build-left-p (fourth node) (third node)) relations))
+         (build nil)
+         (iterator nil))
+    (unwind-protect
+         (progn
+           (setf build (make-physical-plan-iterator (if build-left-p (third node) (fourth node)) relations))
+           (destructuring-bind (probe-slots build-slots types) (getf join :hash-keys)
+             (when build-left-p
+               (rotatef probe-slots build-slots)
+               (rotatef probe-width build-width))
+             (setf iterator
+                   (make-hash-join-iterator
+                    probe build probe-slots build-slots types
+                    :preserve-probe-width probe-width :preserve-build-width build-width :build-left-p build-left-p
+                    :stats (when metadata
+                             (or (plan-node-metadata-hash-join-stats metadata)
+                                 (setf (plan-node-metadata-hash-join-stats metadata) (make-hash-join-stats))))
+                    :residual (when qual
+                                (lambda (row)
+                                  (let ((matched (true-p (eval-expr qual row))))
+                                    (when (and metadata (not matched))
+                                      (incf (plan-node-metadata-filtered-row-count metadata)))
+                                    matched)))))))
+      (unless iterator
+        (unwind-protect (close-sql-iterator probe)
+          (close-sql-iterator build))))))
+
 (defun make-physical-join-iterator (node relations)
   ;; A parameterized index scan needs a new key and iterator for each left
   ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
@@ -1010,13 +1122,93 @@ also closes the active child and input, then removes its remaining files."
                   (let ((*query-row-origins* origins))
                     (funcall emit (coerce values 'vector))))))))
          (batch (make-hash-aggregate-batch-iterator
-                 source keys aggregate-count (max 1 *query-work-memory-bytes*) 0 :input input)))
+                 source keys aggregate-count (max 1 (effective-query-work-memory-bytes)) 0 :input input)))
     (if distinct-p
         (make-mapping-sql-iterator batch (lambda (row) (values (cons row row) t *query-row-origins*)))
         batch)))
 
 (defun make-hash-distinct-iterator (input keys)
   (make-hash-aggregate-iterator input keys 0 :distinct-p t))
+
+(defun int4-hash-count-scan-table (node relations)
+  (when (eq (first node) :seq-scan)
+    (let* ((relation (physical-scan-relation node relations))
+           (table (getf relation :table))
+           (columns (and table (pg-class-columns table))))
+      (when (and (single-int4-scan-layout-p columns)
+                 (not (getf relation :row-source))
+                 (not (getf relation :virtual-p)))
+        table))))
+
+(defun make-plan-node-cardinality-observer (node)
+  "Instrument a fused operator that consumes or produces rows without yielding them."
+  (let ((metadata (and *query-plan-instrumentation-p* *cte-active-plan*
+                       (gethash node (query-plan-metadata *cte-active-plan*)))))
+    (when metadata
+      (lambda (operation)
+        (let* ((result nil)
+               (rows 0)
+               (iterator
+                 (instrument-physical-plan-iterator
+                  node (make-sql-iterator
+                        (lambda ()
+                          (multiple-value-setq (result rows) (funcall operation))
+                          (values nil nil))))))
+          (unwind-protect (sql-iterator-next iterator)
+            (close-sql-iterator iterator))
+          (incf (plan-node-metadata-actual-row-count metadata) rows)
+          (values result rows))))))
+
+(defun execute-int4-hash-count (node build-node probe-node build probe snapshot)
+  (let* ((observer (make-plan-node-cardinality-observer node))
+         (metadata (when observer (gethash node (query-plan-metadata *cte-active-plan*))))
+         (stats (when metadata
+                  (or (plan-node-metadata-hash-join-stats metadata)
+                      (setf (plan-node-metadata-hash-join-stats metadata) (make-hash-join-stats))))))
+    (flet ((run ()
+             (let ((count (count-int4-heap-hash-join
+                           build probe snapshot :stats stats
+                           :observe-build (make-plan-node-cardinality-observer build-node)
+                           :observe-probe (make-plan-node-cardinality-observer probe-node))))
+               (values count count))))
+      (declare (dynamic-extent #'run))
+      (if observer (funcall observer #'run) (run)))))
+
+(defun make-int4-hash-count-iterator (aggregate relations)
+  "Reduce a pure inner integer join directly to COUNT(*) when its build spills."
+  (let* ((node (fourth aggregate))
+         (join (second node)))
+    (when (and (null (second aggregate))
+               ;; The planner only uses HashAggregate for COUNT(*) transitions.
+               (eql (third aggregate) 1)
+               (eq (first node) :hash-join) (eq (getf join :type) :inner)
+               (getf join :hash-spill-pages)
+               (not *datum-origin-capture*)
+               (>= (effective-query-work-memory-bytes) (* 64 1024))
+               (not *query-temp-file-limit-bytes*)
+               (not (and *query-temp-quota* (query-temp-quota-limit *query-temp-quota*))))
+      (multiple-value-bind (left right equality-p) (equality-column-references (getf join :qual))
+        (when (and equality-p (eq (expr-type left) :int4) (eq (expr-type right) :int4)
+                   (or (and (= (second left) 1) (= (second right) 2))
+                       (and (= (second left) 2) (= (second right) 1))))
+          (let* ((left-node (third node))
+                 (right-node (fourth node))
+                 (left-table (int4-hash-count-scan-table left-node relations))
+                 (right-table (int4-hash-count-scan-table right-node relations))
+                 (snapshot *current-snapshot*)
+                 (done nil))
+            (when (and left-table right-table)
+              (when (getf join :build-left-p)
+                (rotatef left-table right-table)
+                (rotatef left-node right-node))
+              (make-sql-iterator
+               (lambda ()
+                 (unless done
+                   (setf done t)
+                   (let ((count (execute-int4-hash-count node right-node left-node right-table left-table snapshot)))
+                     (unless (typep count '(signed-byte 64))
+                       (ereport "22003" "bigint out of range"))
+                     (values (vector count) t))))))))))))
 
 (defun %make-physical-plan-iterator (node relations)
   (case (first node)
@@ -1073,6 +1265,7 @@ also closes the active child and input, then removes its remaining files."
      (make-limit-sql-iterator (second node)
                               (make-physical-plan-iterator (third node) relations) :lazy t))
     (:nested-loop-join (make-physical-join-iterator node relations))
+    (:hash-join (make-physical-hash-join-iterator node relations))
     (:sorted-distinct
      (let* ((keys (second node))
             (input (make-physical-plan-iterator (third node) relations))
@@ -1085,8 +1278,9 @@ also closes the active child and input, then removes its remaining files."
     (:hash-distinct
      (make-hash-distinct-iterator (make-physical-plan-iterator (third node) relations) (second node)))
     (:hash-aggregate
-     (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
-                                   (second node) (third node)))
+     (or (make-int4-hash-count-iterator node relations)
+         (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
+                                       (second node) (third node))))
     ((:sort :top-n)
      (let ((child (physical-buffered-node-child node))
            (metadata (when (and *query-plan-instrumentation-p* *cte-active-plan*)

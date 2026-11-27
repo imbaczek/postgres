@@ -308,6 +308,8 @@ synchronous configuration plan against the same source and generation."
                                   ("s" 1d0) ("ms" 0.001d0) ("us" 0.000001d0)))
                       (:xblocks '(("TB" 134217728d0) ("GB" 131072d0) ("MB" 128d0)
                                   ("kB" 0.125d0) ("B" 0.0001220703125d0)))
+                      (:kilobytes '(("TB" 1073741824d0) ("GB" 1048576d0) ("MB" 1024d0)
+                                    ("kB" 1d0) ("B" 0.0009765625d0)))
                       (:megabytes '(("TB" 1048576d0) ("GB" 1024d0) ("MB" 1d0)
                                     ("kB" 0.0009765625d0) ("B" 0.00000095367431640625d0)))
                       ((nil) nil)))
@@ -1086,6 +1088,8 @@ This configuration path does not take live admission or the code reload lock."
   (call-with-reload-definitions 'startup-reload-settings-under-definition-lock))
 
 (defun startup-format-unit (value kind)
+  (when (eq kind :kilobytes)
+    (return-from startup-format-unit (startup-format-unit (* 1024 value) :bytes)))
   (if (<= value 0) (princ-to-string value)
       (let ((units (ecase kind
                      (:milliseconds '(("d" 86400000) ("h" 3600000) ("min" 60000)
@@ -1142,7 +1146,7 @@ SELECT current_setting or pg_settings may first wait while settling a snapshot."
 
 (defun setting-descriptor-unit-label (spec)
   (case (and spec (startup-setting-descriptor-unit spec))
-    (:seconds "s") (:milliseconds "ms") (:megabytes "MB") (:xblocks "8kB") (t +null+)))
+    (:seconds "s") (:milliseconds "ms") (:megabytes "MB") (:kilobytes "kB") (:xblocks "8kB") (t +null+)))
 
 (defun setting-descriptor-kind-label (spec)
   (case (and spec (startup-setting-descriptor-kind spec))
@@ -1206,6 +1210,7 @@ Without an installed root, return session rows."
        (when row (list row)))
      (list (session-timeout-settings-row)
            (session-application-name-settings-row)
+           (session-setting-descriptor-row (find-session-setting "work_mem"))
            (session-setting-descriptor-row (find-session-setting "pg_stat_statements.track"))
            (session-setting-descriptor-row (find-session-setting "pg_stat_statements.track_planning"))))))
 

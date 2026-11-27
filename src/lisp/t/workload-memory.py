@@ -30,7 +30,10 @@ WORKLOADS = (
 )
 CONCURRENT_READ_WORKLOADS = ("concurrent_point_reads", "concurrent_scan")
 MIXED_WORKLOADS = {"mixed", "mixed_serial"}
-EXPLAIN_WORKLOADS = {"scan", "point_reads", "sort", "join", *CONCURRENT_READ_WORKLOADS}
+BTREE_RANGE_WORKLOADS = ("composite_range", "composite_range_seq")
+EXPLAIN_WORKLOADS = {
+    "scan", "point_reads", "sort", "join", *CONCURRENT_READ_WORKLOADS, *BTREE_RANGE_WORKLOADS,
+}
 EXPLAIN_OPTIONS = {
     "rows": "BUFFERS OFF, TIMING OFF",
     "counters": "BUFFERS ON, TIMING OFF",
@@ -70,6 +73,15 @@ def check(condition, detail):
         raise AssertionError(detail)
 
 
+def composite_range_query(rows):
+    lower = (rows // 2) // 64 * 64
+    upper = min(rows, lower + 4096)
+    query = (f"SELECT id FROM items WHERE grp=0 AND id>={lower} AND id<{upper}"
+             " ORDER BY id DESC LIMIT 10")
+    expected = [[str(value)] for value in sorted(range(lower, upper, 64), reverse=True)[:10]]
+    return query, expected
+
+
 def prepare(sql, workload, rows):
     sql.query("CREATE TABLE items (id integer, grp integer, payload text)")
     if workload in {
@@ -80,6 +92,16 @@ def prepare(sql, workload, rows):
         sql.query("CREATE INDEX items_grp ON items(grp)")
     if workload not in {"heap_insert", "indexed_insert", "toast"}:
         insert(sql, "items", 0, rows)
+    if workload in BTREE_RANGE_WORKLOADS:
+        if workload == "composite_range":
+            sql.query("CREATE INDEX items_range ON items (grp, id)")
+        sql.query("ANALYZE items")
+        query, _ = composite_range_query(rows)
+        [[plan]] = sql.query("EXPLAIN " + query)
+        if workload == "composite_range":
+            check(plan.startswith("Limit") and "Index Scan using items_range" in plan, plan)
+        else:
+            check("Seq Scan" in plan, plan)
     if workload == "join":
         sql.query("CREATE TABLE groups (id integer, grp integer, payload text)")
         insert(sql, "groups", 0, 64, 8)
@@ -127,7 +149,9 @@ def exercise(server, sql, workload, rows, repeat, explain_mode=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(client, range(4)))
 
-    if workload == "scan":
+    if workload in BTREE_RANGE_WORKLOADS:
+        run_query(*composite_range_query(rows))
+    elif workload == "scan":
         scan(sql)
     elif workload == "concurrent_scan":
         run_clients(lambda connection, _: scan(connection))
@@ -324,7 +348,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=4,
                         help="Iterations per sample, per client for concurrent_scan")
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--case", choices=(*WORKLOADS, *CONCURRENT_READ_WORKLOADS, "mixed_serial"),
+    parser.add_argument("--case", choices=(*WORKLOADS, *CONCURRENT_READ_WORKLOADS,
+                                           *BTREE_RANGE_WORKLOADS, "mixed_serial"),
                         action="append")
     parser.add_argument("--profiles", type=Path, help="Separate SB-SPROF allocation sample runs")
     parser.add_argument("--statement-statistics", action="store_true",

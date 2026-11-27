@@ -62,7 +62,7 @@
     (when table
       (when (gethash key table) (return-from recursive-cte-seen-new-p nil))
       (when (<= (+ (recursive-cte-seen-bytes seen) 128 (query-spill-value-size key))
-                *query-work-memory-bytes*)
+                (effective-query-work-memory-bytes))
         (setf (gethash key table) t)
         (incf (recursive-cte-seen-bytes seen) (+ 128 (query-spill-value-size key)))
         (return-from recursive-cte-seen-new-p t))

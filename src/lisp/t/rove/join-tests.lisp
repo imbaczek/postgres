@@ -17,6 +17,55 @@
       (rove:ok (zerop emitted)
                "empty CROSS JOIN emits no rows")))
 
+(rove:deftest hash-join-preserves-real-origins-and-presence-across-repartition
+    (let ((*datum-origin-capture* t)
+          (*query-temp-directory* (uiop:temporary-directory)))
+      (flet ((input (source start)
+               (let ((key start)
+                     (presence (vector source)))
+                 (make-sql-iterator
+                  (lambda ()
+                    (when (< key (+ start 40))
+                      (let* ((item (prog1 key (incf key)))
+                             (compression (make-heap-compressed-varlena :payload (vector source item)))
+                             (origin (make-datum-origin :compressed compression)))
+                        (values (vector item) t (vector origin) nil presence)))))))
+             (payload (origin)
+               (and origin (heap-compressed-varlena-payload (datum-origin-compressed origin)))))
+        (dolist (build-left-p '(nil t))
+          (dolist (budget '(512 65536))
+            (with-query-temp-files
+              (let* ((left (input 11 0))
+                     (right (input 12 1))
+                     (seen (make-array 41 :initial-element 0))
+                     (stats (make-hash-join-stats))
+                     (join (make-hash-join-iterator
+                            (if build-left-p right left) (if build-left-p left right)
+                            #(0) #(0) #(:int4) :build-left-p build-left-p
+                            :preserve-probe-width 1 :preserve-build-width 1 :memory-limit budget :stats stats)))
+                (unwind-protect
+                     (map-sql-iterator
+                      join
+                      (lambda (row)
+                        (let* ((lhs (aref row 0)) (rhs (aref row 1))
+                                                  (key (if (eq lhs +null+) rhs lhs))
+                                                  (left-p (< key 40))
+                                                  (right-p (plusp key))
+                                                  (origins *query-row-origins*))
+                          (incf (aref seen key))
+                          (rove:ok (eql lhs (if left-p key +null+)))
+                          (rove:ok (eql rhs (if right-p key +null+)))
+                          (rove:ok (equalp (payload (aref origins 0)) (when left-p (vector 11 key))))
+                          (rove:ok (equalp (payload (aref origins 1)) (when right-p (vector 12 key))))
+                          (rove:ok (equalp *query-row-presence*
+                                           (cond ((and left-p right-p) #(11 12))
+                                                 (left-p #(11)) (t #(12))))))))
+                  (close-sql-iterator join))
+                (rove:ok (every (lambda (count) (= count 1)) seen))
+                (rove:ok (if (= budget 512)
+                             (> (hash-join-stats-spill-batches stats) 8)
+                             (zerop (hash-join-stats-spill-batches stats)))))))))))
+
 (rove:deftest joins-preserve-source-presence-in-memory-and-on-disk
     (dolist (memory '(1 100000))
       (let ((*query-work-memory-bytes* memory)

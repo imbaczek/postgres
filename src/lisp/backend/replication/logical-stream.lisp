@@ -105,7 +105,7 @@ Discard the cursor after a read error; the stream may have advanced."
 
 (defstruct logical-reader-state
   database-oid batch-open-p xid chunk-count next-chunk fragment-batch
-  (change-bytes 0) (changes '()) (transactions '()) spool catalog-p row-p)
+  (change-bytes 0) (changes '()) (transactions '()) spool catalog-p row-p catalog-prefix)
 
 (defvar *logical-reader-spool-scope* nil)
 
@@ -138,43 +138,40 @@ Discard the cursor after a read error; the stream may have advanced."
 
 (declaim (special *logical-validation-only*))
 
+(defun classify-logical-transaction-change (change &optional schema-contract-p)
+  "Report staged DDL, accepting only operations that may share an XID."
+  (case (logical-change-kind change)
+    ((:insert :update :delete :truncate) :row)
+    (:transaction-ddl (if schema-contract-p :schema-contract :transaction-ddl))
+    (otherwise (error "catalog event appears in a transactional row-change record"))))
+
 (defun logical-reader-store-fragment-cursor (state cursor expected-crc)
   "Validate a completed event, then retain its original framed bytes when selected."
   (let ((size (logical-cursor-limit cursor)))
-    (multiple-value-bind (sink metrics) (logical-encoding-sink size)
-      (loop while (< (logical-cursor-offset cursor) size)
-            do (funcall sink (logical-read-octets cursor
-                                                  (min 65536 (- size (logical-cursor-offset cursor))))))
-      (multiple-value-bind (count checksum) (funcall metrics)
-        (unless (and (= count size) (= checksum expected-crc))
-          (error "logical event checksum mismatch"))))
-    (when (logical-cursor-stream cursor)
-      (unless (file-position (logical-cursor-stream cursor) 0)
-        (error "cannot rewind logical event spool")))
-    (setf (logical-cursor-offset cursor) 0)
-    (let* ((*logical-validation-only* t)
-           (change (logical-decode-change-from-cursor cursor)))
-      (unless (member (logical-change-kind change) '(:insert :update :delete :truncate))
-        (error "catalog event appears in a transactional row-change record"))
-      (when (logical-cursor-stream cursor)
-        (unless (file-position (logical-cursor-stream cursor) 0)
-          (error "cannot rewind logical event spool")))
-      (setf (logical-cursor-offset cursor) 0)
-      (multiple-value-bind (sink metrics) (logical-encoding-sink size)
-        (loop while (< (logical-cursor-offset cursor) size)
-              do (funcall sink (logical-read-octets cursor
-                                                    (min 65536 (- size (logical-cursor-offset cursor))))))
-        (multiple-value-bind (count checksum) (funcall metrics)
-          (unless (and (= count size) (= checksum expected-crc))
-            (error "logical event checksum mismatch"))))
-      (setf (logical-reader-state-row-p state) t)
-      (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
-        (when (logical-cursor-stream cursor)
-          (unless (file-position (logical-cursor-stream cursor) 0)
-            (error "cannot rewind logical event spool")))
-        (setf (logical-cursor-offset cursor) 0)
-        (logical-spool-append-cursor (logical-reader-owned-spool state) cursor expected-crc))))
-  (values))
+    (unless (zerop (logical-cursor-offset cursor))
+      (error "logical fragment reader requires a rewound event"))
+    (let ((*logical-validation-only* t))
+      (multiple-value-bind (change schema-contract-p) (logical-decode-change-from-cursor cursor)
+        (let ((kind (classify-logical-transaction-change change schema-contract-p)))
+          (when (logical-cursor-stream cursor)
+            (unless (file-position (logical-cursor-stream cursor) 0)
+              (error "cannot rewind logical event spool")))
+          (setf (logical-cursor-offset cursor) 0)
+          (multiple-value-bind (sink metrics) (logical-encoding-sink size)
+            (loop while (< (logical-cursor-offset cursor) size)
+                  do (funcall sink (logical-read-octets cursor
+                                                        (min 65536 (- size (logical-cursor-offset cursor))))))
+            (multiple-value-bind (count checksum) (funcall metrics)
+              (unless (and (= count size) (= checksum expected-crc))
+                (error "logical event checksum mismatch"))))
+          (setf (logical-reader-state-row-p state) t)
+          (when (= (logical-change-database-oid change) (logical-reader-state-database-oid state))
+            (when (logical-cursor-stream cursor)
+              (unless (file-position (logical-cursor-stream cursor) 0)
+                (error "cannot rewind logical event spool")))
+            (setf (logical-cursor-offset cursor) 0)
+            (logical-spool-append-cursor (logical-reader-owned-spool state) cursor expected-crc))
+          kind)))))
 
 (defun logical-reader-store-change (state change)
   (if *logical-reader-spool-scope*
@@ -284,6 +281,7 @@ Discard the cursor after a read error; the stream may have advanced."
     (:truncate 4)
     (:ddl 5)
     (:sequence-state 6)
+    (:transaction-ddl 7)
     (otherwise (error "invalid logical row change kind ~a" kind))))
 
 (defun logical-kind-from-code (code)
@@ -294,6 +292,7 @@ Discard the cursor after a read error; the stream may have advanced."
     (4 :truncate)
     (5 :ddl)
     (6 :sequence-state)
+    (7 :transaction-ddl)
     (otherwise (error "invalid logical row change code ~a" code))))
 
 (defun logical-write-u8 (buffer value)
@@ -452,7 +451,8 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
 
 (defun logical-identity-index-usable-p (index table)
   (let ((attnums (pg-index-columns index)))
-    (and (pg-index-valid-p index)
+    (and (null (pg-index-predicate index))
+         (pg-index-valid-p index)
          (pg-index-unique-p index)
          attnums
          (every (lambda (attnum)
@@ -587,7 +587,7 @@ remain distinct. Bytea uses tag 15 followed by a u32 length and raw octets."
         (columns (logical-change-columns change))
         (key-attnums (logical-change-key-attnums change)))
     (when (member (logical-change-kind change)
-                  '(:truncate :ddl :sequence-state))
+                  '(:truncate :ddl :sequence-state :transaction-ddl))
       (logical-write-u8 buffer 0)
       (logical-write-u8 buffer (if (and (eq (logical-change-kind change) :truncate)
                                         (not (eq (logical-change-publication-selection change) :unknown))) 4 2))
@@ -1010,6 +1010,87 @@ revalidated by this codec."
           (error "historic publication relation identities do not match the change")))))
   change)
 
+(defun logical-proper-nonempty-list-p (value)
+  (and (consp value) (handler-case (list-length value) (type-error () nil))))
+
+(defun logical-ddl-acyclic-ast-p (ast)
+  "Allow shared parser subforms while rejecting cycles in a decoded AST."
+  (let ((visited (make-hash-table :test #'eq))
+        (pending (list (cons nil ast))))
+    (loop while pending
+          for (finished . node) = (pop pending)
+          when (consp node)
+            do (if finished
+                   (setf (gethash node visited) :done)
+                   (case (gethash node visited)
+                     (:visiting (return-from logical-ddl-acyclic-ast-p nil))
+                     (:done)
+                     (otherwise
+                      (setf (gethash node visited) :visiting)
+                      (push (cons t node) pending)
+                      (when (consp (cdr node)) (push (cons nil (cdr node)) pending))
+                      (when (consp (car node)) (push (cons nil (car node)) pending))))))
+    t))
+
+(defun logical-transaction-ddl-ast-p (ast)
+  "Check the statement kind, fields and object names before staging a replay operation."
+  (when (and (logical-proper-nonempty-list-p ast)
+             (logical-supported-ddl-ast-p ast)
+             (logical-ddl-acyclic-ast-p ast))
+    (let ((allowed
+            (case (getf ast :type)
+              (:create-table
+               (when (and (stringp (getf ast :name)) (logical-proper-nonempty-list-p (getf ast :columns)))
+                 '(:type :name :columns :constraints :if-not-exists)))
+              (:create-index
+               (let ((columns (getf ast :columns)) (keys (getf ast :index-keys)))
+                 (when (and (stringp (getf ast :name)) (stringp (getf ast :table))
+                            (if keys
+                                (and (null columns) (logical-proper-nonempty-list-p keys))
+                                (and (logical-proper-nonempty-list-p columns) (every #'stringp columns)))
+                            (member (getf ast :unique) '(nil t))
+                            (member (getf ast :nulls-not-distinct) '(nil t)))
+                   '(:type :name :table :columns :index-keys :predicate :unique
+                     :if-not-exists :concurrently :nulls-not-distinct))))
+              ((:drop-table :drop-index)
+               (let ((names (getf ast :names)))
+                 (when (and (logical-proper-nonempty-list-p names) (every #'stringp names))
+                   '(:type :names :if-exists :concurrently)))))))
+      (and allowed
+           (not (or (getf ast :concurrently) (getf ast :if-exists) (getf ast :if-not-exists)))
+           (loop for (key value) on ast by #'cddr always (member key allowed))))))
+
+(defun logical-expand-transaction-schema-after (before compressed)
+  "Restore unchanged catalog sections by sharing the corresponding before lists."
+  (when (and (logical-schema-contract-valid-p before)
+             (logical-plist-has-exact-keys-p compressed '(:tables :indexes :sequences)))
+    (let ((after (loop for (key entries) on compressed by #'cddr
+                       append (list key (if (eq entries :unchanged)
+                                            (getf before key)
+                                            entries)))))
+      (when (logical-schema-contract-valid-p after) after))))
+
+(defun logical-decode-transaction-ddl (payload &optional database-oid)
+  "Return a replay AST or, as the second value, the transaction's final schema contract."
+  (let ((envelope (logical-read-data-string payload)))
+    (when (logical-proper-nonempty-list-p envelope)
+      (let ((source (getf envelope :database-oid)))
+        (when (and (eql (getf envelope :version) 1)
+                   (integerp source) (<= 1 source #xffffffff)
+                   (or (null database-oid) (eql database-oid source)))
+          (cond
+            ((and (logical-plist-has-exact-keys-p envelope '(:version :database-oid :ast))
+                  (logical-transaction-ddl-ast-p (getf envelope :ast)))
+             (return-from logical-decode-transaction-ddl (getf envelope :ast)))
+            ((logical-plist-has-exact-keys-p
+              envelope '(:version :database-oid :schema-before :schema-after))
+             (let ((after (logical-expand-transaction-schema-after
+                           (getf envelope :schema-before) (getf envelope :schema-after))))
+               (when after
+                 (setf (getf envelope :schema-after) after)
+                 (return-from logical-decode-transaction-ddl (values nil envelope))))))))))
+  (ereport "08P01" "invalid transactional logical DDL envelope"))
+
 (defun logical-decode-change-from-cursor (cursor)
   (let* ((*sql-varlena-array-element-reserver* (logical-array-element-reserver))
          (marker (logical-read-u8 cursor))
@@ -1026,15 +1107,19 @@ revalidated by this codec."
                       (otherwise :unknown))))
     (when (member event-version '(2 4))
       (unless (if (= event-version 4) (eq kind :truncate)
-                  (member kind '(:truncate :ddl :sequence-state)))
+                  (member kind '(:truncate :ddl :sequence-state :transaction-ddl)))
         (error "invalid logical catalog-event kind ~a" kind))
       (let ((payload (logical-read-string-u32 cursor)))
         (unless (= (logical-cursor-offset cursor) (logical-cursor-limit cursor))
           (error "logical event payload has trailing bytes"))
-        (return-from logical-decode-change-from-cursor
-          (logical-validate-change-publications
-           (make-logical-change :kind kind :database-oid database-oid
-                                :publication-selection selection :event-payload payload)))))
+        (let ((schema-contract-p
+                (when (eq kind :transaction-ddl)
+                  (not (null (nth-value 1 (logical-decode-transaction-ddl payload database-oid)))))))
+          (return-from logical-decode-change-from-cursor
+            (values (logical-validate-change-publications
+                     (make-logical-change :kind kind :database-oid database-oid
+                                          :publication-selection selection :event-payload payload))
+                    schema-contract-p)))))
     (unless (= event-version 5)
       (error "unsupported logical row-change event version"))
     (let* ((relation-oid (logical-read-u32 cursor))
@@ -1099,11 +1184,9 @@ revalidated by this codec."
 (defun logical-validate-change-from-cursor (cursor)
   "Validate an event while discarding text and binary values during recovery.
 Other types retain their normal semantic checks and may allocate their values."
-  (let* ((*logical-validation-only* t)
-         (change (logical-decode-change-from-cursor cursor)))
-    (unless (member (logical-change-kind change) '(:insert :update :delete :truncate))
-      (error "catalog event appears in a transactional row-change record")))
-  (values))
+  (let ((*logical-validation-only* t))
+    (multiple-value-bind (change schema-contract-p) (logical-decode-change-from-cursor cursor)
+      (classify-logical-transaction-change change schema-contract-p))))
 
 (defun logical-encode-catalog-event (database-oid ast)
   (let* ((text (catalog-readable-data-string
@@ -1189,6 +1272,24 @@ Other types retain their normal semantic checks and may allocate their values."
                  spool change limit :after-measure after-measure)))
       (incf (backend-logical-change-bytes backend) size)))
   (values))
+
+(defun logical-encode-transaction-schema (oid before after)
+  "Serialize one full schema and omit copies of unchanged schema sections."
+  (catalog-readable-data-string
+   (list :version 1 :database-oid oid :schema-before before
+         :schema-after
+         (loop for (key entries) on after by #'cddr
+               append (list key (if (equal entries (getf before key))
+                                    :unchanged
+                                    entries))))))
+
+(defun logical-append-transaction-schema (backend oid before after)
+  "Append the commit-wide contract while the source catalog image is locked."
+  (let ((change (make-logical-change
+                 :kind :transaction-ddl :database-oid oid
+                 :event-payload (logical-encode-transaction-schema oid before after))))
+    (logical-capture-change backend change +max-logical-transaction-bytes+)
+    (logical-preflight-spool (backend-logical-spool backend) :force-fragments t)))
 
 (defun logical-note-transaction-event (kind payload &key (publication-selection :unknown))
   "Capture a transactional utility event such as TRUNCATE before XID commit."
@@ -1392,8 +1493,11 @@ executor, so capture the same operation before transaction commit."
                           (error "invalid logical WAL event length"))
                         (logical-read-octets cursor length))
           do (incf change-bytes length)
-             (let ((*logical-validation-only* (and raw-events-p t)))
-               (push (logical-decode-change event) changes))
+             (let* ((*logical-validation-only* (and raw-events-p t))
+                    (change (logical-decode-change event)))
+               (unless (eq :row (classify-logical-transaction-change change))
+                 (error "transactional logical DDL requires fragment framing"))
+               (push change changes))
              (when raw-events-p (push event events)))
     (unless (= (logical-cursor-offset cursor) (length payload))
       (error "logical WAL chunk has trailing bytes"))
@@ -1464,10 +1568,10 @@ executor, so capture the same operation before transaction commit."
                 *wal-recovery-logical-bytes* change-bytes))))
   (values))
 
-(defun wal-recovery-finish-logical-change-batch (xid)
+(defun wal-recovery-finish-logical-change-batch (xid &optional catalog-transaction-p)
   (when *wal-recovery-logical-chunk-count*
     (if (logical-fragment-batch-p *wal-recovery-logical-xid*)
-        (logical-fragment-batch-finish *wal-recovery-logical-xid* xid)
+        (logical-fragment-batch-finish *wal-recovery-logical-xid* xid catalog-transaction-p)
         (unless (and (= xid *wal-recovery-logical-xid*)
                      (= *wal-recovery-logical-next-chunk*
                         *wal-recovery-logical-chunk-count*))
@@ -1482,6 +1586,7 @@ executor, so capture the same operation before transaction commit."
     (close-logical-spool (logical-reader-state-spool state)))
   (setf (logical-reader-state-spool state) nil
         (logical-reader-state-catalog-p state) nil
+        (logical-reader-state-catalog-prefix state) nil
         (logical-reader-state-row-p state) nil
         (logical-reader-state-batch-open-p state) batch-open-p
         (logical-reader-state-fragment-batch state) nil
@@ -1501,7 +1606,8 @@ executor, so capture the same operation before transaction commit."
 (defun wal-logical-reader-add-chunk (state record)
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL changes appear outside a batch"))
-  (when (logical-reader-state-catalog-p state)
+  (when (or (logical-reader-state-catalog-p state)
+            (logical-reader-state-catalog-prefix state))
     (error "row changes follow a logical catalog event in the same WAL batch"))
   (if (logical-fragment-payload-p (wal-record-payload record))
       (progn
@@ -1541,10 +1647,6 @@ executor, so capture the same operation before transaction commit."
                 (logical-reader-state-chunk-count state) count
                 (logical-reader-state-next-chunk state) next-index
                 (logical-reader-state-change-bytes state) change-bytes)
-          (unless (every (lambda (change)
-                           (member (logical-change-kind change) '(:insert :update :delete :truncate)))
-                         changes)
-            (error "catalog event appears in a transactional row-change record"))
           (loop for change in changes
                 for event in (if events events (make-list (length changes))) do
                   (setf (logical-reader-state-row-p state) t)
@@ -1574,10 +1676,19 @@ executor, so capture the same operation before transaction commit."
         (logical-reader-store-change state change))))
   (values))
 
+(defun wal-logical-reader-note-catalog-chunk (state record)
+  (unless (and (logical-reader-state-batch-open-p state)
+               (not (logical-reader-state-catalog-p state)))
+    (error "WAL catalog chunk is outside the catalog batch prefix"))
+  (setf (logical-reader-state-catalog-prefix state)
+        (wal-note-catalog-chunk-prefix record (logical-reader-state-catalog-prefix state)))
+  (values))
+
 (defun wal-logical-reader-finish-batch (state record &optional (emit t))
   "Validate and finish a batch; retain its transaction only when EMIT is true."
   (unless (logical-reader-state-batch-open-p state)
     (error "logical WAL terminal appears outside a batch"))
+  (wal-check-catalog-chunk-prefix record (logical-reader-state-catalog-prefix state))
   (let* ((record-type (wal-record-type record))
          (catalog-terminal-p
            (member record-type (list +wal-record-catalog+
@@ -1600,12 +1711,13 @@ executor, so capture the same operation before transaction commit."
                            (some (lambda (change) (member (logical-change-kind change)
                                                           '(:insert :update :delete :truncate))) changes))))
     (cond
-      ((= record-type +wal-record-commit+)
+      ((wal-transaction-terminal-type-p record-type)
        (when has-changes
-         (setf commit-timestamp (wal-decode-commit-timestamp (wal-record-payload record))))
+         (setf commit-timestamp (wal-record-commit-timestamp record)))
        (when (logical-reader-state-fragment-batch state)
          (logical-fragment-batch-finish (logical-reader-state-fragment-batch state)
-                                        (wal-record-xid record)))
+                                        (wal-record-xid record)
+                                        (= record-type +wal-record-catalog-transaction-commit+)))
        (when catalog-event-p
          (error "logical catalog events are attached to a row commit"))
        (when (logical-reader-state-chunk-count state)
@@ -2057,12 +2169,15 @@ and leave an incomplete tail invisible."
                           (wal-logical-reader-add-chunk state record))
                          ((= record-type +wal-record-logical-catalog-event+)
                           (wal-logical-reader-add-catalog-event state record))
+                         ((= record-type +wal-record-catalog-chunk+)
+                          (wal-logical-reader-note-catalog-chunk state record))
                          ((wal-terminal-record-type-p record-type)
                           (let* ((emit (> (wal-record-end record) start-lsn))
                                  (has-changes
                                    (and (member record-type
                                                 (list +wal-record-commit+ +wal-record-catalog+
-                                                      +wal-record-catalog-commit+))
+                                                      +wal-record-catalog-commit+
+                                                      +wal-record-catalog-transaction-commit+))
                                         (wal-logical-reader-has-database-changes-p state)))
                                  (batch-bytes (logical-reader-state-change-bytes state)))
                             (when (and emit (not boundary-proven))

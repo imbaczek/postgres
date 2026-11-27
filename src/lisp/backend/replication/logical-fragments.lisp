@@ -128,10 +128,12 @@ LIMIT bounds the total declared bytes across the batch before allocation."
 
 (defstruct (logical-fragment-batch
             (:constructor make-logical-fragment-batch (limit)))
-  limit xid count (next 0) assembler validate-only)
+  limit xid count (next 0) assembler validate-only schema-state)
 
 (defun logical-fragment-batch-accept (batch xid payload &key validate-only on-complete)
   "Validate an ordered fragment; decode completed events unless VALIDATE-ONLY."
+  (when (eq (logical-fragment-batch-schema-state batch) :schema-contract)
+    (error "logical events follow the transaction schema contract"))
   (multiple-value-bind (index count total offset bytes) (logical-decode-fragment payload)
     (unless (and (integerp xid) (plusp xid))
       (error "logical row-change record has no transaction ID"))
@@ -148,17 +150,29 @@ LIMIT bounds the total declared bytes across the batch before allocation."
       ;; Publish the assembler before it can acquire a recovery spool.
       (setf (logical-fragment-batch-assembler batch) assembler
             (logical-fragment-batch-validate-only batch) (not (null validate-only)))
-      (let ((change (logical-recovery-assembler-append assembler total offset bytes
-                                                       :materialize (not validate-only) :on-complete on-complete)))
-        (when (and change (not (member (logical-change-kind change) '(:insert :update :delete :truncate))))
-          (error "catalog event appears in a transactional row-change record"))
+      (multiple-value-bind (change schema-contract-p)
+          (logical-recovery-assembler-append assembler total offset bytes
+                                             :materialize (not validate-only) :on-complete on-complete)
+        (case (if (logical-change-p change)
+                  (classify-logical-transaction-change change schema-contract-p)
+                  change)
+          (:transaction-ddl (setf (logical-fragment-batch-schema-state batch) :transaction-ddl))
+          (:schema-contract
+           (unless (eq (logical-fragment-batch-schema-state batch) :transaction-ddl)
+             (error "logical schema contract has no preceding transactional DDL"))
+           (setf (logical-fragment-batch-schema-state batch) :schema-contract)))
         (setf (logical-fragment-batch-xid batch) xid
               (logical-fragment-batch-count batch) count
               (logical-fragment-batch-next batch) (1+ index))
-        change))))
+        (when (logical-change-p change) change)))))
 
-(defun logical-fragment-batch-finish (batch xid)
+(defun logical-fragment-batch-finish (batch xid &optional catalog-transaction-p)
   "Validate that XID commits the complete fragment sequence at an event boundary."
+  (when (logical-fragment-batch-schema-state batch)
+    (unless catalog-transaction-p
+      (error "transactional logical DDL requires a catalog transaction terminal"))
+    (unless (eq (logical-fragment-batch-schema-state batch) :schema-contract)
+      (error "transactional logical DDL has no schema contract")))
   (unless (and (logical-fragment-batch-count batch)
                (= xid (logical-fragment-batch-xid batch))
                (= (logical-fragment-batch-next batch) (logical-fragment-batch-count batch)))

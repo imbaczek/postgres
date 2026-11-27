@@ -25,11 +25,11 @@
            #:wal-decode-relation-reset #:wal-record-xid #:wal-record-type #:wal-record-payload #:wal-require-ordinary-record-type
            #:+wal-record-running-xacts+ #:+wal-record-xid-reservation+ #:+wal-record-parameter-change+
            #:+wal-record-full-page-writes-change+ #:+wal-record-logical-decoding-status-change+ #:+wal-record-batch-start+
-           #:+wal-record-catalog-commit+ #:+wal-record-commit+ #:+wal-record-catalog+ #:+wal-record-clog-reset+
+           #:+wal-record-catalog-commit+ #:+wal-record-catalog-transaction-commit+ #:+wal-record-commit+ #:+wal-record-catalog+ #:+wal-record-clog-reset+
            #:+wal-record-checkpoint+ #:+wal-record-maintenance+
            #:wal-running-xacts-record-info #:wal-parameter-change-record-info #:wal-full-page-writes-change-record-info
            #:wal-logical-decoding-status-record-info #:wal-xid-reservation-record-bound #:wal-decode-commit-timestamp
-           #:wal-decode-catalog-commit-payload #:wal-read-u64-payload #:wal-checkpoint-record-snapshot #:wal-decode-catalog-chunk-payload
+           #:wal-decode-catalog-commit-payload #:wal-decode-catalog-transaction-commit #:wal-normal-transaction-xid-p #:wal-transaction-terminal-type-p #:wal-read-u64-payload #:wal-checkpoint-record-snapshot #:wal-decode-catalog-chunk-payload
            #:wal-check-batch-page-record #:wal-check-batch-logical-changes #:wal-check-batch-logical-catalog-event #:wal-u32)
   (:intern
    #:%make-wal-page-publication #:*backend* #:*sql-array-output-max-bytes* #:*wal-durable-lsn* #:*wal-end-lsn*
@@ -154,11 +154,11 @@
                 #:wal-decode-relation-reset #:wal-record-xid #:wal-record-type #:wal-record-payload #:wal-require-ordinary-record-type
                 #:+wal-record-running-xacts+ #:+wal-record-xid-reservation+ #:+wal-record-parameter-change+
                 #:+wal-record-full-page-writes-change+ #:+wal-record-logical-decoding-status-change+ #:+wal-record-batch-start+
-                #:+wal-record-catalog-commit+ #:+wal-record-commit+ #:+wal-record-catalog+ #:+wal-record-clog-reset+
+                #:+wal-record-catalog-commit+ #:+wal-record-catalog-transaction-commit+ #:+wal-record-commit+ #:+wal-record-catalog+ #:+wal-record-clog-reset+
                 #:+wal-record-checkpoint+ #:+wal-record-maintenance+
                 #:wal-running-xacts-record-info #:wal-parameter-change-record-info #:wal-full-page-writes-change-record-info
                 #:wal-logical-decoding-status-record-info #:wal-xid-reservation-record-bound #:wal-decode-commit-timestamp
-                #:wal-decode-catalog-commit-payload #:wal-read-u64-payload #:wal-checkpoint-record-snapshot #:wal-decode-catalog-chunk-payload
+                #:wal-decode-catalog-commit-payload #:wal-decode-catalog-transaction-commit #:wal-normal-transaction-xid-p #:wal-read-u64-payload #:wal-checkpoint-record-snapshot #:wal-decode-catalog-chunk-payload
                 #:wal-check-batch-page-record #:wal-check-batch-logical-changes #:wal-check-batch-logical-catalog-event #:wal-u32)
   (:export #:wal-decode-batch-terminal #:wal-decode-next-catalog-chunk
            #:wal-check-batch-logical-terminal #:wal-validate-empty-metadata-terminal))
@@ -207,7 +207,7 @@
   (:use #:cl)
   ;; Keep the PG identities used by compiled callers when reloading this interface.
   (:import-from #:pg
-                #:+first-normal-xid+ #:+wal-record-checkpoint+ #:+wal-record-clog-reset+ #:+wal-record-commit+
+                #:+first-normal-xid+ #:+wal-record-checkpoint+ #:+wal-record-clog-reset+ #:wal-transaction-terminal-type-p
                 #:+wal-record-end-of-recovery+ #:+wal-record-full-page-writes-change+
                 #:+wal-record-logical-decoding-status-change+ #:+wal-record-pages+
                 #:+wal-record-parameter-change+ #:+wal-record-running-xacts+ #:+wal-record-xid-reservation+

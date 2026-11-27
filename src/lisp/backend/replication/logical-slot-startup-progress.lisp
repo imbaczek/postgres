@@ -3,7 +3,7 @@
 (defstruct (logical-slot-startup-progress (:constructor make-logical-slot-startup-progress (confirmed)))
   ;; FIRST holds first XID contributions from completed batches.  STAGED
   ;; belongs to the current batch and cannot contribute until its terminal.
-  confirmed batch-start
+  confirmed batch-start catalog-prefix
   (first (make-hash-table :test #'eql))
   (staged (make-hash-table :test #'eql))
   (pending (make-hash-table :test #'eql)))
@@ -22,9 +22,10 @@
 (defun logical-slot-startup-finish-batch (progress record)
   (unless (logical-slot-startup-progress-batch-start progress)
     (error "startup terminal appears outside a batch"))
+  (wal-check-catalog-chunk-prefix record (logical-slot-startup-progress-catalog-prefix progress))
   (let ((type (wal-record-type record)))
     (cond
-      ((= type +wal-record-commit+) (wal-decode-commit-timestamp (wal-record-payload record)))
+      ((wal-transaction-terminal-type-p type) (wal-record-commit-timestamp record))
       ((wal-empty-metadata-terminal-type-p type)
        (wal-validate-empty-metadata-terminal record *wal-recovery-reservation-batch-clean-p*)))
     (maphash
@@ -32,14 +33,15 @@
        (unless (gethash xid (logical-slot-startup-progress-first progress))
          (setf (gethash xid (logical-slot-startup-progress-first progress)) start)))
      (logical-slot-startup-progress-staged progress))
-    (when (= type +wal-record-commit+)
+    (when (wal-transaction-terminal-type-p type)
       (let* ((xid (wal-record-xid record))
              (first (gethash xid (logical-slot-startup-progress-first progress)))
              (confirmed (logical-slot-startup-progress-confirmed progress)))
         (when (and (plusp xid) first (or (null confirmed) (> (wal-record-end record) confirmed)))
           (setf (gethash xid (logical-slot-startup-progress-pending progress))
                 (cons first (wal-record-end record))))))
-    (setf (logical-slot-startup-progress-batch-start progress) nil)
+    (setf (logical-slot-startup-progress-batch-start progress) nil
+          (logical-slot-startup-progress-catalog-prefix progress) nil)
     (clrhash (logical-slot-startup-progress-staged progress))))
 
 (defun logical-slot-startup-accept-record (progress record kind)
@@ -52,11 +54,18 @@
   (let ((type (wal-record-type record)))
     (cond
       ((= type +wal-record-batch-start+)
-       (setf (logical-slot-startup-progress-batch-start progress) (wal-record-start record))
+       (setf (logical-slot-startup-progress-batch-start progress) (wal-record-start record)
+             (logical-slot-startup-progress-catalog-prefix progress) nil)
        (clrhash (logical-slot-startup-progress-staged progress)))
       ((not (logical-slot-startup-progress-batch-start progress))
        (error "startup WAL record appears outside a batch"))
-      ((= type +wal-record-pages+) (logical-slot-startup-stage-pages progress record))
+      ((= type +wal-record-catalog-chunk+)
+       (setf (logical-slot-startup-progress-catalog-prefix progress)
+             (wal-note-catalog-chunk-prefix record (logical-slot-startup-progress-catalog-prefix progress))))
+      ((= type +wal-record-pages+)
+       (when (logical-slot-startup-progress-catalog-prefix progress)
+         (error "startup page images follow catalog chunks"))
+       (logical-slot-startup-stage-pages progress record))
       ((wal-terminal-record-type-p type) (logical-slot-startup-finish-batch progress record))))
   (values))
 

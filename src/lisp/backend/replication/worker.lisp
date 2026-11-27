@@ -35,7 +35,7 @@
 (defstruct logical-subscription-runtime
   options target (relations (make-hash-table :test #'eql))
   (validated-relations (make-hash-table :test #'equal))
-  source-client current-lsn transaction-open-p source-xid final-lsn)
+  source-client current-lsn transaction-open-p source-xid final-lsn transactional-ddl-p)
 
 (defun logical-simple-identifier-p (value)
   (and (stringp value) (plusp (length value))
@@ -319,7 +319,8 @@ unchanged for standard-conforming strings."
    (logical-subscription-options-target-port options)
    (logical-subscription-options-target-database options)
    :application-name "pg-lisp-subscribe-apply"
-   :options +logical-replication-format-options+))
+   :options (concatenate 'string +logical-replication-format-options+
+                         " -c synchronous_commit=local")))
 
 (defun logical-drop-source-slot-if-present (options)
   (let ((client (logical-startup-replication-client options)))
@@ -333,24 +334,43 @@ unchanged for standard-conforming strings."
                (error condition))))
       (pg-client-close client))))
 
-(defun logical-create-source-slot (options)
+(defun logical-target-transactional-ddl-p (target)
+  "An older subscriber can still participate in the legacy native protocol."
+  (handler-case
+      (let ((rows (pg-client-query target "SELECT pg_catalog.pg_lisp_transactional_ddl_supported()")))
+        (and (= (length rows) 1) (equal (aref (first rows) 0) "t")))
+    (pg-client-error (condition)
+      (unless (equal "42883" (pg-client-error-sqlstate condition))
+        (error condition))
+      nil)))
+
+(defun logical-create-source-slot (options transactional-ddl-p)
   (logical-drop-source-slot-if-present options)
-  (let ((client (logical-startup-replication-client options)))
+  (let ((client (logical-startup-replication-client options))
+        (slot (logical-subscription-options-slot-name options))
+        (plugin (if transactional-ddl-p "pg_lisp_transactional" "pg_lisp")))
     (unwind-protect
-         (let* ((rows
-                  (pg-client-query
-                   client
-                   (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL pg_lisp ~a"
-                           (logical-subscription-options-slot-name options)
-                           (if (logical-subscription-binary-profile-p options)
-                               "(snapshot 'export', binary_bytea 'true')"
-                               "EXPORT_SNAPSHOT"))))
-                (row (first rows)))
-           (unless (and row (= (length row) 4) (equal (aref row 3) "pg_lisp")
-                        (string= (aref row 0)
-                                 (logical-subscription-options-slot-name options)))
-             (error "source returned an invalid replication slot result"))
-           (values (aref row 1) (aref row 2)))
+         (flet ((create ()
+                  (first (pg-client-query
+                          client
+                          (format nil "CREATE_REPLICATION_SLOT ~a LOGICAL ~a ~a"
+                                  slot plugin
+                                  (if (logical-subscription-binary-profile-p options)
+                                      "(snapshot 'export', binary_bytea 'true')"
+                                      "EXPORT_SNAPSHOT"))))))
+           (let ((row (handler-case (create)
+                        (pg-client-error (condition)
+                          (unless (and transactional-ddl-p
+                                       (equal (pg-client-error-sqlstate condition) "0A000")
+                                       (equal (pg-client-error-message condition)
+                                              "unsupported output plugin \"pg_lisp_transactional\""))
+                            (error condition))
+                          (setf plugin "pg_lisp")
+                          (create)))))
+             (unless (and row (= (length row) 4) (equal (aref row 3) plugin)
+                          (equal (aref row 0) slot))
+               (error "source returned an invalid replication slot result"))
+             (values (aref row 1) (aref row 2))))
       (pg-client-close client))))
 
 (defun logical-copy-delay-seconds ()
@@ -766,7 +786,7 @@ Invalid scalars fall back to the encoder and retain its error behavior."
       (logical-create-copy-state options target)))
 
 (defun logical-create-copy-state (options target)
-  (multiple-value-bind (boundary token) (logical-create-source-slot options)
+  (multiple-value-bind (boundary token) (logical-create-source-slot options (logical-target-transactional-ddl-p target))
     (let ((slot (logical-subscription-options-slot-name options)))
       (logical-test-failpoint
        :after-source-slot-created-before-copying-progress slot boundary)
@@ -1377,12 +1397,33 @@ Invalid scalars fall back to the encoder and retain its error behavior."
         (error "pgoutput message has trailing bytes"))
       operation)))
 
+(defun logical-apply-transaction-ddl-message (runtime lsn payload transactional-p)
+  "Apply DDL in the transaction opened by the matching native Begin message."
+  (unless (and (logical-subscription-runtime-transactional-ddl-p runtime)
+               transactional-p
+               (logical-subscription-runtime-transaction-open-p runtime)
+               (eql lsn (logical-subscription-runtime-final-lsn runtime)))
+    (error "transactional logical DDL does not match its Begin message"))
+  (logical-target-query
+   (logical-subscription-runtime-target runtime)
+   (if (< (length payload) *logical-wire-field-spill-threshold*)
+       (format nil "APPLY LOGICAL EVENT 'transaction-ddl' ~d ~a"
+               lsn (logical-sql-literal payload))
+       (make-pg-client-query-plan
+        :writer (lambda (out)
+                  (format out "APPLY LOGICAL EVENT 'transaction-ddl' ~d " lsn)
+                  (logical-write-value-literal out 25 payload))))))
+
 (defun logical-pgoutput-apply-operation (runtime operation)
   (let ((kind (first operation)))
     (case kind
       (#\B
        (when (logical-subscription-runtime-transaction-open-p runtime)
          (error "nested pgoutput transaction"))
+       (when (and (not (eq (logical-subscription-options-mode
+                            (logical-subscription-runtime-options runtime)) :standard))
+                  (<= (third operation) (or (logical-subscription-runtime-current-lsn runtime) 0)))
+         (error "native Begin LSN must advance subscriber progress"))
        (logical-target-query (logical-subscription-runtime-target runtime) "BEGIN")
        (setf (logical-subscription-runtime-transaction-open-p runtime) t
              (logical-subscription-runtime-source-xid runtime)
@@ -1424,6 +1465,8 @@ Invalid scalars fall back to the encoder and retain its error behavior."
               (unless transactional-p
                 (error "pgoutput TRUNCATE message is not transactional"))
               (logical-apply-truncate-message runtime content)))
+           ((string= prefix "pg_lisp/transaction-ddl")
+            (logical-apply-transaction-ddl-message runtime lsn content transactional-p))
            ((member prefix '("pg_lisp/ddl" "pg_lisp/sequence-state")
                     :test #'string=)
             (when (logical-subscription-runtime-transaction-open-p runtime)
@@ -1441,7 +1484,12 @@ Invalid scalars fall back to the encoder and retain its error behavior."
          (error "invalid pgoutput Commit message"))
        (unless (eql (logical-subscription-runtime-final-lsn runtime) (third operation))
          (error "pgoutput Commit LSN does not match Begin final LSN"))
-       ;; logicalrep_write_commit() carries flags, commit LSN, end LSN, and time.
+       ;; Native messages identify one WAL terminal. Standard pgoutput reports
+       ;; its commit and end positions independently.
+       (when (and (not (eq (logical-subscription-options-mode
+                            (logical-subscription-runtime-options runtime)) :standard))
+                  (not (eql (second operation) (third operation))))
+         (error "native Commit LSN fields do not match"))
        (logical-progress-transaction-commit
         runtime (second operation))
        (setf (logical-subscription-runtime-final-lsn runtime) nil))
@@ -1610,6 +1658,19 @@ Invalid scalars fall back to the encoder and retain its error behavior."
              (close-logical-wire-field-owner *logical-wire-field-owner*)
           (unless complete (pg-client-close source)))))))
 
+(defun logical-read-native-slot-plugin (options)
+  "Select START capabilities from the publisher's durable slot identity."
+  (let ((source (logical-startup-source-client options)))
+    (unwind-protect
+         (let* ((rows (pg-client-query
+                       source (format nil "SELECT plugin FROM pg_catalog.pg_replication_slots WHERE slot_name = ~a"
+                                      (logical-sql-literal (logical-subscription-options-slot-name options)))))
+                (plugin (and (= (length rows) 1) (aref (first rows) 0))))
+           (unless (wal-native-slot-plugin-p plugin)
+             (error "publisher has no matching native logical slot"))
+           plugin)
+      (pg-client-close source))))
+
 (defun logical-run-stream (options target marker)
   (let* ((source (logical-startup-replication-client options))
          (runtime
@@ -1620,15 +1681,21 @@ Invalid scalars fall back to the encoder and retain its error behavior."
            (setf (logical-subscription-runtime-source-client runtime) source)
            (when (eq (logical-subscription-options-mode options) :standard)
              (logical-standard-validate-resume-slot options marker))
-           (pg-client-start-replication
-            source
-            (if (eq (logical-subscription-options-mode options) :standard)
-                (logical-standard-start-command options marker)
-                (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2'~a)"
-                        (logical-subscription-options-slot-name options)
-                        (wal-format-lsn marker)
-                        (if (logical-subscription-options-binary-bytea-p options)
-                            ", binary_bytea 'true'" ""))))
+           (if (eq (logical-subscription-options-mode options) :standard)
+               (pg-client-start-replication source (logical-standard-start-command options marker))
+               (let ((transactional-ddl-p
+                       (wal-transactional-ddl-slot-plugin-p (logical-read-native-slot-plugin options))))
+                 (when (and transactional-ddl-p (not (logical-target-transactional-ddl-p target)))
+                   (error "target cannot apply transactional DDL from the existing source slot"))
+                 (pg-client-start-replication
+                  source
+                  (format nil "START_REPLICATION SLOT ~a LOGICAL ~a (proto_version '2'~a~a)"
+                          (logical-subscription-options-slot-name options)
+                          (wal-format-lsn marker)
+                          (if (logical-subscription-options-binary-bytea-p options)
+                              ", binary_bytea 'true'" "")
+                          (if transactional-ddl-p ", transactional_ddl 'true'" "")))
+                 (setf (logical-subscription-runtime-transactional-ddl-p runtime) transactional-ddl-p)))
            ;; The first feedback is the copy boundary or the target's durable
            ;; restart marker; walsender.c validates it before entering its loop.
            (pg-client-send-standby-status source marker)

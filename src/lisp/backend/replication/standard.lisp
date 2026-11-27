@@ -114,7 +114,7 @@
           ((equal name "proto_version") (setf version (replication-protocol-version word)))
           ((equal name "publication_names")
            (unless word (ereport "22023" "publication_names requires a value")))
-          ((member name '("binary" "binary_bytea") :test #'equal)
+          ((member name '("binary" "binary_bytea" "transactional_ddl") :test #'equal)
            (replication-option-boolean name word))
           ((member name '("two_phase" "messages" "streaming") :test #'equal)
            (when (replication-option-boolean name word)
@@ -127,10 +127,12 @@
         (progn
           (when (assoc "binary_bytea" options :test #'equal)
             (ereport "42601" "binary_bytea is a private replication option"))
+          (when (assoc "transactional_ddl" options :test #'equal)
+            (ereport "42601" "transactional_ddl is a private replication option"))
           (unless (assoc "proto_version" options :test #'equal)
             (ereport "22023" "proto_version option is required")))
         (unless (and (= version 2)
-                     (every (lambda (option) (member (car option) '("proto_version" "binary_bytea") :test #'equal)) options))
+                     (every (lambda (option) (member (car option) '("proto_version" "binary_bytea" "transactional_ddl") :test #'equal)) options))
           (ereport "0A000" "private replication requires protocol version 2")))
     (values version options)))
 

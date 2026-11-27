@@ -118,7 +118,7 @@
           (let ((spec (list :raw raw
                             :partition (mapcar #'resolve-key (getf raw :partition))
                             :order (mapcar (lambda (item) (cons (resolve-key (getf item :expr))
-                                                                (getf item :desc)))
+                                                                (analyzed-order-direction item)))
                                            (getf raw :order))
                             :frame (or (getf raw :frame) '(:range :current)))))
             (let ((item (find-if (lambda (item) (member (expr-type (car item)) '(:json :json-array)))

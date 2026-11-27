@@ -25,6 +25,7 @@
    (make-startup-setting-descriptor "log_min_duration_statement" :user :disabled-logging "-1")
    (make-startup-setting-descriptor "log_min_error_statement" :user :disabled-logging "error")
    (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds)
+   (make-startup-setting-descriptor "work_mem" :user :integer 4096 64 2147483647 :kilobytes)
    (make-startup-setting-descriptor "pg_stat_statements.track" :superuser :statement-tracking "top")
    (make-startup-setting-descriptor "pg_stat_statements.track_planning" :superuser :boolean "off")
    (make-startup-setting-descriptor "application_name" :user :string "")))
@@ -315,9 +316,17 @@ This changes in-memory state only; client reporting occurs later."
 (defun session-application-name-settings-row ()
   (session-setting-descriptor-row (find-session-setting "application_name")))
 
+(defun session-set-work-memory (value &optional local-p)
+  (let ((reset-p (or (eq value :default) (eq value +null+))))
+    (session-assign-setting-binding
+     "work_mem" (unless reset-p (session-normalize-extra-setting "work_mem" value))
+     reset-p local-p)))
+
 (defun session-set-extra-setting (name value)
   "Set or reset a session setting, saving the transaction's settings before changes.
 The saved settings allow an abort to restore the values in effect at transaction start."
+  (when (string= name "work_mem")
+    (return-from session-set-extra-setting (session-set-work-memory value)))
   (when (string= name "application_name")
     (return-from session-set-extra-setting (session-set-application-name value)))
   (when (string= name "synchronous_commit")

@@ -30,6 +30,7 @@
   (first-snapshot-set nil)
   (dirty-relations '())
   (role-changes nil)
+  (catalog-transaction nil)
   ;; Per-transaction durable boundaries; reset detaches this context.
   (wal-obligation nil)
   (logical-spool nil)
@@ -133,9 +134,11 @@ The published context retains it for both XID and no-XID completion."
 
 (defun backend-own-wal-effects-p (backend)
   "Return whether BACKEND has its own effects requiring a WAL obligation.
-Dirty relations, logical changes, replacements and recorded durable boundaries
-count; an XID alone, shared cache pages and an empty context do not."
+Dirty relations, catalog changes, logical changes, replacements and recorded
+durable boundaries count. An XID alone does not require a WAL obligation."
   (or (backend-dirty-relations backend)
+      (let ((transaction (backend-catalog-transaction backend)))
+        (and transaction (catalog-transaction-has-changes-p transaction)))
       (plusp (backend-logical-change-bytes backend))
       (let ((context (backend-wal-obligation backend)))
         (and context (or (transaction-wal-obligation-catalog-end context)
@@ -1578,15 +1581,15 @@ the wait begins still counts. Later snapshots cannot enter the cohort."
     older))
 
 (defun wait-for-concurrent-index-snapshots (reference)
-  "Drain old snapshots before a plain-column concurrent index can be scanned."
+  "Drain old snapshots before a concurrent index can be scanned."
   (sb-thread:with-mutex (*relation-lock-mutex*)
     (loop for older = (sb-thread:with-mutex (*snapshot-count-lock*)
                         (concurrent-index-older-snapshots reference))
           while older do (wait-for-relation-dependencies older))))
 
-(defun capture-concurrent-index-snapshot (registration)
+(defun capture-concurrent-index-snapshot (registration safe-p)
   "Pin a fresh build horizon without waiting on wraparound while holding a gate."
-  (let ((*concurrent-index-snapshot-safe-p* t))
+  (let ((*concurrent-index-snapshot-safe-p* safe-p))
     (sb-thread:with-mutex (*xid-wrap-lock*)
       (when (or *xid-wrap-pending* *xid-wrap-failure*)
         (ereport "55000" "transaction ID wraparound interrupted the concurrent index build"))
@@ -2178,7 +2181,7 @@ slot lifecycle mutex, then use the private confirmed-slot core under that mutex.
          (%create-standard-logical-slot name :nothing)))
      :activation (make-wal-logical-info-activation :slot-name name))))
 
-(defun %create-exported-logical-snapshot-slot (slot-name)
+(defun %create-exported-logical-snapshot-slot (slot-name &optional (plugin "pg_lisp"))
   "Create an unconfirmed logical slot and return its copy boundary and token.
 
 Unlike the in-process WITH-EXPORTED-SNAPSHOT helper, this keeps the snapshot
@@ -2231,7 +2234,7 @@ snapshot lifecycle."
              (setf slot-object
                    (wal-publish-captured-replication-slot
                     slot-name captured-boundary restart-lsn registration owner
-                    (snapshot-xip captured) database-id)
+                    (snapshot-xip captured) database-id plugin)
                    published t)
              (logical-test-failpoint
               :after-initial-slot-file-publication slot-name boundary-lsn)
@@ -2272,12 +2275,12 @@ snapshot lifecycle."
       (ignore-errors
        (wal-release-logical-catalog-event-interest registration)))))
 
-(defun create-exported-logical-snapshot-slot (slot-name)
+(defun create-exported-logical-snapshot-slot (slot-name &optional (plugin "pg_lisp"))
   (unless *backend* (ereport "55000" "logical snapshot export requires an active backend"))
   (unless (eq (backend-state *backend*) :idle)
     (ereport "25001" "cannot export a replication snapshot inside a transaction"))
   (call-with-logical-capture-armed
-   (lambda () (%create-exported-logical-snapshot-slot slot-name))
+   (lambda () (%create-exported-logical-snapshot-slot slot-name plugin))
    :activation (make-wal-logical-info-activation :slot-name slot-name)))
 
 (defun import-exported-logical-snapshot (token)
@@ -2728,6 +2731,7 @@ so no interrupt can discard the owner of a virtual ID or its relation locks."
           (backend-first-snapshot-set b) nil
           (backend-dirty-relations b) '()
           (backend-role-changes b) nil
+          (backend-catalog-transaction b) nil
           (backend-wal-obligation b) nil
           (backend-logical-change-bytes b) 0)
     (set-backend-state b :idle))
@@ -2924,6 +2928,13 @@ Run outside publication locks, clean up the transaction, then handle the outcome
           (finish-failed-final-ddl backend))))))
 
 (defun commit-transaction ()
+  (let ((catalog-transaction (backend-catalog-transaction *backend*)))
+    (when (and catalog-transaction (catalog-transaction-has-changes-p catalog-transaction))
+      (unless *wal-ready*
+        (ereport "0A000" "transactional catalog publication requires native WAL"))
+      (when (backend-role-changes *backend*)
+        (ereport "0A000" "catalog and role changes cannot share a transaction"))
+      (get-current-xid)))
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
   (let ((b *backend*))
@@ -2931,7 +2942,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (return-from commit-transaction (commit-role-only-transaction b)))
     (if (backend-xid b)
         (let ((changes
-                (when (and *wal-ready* (backend-logical-spool b))
+                (when (and *wal-ready* (backend-logical-spool b)
+                           (not (catalog-transaction-captured-ddl-p (backend-catalog-transaction b))))
                   (logical-preflight-spool (backend-logical-spool b)))))
           ;; Validate the spool before publishing any WAL batch. Subsequent I/O
           ;; failure during WAL insertion follows the normal critical-failure path.
@@ -2941,7 +2953,7 @@ Run outside publication locks, clean up the transaction, then handle the outcome
           ;; a CLOG commit or abort.
           (multiple-value-bind (obligation source)
               (when *wal-ready*
-                (if (or changes (backend-own-wal-effects-p b))
+                (if (or (backend-logical-spool b) (backend-own-wal-effects-p b))
                     (prepare-backend-wal-obligation b)
                     (values nil (nth-value 0 (sync-replication-configuration-state)))))
             (sb-sys:without-interrupts
@@ -2952,7 +2964,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                                         (policy (if (backend-final-ddl-committed-p b)
                                                     (transaction-wal-obligation-ddl-policy (backend-wal-obligation b))
                                                     (synchronous-commit-policy)))
-                                        (local-durability (if (or (backend-final-ddl-committed-p b)
+                                        (local-durability (if (or (catalog-transaction-has-changes-p (backend-catalog-transaction b))
+                                                                  (backend-final-ddl-committed-p b)
                                                                   (commit-policy-remote-wait policy))
                                                               :flush (commit-policy-local-durability policy)))
                                         (outcome nil)
@@ -2961,8 +2974,8 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                 (unwind-protect
                      (unwind-protect
                           (multiple-value-bind (end receipt)
-                              (wal-commit-transaction
-                               xid
+                              (commit-backend-wal
+                               b xid
                                (lambda (end)
                                  (declare (ignore end))
                                  ;; WAL publication completes CLOG before this callback.
@@ -2970,15 +2983,12 @@ Run outside publication locks, clean up the transaction, then handle the outcome
                                  (unless wal-ready-at-entry-p
                                    (clog-set xid +clog-committed+ :fsync t))
                                  (setf irreversible t))
-                               :logical-changes changes
-                               :terminal-durable-function
+                               changes source local-durability
                                (lambda (end)
                                  (setf irreversible t durable-end end)
                                  (record-transaction-wal-boundary obligation source end nil))
-                               :source-id source
-                               :local-durability local-durability
-                               :accepted-function (lambda (receipt)
-                                                    (setf irreversible t accepted receipt)))
+                               (lambda (receipt)
+                                 (setf irreversible t accepted receipt)))
                             ;; A normal storage return is postcommit even if its receipt is malformed.
                             (setf irreversible t)
                             (validate-wal-commit-receipt

@@ -159,10 +159,11 @@ bootstrap payloads without index owners are rejected before schema changes."
   (with-write-lock
     (logical-private-metadata-ddl-target-name-under-write-lock database ast)))
 
-(defun logical-current-schema-contract-under-write-lock ()
+(defun logical-current-schema-contract-under-write-lock (&optional (database (current-database)))
+  "Derive a contract from the supplied committed or detached database image."
   (logical-bootstrap-schema-contract
    (logical-replication-bootstrap-view
-    (catalog-replication-bootstrap-data (current-database)))))
+    (catalog-replication-bootstrap-data database))))
 
 (defun logical-current-schema-contract ()
   "Capture the supported catalog shape atomically, excluding sequence state."
@@ -300,10 +301,21 @@ preserve catalog state after a durable save."
              (or *logical-source-schema-precondition*
                  (logical-current-schema-contract-under-write-lock)))
            (schema-after (logical-current-schema-contract-under-write-lock))
+           (index-definition
+             (when (and (eq (getf ast :type) :create-index)
+                        (expression-index-definition-p ast))
+               (find (getf ast :name) (getf schema-after :indexes)
+                     :key (lambda (entry) (getf entry :name)) :test #'string=)))
+           (replay-ast
+             (if index-definition
+                 ;; Share the cooked definition with bootstrap. Parsing the
+                 ;; original source expression can repeat session-dependent casts.
+                 (catalog-index-replay-ast (getf index-definition :sql))
+                 ast))
            (envelope
              (list :schema-contract-version 1
                    :database-oid database-oid
-                   :ast ast
+                   :ast replay-ast
                    :schema-before schema-before
                    :schema-after schema-after))
            (change

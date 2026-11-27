@@ -159,11 +159,11 @@
     (let ((plugin (replication-command-identifier (second remaining))))
       (multiple-value-bind (snapshot binary-bytea)
           (parse-create-slot-options (cddr remaining))
-        (unless (member plugin '("pgoutput" "pg_lisp") :test #'equal)
+        (unless (or (equal plugin "pgoutput") (wal-native-slot-plugin-p plugin))
           (ereport "0A000" "unsupported output plugin ~s" plugin))
-        (when (and (equal plugin "pg_lisp") (not (eq snapshot :export)))
+        (when (and (wal-native-slot-plugin-p plugin) (not (eq snapshot :export)))
           (ereport "0A000" "pg_lisp slots require an exported snapshot"))
-        (when (and binary-bytea (not (equal plugin "pg_lisp")))
+        (when (and binary-bytea (not (wal-native-slot-plugin-p plugin)))
           (ereport "0A000" "binary_bytea slot profile requires pg_lisp"))
         (make-logical-replication-command
          :type :create :slot-name slot-name :plugin plugin :snapshot-action snapshot
@@ -735,6 +735,7 @@ Invalid scalars fall back to the encoder and retain its error behavior."
 (defun pgoutput-message-prefix (change)
   (case (logical-change-kind change)
     (:truncate "pg_lisp/truncate")
+    (:transaction-ddl "pg_lisp/transaction-ddl")
     (:ddl "pg_lisp/ddl")
     (:sequence-state "pg_lisp/sequence-state")
     (:progress "pg_lisp/progress")
@@ -779,11 +780,17 @@ keepalive's WAL-end field, which may include changes not yet applied."
   (send-logical-xlog-data
    stream lsn lsn (pgoutput-build-safe-progress-message lsn)))
 
+(defvar *pgoutput-transactional-ddl-p* nil
+  "Whether the held native stream negotiated transactional DDL.")
+
 (defun send-logical-transaction (stream transaction wal-end)
   ;; Validate the entire staged spool before emitting a transaction frame.
   (logical-transaction-map-send-changes
    transaction
    (lambda (change)
+     (when (and (eq (logical-change-kind change) :transaction-ddl)
+                (not *pgoutput-transactional-ddl-p*))
+       (error "native stream has not negotiated transactional DDL"))
      (when (member (logical-change-kind change) '(:insert :update :delete))
        (pgoutput-build-relation change)
        (pgoutput-row-change-size change))))
@@ -807,7 +814,7 @@ keepalive's WAL-end field, which may include changes not yet applied."
         (logical-transaction-map-send-changes
          transaction
          (lambda (change)
-           (if (eq (logical-change-kind change) :truncate)
+           (if (member (logical-change-kind change) '(:truncate :transaction-ddl))
                (send-logical-xlog-data
                 stream (logical-transaction-commit-lsn transaction) wal-end
                 (pgoutput-build-message change transaction))
@@ -921,11 +928,18 @@ The caller releases the slot before sending shutdown completion."
                      t))))))
         (return :disconnect)))))
 
+(defun logical-command-option-boolean (command name)
+  (let ((option (and command
+                     (assoc name (logical-replication-command-options command) :test #'equal))))
+    (and option (replication-option-boolean name (cdr option)))))
+
 (defun start-logical-replication (stream slot-name requested-lsn &optional command)
   (when (and command
              (sb-thread:with-mutex (*wal-lock*)
                (let ((slot (wal-find-usable-replication-slot-under-lock slot-name)))
                  (and slot (equal (wal-replication-slot-plugin slot) "pgoutput")))))
+    (when (assoc "transactional_ddl" (logical-replication-command-options command) :test #'equal)
+      (ereport "42601" "transactional_ddl is a private replication option"))
     (return-from start-logical-replication
       (start-standard-logical-replication stream command)))
   (when (and command
@@ -941,46 +955,49 @@ The caller releases the slot before sending shutdown completion."
           (call-with-logical-replication-slot
            slot-name
            (lambda (slot)
-             (unless (equal (wal-replication-slot-plugin slot) "pg_lisp")
-               (ereport "0A000" "standard pgoutput streaming is not implemented"))
-             (when (eq (wal-slot-profile slot) :binary-bytea)
-               (let ((option (and command
-                                  (assoc "binary_bytea"
-                                         (logical-replication-command-options command)
-                                         :test #'equal))))
-                 (unless (and option (replication-option-boolean "binary_bytea" (cdr option)))
-                   (ereport "0A000" "replication slot requires binary bytea transport"))))
-             (let ((initial-copy-p
-                     (null (wal-replication-slot-confirmed-flush-lsn slot))))
-               (wal-logical-slot-validate-start-position
-                slot-name requested-lsn)
-               (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
-               (send-copy-both-response stream)
-               (setf copy-mode-p t)
-               (let ((first-status (replication-standby-status stream)))
-                 (unless first-status
-                   (return-from start-logical-replication nil))
-                 (if initial-copy-p
-                     (finalize-initial-replication-copy
-                      slot-name slot requested-lsn first-status)
-                     (let ((position (replication-status-position first-status)))
-                       (unless (= position requested-lsn)
-                         (ereport "22023"
-                                  "first resumed standby status must equal the requested LSN"))
-                       (wal-logical-slot-accept-resume-position
-                        slot-name requested-lsn)))
-                 (wal-sender-note-reply *wal-sender* (getf first-status :write)
-                                        (getf first-status :flush) (getf first-status :apply)
-                                        (getf first-status :reply-time 0)))
-               (let* ((option (and command (assoc "binary_bytea" (logical-replication-command-options command) :test #'equal)))
-                      (*pgoutput-binary-bytea* (and option (replication-option-boolean "binary_bytea" (cdr option)))))
-                 (call-with-logical-stream-io
-                  stream slot
-                  (lambda (state)
-                    (setf io-state state)
-                    (wal-sender-stream-logical-ready slot)
-                    (setf reason (stream-logical-replication-loop
-                                  stream slot-name requested-lsn state)))))))
+             (let* ((plugin (wal-replication-slot-plugin slot))
+                    (transactional (wal-transactional-ddl-slot-plugin-p plugin))
+                    (requested (logical-command-option-boolean command "transactional_ddl"))
+                    (binary (logical-command-option-boolean command "binary_bytea")))
+               (unless (wal-native-slot-plugin-p plugin)
+                 (ereport "0A000" "standard pgoutput streaming is not implemented"))
+               (unless (eql requested transactional)
+                 (if transactional
+                     (ereport "0A000" "replication slot requires transactional DDL support")
+                     (ereport "0A000" "replication slot does not support transactional DDL")))
+               (when (and (eq (wal-slot-profile slot) :binary-bytea) (not binary))
+                 (ereport "0A000" "replication slot requires binary bytea transport"))
+               (let ((initial-copy-p
+                       (null (wal-replication-slot-confirmed-flush-lsn slot))))
+                 (wal-logical-slot-validate-start-position
+                  slot-name requested-lsn)
+                 (wal-sender-note-sent *wal-sender* (wal-replication-slot-restart-lsn slot))
+                 (send-copy-both-response stream)
+                 (setf copy-mode-p t)
+                 (let ((first-status (replication-standby-status stream)))
+                   (unless first-status
+                     (return-from start-logical-replication nil))
+                   (if initial-copy-p
+                       (finalize-initial-replication-copy
+                        slot-name slot requested-lsn first-status)
+                       (let ((position (replication-status-position first-status)))
+                         (unless (= position requested-lsn)
+                           (ereport "22023"
+                                    "first resumed standby status must equal the requested LSN"))
+                         (wal-logical-slot-accept-resume-position
+                          slot-name requested-lsn)))
+                   (wal-sender-note-reply *wal-sender* (getf first-status :write)
+                                          (getf first-status :flush) (getf first-status :apply)
+                                          (getf first-status :reply-time 0)))
+                 (let ((*pgoutput-binary-bytea* binary)
+                       (*pgoutput-transactional-ddl-p* transactional))
+                   (call-with-logical-stream-io
+                    stream slot
+                    (lambda (state)
+                      (setf io-state state)
+                      (wal-sender-stream-logical-ready slot)
+                      (setf reason (stream-logical-replication-loop
+                                    stream slot-name requested-lsn state))))))))
            :allow-initial-copy t)
           (case reason
             (:shutdown (standard-finish-shutdown io-state))
@@ -1032,8 +1049,8 @@ The caller releases the slot before sending shutdown completion."
        ;; Serialize DROP until the success row is sent.
        (sb-thread:with-mutex (*logical-slot-lifecycle-lock*)
          (multiple-value-bind (boundary token)
-             (if (equal plugin "pg_lisp")
-                 (create-exported-logical-snapshot-slot name)
+             (if (wal-native-slot-plugin-p plugin)
+                 (create-exported-logical-snapshot-slot name plugin)
                  (create-standard-logical-slot name snapshot))
            (send-create-replication-slot-result stream name boundary token plugin))))
      :activation (make-wal-logical-info-activation :slot-name name))))

@@ -60,7 +60,8 @@
 (defun on-conflict-index-matches-columns-p (index columns)
   ;; Both sides represent attribute sets, even when the index repeats a column.
   (let ((attributes (pg-index-columns index)))
-    (and (subsetp columns attributes :test #'=)
+    (and (not (index-has-expressions-p index))
+         (subsetp columns attributes :test #'=)
          (subsetp attributes columns :test #'=))))
 
 (defun on-conflict-arbiter-oids (indexes constraint inference-p columns &optional admitted)
@@ -160,12 +161,12 @@ ADMITTED contains arbiters already inferred after this writer registered."
                                       (getf conflict :arbiters)))
           (getf conflict :arbiters-admitted-p) t)))
 
-(defun find-on-conflict-tuple (table values indexes arbiters)
+(defun find-on-conflict-tuple (table values indexes arbiters expression-keys)
   (let ((wait nil) (found nil) (xid (backend-xid *backend*)))
     (dolist (index indexes)
       (when (member (pg-index-oid index) arbiters :test #'=)
-        (let ((key (index-values index values)))
-          (unless (and (key-has-null-p key) (not (pg-index-nulls-not-distinct-p index)))
+        (let ((key (index-row-key-values index values expression-keys)))
+          (when (and key (index-key-requires-uniqueness-check-p index key))
             (dolist (tid (btree-search-unlocked (pg-index-relfilenode index)
                                                 (encode-index-key key (index-types index table))))
               (let ((tuple (heapam-get-tuple (pg-class-relfilenode table) (car tid) (cdr tid)
@@ -192,11 +193,11 @@ ADMITTED contains arbiters already inferred after this writer registered."
            (getf conflict :sets))
    old (concatenate 'vector old excluded)))
 
-(defun claim-on-conflict-candidate (table values conflict indexes arbiters)
+(defun claim-on-conflict-candidate (table values conflict indexes arbiters expression-keys)
   ;; Claim before WHERE, retaining ownership to transaction end even when WHERE
   ;; rejects the row. Visibility and cardinality errors also precede WHERE.
   (multiple-value-bind (status candidate)
-      (find-on-conflict-tuple table values indexes arbiters)
+      (find-on-conflict-tuple table values indexes arbiters expression-keys)
     (when (eq status :conflict)
       (check-on-conflict-visible candidate)
       (when (eq (getf conflict :action) :update)
@@ -219,7 +220,7 @@ ADMITTED contains arbiters already inferred after this writer registered."
            :before-check
            (when conflict
              (let ((arbiters :unresolved))
-               (lambda (indexes)
+               (lambda (indexes expression-keys)
                  (when (eq arbiters :unresolved)
                    (setf arbiters
                          (on-conflict-arbiter-oids indexes
@@ -228,7 +229,7 @@ ADMITTED contains arbiters already inferred after this writer registered."
                                                    (getf conflict :inference-columns)
                                                    (when (getf conflict :arbiters-admitted-p)
                                                      (getf conflict :arbiters)))))
-                 (claim-on-conflict-candidate table values conflict indexes arbiters)))))
+                 (claim-on-conflict-candidate table values conflict indexes arbiters expression-keys)))))
         (declare (ignore block off))
         (unless (eq action :conflict)
           (logical-note-row-change :insert table :new-values values :publication-selection publications)

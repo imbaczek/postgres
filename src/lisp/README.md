@@ -792,6 +792,7 @@ TRUNCATE TABLE t [, ...];
 CREATE UNIQUE INDEX name ON t (cols);
 CREATE UNIQUE INDEX name ON t (cols) NULLS NOT DISTINCT;
 CREATE INDEX name ON t (cols);
+CREATE INDEX name ON t (lower(b)) WHERE a > 0;
 DROP INDEX [IF EXISTS] name;
 CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS] name ON t (cols);
 DROP INDEX CONCURRENTLY [IF EXISTS] name [RESTRICT];
@@ -814,12 +815,31 @@ ALTER TABLE t DROP CONSTRAINT old_name,
   ADD CONSTRAINT new_name PRIMARY KEY USING INDEX index_name;
 ```
 
-Concurrent index DDL accepts named B-tree indexes on plain columns and runs as
-a standalone command. Concurrent drop accepts a single index with no owning
-constraint. Readers and writers can use the heap during build and validation.
+Ordinary and concurrent B-tree builds accept plain keys, supported immutable
+scalar expressions and partial predicates. A partial index contains rows whose
+predicate evaluates to TRUE. The planner uses expression equality when the
+resolved key matches and the query implies the predicate. The implication
+checks cover matching conjuncts, proven non-NULL values and same-type bounds.
+Targetless `ON CONFLICT DO NOTHING` honors qualifying unique expression and
+partial indexes. Explicit arbiter inference supports unconditional plain keys.
+
+Concurrent index DDL runs as a standalone command. Concurrent drop accepts a
+single index with no owning constraint. Readers and writers can use the heap
+during build and validation.
 If a build fails after its first catalog commit, it can leave an invalid index.
 An invalid unique index that has reached `indisready` still enforces uniqueness.
 Drop the invalid index before retrying CREATE.
+
+SELECT can use a multicolumn B-tree for a leading equality prefix and a range
+on the next key. The original predicate is still applied to visible heap
+tuples. For an ordered LIMIT, the planner can omit sorting if the index
+supplies the requested order and NULL placement. Native B-trees store NULLs
+first in forward order and last in reverse order. A non-NULL restriction on
+the ordered key can make either traversal compatible with SQL's default NULL
+placement. EXPLAIN JSON reports the chosen scan direction.
+The order must match the unfixed index suffix in forward or reverse direction,
+with compatible NULL placement for every ordering key. Mixed directions on
+unfixed keys and unsupported order expressions use a sort.
 
 The logical DDL extension orders a replica-identity change after every
 transaction that wrote using the previous key. At that boundary, additional
@@ -905,12 +925,27 @@ range and are persisted separately from transaction rollback, as in PostgreSQL.
 See [defaults, checks and aggregates](t/DEFAULTS-CHECKS-AGGREGATES.md) for scope,
 validation and replication limits.
 
-Joins use a nested-loop executor over sequential scans. `ON` predicates can
-reference both join operands; `USING` merges columns with a common type (equal
-types and `int4`/`int8` pairs), with FULL JOIN coalescing the merged key.
-Comma-separated FROM items and NATURAL JOIN are not supported.
+Joins use nested loops, including parameterized index probes. A two-table
+INNER, LEFT, RIGHT or FULL join over sequential scans can use a hash join
+for bare equality keys in the same resolved domain. Supported domains include
+`int2`, `int4`, `int8`, `date`, `time`, `timestamp`, `timestamptz`,
+`text`, `varchar`, and `numeric`. Hash joins use the session's `work_mem`,
+repartition oversized batches with varying hashes, and use bounded block
+replay for unsplittable skew. An oversized tuple can occupy its own block.
+The workspace charge reserves the live spill buffers and match map.
+EXPLAIN ANALYZE JSON reports candidate pairs, spill batches, build blocks and
+peak charged build bytes.
+For an ungrouped `count(*)` over a spilling inner equality join of two
+single-column `int4` heaps, the executor can count matches directly from
+batched keys and build-side frequencies. This path reports key probes in
+EXPLAIN ANALYZE JSON.
 
-Transactions (READ COMMITTED only):
+`ON` predicates can reference both join operands. `USING` merges columns
+with a common type (equal
+types and `int4`/`int8` pairs), with FULL JOIN coalescing the merged key.
+Comma-separated FROM items act as cross joins. NATURAL JOIN is unsupported.
+
+Transaction commands:
 
 ```sql
 BEGIN | START TRANSACTION;
@@ -989,9 +1024,13 @@ again, withholds the last frame byte until validation succeeds, and closes the
 connection if emission fails. Source SQL values, including detoasted values,
 still occupy memory, as can values and frames at the receiving client.
 
-Idle simple-query messages containing only supported ordinary settings and MVCC
-statements commit or roll back together. DDL, maintenance and transaction-control
-messages retain the prior per-statement behavior; see the staged boundary in
+Ordinary CREATE and DROP TABLE or INDEX can share an explicit transaction
+with row changes. Other sessions see the committed catalog until publication.
+Rollback releases provisional storage. Future plans use the published catalog
+generation, while an admitted scan can finish under its retained relation lease.
+Idle simple-query messages containing only supported settings, MVCC statements
+and stageable DDL commit or roll back together. Other DDL, maintenance and
+transaction-control messages follow the command-specific boundary in
 [the HA ledger](PHYSICAL-HA.md#application-name-and-supported-implicit-query-messages).
 The read-only virtual catalogs expose a subset of `pg_type`, `pg_class`,
 `pg_attribute`, and `pg_index`. TOAST ownership and its heap and index appear in
@@ -1981,8 +2020,9 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   cycle boundary. VACUUM now freezes eligible tuples incrementally, but
   PostgreSQL's wraparound limits are not implemented. XID allocation stops
   after `2^64 - 1`.
-- DDL and `ANALYZE` inside an explicit transaction block are rejected (`0A000`)
-  because catalog changes and statistics have no rollback log.
+- Catalog DDL outside the staged CREATE and DROP TABLE or INDEX subset follows
+  its own transaction rules. `ANALYZE` and concurrent index DDL require a
+  standalone command.
 - `COUNT(*)`, `COUNT(expr)`, `MIN`, `MAX` and `GROUP BY` are supported.
   `COUNT(expr)` counts non-NULL values, including false and zero; `MIN` and `MAX`
   ignore NULLs and support numeric, floating, text, date/time and interval inputs,
@@ -1999,7 +2039,7 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   supported; see [HAVING and LATERAL](t/HAVING-LATERAL.md) for scope and tests.
   Row-valued and MULTIEXPR subqueries and `DISTINCT ON` remain unsupported.
   Hash subplans, full optimizer constant folding, and subquery decorrelation are
-  not implemented. Joins use nested loops;
+  not implemented. Nested-loop
   INNER/CROSS join order uses a greedy statistics-based choice, while outer
   joins retain source order. NATURAL JOIN
   is not supported; comma-separated `FROM` items act as cross joins.
@@ -2026,8 +2066,8 @@ recorded in [`vendor/swank/README.md`](vendor/swank/README.md).
   nested-loop inputs, and greedy
   INNER/CROSS join order. Statistics are explicit and can become stale between
   ANALYZE commands. Index scans stream duplicate-key TIDs, enforce MVCC
-  visibility, and recheck the full predicate. Composite equality, range scans,
-  bitmap scans, and index-only scans are not implemented.
+  visibility, and recheck the full predicate. Composite equality and range
+  paths use plain B-tree keys. Bitmap and index-only scans are deferred.
 - VACUUM is manual only; autovacuum and index-only scans are not implemented.
   Manual VACUUM removes dead index TIDs before making safe dead heap slots
   reusable, freezes eligible tuples, and updates the visibility map and volatile

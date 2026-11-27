@@ -96,7 +96,9 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
   (unless active (error "WAL terminal record appears outside a batch"))
   (let ((type (wal-record-type record))
         (payload (wal-record-payload record)))
-    (when (and catalog-count (/= type +wal-record-catalog-commit+))
+    (when (and catalog-count
+               (/= type +wal-record-catalog-commit+)
+               (/= type +wal-record-catalog-transaction-commit+))
       (error "WAL catalog chunks lack a catalog commit record"))
     (flet ((check-logical (kind)
              (wal-check-batch-logical-terminal kind (wal-record-xid record)
@@ -112,6 +114,11 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
         ((= type +wal-record-catalog-commit+)
          (check-logical :catalog)
          (wal-decode-catalog-commit-payload payload))
+        ((= type +wal-record-catalog-transaction-commit+)
+         (unless (and (wal-normal-transaction-xid-p (wal-record-xid record)) catalog-count)
+           (error "WAL catalog transaction requires an XID and catalog chunks"))
+         (check-logical :commit)
+         (wal-decode-catalog-transaction-commit payload))
         (t
          (check-logical :other)
          (cond
@@ -148,12 +155,14 @@ CLEAN-P must certify that only a valid batch marker precedes the terminal."
                  (= (+ 8 (wal-u32 payload 4)) (length payload)))
       (error "logical catalog event has an invalid payload"))))
 
-(defun wal-decode-next-catalog-chunk (record active logical-catalog-event logical-count count next)
+(defun wal-decode-next-catalog-chunk (record active logical-catalog-event count next)
   "Validate the catalog chunk against the batch's grammar and return its count and bytes."
   (unless active
     (error "WAL catalog chunks appear outside a batch"))
-  (when (or logical-catalog-event logical-count)
-    (error "WAL catalog chunks are mixed with row or catalog events"))
+  (unless (eql 0 (wal-record-xid record))
+    (error "WAL catalog chunks must not carry an XID"))
+  (when logical-catalog-event
+    (error "WAL catalog chunks follow a standalone catalog event"))
   (multiple-value-bind (chunk-index chunk-count bytes)
       (wal-decode-catalog-chunk-payload (wal-record-payload record))
     (unless (= chunk-index next)

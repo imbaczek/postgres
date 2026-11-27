@@ -172,7 +172,7 @@ Do not consult replay CLOG: it may be ahead of this record's applied position."
       (t
        (running-xacts-advance
         prior observed-next end
-        :committed-xid (when (= type +wal-record-commit+) (wal-record-xid record)))))))
+        :committed-xid (when (wal-transaction-terminal-type-p type) (wal-record-xid record)))))))
 
 (defun physical-recovery-scan-seeds (state start checkpoint checkpoint-p next next-p)
   "Select checkpoint and observed XID seeds for exactly START.

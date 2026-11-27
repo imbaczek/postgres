@@ -38,6 +38,9 @@
 
 (defconstant +wal-record-logical-decoding-status-change+ 18)
 
+(defconstant +wal-record-catalog-transaction-commit+ 19
+  "Commit one XID with a chunked catalog image and its deferred file deletions.")
+
 (defconstant +wal-record-relation-reset+ 15)
 
 (defconstant +wal-record-end-of-recovery+ 13)
@@ -171,7 +174,8 @@ other inputs and modified tables use the scalar recurrence. BYTES is read only."
                  +wal-record-logical-changes+ +wal-record-logical-catalog-event+
                  +wal-record-xid-reservation+ +wal-record-end-of-recovery+ +wal-record-running-xacts+
                  +wal-record-relation-reset+ +wal-record-parameter-change+
-                 +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
+                 +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+
+                 +wal-record-catalog-transaction-commit+)
            t)))
 
 (defun wal-record-header-valid-p (bytes version expected-lsn)
@@ -260,7 +264,7 @@ copying the complete image."
     (replace payload bytes :start1 +wal-catalog-chunk-header-size+)
     payload))
 
-(defun wal-decode-catalog-chunk-payload (payload)
+(defun wal-decode-catalog-chunk-payload (payload &optional (copy-bytes-p t))
   (when (< (length payload) (1+ +wal-catalog-chunk-header-size+))
     (error "WAL catalog chunk is too short"))
   (let ((index (wal-u32 payload 0))
@@ -268,7 +272,7 @@ copying the complete image."
     (unless (and (plusp count) (< index count))
       (error "WAL catalog chunk has an invalid index or count"))
     (values index count
-            (subseq payload +wal-catalog-chunk-header-size+))))
+            (when copy-bytes-p (subseq payload +wal-catalog-chunk-header-size+)))))
 
 (defun wal-catalog-chunk-count (payload)
   (let* ((chunk-size (- +wal-segment-size+ +wal-header-size+
@@ -311,9 +315,84 @@ copying the complete image."
          (if (logbitp 63 value) (- value (ash 1 64)) value)))
     (otherwise (error "WAL commit record has an invalid payload"))))
 
+(defun wal-encode-catalog-transaction-commit (timestamp catalog-payload)
+  "Encode the XID terminal payload after WAL catalog chunks have been staged."
+  (let ((count (wal-catalog-chunk-count catalog-payload))
+        (bytes (make-array 20 :element-type '(unsigned-byte 8))))
+    (unless (plusp count) (error "WAL catalog transaction requires a catalog image"))
+    (replace bytes (wal-encode-commit-timestamp timestamp))
+    (wal-set-u32 bytes 8 count)
+    (wal-set-u64 bytes 12 (length catalog-payload))
+    bytes))
+
+(defun wal-decode-catalog-transaction-commit (payload)
+  "Return catalog chunk count, catalog byte length, and signed commit timestamp."
+  (unless (= (length payload) 20)
+    (error "WAL catalog transaction commit has an invalid length"))
+  (let ((count (wal-u32 payload 8))
+        (size (wal-u64 payload 12)))
+    (unless (and (plusp count) (plusp size))
+      (error "WAL catalog transaction commit has an invalid image size or chunk count"))
+    (values count size (wal-decode-commit-timestamp (subseq payload 0 8)))))
+
+(defun wal-normal-transaction-xid-p (xid)
+  (and (typep xid '(unsigned-byte 64))
+       (>= (ldb (byte 32 0) xid) 3)))
+
+(defun wal-transaction-terminal-type-p (type)
+  (or (= type +wal-record-commit+) (= type +wal-record-catalog-transaction-commit+)))
+
+(defun wal-catalog-terminal-type-p (type)
+  (or (= type +wal-record-catalog+)
+      (= type +wal-record-catalog-commit+)
+      (= type +wal-record-catalog-transaction-commit+)))
+
+(defun wal-record-commit-timestamp (record)
+  "Read a transaction terminal's timestamp, including the legacy empty payload."
+  (let ((payload (wal-record-payload record)))
+    (if (= (wal-record-type record) +wal-record-catalog-transaction-commit+)
+        (nth-value 2 (wal-decode-catalog-transaction-commit payload))
+        (wal-decode-commit-timestamp payload))))
+
+(defstruct wal-catalog-chunk-prefix
+  count (next 0) (bytes 0))
+
+(defun wal-note-catalog-chunk-prefix (record prefix)
+  "Check a catalog chunk header without retaining or copying the catalog bytes."
+  (unless (eql 0 (wal-record-xid record))
+    (error "WAL catalog chunks must not carry an XID"))
+  (let ((payload (wal-record-payload record)))
+    (multiple-value-bind (index count) (wal-decode-catalog-chunk-payload payload nil)
+      (let ((state (or prefix (make-wal-catalog-chunk-prefix :count count))))
+        (unless (and (= count (wal-catalog-chunk-prefix-count state))
+                     (= index (wal-catalog-chunk-prefix-next state)))
+          (error "invalid WAL catalog chunk sequence"))
+        (incf (wal-catalog-chunk-prefix-next state))
+        (incf (wal-catalog-chunk-prefix-bytes state) (- (length payload) +wal-catalog-chunk-header-size+))
+        state))))
+
+(defun wal-check-catalog-chunk-prefix (record prefix)
+  "Require a terminal to certify the complete catalog chunk prefix."
+  (let ((type (wal-record-type record))
+        (payload (wal-record-payload record)))
+    (multiple-value-bind (count length)
+        (cond ((= type +wal-record-catalog-commit+)
+               (wal-decode-catalog-commit-payload payload))
+              ((= type +wal-record-catalog-transaction-commit+)
+               (unless (wal-normal-transaction-xid-p (wal-record-xid record))
+                 (error "invalid WAL catalog transaction XID"))
+               (wal-decode-catalog-transaction-commit payload)))
+      (if count
+          (unless (and prefix (= count (wal-catalog-chunk-prefix-count prefix)
+                                 (wal-catalog-chunk-prefix-next prefix))
+                       (= length (wal-catalog-chunk-prefix-bytes prefix)))
+            (error "incomplete WAL catalog chunk prefix"))
+          (when prefix (error "WAL catalog chunks lack a catalog commit record")))))
+  (values))
+
 (defun wal-terminal-record-type-p (type)
   (member type (list +wal-record-commit+ +wal-record-catalog+
-                     +wal-record-catalog-commit+ +wal-record-checkpoint+
+                     +wal-record-catalog-commit+ +wal-record-catalog-transaction-commit+ +wal-record-checkpoint+
                      +wal-record-maintenance+ +wal-record-clog-reset+ +wal-record-xid-reservation+
                      +wal-record-running-xacts+ +wal-record-parameter-change+
                      +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)

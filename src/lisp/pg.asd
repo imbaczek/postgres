@@ -111,6 +111,8 @@
      (:module "catalog"
       :serial t
       :components ((:file "catalog")
+                   (:file "dependency")
+                   (:file "transaction")
                    (:file "namespace")))
      (:module "replication"
       :serial t
@@ -145,12 +147,15 @@
      (:module "executor"
       :serial t
       :components ((:file "exec_arena")
+                   (:file "exec_spill_buffer")
                    (:file "exec_spill")
                    (:file "../replication/logical-spool")
                    (:file "exec_scan")
                    (:file "exec_plan")
                    (:file "exec_window")
                    (:file "exec_iterator")
+                   (:file "exec_hash_join")
+                   (:file "exec_int4_hash_join")
                    (:file "exec_cursor_window")
                    (:file "exec_cursor")
                    (:file "exec_cte")
@@ -163,6 +168,7 @@
                    (:file "exec_joined_dml")
                    (:file "exec_on_conflict")
                    (:file "exec_constraints")
+                   (:file "index-expression")
                    (:file "exec_vacuum")
                    (:file "exec_simple")))
      ;; Recovery uses executor temporary storage and supplies the startup

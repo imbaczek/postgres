@@ -382,9 +382,8 @@ Updating source membership does not change existing snapshots."
           (getf *physical-recovery-state* :source-reservation) (copy-list reservation)
           *next-xid* next-xid *xid-batch-end* next-xid
           *last-replay-lsn* (wal-record-end record))
-    (when (= (wal-record-type record) +wal-record-commit+)
-      (setf *last-replay-xact-timestamp*
-            (wal-decode-commit-timestamp (wal-record-payload record))))
+    (when (wal-transaction-terminal-type-p (wal-record-type record))
+      (setf *last-replay-xact-timestamp* (wal-record-commit-timestamp record)))
     (when (= (wal-record-type record) +wal-record-checkpoint+)
       (setf (getf *physical-recovery-state* :source-checkpoint)
             (wal-checkpoint-record-snapshot record)))))
@@ -401,8 +400,7 @@ Check resource limits after the durable terminal and its fact are published."
     (unless (equal (catalog-cluster-identity catalog)
                    (getf *physical-recovery-state* :cluster-identity))
       (error "replayed catalog lost the source cluster identity"))
-    (when (member (wal-record-type record)
-                  (list +wal-record-catalog+ +wal-record-catalog-commit+))
+    (when (wal-catalog-terminal-type-p (wal-record-type record))
       (physical-replay-create-heap-forks catalog)
       (let ((*catalog* catalog))
         (dolist (node (catalog-physical-relfilenodes))

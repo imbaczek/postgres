@@ -343,6 +343,9 @@ OCTET-CONSUMER, when supplied, receives each bounded input block."
            (sb-bsd-sockets:socket-connect
             socket (sb-bsd-sockets:host-ent-address
                     (sb-bsd-sockets:get-host-by-name host)) port)
+           ;; Like libpq, send the small pieces of unbuffered frontend frames
+           ;; without waiting for a delayed acknowledgment of the first piece.
+           (setf (sb-bsd-sockets:sockopt-tcp-nodelay socket) t)
            (setf stream
                  (sb-bsd-sockets:socket-make-stream
                   socket :input t :output t

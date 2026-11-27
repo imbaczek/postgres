@@ -494,14 +494,14 @@ BLOCK-FUNCTION must consume its byte range before returning; file buffers are re
   (unless (<= 1 count #xffffffff) (error "invalid logical WAL chunk count"))
   count)
 
-(defun logical-preflight-spool (spool)
+(defun logical-preflight-spool (spool &key force-fragments)
   "Validate SPOOL and plan bounded WAL records before publishing a batch."
   (logical-spool-seal spool)
   (let ((payload-limit (- +wal-segment-size+ +wal-header-size+
                           +logical-change-chunk-header-size+))
         (fragment-limit (- +wal-segment-size+ +wal-header-size+
                            +logical-fragment-header-size+))
-        (chunk-bytes 0) (chunks 0) (fragments 0) (fragment-p nil))
+        (chunk-bytes 0) (chunks 0) (fragments 0) (fragment-p force-fragments))
     (logical-spool-map-event-blocks
      spool
      (lambda (size)

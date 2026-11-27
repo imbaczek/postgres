@@ -667,7 +667,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
         (pushnew (pg-column-attnum (car assignment)) slots))
       (let ((indexes (capture-insert-indexes table)))
         (dolist (index indexes)
-          (dolist (slot (pg-index-columns index))
+          (dolist (slot (or (pg-index-referenced-columns index) (pg-index-columns index)))
             (unless (and (integerp slot) (<= 1 slot width))
               (return-from simple-update-toast-demand nil))
             (pushnew slot slots))))

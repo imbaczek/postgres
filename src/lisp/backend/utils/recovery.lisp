@@ -7,7 +7,7 @@
 
 (declaim (ftype function session-synchronous-commit-policy))
 
-(defparameter *session-local-setting-names* '("application_name" "synchronous_commit"))
+(defparameter *session-local-setting-names* '("application_name" "synchronous_commit" "work_mem"))
 
 (declaim (ftype function sync-replication-monitoring-snapshots-under-lock))
 

@@ -120,20 +120,23 @@ staged cache, but does not scan the old physical relation."
        replacements))
     (nreverse resets)))
 
-(defun discard-transaction-replacements (backend)
-  "Release BACKEND's private references and close scratch when no references remain."
+(defun discard-transaction-replacements (backend &optional relfilenode)
+  "Release private references for BACKEND, or only those for RELFILENODE."
   (call-with-replacement-page-lock
    (lambda ()
      (let ((replacements (gethash backend *transaction-relation-replacements*)))
        (when replacements
          (maphash (lambda (key replacement)
-                    (declare (ignore key))
-                    (discard-replacement-pages replacement)
-                    (when (fboundp 'heap-fsm-forget)
-                      (funcall 'heap-fsm-forget
-                               (relation-replacement-relfilenode replacement))))
+                    (let ((node (relation-replacement-relfilenode replacement)))
+                      (when (or (null relfilenode) (eql relfilenode node))
+                        (sb-sys:without-interrupts
+                          (discard-replacement-pages replacement)
+                          (remhash key replacements))
+                        (when (fboundp 'heap-fsm-forget)
+                          (funcall 'heap-fsm-forget node)))))
                   replacements)
-         (remhash backend *transaction-relation-replacements*)
+         (when (zerop (hash-table-count replacements))
+           (remhash backend *transaction-relation-replacements*))
          (wal-dirty-close-empty-store)))))
   (values))
 
@@ -198,28 +201,29 @@ the accounting entry; interrupts and deadlines cannot strand that entry."
           (buf-page-handle-borrow-registry handle) nil))
   (values))
 
-(defun buf-read-clean-page (handle relfilenode block fork)
+(defun buf-read-clean-page (handle relfilenode block fork &optional scratch)
   (sb-thread:with-mutex (*smgr-lock*)
     (multiple-value-bind (page cached)
         (smgr-read-clean-page-locked relfilenode block fork *wal-storage-incarnation*
-                                     #'buf-verify-page *buf-borrow-lock* *buf-borrowed-pages*)
+                                     #'buf-verify-page *buf-borrow-lock* *buf-borrowed-pages* scratch)
       ;; Register the borrow before eviction can select this entry.
       (values page (and cached (not (buf-borrow-page handle page))) t))))
 
-(defun buf-acquire-read-page (handle relfilenode block &optional (fork :main))
+(defun buf-acquire-read-page (handle relfilenode block &optional (fork :main) scratch)
   "Fill an empty, already owned HANDLE and return the page for read-only use.
 Install cleanup before acquiring HANDLE and release it on every exit, including
 when acquisition or validation fails.  A private replacement shadows the whole
 fork.  Otherwise WAL visibility precedes the clean storage cache.  Resident
 dirty pages can be borrowed under the WAL lock; scratch and compatibility
 entries use owned reads.  When the borrow budget is full, return an owned
-copy instead.  Acquisition does not hold a lock across the caller's use."
+copy instead. SCRATCH is an optional caller-owned page for a clean cache miss.
+Release HANDLE before reusing SCRATCH. Acquisition holds no lock across use."
   (assert (null (buf-page-handle-page handle)))
   (let ((replacement (current-relation-replacement relfilenode fork)))
     (multiple-value-bind (page copy-p validated-p)
         (cond
           (replacement (replacement-read-page replacement block))
-          ((not *wal-ready*) (buf-read-clean-page handle relfilenode block fork))
+          ((not *wal-ready*) (buf-read-clean-page handle relfilenode block fork scratch))
           (t
            (with-wal-page-state-lock
              (let* ((key (wal-page-key relfilenode block fork))
@@ -234,7 +238,7 @@ copy instead.  Acquisition does not hold a lock across the caller's use."
                  ((wal-dirty-reference-p reference)
                   (wal-dirty-read-reference key reference))
                  (reference (values reference t))
-                 (t (buf-read-clean-page handle relfilenode block fork)))))))
+                 (t (buf-read-clean-page handle relfilenode block fork scratch)))))))
       (setf page (if copy-p (copy-seq page) page)
             (buf-page-handle-page handle) page)
       (if validated-p page (buf-verify-page page relfilenode block fork)))))

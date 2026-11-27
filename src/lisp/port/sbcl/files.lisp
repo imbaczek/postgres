@@ -353,10 +353,10 @@ callers needing a coherent view across publications must compare control images.
   (let ((len (file-length stream)))
     (floor len +blcksz+)))
 
-(defun read-page (stream block)
-  "Return the page vector for BLOCK, or NIL if the block does not exist."
-  (let ((buf (make-array +blcksz+ :element-type '(unsigned-byte 8)
-                                  :initial-element 0)))
+(defun read-page (stream block &optional scratch)
+  "Read BLOCK into SCRATCH or a fresh page. Return NIL on a short read."
+  (let ((buf (or scratch (make-array +blcksz+ :element-type '(unsigned-byte 8)))))
+    (assert (= (length buf) +blcksz+))
     (file-position stream (* block +blcksz+))
     (let ((n (read-sequence buf stream)))
       (if (< n +blcksz+)

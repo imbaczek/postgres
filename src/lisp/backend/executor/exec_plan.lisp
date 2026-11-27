@@ -2,6 +2,14 @@
 
 (in-package #:pg)
 
+(defstruct hash-join-stats
+  "Cumulative work across node loops and the largest charged build block."
+  (candidates 0)
+  (spill-batches 0)
+  (build-blocks 0)
+  (peak-build-bytes 0)
+  key-probes)
+
 (defstruct plan-node-metadata
   estimated-rows
   estimated-cost
@@ -10,6 +18,7 @@
   (filtered-row-count 0)
   resources
   sort-methods
+  hash-join-stats
   (actual-loops 0)
   (actual-startup-time-ticks 0)
   (actual-total-time-ticks 0)
@@ -161,7 +170,8 @@ physical two-way nested loop can apply a supported integer equality at the join.
               (list (make-select-scan-path :kind :seq-scan)))
              ((null (getf prepared :joins))
               (list (with-write-lock
-                      (choose-select-scan-path table (getf prepared :where)))))
+                      (choose-ordered-limit-scan-path
+                       table prepared (choose-select-scan-path table (getf prepared :where))))))
              (t (choose-source-order-select-paths prepared))))
          (seq-paths (loop repeat (length relations)
                           collect (make-select-scan-path :kind :seq-scan)))
@@ -182,16 +192,126 @@ physical two-way nested loop can apply a supported integer equality at the join.
              (getf relation (if physical-p :subquery-physical :subquery-logical))))
       ((not physical-p) (list :scan relation-index (pg-class-oid table)))
       ((eq (select-scan-path-kind path) :index-scan)
-       (list :index-scan relation-index (pg-class-oid table)
-             (pg-index-oid (select-scan-path-index path))
-             (select-scan-path-qual path) (select-scan-path-key path)
-             (select-scan-path-parameter-expr path)))
+       (let ((range (select-scan-path-range path)))
+         (list* :index-scan relation-index (pg-class-oid table)
+                (pg-index-oid (select-scan-path-index path))
+                (select-scan-path-qual path) (select-scan-path-key path)
+                (select-scan-path-parameter-expr path)
+                (when range
+                  (list (if (select-index-range-backward-p range) :backward :forward))))))
       (t (list :seq-scan relation-index (pg-class-oid table))))))
+
+(defun hash-join-key-slots (join)
+  "Extract bare equijoin keys and indicate whether they cover the full qualifier."
+  (let ((width (getf join :left-width))
+        (right-width (getf join :right-width))
+        (terms (where-conjuncts (getf join :qual)))
+        (left nil) (right nil) (types nil))
+    (dolist (qual terms)
+      (multiple-value-bind (a b equality-p) (equality-column-references qual)
+        (when (and equality-p (eq (expr-type a) (expr-type b))
+                   (hash-join-key-type-p (expr-type a)))
+          (when (> (second a) (second b)) (rotatef a b))
+          (when (and (<= 1 (second a) width)
+                     (< width (second b) (1+ (+ width right-width))))
+            (push (1- (second a)) left)
+            (push (- (second b) width 1) right)
+            (push (expr-type a) types)))))
+    (when types
+      (let ((covered-p (= (length types) (length terms))))
+        (values (list (coerce (nreverse left) 'vector)
+                      (coerce (nreverse right) 'vector)
+                      (coerce (nreverse types) 'vector))
+                covered-p)))))
+
+(defconstant +hash-join-entry-overhead-bytes+ 112)
+
+(defun estimate-hash-build-bytes (table rows)
+  "Estimate retained SQL row bytes without fetching or detoasting tuples."
+  (let* ((statistics (pg-class-statistics table))
+         (width (or (and statistics (pg-table-statistics-average-tuple-bytes statistics))
+                    (ceiling (* +blcksz+ (table-page-estimate table)) (max 1 rows))))
+         (toast (pg-class-toast table)))
+    ;; Charge the hash entry, record and row-vector overhead, and one relation's
+    ;; origin and presence. Heap and TOAST bytes approximate decoded values,
+    ;; which can be larger for compressed or boxed data.
+    (+ (* rows (+ width +hash-join-entry-overhead-bytes+ 64 64 16))
+       (if toast (* +blcksz+ (buf-nblocks (pg-toast-relfilenode toast))) 0))))
+
+(defun hash-join-streaming-limit (prepared)
+  "Return an early row demand when no upper operator consumes all join rows."
+  (let ((limit (getf prepared :limit)))
+    (when (and (typep limit '(integer 0))
+               (not (or (getf prepared :order) (getf prepared :where)
+                        (getf prepared :aggregate-p) (getf prepared :distinct)
+                        (getf prepared :has-having) (getf prepared :windows)
+                        (getf prepared :set-functions))))
+      limit)))
+
+(defun hash-join-estimated-spill-pages (build-bytes left-bytes right-bytes preserve-probe-p)
+  "Estimate sequential spill work when the retained build exceeds work_mem."
+  (when (> build-bytes
+           (hash-join-initial-build-memory (effective-query-work-memory-bytes) preserve-probe-p))
+    (ceiling (+ left-bytes right-bytes) +blcksz+)))
+
+(defun prefer-streaming-nested-loop-p (prepared join left right relations spill-pages left-rows right-rows)
+  "Compare a lazy nested loop's first requested rows with spill startup.
+Use a simple equality with statistics so the estimate has a match rate."
+  (let* ((limit (and spill-pages (eq (getf join :type) :inner)
+                     (hash-join-streaming-limit prepared)))
+         (selectivity (and limit (explain-equality-join-selectivity join left right relations))))
+    (when (and selectivity (plusp selectivity))
+      (let ((candidates (/ limit selectivity)))
+        ;; Charge both full scans to both paths. The lazy loop can stop
+        ;; inside its first materialization, before hashing or spill writes.
+        (and (< candidates (* left-rows right-rows))
+             (< (* 0.0225d0 candidates) (+ spill-pages (* 0.02d0 (+ left-rows right-rows)))))))))
+
+(defun select-two-table-hash-input (relations joins paths prepared)
+  "Choose a two-way hash join when full scans make repeated probing costly."
+  (let ((join (first joins)))
+    (when (and (= (length relations) (length paths) 2) (null (rest joins))
+               (member (getf join :type) '(:inner :left :right :full))
+               (not (getf join :lateral-dependent))
+               (every (lambda (relation)
+                        (and (getf relation :table) (not (getf relation :virtual-p))
+                             (not (getf relation :row-source))
+                             (not (getf relation :lateral-dependent))))
+                      relations)
+               (every (lambda (path) (eq (select-scan-path-kind path) :seq-scan)) paths)
+               (not (analyzed-expression-volatile-p (getf join :qual))))
+      (multiple-value-bind (keys covered-p) (hash-join-key-slots join)
+        (when keys
+          (with-write-lock
+            (let ((left (getf (first relations) :table))
+                  (right (getf (second relations) :table)))
+              (ensure-current-table left)
+              (ensure-current-table right)
+              (let ((left-rows (table-row-estimate left))
+                    (right-rows (table-row-estimate right)))
+                (when (> (* left-rows right-rows) (* 64 (+ left-rows right-rows)))
+                  (let* ((left-bytes (estimate-hash-build-bytes left left-rows))
+                         (right-bytes (estimate-hash-build-bytes right right-rows))
+                         (build-left-p (< left-bytes right-bytes))
+                         (preserve-probe-p (member (getf join :type)
+                                                   (if build-left-p '(:right :full) '(:left :full))))
+                         (spill-pages (hash-join-estimated-spill-pages (min left-bytes right-bytes)
+                                                                       left-bytes right-bytes preserve-probe-p))
+                         (left-node (select-scan-plan-form 0 (first relations) (first paths) t))
+                         (right-node (select-scan-plan-form 1 (second relations) (second paths) t)))
+                    (unless (prefer-streaming-nested-loop-p prepared join left-node right-node relations
+                                                            spill-pages left-rows right-rows)
+                      (list :hash-join (list* :hash-keys keys :hash-qual-covered-p covered-p
+                                              :build-left-p build-left-p
+                                              :hash-spill-pages spill-pages join)
+                            left-node right-node))))))))))))
 
 (defun select-plan-input-form (prepared physical-p paths)
   (let* ((relations (getf prepared :relations))
          (joins (getf prepared :joins))
-         (join-order (getf prepared :join-order)))
+         (join-order (getf prepared :join-order))
+         (hash-input (when physical-p (select-two-table-hash-input relations joins paths prepared))))
+    (when hash-input (return-from select-plan-input-form hash-input))
     (if (null relations)
         '(:result)
         (if join-order
@@ -377,7 +497,7 @@ sorting and adjacent equality. The remaining key order controls sort priority."
          (degenerate-having-p (and (getf prepared :has-having)
                                    (not (getf prepared :group-keys))
                                    (zerop (getf prepared :aggregate-count 0)))))
-    (when (getf prepared :join-order)
+    (when (and (getf prepared :join-order) (not (eq (first input) :hash-join)))
       (let ((join-qual (select-reordered-join-qual prepared)))
         (when join-qual
           ;; A false or NULL constant rejects every joined row. Keep the filter
@@ -431,7 +551,11 @@ sorting and adjacent equality. The remaining key order controls sort priority."
       (setf input (list (select-distinct-plan-kind (getf prepared :targets) physical-p)
                         (select-distinct-keys prepared)
                         input)))
-    (finish-select-plan-tree input prepared physical-p)))
+    (finish-select-plan-tree
+     input prepared physical-p
+     (and physical-p (null (rest paths))
+          (let ((range (and (first paths) (select-scan-path-range (first paths)))))
+            (and range (select-index-range-ordered-p range)))))))
 
 (defun query-plan-node-shape (node)
   "Return NODE's child layout and whether slot two is a relation handle."
@@ -445,7 +569,7 @@ sorting and adjacent equality. The remaining key order controls sort priority."
          :distinct :hash-distinct :sorted-distinct :project-set)
        :third)
       ((:top-n :aggregate :hash-aggregate :sorted-aggregate) :fourth)
-      ((:join :nested-loop-join :recursive-union) :pair)
+      ((:join :nested-loop-join :hash-join :recursive-union) :pair)
       (:append :append))))
 
 (defun query-plan-relation-node-p (node)
@@ -527,7 +651,7 @@ Heap bytes per row approximate the payload for a direct scan or
 column-only projection. Estimate run counts from retained record bytes and
 charge sequential I/O for the payload on each estimated merge pass."
   (let* ((tuples (max 2 rows))
-         (memory (max 1 *query-work-memory-bytes*))
+         (memory (max 1 (effective-query-work-memory-bytes)))
          (heap-width (explain-heap-row-width table))
          (record-width (+ heap-width (query-spill-record-size #(0 #() #()))))
          (input-bytes (* rows record-width))
@@ -616,6 +740,34 @@ comparison, and output tuple. A required internal sort is blocking."
                       (- 1.0d0 (pg-column-statistics-null-fraction right-stats)))
                    (max 1 (pg-column-statistics-distinct-count left-stats)
                         (pg-column-statistics-distinct-count right-stats))))))))))
+
+(defun explain-hash-join-estimates (node outer inner relations)
+  "Estimate input, hash and match work, including spill before the first output."
+  (let* ((join (second node))
+         (outer-rows (plan-node-metadata-estimated-rows outer))
+         (inner-rows (plan-node-metadata-estimated-rows inner))
+         (outer-cost (plan-node-metadata-estimated-cost outer))
+         (inner-cost (plan-node-metadata-estimated-cost inner)))
+    (when (and outer-rows inner-rows)
+      (let* ((selectivity (or (explain-equality-join-selectivity
+                               join (third node) (fourth node) relations) 0.01d0))
+             (rows (max (case (getf join :type)
+                          (:left outer-rows) (:right inner-rows) (:full (max outer-rows inner-rows)) (t 1))
+                        (round (* outer-rows inner-rows selectivity))))
+             (spill-pages (getf join :hash-spill-pages)))
+        (if (and outer-cost inner-cost)
+            (let* ((input-cost (+ outer-cost inner-cost (* 0.02d0 (+ outer-rows inner-rows))))
+                   (build-left-p (getf join :build-left-p))
+                   (probe (if build-left-p inner outer))
+                   (build-cost (if build-left-p outer-cost inner-cost))
+                   (build-rows (if build-left-p outer-rows inner-rows)))
+              (values rows
+                      (if spill-pages
+                          (+ input-cost spill-pages)
+                          (+ build-cost (* 0.02d0 build-rows)
+                             (or (plan-node-metadata-estimated-startup-cost probe) 0.0d0)))
+                      (+ input-cost (* 2 (or spill-pages 0)) (* 0.01d0 rows))))
+            rows)))))
 
 (defun explain-nested-loop-estimates (node outer inner relations)
   "Estimate independent Cartesian and simple integer equality nested loops."
@@ -719,7 +871,7 @@ afterward. Assume uniform groups and use heap width as a spill-volume proxy."
                      (loop for value in (list (- (ash 1 63)) +null+)
                            maximize (hash-aggregate-entry-size
                                      (list (sql-group-value-key value type)) (list value) nil)))
-                   (capacity (max 1 (floor *query-work-memory-bytes* entry-size)))
+                   (capacity (max 1 (floor (effective-query-work-memory-bytes) entry-size)))
                    (table (explain-sort-input-table (fourth node) relations)))
               (multiple-value-bind (spill-start spill-total)
                   (explain-hash-overflow-cost rows groups capacity table)
@@ -783,6 +935,9 @@ costs are modeled. Nodes with unmodeled work do not publish a total cost."
                  (:filter
                   (explain-scan-filter-estimates
                    node rows startup total (getf (query-plan-prepared plan) :relations)))
+                 (:hash-join
+                  (explain-hash-join-estimates node input (second children)
+                                               (getf (query-plan-prepared plan) :relations)))
                  (:nested-loop-join
                   (explain-nested-loop-estimates node input (second children)
                                                  (getf (query-plan-prepared plan) :relations)))
@@ -870,19 +1025,21 @@ costs are modeled. Nodes with unmodeled work do not publish a total cost."
                       (plan-node-metadata-estimated-cost metadata) cost
                       (plan-node-metadata-estimated-startup-cost metadata) startup)))
             (setf (plan-node-metadata-selection-rule metadata)
-                  (if (eq (select-scan-path-kind path) :index-scan)
-                      (if (select-scan-path-parameter-expr path)
-                          :parameterized-equality-index :equality-index)
-                      :sequential-fallback))))
+                  (cond ((eq (select-scan-path-kind path) :seq-scan) :sequential-fallback)
+                        ((select-scan-path-range path)
+                         (if (select-index-range-ordered-p (select-scan-path-range path))
+                             :ordered-index :range-index))
+                        ((select-scan-path-parameter-expr path) :parameterized-equality-index)
+                        (t :equality-index)))))
         (setf (gethash node (query-plan-metadata plan)) metadata)))
     (when *explain-estimates-p* (propagate-explain-plan-estimates plan))
     plan))
 
-(defun finish-select-plan-tree (input prepared physical-p)
+(defun finish-select-plan-tree (input prepared physical-p &optional ordered-input-p)
   "Add final ordering and limit nodes to INPUT.
 For sorted DISTINCT, omit ORDER BY keys pruned as constant from the final sort
 as well. A physical ordered limit can use the bounded top-N node."
-  (let ((order (getf prepared :order)))
+  (let ((order (unless ordered-input-p (getf prepared :order))))
     (when (and (getf prepared :distinct)
                (eq (select-distinct-plan-kind (getf prepared :targets) t) :sorted-distinct))
       (let ((keys (select-distinct-keys prepared)))
@@ -895,7 +1052,8 @@ as well. A physical ordered limit can use the bounded top-N node."
       (setf input
             (if (and physical-p order)
                 (list :top-n order (getf prepared :limit) (third input))
-                (list :limit (getf prepared :limit) input))))
+                (list* :limit (getf prepared :limit) input
+                       (when ordered-input-p (list (getf prepared :order)))))))
     input))
 
 (defun plan-prepared-union (prepared)
@@ -1127,6 +1285,7 @@ as well. A physical ordered limit can use the bounded top-N node."
                               :index index
                               :qual (fifth node)
                               :key (sixth node)
+                              :range (select-scan-path-range path)
                               :parameter-expr (physical-index-scan-parameter node)
                               :selectivity
                               (select-scan-path-selectivity path))))))
@@ -1181,11 +1340,11 @@ if a registered TOAST index is missing."
   (loop for entry in order
         for position from 0
         for comparison =
-                       (order-compare (query-sort-item-key left entry position)
-                                      (query-sort-item-key right entry position))
-        unless (zerop comparison)
-          return (if (cdr entry) (> comparison 0) (< comparison 0))
-        finally (return (< (query-sort-item-sequence left) (query-sort-item-sequence right)))))
+                       (order-key-compare (query-sort-item-key left entry position)
+                                          (query-sort-item-key right entry position)
+                                          (cdr entry))
+        unless (zerop comparison) return (minusp comparison)
+          finally (return (< (query-sort-item-sequence left) (query-sort-item-sequence right)))))
 
 (defun write-query-sort-run (items order)
   "Write a stable sorted run and return its path and leading key bounds.
@@ -1385,7 +1544,7 @@ iterator. In-memory arena items are copied out before the arena is destroyed."
          (projected-keys-p (and projected-only-p
                                 (every (lambda (entry) (eq (caar entry) :sort-output)) order)))
          (runs nil)
-         (memory-limit (max 1 *query-work-memory-bytes*))
+         (memory-limit (max 1 (effective-query-work-memory-bytes)))
          (top-n (when limit
                   (make-select-top-n-collector
                    limit order (lambda (item) (query-spill-record-size (top-n-spill-item item)))))))
@@ -1455,7 +1614,7 @@ iterator. In-memory arena items are copied out before the arena is destroyed."
                  (progn
                    (flush-run)
                    (let* ((ordered (nreverse runs))
-                          (disjoint (disjoint-query-sort-runs ordered (cdar order))))
+                          (disjoint (disjoint-query-sort-runs ordered (order-descending-p (cdar order)))))
                      (if disjoint
                          (values (make-disjoint-query-sort-iterator disjoint) :external-runs)
                          (let ((paths (mapcar #'first ordered))
@@ -1773,7 +1932,7 @@ returned overflow file and processes it after the in-memory groups."
       (write-char #\] out))))
 
 (defun make-aggregate-transition-states (descriptors)
-  (let ((budget (max 1 (floor *query-work-memory-bytes* (max 1 (length descriptors))))))
+  (let ((budget (max 1 (floor (effective-query-work-memory-bytes) (max 1 (length descriptors))))))
     (map 'vector (lambda (descriptor)
                    (ecase (getf descriptor :kind)
                      ((:count :count-expr) 0)
@@ -1980,7 +2139,7 @@ ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
     ((:sorted-aggregate :hash-aggregate)
      (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
     (:subquery-scan (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen))
-    (:nested-loop-join
+    ((:nested-loop-join :hash-join)
      (and (simple-datum-origin-plan-p (third node) relations iterator-p worktable seen)
           (simple-datum-origin-plan-p (fourth node) relations iterator-p worktable seen)))
     (:with-ctes
@@ -2332,30 +2491,35 @@ projection or filter forms fall back to ordinary full materialization."
     (nreverse children)))
 
 (defun reconcile-query-plan-access-paths (plan registered-relations)
-  "Keep the physical tree and metadata in sync with registered read paths."
-  (labels ((visit (node)
+  "Keep the physical tree in sync with admitted access paths and ordering guarantees."
+  (labels ((downgrade-scan (node)
+             (let* ((relation (physical-scan-relation node registered-relations))
+                    (path (getf relation :path))
+                    (table (getf relation :table))
+                    (index (and (eq (select-scan-path-kind path) :index-scan)
+                                (select-scan-path-index path))))
+               (unless (and index
+                            (= (pg-index-oid index) (fourth node))
+                            (= (pg-index-table-oid index) (pg-class-oid table)))
+                 (setf (first node) :seq-scan
+                       (cdddr node) nil)
+                 (let ((metadata (gethash node (query-plan-metadata plan))))
+                   (when metadata
+                     (setf (plan-node-metadata-selection-rule metadata) :sequential-fallback)))
+                 t)))
+           (visit (node)
              (when (consp node)
-               (when (eq (first node) :index-scan)
-                 (let* ((relation (physical-scan-relation
-                                   node registered-relations))
-                        (path (getf relation :path))
-                        (table (getf relation :table))
-                        (index (and (eq (select-scan-path-kind path) :index-scan)
-                                    (select-scan-path-index path))))
-                   (unless (and index
-                                (= (pg-index-oid index) (fourth node))
-                                (= (pg-index-table-oid index)
-                                   (pg-class-oid table)))
-                     ;; Revalidation found that DDL replaced the planned index.
-                     (setf (first node) :seq-scan
-                           (cdddr node) nil)
-                     (let ((metadata (gethash node
-                                              (query-plan-metadata plan))))
-                       (when metadata
-                         (setf (plan-node-metadata-selection-rule metadata)
-                               :sequential-fallback))))))
-               (dolist (child (physical-plan-node-children node))
-                 (visit child)))))
+               (if (eq (first node) :index-scan)
+                   (downgrade-scan node)
+                   (let ((downgraded-p nil))
+                     (dolist (child (physical-plan-node-children node))
+                       (when (visit child) (setf downgraded-p t)))
+                     (when (and downgraded-p (eq (first node) :limit) (fourth node))
+                       ;; This LIMIT was built without a Sort because its input
+                       ;; was ordered by the index. Restore top-N after DDL.
+                       (setf (first node) :top-n
+                             (rest node) (list (fourth node) (second node) (third node))))
+                     downgraded-p)))))
     (visit (query-plan-physical plan)))
   plan)
 
@@ -2401,6 +2565,7 @@ projection or filter forms fall back to ordinary full materialization."
     (:sorted-aggregate "GroupAggregate")
     (:hash-distinct "HashDistinct")
     (:sorted-distinct "Unique")
+    (:hash-join (format nil "Hash ~a Join" (string-capitalize (getf (second node) :type))))
     (:nested-loop-join
      (format nil "Nested Loop ~a Join"
              (case (getf (second node) :type)
@@ -2467,7 +2632,7 @@ projection or filter forms fall back to ordinary full materialization."
 (defun explain-filter-count-label (node)
   (case (first node)
     (:filter "Rows Removed by Filter")
-    (:nested-loop-join "Rows Removed by Join Filter")))
+    ((:nested-loop-join :hash-join) "Rows Removed by Join Filter")))
 
 (defun write-explain-resource-usage (stream usage json-p)
   "Write native storage and spill counters at a query or plan-node boundary."
@@ -2698,6 +2863,8 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                  "Node Type" (if index-p "Index Scan" "Seq Scan")
                  "Relation Name" (sql-typed-to-json :text (pg-class-name table)))
          (when index-p
+           (format stream ",~s:~s" "Scan Direction"
+                   (if (eq (eighth node) :backward) "Backward" "Forward"))
            (format stream ",~s:~a" "Index Name"
                    (sql-typed-to-json
                     :text (pg-index-name (select-scan-path-index
@@ -2715,6 +2882,9 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
            (format stream ",~s:~a" "CTE Name" (sql-typed-to-json :text (sql-cte-name cte))))
          (when alias
            (format stream ",~s:~a" "Alias" (sql-typed-to-json :text alias)))))
+      (:hash-join (format stream "~s:~s,~s:~s,~s:~s" "Node Type" "Hash Join" "Join Type"
+                          (string-capitalize (getf (second node) :type))
+                          "Build Side" (if (getf (second node) :build-left-p) "Left" "Right")))
       (:nested-loop-join
        (let ((join-type (getf (second node) :type)))
          (format stream "~s:~s,~s:~s" "Node Type" "Nested Loop" "Join Type"
@@ -2761,6 +2931,16 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
                      (write-explain-sort-methods stream (plan-node-metadata-sort-methods metadata) t))
                    (when (and metadata (plan-node-metadata-resources metadata))
                      (write-explain-resource-usage stream (plan-node-metadata-resources metadata) t))
+                   (when (and metadata (plan-node-metadata-hash-join-stats metadata))
+                     (let ((stats (plan-node-metadata-hash-join-stats metadata)))
+                       (let ((probes (hash-join-stats-key-probes stats)))
+                         (format stream ",~s:~d"
+                                 (if probes "Native Hash Key Probes" "Native Hash Candidates")
+                                 (or probes (hash-join-stats-candidates stats))))
+                       (format stream ",~s:~d,~s:~d,~s:~d"
+                               "Native Hash Spill Batches" (hash-join-stats-spill-batches stats)
+                               "Native Hash Build Blocks" (hash-join-stats-build-blocks stats)
+                               "Native Hash Peak Build Bytes" (hash-join-stats-peak-build-bytes stats))))
                    (when timing-p
                      (format stream ",~s:~,3f,~s:~,3f"
                              "Actual Startup Time"

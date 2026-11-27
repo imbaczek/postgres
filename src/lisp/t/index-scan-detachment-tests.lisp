@@ -172,6 +172,41 @@
          (ok (not (probe-file path)))
          (ok (null (uiop:directory-files root)))))))
 
+(deftest backward-range-detachment-preserves-candidates-across-a-writer
+    (call-with-fpw-wal-fixture
+     (lambda ()
+       (call-with-detachment-test-state
+        (lambda (root)
+          (let ((node 901) (seen nil))
+            (flet ((key (value) (pg::encode-index-key (list 7 value) '(:int4 :int4))))
+              (unwind-protect
+                   (progn
+                     (pg::btree-init node)
+                     (dotimes (value 600)
+                       (pg::btree-insert node (key value) value 1))
+                     (let ((lower (pg::make-btree-scan-bound :prefix (key 40)))
+                           (upper (pg::make-btree-scan-bound :prefix (key 560) :inclusive-p nil)))
+                       (pg::with-live-operation
+                         (pg::call-with-btree-relation-read-lease
+                          node
+                          (lambda (lease)
+                            (let ((cursor (pg::open-btree-scan-cursor-unlocked node lower upper
+                                                                               :backward-p t)))
+                              (pg::call-with-select-index-cursor
+                               cursor lease
+                               (lambda (tid)
+                                 (push (car tid) seen)
+                                 (when (= (car tid) 559)
+                                   (pg::call-with-live-operation-parked
+                                    (lambda ()
+                                      (ok (not (pg::btree-read-lease-active-p lease)))
+                                      (pg::btree-insert node (key 100) 999 1))))
+                                 nil)))))))
+                     (ok (equal (nreverse seen) (loop for value from 559 downto 40 collect value)))
+                     (ok (equal (pg::btree-search node (key 100)) '((100 . 1) (999 . 1))))
+                     (ok (null (uiop:directory-files root))))
+                (pg::smgr-close-all)))))))))
+
 (deftest real-plan-index-lease-is-released-with-its-detached-cursor
     (call-with-detachment-test-state
      (lambda (root)

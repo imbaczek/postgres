@@ -1561,6 +1561,947 @@ instrumentation.
   cover the two frontend activity publication sites and exclude
   timing samples. They do not measure lock hold durations.
 
+## P03 — Composite range and ordered B-tree scans
+
+The range cursor preserves the existing index format and equality cursor. It
+uses encoded leading-key prefixes with inclusive or exclusive endpoints and
+traverses parent frames in either direction under the existing index lease.
+SELECT applies the original filter after fetching visible heap tuples. An
+ordered LIMIT can omit the sort when the leading equality constraints and
+the physical key order prove the requested direction and NULL placement.
+
+The localhost wire smoke test is `python3 src/lisp/t/btree-range.py`.
+It covers composite bounds, empty results, ordered LIMIT, NULL placement,
+portal suspension, and rebinding. The allocation comparison used three warm
+runs with 16,384 rows and 100 ordered LIMIT queries per run.
+
+```sh
+python3 src/lisp/t/workload-memory.py --case composite_range --case composite_range_seq \
+    --rows 16384 --repeat 100 --runs 3 --warmup
+```
+
+| Path | Allocated bytes | Peak RSS bytes | Median SQL latency |
+| --- | ---: | ---: | ---: |
+| Index with eager leaf decoding | 8,642,240 | 114,536,448 | 0.486 ms |
+| Index with leaf images and on-demand decoding | 7,155,280 | 113,049,600 | 0.451 ms |
+| Sequential reference | 799,807,840 | 909,606,912 | 12.577 ms |
+
+Three warm runs at 131,072 rows with 20 ordered LIMIT queries each measured
+1,841,696 bytes allocated and 0.500 ms median query latency with the index.
+The sequential reference allocated 1,937,763,056 bytes at 89.358 ms median
+latency. Peak RSS was 111,001,600 and 1,004,949,504 bytes respectively.
+
+One warm run at 1,000,000 rows with three ordered LIMIT queries allocated
+353,280 bytes with the index and 2,216,342,848 bytes for the sequential
+reference. Median query latency was 0.680 ms and 676.746 ms, respectively.
+Peak RSS was 110,612,480 bytes and 1,002,242,048 bytes, respectively.
+
+The wire test also checks results after an immediate stop and restart.
+With `--reference-bin`, it compares 144 queries with C PostgreSQL, including
+keys with 700 duplicates at each endpoint, crossed bounds, and both directions.
+The physical detachment test confirms that a parked backward range releases
+its lease, permits a write, and resumes its original candidate stream. A Rove
+regression executes a stale ordered plan after replacing its index path and
+checks the top-N results.
+
+The skewed range benchmark gives one tenant half the rows and spreads
+the remainder over 63 smaller tenants. It checks the same sorted query
+at 0.01%, 0.1%, 1%, 10%, and 50% selectivity and LIMIT 10, 100, and
+10,000. The sequential, tenant-equality, and composite-index cases use
+one data set. The benchmark records the unforced plan before measuring
+each controlled path, so a cost-based sequential choice remains visible.
+The diagnostic pass counts candidate TIDs and distinct heap blocks in
+the index stream. The sequential case visits all heap blocks. The
+warm-cache allocation and time samples follow the diagnostic pass
+and run with diagnostic counting disabled.
+
+```sh
+python3 src/lisp/t/btree-range-memory.py
+python3 src/lisp/t/btree-range-memory.py --writer-only
+```
+
+All 45 comparisons passed with 1,000,000 seeded rows. The planner
+naturally selected the ordered composite index in all 15 composite
+cases and preferred the sequential path to the tenant-only index.
+The forced equality measurements therefore describe the old access
+path as a control.
+
+| Selectivity and limit | Path | Candidate TIDs | Heap blocks | Rows removed | Allocation MB | Time ms |
+|---|---|---:|---:|---:|---:|---:|
+| 0.01%, 10 | Sequential | — | 4,425 | 999,900 | 202.58 | 625 |
+| 0.01%, 10 | Tenant equality | 500,000 | 4,425 | 499,900 | 358.72 | 1,010 |
+| 0.01%, 10 | Composite | 10 | 1 | 0 | 0.16 | 0.8 |
+| 0.01%, 10,000 | Composite | 100 | 2 | 0 | 0.23 | 1.4 |
+| 50%, 10,000 | Sequential | — | 4,425 | 500,000 | 288.46 | 963 |
+| 50%, 10,000 | Tenant equality | 500,000 | 4,425 | 0 | 444.58 | 1,548 |
+| 50%, 10,000 | Composite | 10,000 | 89 | 0 | 6.17 | 38 |
+
+The equality allocation check used three warm samples of 64,000
+single-column point lookups over 16,384 rows. The pre-roadmap
+baseline at `280ecd87618` allocated 4,325,832,832 bytes at the
+median. The roadmap worktree allocated 4,340,205,632 bytes before
+the planner skipped redundant range comparisons and 4,329,950,688
+bytes afterward. The change saves about 160 bytes per lookup and
+leaves the measured worktree allocation 0.10% above the baseline.
+Range terms and composite equality prefixes still produce range
+candidates.
+
+The range cursor now returns a TID directly from an accepted plain
+leaf entry because the executor only needs its block and slot.
+Decoded and packed keys share the bound comparison. With 100 warmed
+LIMIT 10 probes over 16,384 rows, the median of three samples moved
+from 7,101,296 to 7,035,232 allocated bytes, about 66 bytes saved per
+returned candidate.
+
+The writer probe pauses each reader at its first input row, aligns a
+same-table insert, and releases the reader. It reports acquisition
+wait and the portion after the reader is released separately. At
+1,000,000 rows with 50% selectivity and LIMIT 10,000, the sequential
+writer finished in 8.2 ms while the reader was still paused. The
+equality writer waited 1,220 ms, with 1,200 ms after release, and
+the bounded writer waited 44 ms, with 24 ms after release. The
+insert is rolled back at the end of each comparison.
+
+The restart fixture builds an index before inserting 3,500 rows,
+updates indexed keys, deletes rows and runs VACUUM. Forward and
+backward bounded scans agree with sorted heap scans and the fixture's
+expected values before and after immediate restart.
+The 16,000-row timestamp fixture verifies that the ordered composite
+range uses a bounded index scan without a sort and returns the expected
+100 rows.
+
+## P04 — Partial and expression indexes
+
+CREATE INDEX parsing preserves key order across column names, function
+calls and parenthesized expressions. It keeps WHERE as a separate AST.
+Ordinary CREATE INDEX can publish these definitions using the transactional
+catalog. CREATE INDEX CONCURRENTLY uses the same evaluator for its build,
+writer maintenance, and validation phases.
+
+In a warmed SBCL REPL, 10,000 parses allocated 20.9 MB for a two-column
+definition and 34.0 MB for a two-key definition with a qualified function
+and predicate. Neither workload increased live Lisp data after full GC.
+
+The definition analyzer resolves result types and typmods, requires a
+Boolean predicate, and collects key and predicate column dependencies.
+The initial volatility checks reuse the scalar builtin registry.
+PostgreSQL C and the analyzer agree on the mixed timestamp-to-date
+definition and six invalid definitions, including a session-dependent
+timestamptz-to-date cast. After keeping the per-expression visitor
+stack-local, three warmed runs of 10,000 analyses each allocated 16.9 MB
+with no increase in post-GC live Lisp data.
+
+The catalog codec persists ordered expression keys, the predicate and
+referenced attribute numbers. Ordinary definitions retain the legacy
+encoding. The shared row evaluator admits only SQL TRUE and evaluates
+keys in definition order. In 10,000 operations, plain and expression
+catalog round trips allocated 5.4 MB and 22.2 MB respectively. Plain and
+expression row evaluations allocated 0.29 MB and 0.75 MB respectively.
+
+Index builds and DML maintenance use the same predicate and key evaluator.
+DML computes expression keys before heap insertion and reuses them after
+uniqueness waits. UPDATE includes predicate and expression inputs in its
+TOAST demand. For 10,000 row preparations the new step allocated zero
+bytes for plain indexes, 2.46 MB for qualifying expression rows and
+0.07 MB for excluded rows.
+
+Wire tests cover build, predicate transitions, uniqueness, rollback, and
+restart, including a numeric-array predicate. Targetless ON CONFLICT
+checks qualifying unique keys. Unconditional conflict inference excludes
+partial and expression definitions. Single-table planning can use an
+equality probe on all index keys, including mixed column/expression keys,
+after proving the predicate from top-level query conjuncts. Proofs cover
+exact matches, strict column comparisons implying IS NOT NULL, and
+same-type integer or temporal bounds. Proven partial indexes over plain
+columns can also supply bounded ranges and ordered LIMIT scans.
+
+On a 1,200-row table, 100 composite expression lookups allocated 6.1 MB
+and took 38 ms with the index, versus 34.1 MB and 121 ms after dropping it.
+Planning the same statements allocated 2.6 MB and 2.2 MB respectively.
+
+Typed parameters can supply probe values for composite expression
+indexes once independent query conjuncts prove the partial predicate.
+The wire test holds a scan open, verifies DROP INDEX waits, then
+replaces the index with a different predicate and rebinds the same
+prepared statement. Over 100 prepared lookups, the indexed path
+allocated 5.6 MB and took 39 ms. Dropping the index raised this to
+34.8 MB and 122 ms.
+
+On a 1,200-row table with 1% predicate selectivity, 100 descending
+LIMIT queries allocated 5.4 MB and took 38 ms through the partial
+index. After dropping it, they allocated 19.3 MB and took 92 ms.
+The wire suite also checks that an excluded predicate falls back and
+returns the non-indexed rows.
+
+For 2,000 rows at 1%, 10% and 90% selectivity, build allocations were
+2.6 MB, 11.8 MB and 151.2 MB. The indexes occupied 2, 4 and 21 blocks
+after updating all keys, compared with 21 blocks for the full expression
+index. For the full index, encoding a single computed key directly
+reduced build allocation from 168.6 MB to 168.3 MB and update allocation
+from 196.8 MB to 196.4 MB.
+
+Concurrent expression and partial builds are qualified for native
+physical storage. SQL tests pause at the unready and ready boundaries,
+apply row changes from another session, and check final uniqueness.
+Only builds with plain keys and no predicate mark their snapshots safe
+for other concurrent builds to ignore. A live standby replayed the
+unready, valid, and dropped catalog states of a partial expression
+index. It also replayed a mixed transaction that created a table and an
+expression index and then inserted and updated rows in the new table.
+
+A native logical subscriber applies standalone ordinary and concurrent
+partial expression index builds and drops. Replay uses the cooked index
+definition shared with bootstrap. The replay test covers predicate
+membership, uniqueness, an `oid8` cast, and a temporal cutoff resolved
+under a different publisher TimeZone. Concurrent creation emits one logical catalog event when
+interest starts during the build. A name collision with `IF NOT EXISTS`
+emits no logical catalog event, including when another DDL command takes
+the name after an ordinary build finishes. The native replication
+suite also sends an INSERT, partial expression index creation, and
+expression-changing UPDATE in one transaction. Both subscribers
+enforce uniqueness for the new key and accept the retired key. A
+second mixed transaction removes the index and its test row.
+
+Across three 2,000-row builds at 10% selectivity, ordinary and concurrent
+creation allocated a median of 6.24 MB and 6.21 MB and took 27 ms and
+39 ms, respectively. Peak RSS was about 109 MB for both and post-GC
+Lisp heap was about 48 MB. Moving the standalone build onto the shared
+catalog publication path reduced ordinary build allocation from 11.0 MB
+to 6.24 MB. The concurrent index still enforced uniqueness after
+immediate restart.
+
+With a live native subscriber, three 200-row builds at 10% selectivity
+allocated a median of 1.38 MB for ordinary creation and 1.89 MB for
+concurrent creation on the source. The subscriber allocated 1.49 MB and
+1.52 MB respectively. Source and subscriber peak RSS was about 105 MB
+in both cases. Median time to observe the valid index on the subscriber
+was 124 ms and 160 ms, including polling.
+
+The 2,000-row logical benchmark initially waited over 90 seconds for
+bootstrap. The native client now sets `TCP_NODELAY` as libpq does.
+Bootstrap completed in 1.96 seconds and allocated 5.86 MB on the
+source and 192.93 MB on the subscriber. Sampled peak RSS was 105 MB
+and 295 MB, with about 48 MB of live Lisp heap on each server after GC.
+In three runs after bootstrap, ordinary and concurrent index creation
+allocated 7.28 MB and 7.57 MB on the source and 7.43 MB and 7.66 MB on
+the subscriber. The logical wire fixture now copies all 2,000 rows
+before exercising ordinary and concurrent index DDL.
+
+The expression-index benchmark seeds 10,000 rows, verifies 20 warm
+point lookups, then inserts 1,000 more rows. It uses the same
+`abs(key)` expression and lookup SQL across sequential, full,
+and partial builds. Build allocation and time include the ordinary
+catalog and WAL publication. Insert WAL numbers are the change
+in durable WAL position.
+
+```sh
+python3 src/lisp/t/expression-index-memory.py
+```
+
+| Index | Index KiB | Build ms | Build allocation MB | Insert WAL KiB | Insert allocation MB |
+|---|---:|---:|---:|---:|---:|
+| Sequential baseline | 0 | — | — | 56.6 | 16.1 |
+| Full expression | 408 | 362 | 224.6 | 120.8 | 46.5 |
+| Partial, 1% | 16 | 38 | 6.3 | 72.6 | 16.5 |
+| Partial, 10% | 48 | 64 | 21.6 | 88.7 | 19.9 |
+| Partial, 90% | 368 | 331 | 200.2 | 120.8 | 43.8 |
+| Partial, 100% control | 408 | 363 | 224.7 | 120.8 | 46.5 |
+
+The indexed lookup reported one native clean-cache hit and removed
+no rows. The sequential plan reported 55 hits and removed 9,999
+rows. Twenty lookups allocated 32.9 MB sequentially,
+1.34 MB with the full index, and 0.95–1.34 MB with the partial
+indexes. Times were 129–136 ms sequentially and 7–9 ms indexed.
+The all-qualifying control holds key count and size fixed. Its build
+allocated about 24 kB more than the corresponding full index build,
+and its insert WAL and allocation matched the full index in this
+sample. The integer predicate added little allocation at equal
+coverage.
+
+Ordinary build, concurrent build, and concurrent validation now
+fetch external columns needed by the predicate first. Rows it
+accepts fetch any remaining key columns and reuse values the
+predicate already read. The build preserves the original
+compression metadata for plain-column keys. The ordering follows
+PostgreSQL C's predicate check before `FormIndexDatum`. The wire test inserts
+a qualifying row and a rejected row between concurrent build and
+validation, then checks TOAST reads and B-tree membership. It also
+verifies that ordinary and concurrent builds store a compressed
+plain key when the predicate reads that same external column.
+
+At 1% coverage over 1,000 rows with external 6,400-byte payloads,
+TOAST fetches fell from 1,000 to 10 per build. Median ordinary build
+allocation fell from 89.0 MB to 2.23 MB and time from 91 ms to
+19 ms. Concurrent build allocation fell from 89.2 MB to 2.37 MB
+and time from 104 ms to 32 ms. Peak RSS fell from about 202 MB to
+112 MB in both modes. Each build produced a 16 KiB index. The
+10,000-row inline control at full coverage still allocated about
+225 MB and produced a 408 KiB index for both full and partial indexes.
+
+```sh
+python3 src/lisp/t/expression-index-memory.py --external
+```
+
+The PostgreSQL C differential checks DDL SQLSTATEs and catalog
+cleanup, NULL membership, predicate transitions, changed keys,
+rollback, targetless and explicit ON CONFLICT, DELETE/VACUUM,
+and a copied table with a rebuilt NULLS NOT DISTINCT index.
+Concurrent qualifying inserts wait for a conflicting transaction,
+then reject on commit or proceed on rollback. A predicate-false
+insert completes while the contender waits. After immediate restart,
+the rebuilt index retains its catalog flags and uniqueness, and an
+aborted index is absent.
+Immediate restarts also cover a built but unpublished partial expression
+index, catalog WAL commit, and key maintenance on both sides of WAL flush.
+The composite date-expression fixture checks its results against PostgreSQL
+C. Using ANALYZE statistics for the plain tenant key reduced allocation in
+20 warmed lookups from 5.83 MB to 1.37 MB and elapsed time from 28 ms to 12 ms
+in a controlled comparison with the former estimate.
+
+```sh
+python3 src/lisp/t/expression-index-differential.py --reference-bin /path/to/postgresql/bin
+```
+
+## P05 — Spilling hash joins
+
+The inner hash-join iterator builds and probes resumable inputs, retains
+duplicate rows and their carriers, and rechecks keys and the residual ON
+predicate. NULL keys never match. Integer, temporal, text and numeric
+keys have matching hash and equality rules, including numeric scale
+normalization and NaN equality.
+
+The admitted resolved domains are `int2`, `int4`, `int8`, `date`,
+`time`, `timestamp`, `timestamptz`, `text`, `varchar`, and
+`numeric`. Integer and temporal keys use integral equality, text keys
+use the executor's string equality, and numeric keys share the
+ANALYZE value hash with the numeric comparator. Other equality domains
+use the available nested-loop paths.
+
+Three warmed 10,000-row inner joins allocated 4.7–4.9 MB and produced
+10,000 matches each. Hashing reads key components directly from row
+vectors, avoiding a temporary composite key per row. Both inputs must
+present keys in the same resolved equality domain.
+
+At the memory boundary the iterator partitions both inputs into eight
+initial batches. An oversized batch that cannot split streams bounded
+build blocks and replays its probe spool for each block. This retains
+all duplicate matches under skew. An oversized build row gets its own
+replay block.
+One decoded row can coexist with a charged block, and a single row can
+exceed the workspace target. Temporary files remain subject to the
+query's temp-file quota.
+Replay releases the initial hash table and sizes a new table for its
+build blocks. The peak build counter covers retained rows and their
+estimated table overhead. Hash spill now uses 512-byte executor buffers
+for each input, writer, and on-disk match map. This replaces SBCL's
+32 KiB per direction, plus its character input cache. The initial build
+reserves space for eight writers. Repartitioning runs without a retained
+build block and opens at most eight writers and one reader. Replay
+reserves two readers and, for probe-preserving joins, a disk match map.
+The reservations include an allowance for stream metadata. Tiny
+internal test budgets exercise the requested row cap with a separate
+fixed buffer allowance.
+Sealed replay now reads records sequentially. In three 100,000-row-per-side
+runs at 64 KiB, removing the redundant seeks reduced median runtime from
+3.22 s to 2.15 s. Median allocation stayed near 428 MB and peak RSS near
+538 MB. All runs returned 100,000 matches.
+The first executor-buffer implementation took a median 5.76 s with
+1 KiB buffers. Reducing these to 512 bytes preserved an existing
+in-memory build case, and the ASCII fast path cut median spill time
+to 4.46 s. The latter runs allocated 430 MB with peak RSS of 539 MB.
+Using typed byte-buffer state reduced the median to 3.06 s. Writing
+disk-only partitions without copying their input rows, and returning
+the rows already owned by the decoder, reduced median allocation to
+324 MB and peak RSS to 434 MB. Median runtime was 3.03 s. The native
+streams reached 2.15 s with their buffers outside the workspace charge.
+With skewed keys and external text, 100,000 probes against 96 build
+rows returned 140,325 matches in every sample. The copy and buffer
+changes reduced the 64 KiB median from 0.93 s to 0.64 s, allocation
+from 142 MB to 114 MB, and peak RSS from 252 MB to 222 MB.
+On a 10,000-by-10,000 integer join, the 4 MiB, 256 KiB and 64 KiB budgets
+all produced 10,000 matches. Allocations were 5.0 MB, 24.6 MB and
+21.1 MB. The two spill runs took 92 ms and 152 ms respectively.
+
+SQL planning can choose a two-table INNER hash join for large sequential
+inputs with bare, same-type equality keys. Selective indexed joins keep
+their nested-loop path. Both simple execution and one-row portal pulls
+use the same iterator. EXPLAIN reports Hash Join and estimates build work.
+
+Ten 1,200-row-per-side SQL joins allocated 11.5 MB and took 41 ms in
+memory, and allocated 28.3 MB and took 155 ms at a 64 KiB budget. Writing
+one equality operand as `l.a + 0` kept the equivalent query on the
+nested-loop path, where ten runs allocated 2.09 GB and took 7.93 s.
+
+SQL work_mem now supplies executor workspace budgets and supports SET,
+SET LOCAL, RESET, and pg_settings reporting. Unadorned values use
+kilobytes. The wire tests verify session isolation and transaction restore.
+At SQL settings of 4 MiB and 64 KiB, ten joins allocated 11.5 MB and
+28.3 MB respectively. Peak temporary space was zero and 183,660 bytes.
+
+With a 100,000-byte TOAST payload at a 64 KiB workspace target, the
+join returns the same count and payload length as PostgreSQL C. Ten
+runs allocated 57.4 MB after reusing owned replay rows, down from
+58.5 MB. Peak temporary space was 293,253 bytes.
+
+LEFT hash joins retain unmatched and NULL-key probe rows. A spilled
+partition tracks probe matches by spool ordinal and emits each unmatched
+row after the final build block. Match tracking can spill independently.
+The fit and spill wire workloads both matched PostgreSQL C, including
+an ON residual and a post-join WHERE filter. Ten runs allocated 15.3 MB
+at 4 MiB and 37.0 MB at 64 KiB, with peak temporary space of zero and
+195,744 bytes respectively.
+
+RIGHT and FULL hash joins mark build rows only after the key and ON
+checks pass. An unmatched build row is emitted after its block has
+scanned the full probe partition. NULL keys and disjoint partitions
+receive the same null-extension and source-presence treatment.
+PostgreSQL C agreed on the RIGHT and FULL wire results in memory and
+during spill. Ten FULL joins allocated 21.0 MB at 4 MiB and 42.9 MB at
+64 KiB, with peak temporary space of zero and 196,004 bytes respectively.
+
+The wire suite checks early close of a suspended spill portal, DDL
+admission after close, quota failure cleanup, and startup cleanup after
+an immediate stop with live spill files. The iterator now unlinks each
+finished partition pair before opening the next one. At 64 KiB, a
+1,200-row-per-side workload used 193,260 bytes of peak temporary space.
+After the first one-row portal pull, 170,220 bytes remained on disk,
+and closing the portal removed them. Ten runs allocated 29.9 MB.
+
+The wire suite also sends CancelRequest after observing spill files,
+checks SQLSTATE 57014 and verifies that rollback leaves the session
+usable. Disconnecting a suspended portal releases its spill files.
+A suspended join continues to return its captured rows after another
+session updates and deletes build-side tuples. The initial hash-table
+flush checks for interrupts between rows. Repeating the ten-run spill
+workload preserved the 29.9 MB allocation and 193,260-byte temp peak.
+
+EXPLAIN ANALYZE JSON reports hash candidates examined before key
+rechecks, populated spill batches, nonempty build blocks, and the
+largest charged build block. Build blocks count the in-memory build
+or the replay blocks used after spill. Candidates, batches, and blocks
+sum across executions of the node. Peak build bytes can exceed
+work_mem when replay processes an oversized tuple on its own.
+The wire test checks that the in-memory and spilled runs examine the
+same candidates and that the ordinary spilled fixture stays within
+its 64 KiB build budget.
+
+With 10,000 probe rows, 512 build rows and 64 KiB of work_mem,
+uniform keys used 8 batches and 8 blocks (65,454 peak build bytes,
+765,644 temp bytes, 8.2 MB allocated, 112 MB peak RSS, 52 ms).
+Skewed keys used 8 batches and 8 blocks (65,518 peak build bytes,
+760,216 temp bytes, 13.5 MB allocated, 118 MB RSS, 72 ms). One key
+used one batch and three blocks (65,455 peak build bytes, 746,352
+temp bytes, 425.3 MB allocated, 530 MB RSS, 1.48 s). Candidate and
+result counts agreed between the 64 KiB and 4 MiB runs at 512,
+67,698 and 5,120,000 respectively. The single-key case also
+allocated 411.2 MB without spill. SBCL allocation profiling attributed
+99.6% of samples to vector concatenation in hash join row assembly.
+Reusing the last immutable source-presence vector reduced single-key
+allocation to 247.3 MB in memory and 261.4 MB during spill. Peak RSS
+fell from 516 MB to 355 MB in memory and from 530 MB to 369 MB
+during spill. The candidate count, peak charged build bytes and
+temporary bytes agreed with the baseline. The join still allocates
+an independently owned value vector for each emitted row.
+
+At 100,000 probe rows and 512 build rows, uniform keys returned 512
+matches and skewed keys returned 675,901 at both budgets. At 64 KiB
+the respective spill peaks were 7.43 MB and 7.27 MB, allocation was
+74.5 MB and 107.0 MB, and peak RSS was 183 MB and 216 MB. At 4 MiB
+neither spilled and allocation was 13.2 MB and 45.7 MB. The uniform
+case shows the cost of writing probe rows whose keys have no build
+match when their partition contains at least one build row.
+
+Spilling joins with a non-preserved probe side use a fixed 8,192-bit
+build-hash filter during partitioning. Equal join keys must share a
+hash, so a clear bit rules out a match. A set bit sends the row
+through the existing batch and equality checks. The initial build
+reserves space for the filter, and replay restores the full build
+budget. Small budgets and joins that emit unmatched probe rows
+skip the filter. The wire regression checks matched rows and
+temporary writes for both INNER and LEFT joins.
+In the same 100,000-probe-row benchmark at 64 KiB, the filter cut
+uniform temp use from 7.43 MB to 0.53 MB, allocation from 74.5 MB
+to 17.8 MB, peak RSS from 183 MB to 129 MB and time from 506 ms to
+69 ms. Skewed temp use fell from 7.27 MB to 5.36 MB, allocation
+from 107.0 MB to 91.0 MB, peak RSS from 216 MB to 203 MB and time
+from 686 ms to 564 ms. Both distributions retained their candidate
+and result counts.
+
+Run the hash-join memory workload from the checkout root. It starts
+a disposable pg-lisp instance, verifies query results against counts
+computed independently of the executor, and prints JSON lines with
+the plan counters, spill reads and writes, peak temp bytes, elapsed
+time, allocations, and RSS. The external case checks that the payload
+was stored out of line. The comparison option selects the loop
+paths in the disposable instance so it can use the same SQL and
+memory budgets; index creation is outside the measured window.
+
+```sh
+python3 src/lisp/t/hash-join-memory.py --probe-rows 1000000
+python3 src/lisp/t/hash-join-memory.py --probe-rows 1000000 --build-rows 1000000 --work-mem 4MB
+python3 src/lisp/t/hash-join-memory.py --distribution skew --payload external
+python3 src/lisp/t/hash-join-memory.py --build-rows 256 --compare-loops
+```
+
+The one-million-row narrow uniform run used 512 build rows and
+returned 512 matches at both budgets. At 4 MiB it took 384 ms and
+allocated 202.8 MB, with 319 MB peak RSS and no spill. At 64 KiB it
+took 667 ms and allocated 241.6 MB, with 356 MB peak RSS, 4.75 MB
+of temporary data, eight batches and blocks, and a 64,394-byte
+peak build block.
+
+With 100,000 uniform rows on each side, the fixed-partition
+executor returned 100,000 matches at both budgets and wrote
+14.78 MB of temp. At 4 MiB it used eight build blocks and
+allocated 177 MB in 1.07 s. At 64 KiB it used 408 blocks and
+allocated 2.09 GB in 14.65 s, with 980 MB peak RSS. This isolates
+the cost of repeatedly reading probe partitions for large
+splittable build batches.
+The balanced one-million-row baseline at 4 MiB returned a million
+matches, with eight spill batches and 64 build blocks. It peaked at
+4,194,303 charged build bytes, 149.8 MB of temp and 992 MB RSS,
+and allocated 4.42 GB in 29.23 s.
+
+Oversized build partitions with varying non-NULL hashes now split
+before replay. Each split estimates how many build blocks it needs,
+selects up to three unused varying hash bits, and routes both inputs
+through the same selector. The worklist
+processes children depth first and closes each parent side after
+its children are sealed. The initial and later passes write one
+side at a time, with up to eight output streams. The partition
+bit budget bounds the depth. Unsplittable batches and hard temporary
+file quotas use bounded block replay. A final batch keeps one
+probe match map across its build blocks, with its byte allowance
+reserved from the replay build budget. A sealed probe partition supplies
+the count used to allocate the backing array within that allowance.
+Replay marks each matched probe ordinal once per build block. NULL-key rows still reach
+the unmatched pass of preserved inputs. Four full-join cases with
+NULLs, disjoint keys and a residual predicate matched PostgreSQL C
+in memory and under repartitioning, in both source orders.
+The wire suite pauses and cancels during initial build, initial
+spill, between the sides of a repartition pass, during batch load
+and probe, and during both unmatched passes. Each case returns
+SQLSTATE 57014, leaves no registered iterators or temporary files,
+and runs the same query successfully on the canceled connection.
+Forcing every non-NULL key to the same hash checks unequal-key
+rejection across 1.44 million candidates in memory and in one
+spill batch. A spilled LIMIT 1 stops after one valid match and
+leaves no temporary files.
+A correlated LATERAL query rescans its hash join for three outer rows,
+returns the same counts at 4 MiB and 64 KiB, and releases the spill files.
+The wire suite also corrupts sealed spill records before replay
+opens them. The decode error releases every file and iterator and
+the connection can rerun the query. A concurrent TRUNCATE times out
+while a spilled portal is suspended. The portal returns its original
+snapshot across concurrent UPDATE and DELETE, and TRUNCATE succeeds
+after the portal closes. The immediate-restart case compares all
+committed input rows, including the wide payload, before and after
+recovery.
+
+The optional PostgreSQL C differential covers 46 cases across all
+admitted key types, with duplicate rows, NULL keys, empty input,
+numeric scale and NaN, residual ON conditions, post-join WHERE, and
+correlated LATERAL. It checks the planned hash join and verifies
+spill at 64 KiB for each hash key type. The Rove suite separately
+checks nonempty datum-origin payloads and source-presence vectors
+for both orientations, in memory and through repartitioning.
+
+```sh
+python3 src/lisp/t/hash-join.py --reference-bin /path/to/postgresql/bin
+```
+
+At 100,000 rows per side and 64 KiB, repartitioning kept all
+100,000 matches. Allocation fell from 2.09 GB to 428 MB, peak RSS
+from 980 MB to 539 MB, and elapsed time from 14.65 s to 2.90 s.
+Peak temp rose from 14.78 MB to 15.70 MB while a parent and its
+children coexisted. Spill batch counts now include populated parent
+and child partitions, while build blocks count leaf replay work.
+In this run, the 584 partitions produced 512 blocks. The temporary
+I/O counters recorded 44.33 MB of spill reads and writes each.
+The balanced million-row run still returned one million matches.
+At 4 MiB it allocated 2.95 GB in 19.70 s, versus 4.42 GB in
+29.23 s before repartitioning. At 64 KiB it completed in 37.89 s
+and allocated 5.48 GB, with 4,096 build blocks and a 65,399-byte
+peak build block. Peak temp was 159.1 MB at both budgets. Spill
+reads and writes were 299.6 MB each at 4 MiB and 599.1 MB each
+at 64 KiB. Peak RSS was about 991 MB, with about 53 MB live
+after forced collection.
+
+With the serialization buffers included in the 64 KiB workspace,
+the million-row run returned all one million matches in 43.06 s.
+Sizing repartition fanout reduced build blocks from 32,768 to 8,192
+and allocation from 5.56 GB to 5.12 GB compared with the fixed
+eight-way split at the same budget. Peak charged build bytes were
+59,094, with 986 MB peak RSS and 53 MB live after collection.
+Peak temp was 159.1 MB, with 748.9 MB of spill reads and writes each.
+
+The compact spill format stores a signed 32-bit key and one source identity
+in nine bytes. Other rows use the general codec. At 64 KiB the million-row
+join returned one million matches in a median 4.40 s across three runs,
+with 2.68 GB allocated and 955 MiB peak RSS. Spill I/O fell to 90 MB in each
+direction, and peak temp fell to 19.1 MB. In isolation, one million-row
+`count(*)` heap scan took a median 0.41 s and allocated 219 MB.
+Decoding single-column integer tuples directly into SQL rows cut the
+scan to 0.26 s and 123 MB. Computing the page checksum without copying
+the page cut scan allocation further to 86 MB, with a 0.25 s median
+and 190 MiB peak RSS. At the same settings the full join still took
+4.11 s and allocated 2.41 GB, with 934 MiB peak RSS.
+Reading non-NULL keys into reusable 256-element integer batches took
+0.088 s per million-row input and allocated 37 MB in an isolated
+scan. The scan verified the key count and sum in four samples under a
+registered snapshot.
+
+The executor fuses ungrouped `count(*)` with a spilling inner equality
+join of two single-column `int4` heaps. It skips NULL keys, partitions
+four-byte keys, and counts probe matches using a 48 KiB build frequency
+table. Reusing a caller-owned block on clean cache misses keeps each heap
+scan from allocating a page per read.
+
+On the same one-million-row-per-side query, five warmed samples at
+`work_mem = '64kB'` verified one million matches each. PostgreSQL C
+20devel ran serially with JIT disabled and its default
+`hash_mem_multiplier = 2`. The median elapsed time and largest sampled
+RSS were:
+
+| Engine | Median elapsed | Peak RSS | Spill read | Spill written |
+| --- | ---: | ---: | ---: | ---: |
+| PostgreSQL C | 0.198 s | 96.2 MiB, query backend | 47.7 MB | 47.7 MB |
+| pg-lisp | 0.273 s | 110.7 MiB, whole server | 16.0 MB | 16.0 MB |
+
+The Lisp run allocated 12.2 MB per warmed query, used 8.1 MB peak
+temporary space, and probed one million keys across 512 build blocks.
+To reproduce the Lisp case, run `python3 src/lisp/t/hash-join-memory.py
+--probe-rows 1000000 --build-rows 1000000 --work-mem 64kB --samples 5`.
+
+### Performance holdouts
+
+`python3 src/lisp/t/hash-join-holdout.py` verifies every result and reports
+CPU time, cumulative allocations, and sampled whole-server RSS. It runs
+each fixture in a fresh server, warms the query once, and collects three
+samples. CPU time and allocations below are the sample medians divided by
+the number of executions. Peak RSS is the largest sampled process RSS
+across the three samples. Each scan sample contains seven executions and
+each join sample contains three.
+
+The controlled comparison runs the same roadmap checkout with the typed
+scan and count path disabled, the copy-based page checksums restored,
+and hash spill records restored to text serialization with a quota
+writer per record. This keeps spilling hash joins available on both
+sides of the comparison. The pre-roadmap commit `280ecd87618` is a
+separate reference and runs nested loops for these joins.
+Run the controlled baseline with
+`--control-prelude src/lisp/t/hash-join-holdout-ablation.lisp`.
+Pass `typed_skew typed_sparse` to select the two large typed holdouts
+outside the six default cases.
+
+| Holdout | Allocation, MB | Peak RSS, MiB | CPU, ms |
+| --- | ---: | ---: | ---: |
+| 100k nullable int4 scan | 20.97 → 11.37 | 244.4 → 179.9 | 45.7 → 31.4 |
+| 40k mixed int/text filtered scan | 8.75 → 8.75 | 160.3 → 160.2 | 28.6 → 27.1 |
+| int4 join with sum of projected keys | 2.20 → 1.45 | 106.0 → 103.4 | 16.7 → 3.3 |
+| two-column int4 join with a residual | 1.94 → 1.80 | 105.1 → 104.5 | 13.3 → 13.3 |
+| text join with length aggregation | 2.49 → 2.35 | 106.7 → 105.9 | 13.3 → 16.7 |
+| LEFT JOIN with 6,400-byte external text | 23.85 → 23.79 | 172.0 → 171.8 | 43.3 → 40.0 |
+| 5,200 by 4,400 nullable, skewed int4 count | 15.80 → 0.70 | 145.3 → 101.6 | 113.3 → 3.3 |
+| 14k by 12k nullable, sparse signed int4 count | 38.00 → 0.72 | 209.6 → 102.6 | 336.7 → 6.7 |
+
+Against the committed baseline, the text join dropped from 207 MB and
+383 ms CPU per query to 2.35 MB and about 15 ms. The wide LEFT JOIN
+dropped from 8.40 GB and 2.70 s CPU per query to 23.79 MB and 43 ms.
+These larger differences include the change from nested loops to hash
+joins. Pass `--engine-root /path/to/baseline/worktree` to rerun that
+comparison. The large typed holdouts use the controlled comparison.
+
+CPU samples for the smaller joins were coarse because Linux exposes
+process CPU in ticks. A separate 30-execution comparison isolated a
+planner change that skips a hash join's ON evaluation when the hash keys
+cover every conjunct. It reduced median elapsed time from 4.15 to 3.50 ms
+for the int4 projection and from 14.45 to 13.75 ms for the text join,
+with allocations and peak RSS within one percent. Residual conditions
+keep their ordinary evaluation path. The TOAST-heavy join stayed around
+43 ms. A 30-execution rerun against the full controlled baseline also
+put the text join at 13.7 ms CPU versus 14.3 ms. The residual join
+stayed within one CPU tick per batch, and the TOAST-heavy join fell
+from 44.7 to 43.0 ms. The exact million-row workload retained both
+2× stretch thresholds on rerun.
+
+In the same-SQL comparison with 10,000 probe rows and 256 build
+rows, all three plans returned 256 rows. At 64 KiB, the hash join
+processed 256 candidates in 7 ms and allocated 2.0 MB, with 37 kB
+of temp and 106 MB peak RSS. The parameterized loop used 256
+index probes in 9 ms and allocated 9.3 MB, with no temp and
+113 MB peak RSS. The plain loop rejected 2,559,744 pairs in 6.98 s
+and allocated 823.7 MB, with 739 kB of temp and 928 MB peak RSS.
+At 4 MiB the three times were 4 ms, 10 ms and 6.87 s.
+
+With 10,000 skewed probe rows and 96 build rows carrying external
+6,400-byte text, ANALYZE reported a 46-byte mean physical build
+tuple. Both budgets returned 14,069 matches and the expected
+maximum payload length. At 4 MiB, the hash join used one build
+block, took 18 ms and allocated 11.1 MB, with 117 MB peak RSS.
+At 64 KiB it used eight batches and 51 build blocks, took 102 ms
+and allocated 32.8 MB, with 139 MB peak RSS and 859 kB temp.
+With the same 96 external build rows and 100,000 probes, skewed
+keys returned 140,325 matches at both budgets. At 64 KiB they used
+75 build blocks, 3.46 MB peak temp and 142 MB of allocation in
+0.63 s. A single key returned 9.6 million matches at both budgets.
+At 64 KiB it stayed in one spill batch with 48 build blocks,
+51,810 peak build bytes, 7.62 MB peak temp and 3.29 GB allocated
+in 17.50 s. At 4 MiB the same output allocated 1.41 GB in 4.25 s
+without spill.
+
+The planner chooses the build side using estimated retained bytes.
+ANALYZE records the mean physical width of visible tuples during its
+existing scan. The planner adds entry and row-container overhead and
+uses TOAST heap pages as a proxy for external payloads. Older statistics
+fall back to heap pages and estimated rows. The estimate guides
+orientation. The iterator still charges each decoded row against
+work_mem.
+
+When the estimated build exceeds work_mem, EXPLAIN charges startup
+for scanning and partitioning both inputs. Total cost also includes
+reading the spilled data. The cost uses estimated input bytes as a
+page proxy and models one write and read pass, following the initial
+hash join cost model in PostgreSQL C. For an unordered
+constant LIMIT over a bare integer inner equality, the planner can
+choose a lazy nested loop when ANALYZE statistics predict that the
+requested matches cost less than hash spill startup. ORDER BY,
+post-join filtering and whole-input operators leave the existing
+selection rule in place.
+
+On a 10,000-by-10,000 uniform integer join with LIMIT 1 and 64 KiB,
+the median five-execution sample allocated 0.29 MB and took 2.6 ms.
+Forcing the same query onto a hash join allocated 45.1 MB and took
+291 ms. The hash plan peaked at 1.57 MB of temp and 150 MB RSS.
+The nested loop used no temp and 104 MB peak RSS. Each sampled
+execution verified that the returned keys matched.
+
+The iterator restores SQL column order and source presence before
+evaluating residual ON conditions and emitting rows. Wire cases cover
+all four join types with the left input built, including a spilled
+FULL join. EXPLAIN JSON identifies the build side.
+
+The width regression leaves dead pages in a narrow table, restarts
+after ANALYZE, and verifies that the planner builds the narrow input
+with both inline and external wide payloads on the probe side. Eight
+INNER, LEFT, RIGHT and FULL cases matched PostgreSQL C. On ten joins
+of 100 rows with 1,500-byte text against 400 integer rows at 128 KiB,
+the row-count choice allocated 37.7 MB, took 65 ms and used 186,080
+temporary bytes. Selecting by width allocated 8.4 MB, took 15 ms and
+used no temporary space. Peak RSS fell from 144 MB to 112 MB.
+
+For ten 200-by-1,201-row INNER joins at 64 KiB, the smaller build
+allocated 4.4 MB and took 29 ms. Changing only the estimates to force
+the larger build allocated 16.3 MB and took 107 ms. Peak temporary
+space was zero and 119,010 bytes respectively.
+
+## P07 — Transactional catalog foundation for P04
+
+The catalog tracks relation names in a backend-owned overlay. The owning
+backend can resolve staged table and index identities by name and OID.
+Committed maps remain visible to other backends. The write set captures the
+committed definitions it replaces and the owning heap definitions observed
+by new indexes. Validation rejects conflicts before publication. The detached
+merge starts from the latest committed map so an unrelated publication
+survives a transaction that began earlier.
+
+Catalog object addresses include the database, relation OID and column
+attribute number. Staged indexes validate their owner and key columns on
+insertion and again before publication, without allocating an address per
+key. The 100-cycle implicit catalog workload allocated 78.7 MB with these
+checks versus 78.8 MB in the prior run.
+
+Staged table creation captures the OIDs of referenced sequences under the
+same lock that resolves its expressions. Commit rejects a missing or
+replaced sequence and allows a settings change on the same OID. A staged
+drop or replacement also rechecks explicit publication membership before
+WAL. A publication added after staging causes a serialization failure,
+and a FOR ALL TABLES publication continues to follow the live table set.
+PostgreSQL C records the corresponding dependencies in `pg_depend` from
+`StoreAttrDefault` and `publication_add_relation`.
+
+Native logical capture and apply retain the sequence identities of
+each staged CREATE even if the same transaction drops its new table.
+The sequence check runs before the mixed WAL terminal when the final
+catalog is empty. The wire regression drops the sequence on another
+connection after staging and verifies that the transient CREATE/DROP
+transaction fails at commit.
+
+Retaining those identities reuses the dependency records from staging
+and allocates no history for tables without sequence references. The
+20-cycle SQL benchmark stayed at 85.4 MB with capture disabled and
+89.6 MB with capture enabled, with about 48 MB live after full GC.
+In a separate 20-cycle workload that created and dropped a table with
+a sequence default in each transaction, allocation was 0.79 MB locally
+and 1.67 MB with logical capture, with about 48 MB live in both cases.
+
+Skipping the expression walker for absent defaults reduced allocation
+from 23.0 MB to 4.1 MB over 20,000 dependency checks on a 24-column
+table. The 20-cycle create/insert/index/update SQL workload allocated
+85.4 MB with capture disabled, with about 48 MB of live heap after full
+GC, consistent with the prior run.
+
+The storage prototype uses transaction-private forks for a new heap or
+B-tree. Dropping a provisional node discards only that node's references.
+The owning backend sees its staged indexes through table index lookup and
+the virtual catalogs. Catalog preparation serializes a detached image with
+adjusted index membership and retains the committed table descriptors for
+admitted operations.
+
+Logical schema rendering resolves table constraints and standalone indexes
+against its supplied database image. A Rove test stages an index drop and
+checks that the committed schema contract retains the index while the
+detached candidate contract omits it. This lets mixed logical apply
+validate both catalog images even when an overlay is active.
+
+The logical WAL codec can carry ordered transactional DDL fragments beside
+row changes. Recovery and retained readers require a catalog-bearing
+transaction terminal, even when the slot filters out the event. The native
+sender uses a transactional Message with the commit LSN. Standalone
+catalog records and legacy change chunks reject the new event.
+
+The publisher can capture effective staged CREATE and DROP operations for
+tables and indexes in the same spool as the rows. CREATE events use the
+cooked definition. A transaction that creates, writes, and drops a table
+still uses a catalog-bearing terminal. A SQL test reads the committed
+event order from a retained slot and checks that rollback emits nothing.
+
+The native subscriber stages those operations in the row apply transaction
+and commits the catalog, rows and progress marker together. It requires the
+event LSN to match Begin, rejects subscriber-owned metadata targets, and
+requires local WAL flush before feedback. Wire tests crash the worker both
+before target commit and after commit but before feedback. They verify
+rollback and retry at the first cut and resume without reapplying a table
+replacement at the second.
+
+The publisher appends one schema contract after the ordered changes
+while holding the catalog publication locks. It describes the latest
+committed schema and the prepared catalog image. Recovery and slot
+readers require exactly one final contract for a mixed batch, including
+when the slot filters out the database. The subscriber compares both
+shapes under its own commit locks. The wire tests cover an unrelated
+publisher DDL that commits first, a missing contract, and subscriber
+drift that prevents catalog, rows and progress from committing until
+the drift is removed.
+
+The native protocol can create a `pg_lisp_transactional` slot and
+requires `transactional_ddl 'true'` before streaming it. The slot
+retains its plugin and confirmed position across restart, using the
+existing slot file format. Standard publication streams reject the
+private option. The capability requires modern slot provenance.
+The wire fixture confirms initial copy with the binary bytea profile,
+rejects mismatched START options in both directions, and resumes the
+confirmed slot after an immediate restart. In a 10,000-round-trip
+PGSLOT6 codec benchmark, the legacy and transactional images allocated
+95.7 MB and 90.3 MB and took 112 ms and 116 ms, respectively. The sample
+slot image grew by 14 bytes.
+
+The native worker selects the transactional plugin for a new slot
+when the target supports transactional apply and the source accepts
+the plugin. Older endpoints use the legacy native path. Resume uses
+the existing source slot and rejects an incompatible target before
+starting the stream. Publishers admit mixed DDL only when the database's
+logical interests are compatible. The WAL fence checks again before
+publication. The wire fixture adds a standard slot after captured DDL
+is staged and verifies that COMMIT fails. It also checks activation of
+the first slot during an uncaptured transaction and legacy startup and
+resume with an older endpoint. A transaction can fail at commit if its
+last capable slot disappears while logical capture remains active.
+Legacy native and standard slots can continue to receive ordinary
+changes. The publisher no longer needs a private capture switch.
+
+Across three runs of 20 create/insert/index/update transactions, with
+50 rows per transaction, ordinary publication allocated 85.4 MB and
+opt-in capture allocated 89.2 MB. Peak RSS was 194 MB and 199 MB, with
+about 48 MB of live heap after full GC in both cases. Median elapsed
+time was 484 ms and 520 ms. The local-only path skips replay AST
+construction and avoids an extra catalog lock acquisition.
+
+For a separate 200-row subscriber workload with 20 alternating index
+creates/drops and row updates, issuing DDL as standalone commands
+allocated 77.6 MB on the source and 79.0 MB on the target. Combining
+each pair into one transaction allocated 118.1 MB and 112.7 MB,
+with median end-to-end time of 587 ms versus 1,050 ms. Post-GC live
+heap was about 48 MB on both servers. Streaming the SQL frame for
+large apply payloads reduced sender allocation from 171.7 MB to
+25.6 MB over twelve 1 MiB payloads in a REPL sink benchmark. It
+increased CPU time for those large messages, so smaller payloads
+keep the inline query path.
+
+With the commit-wide check enabled, the same mixed workload allocated
+120.3 MB on the source and 113.6 MB on the subscriber and took a median
+605 ms. The schema footer transmits unchanged sections once. In a
+1,000-table serialization benchmark with one added index, this reduced
+each footer from 294 KB to 147 KB and allocation over 30 encodes from
+97.7 MB to 52.2 MB.
+
+After enabling durable slot negotiation, the live mixed workload
+allocated 120.3 MB on the publisher and 113.6 MB on the subscriber,
+took 601 ms, and retained about 48 MB of Lisp heap on both after GC.
+
+The fragment reader now validates event bytes after decoding and verifies
+transferred bytes against the same checksum. Removing the duplicate
+pre-decode checksum pass cut allocation from 27.9 MB to 19.7 MB and
+elapsed time from 388 ms to 268 ms over 200 filtered 64 KiB events in a
+warmed REPL. Post-GC live heap was about 80 MB in the test image.
+
+The catalog-bearing WAL terminal records the XID and commit timestamp and
+certifies a chunked catalog image with its deferred deletions. Redo applies
+relation resets and page images before installing the catalog and removing
+dropped files. The primary creates fresh forks only after WAL flush and
+uses the same page-before-delete ordering. Logical readers can count
+catalog chunks and bytes without keeping the image in memory.
+
+Explicit transactions can stage CREATE TABLE, DROP TABLE, ordinary CREATE
+INDEX and DROP INDEX alongside row writes. The primary installs the catalog
+and removes the committed XID from new snapshots under the same lock. Heap
+and index admission stays in force through commit or rollback.
+
+Wire tests cover cross-backend visibility, rollback, committed uniqueness,
+and immediate restart. Crash tests cover the interval before the terminal
+record and the interval after WAL flush but before primary fork creation.
+On a disposable server, 100 create/insert/create-index transactions
+allocated 12.1 MB when rolled back and 77.4 MB when committed and followed
+by an autocommit drop. After full GC, live Lisp data changed by +124 KB and
+−22 KB respectively. RSS grew by 12.2 MB and 82.5 MB before the final GC.
+In a separate cold-server comparison with identical SQL operations, the
+explicit transaction reduced allocation from 84.8 MB to 77.4 MB and elapsed
+time from 4.30 s to 2.20 s versus committing each statement separately.
+
+Transactional CREATE TABLE stages the empty indexes for column and table
+PRIMARY KEY and UNIQUE constraints. They enforce writes in the owning
+transaction and recover with the table. In 100 create/insert/drop cycles
+with two constraints, the explicit transaction allocated 105.1 MB and
+took 2.42 s, compared with 122.5 MB and 3.41 s for autocommit. Post-GC live
+Lisp data changed by −77 KB and −4 KB respectively.
+
+Eligible multi-statement Simple Query messages stage table and ordinary
+index DDL alongside row writes and TRUNCATE. A later statement error rolls
+back the block. The commit and rollback cases also pass against PostgreSQL C.
+Messages containing utilities outside the implicit-block allowlist, such
+as CREATE SEQUENCE, still use the existing per-statement path.
+In 100 create/insert/index/drop cycles, the implicit
+message allocated 78.8 MB and took 1.95 s, compared with 79.0 MB and
+2.01 s for the corresponding explicit transaction. Post-GC live Lisp
+data changed by −43 KB and −47 KB respectively.
+
+Mixed logical DDL uses the transactional native slot and its schema
+contract. Admission checks slots when staging a catalog command and
+again under the WAL lock before commit. The commit check remembers
+effective staging even when create and drop cancel out in the final
+catalog. A wire regression starts a standard slot during such a
+transaction and verifies that commit fails and the original table's
+rows stay unchanged. Without slot interest, the same local sequence
+commits on the existing row-only path. In three warmed samples of 20
+such transactions, median allocation was 3.75 MB, peak RSS was
+107 MB, and elapsed time was 132 ms. The workload verified all
+durable row inserts and the same catalog generation after the run.
+With a standard slot present, four conditional DDL no-ops can commit
+alongside an INSERT. The corresponding effective commands still fail
+admission. Across 20 warmed transactions, adding the four no-ops raised
+allocation from 5.63 MB to 5.99 MB. Both workloads took about 99 ms,
+peaked at about 109 MB RSS, and preserved the catalog generation.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
