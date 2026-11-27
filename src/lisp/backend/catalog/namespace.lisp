@@ -284,6 +284,8 @@ A changed value is reported at the next reporting boundary."
 (defun set-config-value (name value local-p)
   "Set a supported session value, including LOCAL application_name and
 synchronous_commit. Reject unsupported parameters and other local settings."
+  (when (and *backend* (backend-savepoints *backend*))
+    (ereport "0A000" "set_config is not supported with an active savepoint"))
   (when (eq name +null+)
     (ereport "22004" "SET requires parameter name"))
   (startup-check-session-setting (string-downcase name))

@@ -945,8 +945,14 @@ Its writer admission and logical capture decision must precede this call."
   (destructuring-bind (kind node block offnum xmin &optional xmax old-cid mask ctid-block ctid-offnum) entry
     (unless
         (with-heap-tuple-edit (page offset node block offnum :take-ownership)
-          (unless (= xmin (page-u32 page (+ offset +heap-tuple-xmin-off+)))
-            (ereport "XX001" "savepoint rollback lost its heap tuple version"))
+          (let ((live-xmin (page-u32 page (+ offset +heap-tuple-xmin-off+))))
+            ;; VACUUM can freeze a committed xmin while our xmax still protects the TID.
+            (unless (or (= xmin live-xmin)
+                        (and (eq kind :header)
+                             (>= xmin +first-normal-xid+)
+                             (= live-xmin +frozen-xid+)
+                             (= (xid32-of xid) (page-u32 page (+ offset +heap-tuple-xmax-off+)))))
+              (ereport "XX001" "savepoint rollback lost its heap tuple version")))
           (ecase kind
             (:insert
              ;; Index entries stay valid physical pointers to a dead tuple.

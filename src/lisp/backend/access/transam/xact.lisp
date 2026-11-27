@@ -1525,13 +1525,40 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
 (defstruct foreign-key-savepoint-state
   checks modes grants)
 
+(defun capture-savepoint-relation-access (backend)
+  (let ((owner (relation-lock-owner-xid (backend-xid backend) backend)))
+    (when owner
+      (sb-thread:with-mutex (*relation-lock-mutex*)
+        (loop for table in (list *relation-readers* *relation-writers*)
+              collect (loop for node being the hash-keys in table using (hash-value owners)
+                            when (member owner owners :test #'=) collect node))))))
+
+(defun restore-savepoint-relation-access (backend checkpoint)
+  (let ((owner (relation-lock-owner-xid (backend-xid backend) backend)))
+    (when owner
+      (sb-thread:with-mutex (*relation-lock-mutex*)
+        (loop for table in (list *relation-readers* *relation-writers*)
+              for keep in (list (first checkpoint) (second checkpoint))
+              do (maphash (lambda (node owners)
+                            (when (and (member owner owners :test #'=)
+                                       (not (member node keep :test #'=)))
+                              (let ((remaining (remove owner owners :test #'=)))
+                                (if remaining
+                                    (setf (gethash node table) remaining)
+                                    (remhash node table)))))
+                          table))
+        (sb-thread:condition-broadcast *relation-lock-cv*)))))
+
 (defstruct backend-savepoint
-  name heap-checkpoint foreign-key-state conflict-row-checkpoint
+  name portal-checkpoint relation-access-checkpoint heap-checkpoint foreign-key-state conflict-row-checkpoint
   logical-checkpoint logical-bytes binary-required-database)
 
 (defun capture-backend-savepoint (backend name)
   (make-backend-savepoint
    :name name
+   :portal-checkpoint (when (fboundp 'capture-savepoint-portals)
+                        (funcall 'capture-savepoint-portals))
+   :relation-access-checkpoint (capture-savepoint-relation-access backend)
    :heap-checkpoint (backend-heap-undo-log backend)
    :foreign-key-state (capture-foreign-key-savepoint-state backend)
    :conflict-row-checkpoint (on-conflict-row-lock-checkpoint (backend-xid backend))
@@ -1769,7 +1796,13 @@ Registrations made after this census cannot prolong the wait."
                                      (copy-list (gethash relfilenode *relation-readers*)))
                              :test #'eql)
                             (copy-list (gethash relfilenode *relation-writers*)))
-          while (setf cohort (delete-if-not #'relation-user-active-under-lock-p cohort))
+          while (setf cohort
+                      (delete-if-not
+                       (lambda (xid)
+                         (and (or (member xid (gethash relfilenode *relation-writers*))
+                                  (and readers (member xid (gethash relfilenode *relation-readers*))))
+                              (relation-user-active-under-lock-p xid)))
+                       cohort))
           do (wait-for-relation-dependencies cohort))))
 
 (defun acquire-concurrent-index-writer-fence (node on-acquired)

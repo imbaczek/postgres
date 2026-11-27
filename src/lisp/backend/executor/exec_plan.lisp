@@ -2908,6 +2908,8 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
 
 (defun decode-copy-text-row (bytes column-count)
   "Split unescaped tabs before decoding fields so an escaped tab stays in its field."
+  (when (and (zerop column-count) (zerop (length bytes)))
+    (return-from decode-copy-text-row nil))
   (let ((start 0) (escaped-p nil) (fields nil))
     (loop for byte across bytes for offset from 0
           do (cond (escaped-p (setf escaped-p nil))

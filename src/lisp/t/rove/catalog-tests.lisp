@@ -1006,6 +1006,13 @@
                       (column-statistics-from-sexp '(:null-fraction 0.0d0 :distinct-count 1
                                                      :most-common-values ((1 . 1.0d0)))))))))
 
+(rove:deftest boolean-false-uses-its-most-common-value-frequency
+    (let* ((column (make-pg-column-statistics :null-fraction 0d0 :distinct-count 2
+                                              :most-common-values '((nil . 0.95d0) (t . 0.05d0))))
+           (table (make-pg-class :statistics (make-pg-table-statistics :columns (vector column)))))
+      (rove:ok (= (planner-equality-selectivity table 1 nil) 0.95d0))
+      (rove:ok (= (planner-equality-selectivity table 1 t) 0.05d0))))
+
 (rove:deftest range-index-cost-uses-nonnull-distribution
     (let* ((column (make-pg-column :name "k" :type :int8 :attnum 1))
            (distribution (make-pg-column-statistics :null-fraction 0.1d0

@@ -758,7 +758,12 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
       (flush))
     deleted))
 
-(defun exec-delete-subqueries (stream ast &optional cascade-p)
+(defun check-foreign-key-action-snapshot (tuple crosscheck)
+  "Require the actual target version to be visible to the transaction snapshot."
+  (when (and crosscheck (not (htup-visible-p tuple crosscheck)))
+    (ereport "40001" "could not serialize access due to concurrent update")))
+
+(defun exec-delete-subqueries (stream ast &optional cascade-p crosscheck)
   (let* ((prepared (dml-execution-preparation ast))
          (where (or (getf prepared :dml-row-where) (getf prepared :where))))
     (call-with-dml-subqueries
@@ -790,9 +795,11 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
                                   (true-p (eval-expr where (concatenate 'vector (htup-values tuple) source)))))))
                          (lambda () (logical-capture-publications (list table) :delete))
                          t candidate
-                         (when references
+                         (when (or references crosscheck)
                            (lambda (tuple)
-                             (setf prepared-changes (lock-foreign-key-parent-change table references tuple)))))
+                             (check-foreign-key-action-snapshot tuple crosscheck)
+                             (when references
+                               (setf prepared-changes (lock-foreign-key-parent-change table references tuple))))))
                       (declare (ignore block off))
                       (check-heapam-write-status status)
                       (when deleted
@@ -805,7 +812,7 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
                                             :old-values (htup-values tuple) :new-values nil :source-values source)
                         (incf count))
                       deleted))))
-           (if (and cascade-p (null references) (null (pg-class-toast table))
+           (if (and cascade-p (null crosscheck) (null references) (null (pg-class-toast table))
                     (not (logical-capture-xid-needed-p xid)))
                (let ((batched (delete-cascade-candidates prepared table rel xid #'delete-candidate)))
                  (incf count batched))
@@ -926,7 +933,7 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
              (htup-values (materialize-select-tuple table (make-htup :values values) snapshot))))))
       (values block off))))
 
-(defun exec-update-subqueries (stream ast)
+(defun exec-update-subqueries (stream ast &optional crosscheck)
   (let* ((*datum-origin-capture* t)
          (*query-row-origins* nil)
          (prepared (dml-execution-preparation ast))
@@ -975,10 +982,12 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
                                 (subquery-update-values table sets (htup-values tuple) environment))
                               t)))))
                      nil t candidate
-                     (when references
+                     (when (or references crosscheck)
                        (lambda (tuple)
+                         (check-foreign-key-action-snapshot tuple crosscheck)
                          (setf prepared-changes
-                               (lock-foreign-key-parent-change table references tuple new)))))
+                               (when references
+                                 (lock-foreign-key-parent-change table references tuple new))))))
                   (check-heapam-write-status status)
                   (when deleted
                     (setf key-changes (nreconc prepared-changes key-changes))

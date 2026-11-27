@@ -1236,6 +1236,15 @@ An omitted column list uses the primary key's order."
   (with-write-lock
     (referencing-foreign-keys-locked parent)))
 
+(defun foreign-key-stored-keys-equal-p (parent index old new)
+  ;; Compare stored datum images when SQL equality hides a representation change.
+  (or (every #'eq old new)
+      (let ((columns (map 'vector (lambda (attnum)
+                                    (aref (pg-class-columns parent) (1- attnum)))
+                          (pg-index-columns index))))
+        (equalp (form-heap-tuple (coerce old 'vector) columns 0 0 0 0 0)
+                (form-heap-tuple (coerce new 'vector) columns 0 0 0 0 0)))))
+
 (defun lock-foreign-key-parent-change (parent references tuple &optional new-values)
   "Lock the old referenced keys of the actual version that will be changed."
   (let ((old-values (htup-values (materialize-select-tuple parent tuple *current-snapshot*))))
@@ -1246,7 +1255,10 @@ An omitted column list uses the primary key's order."
           unless (member +null+ old :test #'eq)
             append (let ((key (encode-index-key old types)))
                      (unless (and new-values
-                                  (equalp key (encode-index-key (index-values index new-values) types)))
+                                  (let ((new (index-values index new-values)))
+                                    (and (equalp key (encode-index-key new types))
+                                         (or (eq (pg-foreign-key-update-action constraint) :no-action)
+                                             (foreign-key-stored-keys-equal-p parent index old new)))))
                        (acquire-referenced-key-lock (pg-index-oid index) key :exclusive)
                        (list (list child constraint index key
                                    (loop for attnum in (pg-foreign-key-referenced-columns constraint)
@@ -1308,12 +1320,16 @@ An omitted column list uses the primary key's order."
           (*select-index-lease-groups* nil)
           (*select-index-scans* nil)
           (*select-suppress-description* nil)
-          (*select-expected-result-columns* nil))
+          (*select-expected-result-columns* nil)
+          (crosscheck (when (backend-transaction-snapshot *backend*)
+                        (copy-snapshot (backend-transaction-snapshot *backend*)))))
+      (when crosscheck
+        (setf (snapshot-curcid crosscheck) (backend-command-id *backend*)))
       (with-fresh-foreign-key-snapshot (snapshot (backend-command-id *backend*))
         (note-backend-command-id-used)
         (if delete-p
-            (exec-delete-subqueries (make-broadcast-stream) ast t)
-            (exec-update-subqueries (make-broadcast-stream) ast))))))
+            (exec-delete-subqueries (make-broadcast-stream) ast t crosscheck)
+            (exec-update-subqueries (make-broadcast-stream) ast crosscheck))))))
 
 (defun reject-referenced-key-change (parent child constraint)
   (ereport "23503" "update or delete on table ~s violates foreign key constraint ~s on table ~s"
@@ -1343,8 +1359,8 @@ An omitted column list uses the primary key's order."
   "Run referential actions or verify immediate restrictions at statement end."
   (when changes
     (let ((retained
-            (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
-              (copy-snapshot *current-snapshot*))))
+            (when (backend-transaction-snapshot *backend*)
+              (copy-snapshot (backend-transaction-snapshot *backend*)))))
       (loop for pending = changes then (rest pending)
             while pending
             for (child constraint index key old new) = (first pending)
@@ -1376,7 +1392,7 @@ An omitted column list uses the primary key's order."
                     (when (and (or (not (eq action :no-action))
                                    (not (foreign-key-parent-visible-p parent index key latest)))
                                (foreign-key-child-visible-p child parent constraint index key latest))
-                      (when (and retained
+                      (when (and retained (member action '(:no-action :restrict))
                                  (not (foreign-key-child-visible-p child parent constraint index key retained)))
                         (ereport "40001" "could not serialize access due to concurrent update"))
                       (if (member action '(:no-action :restrict))
@@ -3546,11 +3562,14 @@ without a change; each actual publication captures its own schema precondition."
             (:rollback-to-savepoint
              (handler-case
                  (progn
+                   (when (fboundp 'restore-savepoint-portals)
+                     (funcall 'restore-savepoint-portals (backend-savepoint-portal-checkpoint checkpoint)))
                    (undo-heap-to-savepoint (backend-savepoint-heap-checkpoint checkpoint))
                    (restore-backend-savepoint-logical-state backend checkpoint)
                    (restore-on-conflict-row-locks
                     (backend-xid backend) (backend-savepoint-conflict-row-checkpoint checkpoint))
                    (restore-foreign-key-savepoint-state backend (backend-savepoint-foreign-key-state checkpoint))
+                   (restore-savepoint-relation-access backend (backend-savepoint-relation-access-checkpoint checkpoint))
                    (setf (backend-savepoints backend) tail)
                    (set-backend-state backend :in-progress))
                (error (condition)

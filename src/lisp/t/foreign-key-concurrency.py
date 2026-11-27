@@ -3,6 +3,7 @@
 import contextlib
 import runpy
 import shutil
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -452,6 +453,10 @@ def verify_copy_foreign_keys(server):
 
         assert copy_input("COPY copy_child FROM STDIN", [b"1\tpart\\", b"tend\n\\N\t\\141\n"]) == b"COPY 2\0"
         assert copy_input("COPY copy_child (parent_id) FROM STDIN", [b"1\n"]) == b"COPY 1\0"
+        connection.query("CREATE TABLE zero_copy (gone integer)")
+        connection.query("ALTER TABLE zero_copy DROP COLUMN gone")
+        assert copy_input("COPY zero_copy FROM STDIN", [b"\n"]) == b"COPY 1\0"
+        assert connection.query("SELECT count(*) FROM zero_copy") == [["1"]]
         for data, terminal, terminal_payload, state in (
             ([b"1\n999\n"], b"c", b"", "23503"),
             ([b"1\ninvalid\n", b"1\n"], b"c", b"", "22P02"),
@@ -801,6 +806,127 @@ def verify_savepoint_logical_capture(server):
         connection.query("SELECT pg_drop_replication_slot('savepoint_capture_slot')")
 
 
+def expect_sqlstate(connection, sql, expected):
+    try:
+        connection.query(sql)
+    except WireError as error:
+        assert error.sqlstate == expected, error
+    else:
+        raise AssertionError(f"{sql} should raise {expected}")
+
+
+def verify_cascade_snapshot_and_key_images(server):
+    with contextlib.closing(Connection(server.port)) as tx, contextlib.closing(Connection(server.port)) as peer:
+        tx.query("CREATE TABLE rr_parent (id integer PRIMARY KEY)")
+        tx.query(
+            "CREATE TABLE rr_child (id integer, parent_id integer REFERENCES rr_parent"
+            " ON DELETE CASCADE ON UPDATE CASCADE)"
+        )
+        tx.query("INSERT INTO rr_parent VALUES (1)")
+        tx.query("INSERT INTO rr_child VALUES (10,1)")
+        for child, action in ((20, "DELETE FROM rr_parent WHERE id=1"),
+                              (30, "UPDATE rr_parent SET id=2 WHERE id=1")):
+            tx.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            assert tx.query("SELECT id FROM rr_child") == [["10"]]
+            peer.query(f"INSERT INTO rr_child VALUES ({child},1)")
+            expect_sqlstate(tx, action, "40001")
+            tx.query("ROLLBACK")
+            assert peer.query("SELECT id FROM rr_child ORDER BY id") == [["10"], [str(child)]]
+            peer.query(f"DELETE FROM rr_child WHERE id={child}")
+        tx.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        tx.query("INSERT INTO rr_child VALUES (40,1)")
+        tx.query("DELETE FROM rr_parent WHERE id=1")
+        tx.query("COMMIT")
+        assert peer.query("SELECT id FROM rr_child") == []
+
+        tx.query("CREATE TABLE interval_parent (id interval PRIMARY KEY)")
+        tx.query("CREATE TABLE interval_child (id interval REFERENCES interval_parent ON UPDATE CASCADE)")
+        tx.query("INSERT INTO interval_parent VALUES (interval '1 month')")
+        tx.query("INSERT INTO interval_child VALUES (interval '1 month')")
+        tx.query("UPDATE interval_parent SET id = interval '30 days'")
+        assert tx.query("SELECT id::text FROM interval_child") == [["30 days"]]
+
+
+def verify_savepoint_relation_and_setting_state(server):
+    with contextlib.closing(Connection(server.port)) as tx, contextlib.closing(Connection(server.port)) as peer:
+        tx.query("CREATE TABLE before_savepoint (id integer)")
+        tx.query("CREATE TABLE after_savepoint (id integer)")
+        tx.query("SET application_name = 'outer'")
+        tx.query("BEGIN")
+        tx.query("INSERT INTO before_savepoint VALUES (1)")
+        tx.query("SAVEPOINT p")
+        tx.query("INSERT INTO after_savepoint VALUES (2)")
+        expect_sqlstate(tx, "SELECT set_config('application_name', 'inner', false)", "0A000")
+        tx.query("ROLLBACK TO p")
+        assert tx.query("SHOW application_name") == [["outer"]]
+        peer.query("SET statement_timeout = '500ms'")
+        peer.query("ALTER TABLE after_savepoint ADD COLUMN added integer")
+        expect_sqlstate(peer, "ALTER TABLE before_savepoint ADD COLUMN added integer", "57014")
+        tx.query("COMMIT")
+        assert peer.query("SELECT id FROM before_savepoint") == [["1"]]
+
+
+def verify_savepoint_portals_and_index_waiters(server):
+    with contextlib.closing(Connection(server.port)) as tx, contextlib.closing(Connection(server.port)) as peer:
+        tx.query("CREATE TABLE savepoint_portal (id integer)")
+        tx.query("INSERT INTO savepoint_portal VALUES (1), (2), (3)")
+        tx.query("BEGIN")
+        tx.query("SAVEPOINT p")
+        execute = frame(b"E", b"p\0" + struct.pack("!I", 1)) + frame(b"S", b"")
+        tx.socket.sendall(
+            parse("SELECT id FROM savepoint_portal")
+            + frame(b"B", b"p\0\0" + struct.pack("!HHH", 0, 0, 0))
+            + execute
+        )
+        assert [tx.receive()[0] for _ in range(5)] == [b"1", b"2", b"D", b"s", b"Z"]
+        tx.query("ROLLBACK TO p")
+        peer.query("TRUNCATE savepoint_portal")
+        tx.socket.sendall(execute)
+        kind, payload = tx.receive()
+        assert kind == b"E" and b"C34000\0" in payload, (kind, payload)
+        assert tx.receive()[0] == b"Z"
+        tx.query("ROLLBACK")
+
+        tx.query("BEGIN")
+        tx.query("SAVEPOINT p")
+        tx.query("INSERT INTO savepoint_portal VALUES (4)")
+        peer.query("SET statement_timeout = '5s'")
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            pending = worker.submit(
+                peer.query, "CREATE INDEX CONCURRENTLY savepoint_index ON savepoint_portal(id)"
+            )
+            try:
+                wait_for_relation_waiter(server, pending)
+                tx.query("ROLLBACK TO p")
+                pending.result(timeout=5)
+            finally:
+                tx.query("ROLLBACK")
+
+
+def verify_frozen_savepoint_undo(server):
+    with contextlib.closing(Connection(server.port)) as tx, contextlib.closing(Connection(server.port)) as peer:
+        tx.query("CREATE TABLE aged_undo (id integer)")
+        tx.query("INSERT INTO aged_undo VALUES (13)")
+        server.control("(sb-thread:with-mutex (*xid-lock*) (incf *next-xid* 50000050))")
+        tx.query("BEGIN")
+        tx.query("INSERT INTO aged_undo VALUES (99)")
+        tx.query("SAVEPOINT p")
+        tx.query("DELETE FROM aged_undo WHERE id=13")
+        peer.query("VACUUM aged_undo")
+        frozen = """
+          (let* ((*backend* (make-backend :database "postgres"))
+                 (table (resolve-table-or-error "aged_undo"))
+                 (tuple (heapam-get-tuple (pg-class-relfilenode table)
+                                         0 1 (pg-class-columns table))))
+            (= (htup-xmin tuple) +frozen-xid+))
+        """
+        assert "\nT\n" in server.control(frozen)
+        tx.query("ROLLBACK TO p")
+        assert "\nT\n" in server.control(frozen)
+        tx.query("COMMIT")
+        assert peer.query("SELECT id FROM aged_undo ORDER BY id") == [["13"], ["99"]]
+
+
 if __name__ == "__main__":
     server = OwnedLisp()
     try:
@@ -816,6 +942,9 @@ if __name__ == "__main__":
         verify_composite_self_reference(server)
         verify_inline_create_reference(server)
         verify_referential_actions(server)
+        verify_cascade_snapshot_and_key_images(server)
+        verify_savepoint_relation_and_setting_state(server)
+        verify_savepoint_portals_and_index_waiters(server)
         verify_copy_foreign_keys(server)
         verify_deferred_constraints(server)
         verify_deferred_row_versions(server)
@@ -826,6 +955,7 @@ if __name__ == "__main__":
         verify_savepoint_logical_capture(server)
         verify_before_claim_rechecks_latest_version(server)
         verify_recovered_constraint(server)
+        verify_frozen_savepoint_undo(server)
     finally:
         server.stop()
         shutil.rmtree(server.root)

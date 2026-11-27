@@ -319,7 +319,7 @@ BYTEA vectors match the byte-content values stored in the MCV list."
     (if (null statistics)
         0.1d0
         (let* ((mcv (pg-column-statistics-most-common-values statistics))
-               (common (and value
+               (common (and (not (eq value +null+))
                             (assoc value mcv
                                    :test #'analyze-statistics-value-equal-p)))
                (common-fraction (reduce #'+ mcv :key #'cdr :initial-value 0.0d0))

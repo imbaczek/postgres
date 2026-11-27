@@ -206,6 +206,23 @@
         (ereport "58030" "portal cleanup remains incomplete"))))
   (values))
 
+(defun capture-savepoint-portals ()
+  (when *extended-query-state*
+    (loop for portal being the hash-values of (extended-query-state-portals *extended-query-state*)
+          collect portal)))
+
+(defun restore-savepoint-portals (checkpoint)
+  (when *extended-query-state*
+    (let* ((portals (extended-query-state-portals *extended-query-state*))
+           (discard
+             (loop for name being the hash-keys of portals using (hash-value portal)
+                   unless (member portal checkpoint :test #'eq) collect name)))
+      (dolist (name discard)
+        (let ((portal (gethash name portals)))
+          (unless (extended-close-portal portal nil t)
+            (ereport "58030" "portal cleanup remains incomplete"))
+          (remhash name portals))))))
+
 (defun make-extended-portal-execution-owner (portal &key suppress-datum-origins)
   "Build the bindings retained by the portal's resumable executor."
   (make-query-execution-owner
