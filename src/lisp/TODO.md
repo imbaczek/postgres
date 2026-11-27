@@ -2828,6 +2828,51 @@ admission. Across 20 warmed transactions, adding the four no-ops raised
 allocation from 5.63 MB to 5.99 MB. Both workloads took about 99 ms,
 peaked at about 109 MB RSS, and preserved the catalog generation.
 
+## P08 — Common stored types
+
+- [ ] Store Boolean columns end to end. Preserve FALSE, TRUE and NULL across
+  DML, defaults, checks, indexes, supported COPY paths, rollback and restart.
+- [ ] Add UUID scalar semantics and persistence. Match upstream input,
+  canonical output, comparison and hashing. Cover heap, indexes, spill,
+  text and 16-byte binary wire formats, COPY and supported logical replication.
+  Verify indexed and sequential results agree after VACUUM and restart.
+- [ ] Generalize array storage while preserving existing stored array types.
+  Add Boolean, integer, text/varchar and UUID arrays. Verify dimensions, lower
+  bounds, NULL elements, TOAST and slice updates. Qualify comparison, hashing,
+  containment, overlap and each supported transport path.
+
+## P09 — Column schema evolution
+
+Build on P07 catalog transactions, dependency tracking and descriptor generations.
+
+- [ ] Preserve stable attribute identities and decode older tuples using
+  physical attribute counts and dropped/missing attribute metadata.
+- [ ] Add transactional column rename, nullable ADD COLUMN, immutable constant
+  missing defaults and dependency-aware DROP COLUMN. Keep stored missing values
+  stable across later default changes. Verify rollback, prepared-plan invalidation
+  and RESTRICT/CASCADE behavior.
+- [ ] Add SET/DROP NOT NULL and ordered multi-action validation. Prevent
+  concurrent writes from introducing invalid rows during validation and publish
+  the descriptor atomically.
+- [ ] Qualify a bounded ALTER TYPE conversion matrix with USING. Rewrite heap,
+  indexes and TOAST atomically, and verify conversion failure, cancellation,
+  disk quota, restart, physical replay and supported logical replication.
+
+## P10 — Foreign keys
+
+- [ ] Use P07 for transactional constraint metadata and dependencies. Validate
+  referenced unique keys and expose the constraint state in `pg_constraint`.
+- [ ] Implement transaction-owned referenced-key locks with deadlock handling
+  and cancellation. Prove that a child insert racing a parent delete or
+  key-changing update cannot commit an orphan before enabling enforcement.
+- [ ] Enforce immediate checks for single and composite keys across DML paths,
+  including parent-side NO ACTION and RESTRICT, multirow writes and self-references.
+- [ ] Add NOT VALID/VALIDATE, CASCADE, SET NULL and SET DEFAULT. Verify concurrent
+  validation, cascading chains and cycles, rollback and checks of default values.
+- [ ] Add deferrable checks and SET CONSTRAINTS using P07 subtransaction
+  ownership. Verify commit-time checking, savepoint rollback, replay and the
+  deferred cascading constraint used by upstream pg_partman.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
