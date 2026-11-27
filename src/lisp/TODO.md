@@ -2999,6 +2999,33 @@ for integers and 5.30 MB for varchar. The 500-row Boolean cascade allocated
 0.99 MB. The live fixture also verifies blocked parent changes, savepoint
 rollback, concurrent child updates, and crash recovery.
 
+## P11 — Views
+
+Start with persistent, read-only views over the supported SELECT subset.
+Durable view DDL depends on P07 catalog transactions, object dependencies and
+plan invalidation. View definitions require stable attribute identities.
+
+- [ ] Add a storage-free view relation kind. Persist a versioned analyzed
+  query, its output descriptor, source text for diagnostics and dependency
+  identities. Resolve references at definition time and verify catalog round
+  trips preserve those bindings without creating a relation file.
+- [ ] Add transactional CREATE VIEW and DROP VIEW. Expand ordinary and nested
+  views through the existing derived-query planner with cycle detection.
+  Support output aliases and explicitly reject writes to views. Verify query
+  equivalence, rollback and visibility across sessions.
+- [ ] Implement CREATE OR REPLACE VIEW and DROP RESTRICT/CASCADE. Preserve the
+  existing output prefix of names, types and typmods on replacement, and
+  freeze SELECT * at definition time. Verify base-column changes and failed
+  replacements against C PostgreSQL, including cached-plan invalidation.
+- [ ] Preserve eligible predicate pushdown and hold descriptor leases for
+  admitted plans. Verify joins, aggregates, LIMIT and prepared execution,
+  including a suspended portal during concurrent view DDL.
+- [ ] Expose relation kind `v`, column metadata, `pg_views` and
+  `pg_get_viewdef`. Verify restart and physical replay preserve definitions
+  and dependencies, including crashes on either side of the DDL commit record.
+  Qualify logical DDL end to end or reject unsupported cases before source
+  publication.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
