@@ -28,7 +28,9 @@
       (with-query-temp-files
         (multiple-value-bind (path output) (open-query-temp-output nil t)
           (let ((records (list (list #(-2147483648) nil #(4294967295))
+                               (list #(-9223372036854775808) nil #(4294967295))
                                (list #("東京") nil #(17))
+                               (list #(9223372036854775807) nil #(0))
                                (list #(2147483647) nil #(0)))))
             (dolist (record records) (query-spill-write-record output record))
             (finish-query-temp-stream output t)
@@ -36,8 +38,31 @@
               (rove:ok (equalp (first records) (query-spill-read-record input)))
               (rove:ok (= 9 (file-position input)))
               (rove:ok (equalp (second records) (query-spill-read-record input)))
-              (rove:ok (equalp (third records) (query-spill-read-record input)))
+              (rove:ok (= 22 (file-position input)))
+              (dolist (record (cddr records))
+                (rove:ok (equalp record (query-spill-read-record input))))
               (rove:ok (eq +query-spill-eof+ (query-spill-read-record input)))))))))
+
+(rove:deftest interval-hash-key-signed-boundaries
+    (let ((page (make-page)))
+      (rove:ok
+       (loop for time in '(-9223372036854775808 -86400000001 -1 0 1 86400000001 9223372036854775807)
+             always
+             (loop for day in '(-2147483648 -1 0 2147483647)
+                   always
+                   (loop for month in '(-2147483648 -1 0 2147483647)
+                         always
+                         (progn
+                           (page-set-u64 page 0 (ldb (byte 64 0) time))
+                           (page-set-u32 page 8 (ldb (byte 32 0) day))
+                           (page-set-u32 page 12 (ldb (byte 32 0) month))
+                           (multiple-value-bind (low days high) (read-interval-hash-key page 0)
+                             (let ((subday (+ (ldb (byte 32 0) low) (ash (ldb (byte 5 0) high) 32)))
+                                   (whole-days (+ (ldb (byte 32 0) days) (ash (ash high -5) 32))))
+                               (and (typep high '(signed-byte 16))
+                                    (<= 0 subday (1- +sql-microseconds-per-day+))
+                                    (= (sql-interval-comparison-value (make-sql-interval month day time))
+                                       (+ subday (* whole-days +sql-microseconds-per-day+)))))))))))))
 
 (rove:deftest hash-spill-disk-match-map
     (let ((*query-temp-directory* (uiop:temporary-directory)))

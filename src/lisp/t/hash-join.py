@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import datetime as dt
 import json
 import random
 import runpy
@@ -675,20 +676,23 @@ def verify_reference_keys(connection, reference):
     print("88 join differential cases matched PostgreSQL C", flush=True)
 
 
-def verify_compact_hash_count(server, connection, reference=None):
+def verify_compact_hash_count(server, connection, reference=None, key_type="int4"):
     expected = [["1619"]]
     query = "SELECT count(*) FROM compact_probe p JOIN compact_build b ON p.k = b.k"
     before = spill_files(server)
+    width = 4 if key_type == "int4" else 8
+    offset = 0 if width == 4 else 1 << 62
+    low, high = -(1 << (width * 8 - 1)), (1 << (width * 8 - 1)) - 1
     for peer in (connection, reference):
         if peer is None:
             continue
         peer.query("SET work_mem = '64kB'")
-        for table, offset, extra in (
-            ("compact_build", 0, [None, -2147483648, -2147483648, 2147483647, 7, 7]),
-            ("compact_probe", 1600, [None, -2147483648, -2147483648, -2147483648, 2147483647, 7, 7, 7, 7]),
+        for table, start_key, extra in (
+            ("compact_build", 0, [None, low, low, high, offset + 7, offset + 7]),
+            ("compact_probe", 1600, [None, low, low, low, high, *([offset + 7] * 4)]),
         ):
-            peer.query(f"CREATE TABLE {table} (k int)")
-            keys = list(range(offset, offset + 3200)) + extra
+            peer.query(f"CREATE TABLE {table} (k {key_type})")
+            keys = list(range(offset + start_key, offset + start_key + 3200)) + extra
             for start in range(0, len(keys), 500):
                 rows = ",".join(f"({key if key is not None else 'NULL'})" for key in keys[start:start + 500])
                 peer.query(f"INSERT INTO {table} VALUES " + rows)
@@ -697,13 +701,28 @@ def verify_compact_hash_count(server, connection, reference=None):
         assert peer.query(query + " AND p.k >= 0") == [["1613"]]
     plan, temp = hash_join_metrics(connection, query)
     assert plan["Actual Rows"] == 1619 and temp > 0, plan
-    assert plan["Native Hash Peak Build Bytes"] == 48 * 1024, plan
+    assert plan["Native Hash Peak Build Bytes"] == (48 if width == 4 else 40) * 1024, plan
     assert plan["Native Hash Key Probes"] == 3208, plan
-    assert plan["Native Spill Written Bytes"] == (3205 + 3208) * 4, plan
+    assert plan["Native Spill Written Bytes"] == (3205 + 3208) * width, plan
     assert spill_files(server) == before
+    if key_type == "int8":
+        connection.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        try:
+            assert connection.query(query) == expected
+            with contextlib.closing(fixture["Connection"](server.port)) as writer:
+                writer.query(f"INSERT INTO compact_build VALUES ({offset + 3200})")
+            snapshot_plan, _ = hash_join_metrics(connection, query)
+            assert snapshot_plan["Native Hash Key Probes"] == 3208, snapshot_plan
+            assert snapshot_plan["Actual Rows"] == 1619, snapshot_plan
+            connection.query(f"DELETE FROM compact_build WHERE k = {offset + 1600}")
+            assert connection.query(query) == [["1618"]]
+        finally:
+            connection.query("ROLLBACK")
+        assert connection.query(query) == [["1620"]]
+        connection.query(f"DELETE FROM compact_build WHERE k = {offset + 3200}")
     with contextlib.closing(CancelConnection(server.port)) as active:
         active.query("SET work_mem = '64kB'")
-        with pause_hash_join_phase(server, "map-int4-hash-spill-keys", 1, "t") as (marker, _):
+        with pause_hash_join_phase(server, f"map-{key_type}-hash-spill-keys", 1, "t") as (marker, _):
             active.send(b"Q", query.encode() + b"\0")
             wait_for_pause(marker, "before compact hash replay")
             assert spill_files(server) - before
@@ -724,6 +743,117 @@ def verify_compact_hash_count(server, connection, reference=None):
             peer.query("RESET work_mem")
 
 
+def verify_compact_temporal_counts(connection, reference):
+    epoch = dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc)
+    east = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+    def literal(type_name, i, right):
+        instant = epoch + dt.timedelta(seconds=2 * i, microseconds=17 * i)
+        if type_name == "date":
+            value = epoch.date() + dt.timedelta(days=i)
+        elif type_name == "time":
+            value = instant.time()
+        elif type_name == "timestamp":
+            value = instant.replace(tzinfo=None)
+        else:
+            value = instant.astimezone(east) if right else instant
+        return "'" + value.isoformat() + "'"
+
+    query = "SELECT count(*) FROM temporal_probe p JOIN temporal_build b ON p.k = b.k"
+    for type_name, width in (("date", 4), ("time", 8), ("timestamp", 8), ("timestamptz", 8)):
+        for peer in (connection, reference):
+            peer.query("SET work_mem = '64kB'")
+            for table, start, right in (("temporal_probe", 0, False), ("temporal_build", 1200, True)):
+                peer.query(f"CREATE TABLE {table} (k {type_name})")
+                keys = [literal(type_name, i, right) for i in range(start, start + 2400)]
+                keys.extend([literal(type_name, 1200, right), "NULL"])
+                for offset in range(0, len(keys), 400):
+                    rows = ",".join(f"({key})" for key in keys[offset:offset + 400])
+                    peer.query(f"INSERT INTO {table} VALUES " + rows)
+                peer.query(f"ANALYZE {table}")
+            assert peer.query(query) == [["1203"]], type_name
+        plan, _ = hash_join_metrics(connection, query)
+        assert "Native Hash Key Probes" in plan and plan["Actual Rows"] == 1203, plan
+        assert plan["Native Hash Peak Build Bytes"] == (48 if width == 4 else 40) * 1024, plan
+        for peer in (connection, reference):
+            peer.query("DROP TABLE temporal_probe, temporal_build")
+            peer.query("RESET work_mem")
+
+
+def verify_fixed_float_counts(connection, reference):
+    query = "SELECT count(*) FROM fixed_probe p JOIN fixed_build b ON p.k = b.k"
+    rows_query = "SELECT count(p.k) FROM fixed_probe p JOIN fixed_build b ON p.k = b.k"
+    for type_name, width in (("float4", 4), ("float8", 8)):
+        exceptional = ["'Infinity'", "'-Infinity'", "'NaN'", "'-0.0'", "'0.0'"]
+        expected = 1207
+        for peer in (connection, reference):
+            peer.query("SET work_mem = '64kB'")
+            for table, start in (("fixed_probe", 0), ("fixed_build", 1200)):
+                peer.query(f"CREATE TABLE {table} (k {type_name})")
+                keys = [str(i + 0.125) for i in range(start, start + 2400)]
+                keys.extend([*exceptional, "NULL"])
+                for offset in range(0, len(keys), 400):
+                    rows = ",".join(f"({value})" for value in keys[offset:offset + 400])
+                    peer.query(f"INSERT INTO {table} VALUES " + rows)
+                peer.query(f"ANALYZE {table}")
+            assert peer.query(query) == [[str(expected)]], type_name
+            assert peer.query(rows_query) == [[str(expected)]], type_name
+        plan, _ = hash_join_metrics(connection, query)
+        assert "Native Hash Key Probes" in plan and plan["Actual Rows"] == expected, plan
+        assert plan["Native Hash Peak Build Bytes"] == (48 if width == 4 else 40) * 1024, plan
+        generic, _ = hash_join_metrics(connection, rows_query)
+        assert generic["Native Hash Spill Batches"] > 0 and generic["Actual Rows"] == expected, generic
+        for peer in (connection, reference):
+            peer.query("DROP TABLE fixed_probe, fixed_build")
+            peer.query("RESET work_mem")
+
+
+def verify_interval_hash_equality(connection, reference):
+    query = "SELECT count(*) FROM span_probe p JOIN span_build b ON p.k = b.k"
+    rows_query = "SELECT count(p.k) FROM span_probe p JOIN span_build b ON p.k = b.k"
+    for peer in (connection, reference):
+        peer.query("SET work_mem = '64kB'")
+        for table, start in (("span_probe", 0), ("span_build", 1200)):
+            peer.query(f"CREATE TABLE {table} (k interval)")
+            equivalent = ("1 month", "30 days") if start == 0 else ("720 hours", "30 days")
+            keys = [f"'{i - 1800} microseconds'" for i in range(start, start + 2400)]
+            keys.extend(f"'{span}'" for span in (*equivalent, "2147483647 months", "-2147483648 days"))
+            keys.append("NULL")
+            for offset in range(0, len(keys), 400):
+                rows = ",".join(f"({value})" for value in keys[offset:offset + 400])
+                peer.query(f"INSERT INTO {table} VALUES " + rows)
+            peer.query(f"ANALYZE {table}")
+        assert peer.query(query) == [["1206"]]
+        assert peer.query(rows_query) == [["1206"]]
+    plan, _ = hash_join_metrics(connection, query)
+    assert plan["Native Hash Peak Build Bytes"] == 48 * 1024 and plan["Actual Rows"] == 1206, plan
+    generic, _ = hash_join_metrics(connection, rows_query)
+    assert generic["Native Hash Spill Batches"] > 0 and generic["Actual Rows"] == 1206, generic
+    for peer in (connection, reference):
+        peer.query("DROP TABLE span_probe, span_build")
+        peer.query("RESET work_mem")
+
+
+def verify_interval_hash_skew(connection, reference):
+    query = "SELECT count(*) FROM span_probe p JOIN span_build b ON p.k = b.k"
+    for peer in (connection, reference):
+        peer.query("SET work_mem = '64kB'")
+        for table in ("span_probe", "span_build"):
+            peer.query(f"CREATE TABLE {table} (k interval)")
+            # These distinct spans share the interval router's mixed 64 bits.
+            rows = ",".join(["('0 seconds')", "('1 day 01:11:34.967296')"] * 200)
+            for _ in range(9):
+                peer.query(f"INSERT INTO {table} VALUES " + rows)
+            peer.query(f"ANALYZE {table}")
+        assert peer.query(query) == [["6480000"]]
+    plan, _ = hash_join_metrics(connection, query)
+    assert plan["Native Hash Build Blocks"] == 2, plan
+    assert plan["Native Hash Spill Batches"] <= 4, plan
+    for peer in (connection, reference):
+        peer.query("DROP TABLE span_probe, span_build")
+        peer.query("RESET work_mem")
+
+
 def main(reference_bin=None):
     server = fixture["OwnedLisp"]()
     try:
@@ -734,8 +864,14 @@ def main(reference_bin=None):
                 with reference_server(reference_bin) as reference:
                     verify_reference_keys(connection, reference)
                     verify_compact_hash_count(server, connection, reference)
+                    verify_compact_hash_count(server, connection, reference, key_type="int8")
+                    verify_compact_temporal_counts(connection, reference)
+                    verify_fixed_float_counts(connection, reference)
+                    verify_interval_hash_equality(connection, reference)
+                    verify_interval_hash_skew(connection, reference)
             else:
                 verify_compact_hash_count(server, connection)
+                verify_compact_hash_count(server, connection, key_type="int8")
             query = verify_join(connection)
             assert connection.query("SHOW work_mem") == [["4MB"]]
             connection.query("BEGIN")

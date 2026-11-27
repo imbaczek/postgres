@@ -512,18 +512,24 @@ reject external and compressed datums and lengths outside BYTES."
   (let ((value (page-u32 bytes offset)))
     (if (logbitp 31 value) (- value #x100000000) value)))
 
-(defun single-int4-heap-tuple-value (bytes start limit infomask)
-  "Decode the SQL value of a heap tuple with exactly one int4 column."
+(declaim (inline single-fixed-heap-tuple-offset))
+
+(defun single-fixed-heap-tuple-offset (bytes start limit infomask width alignment)
+  "Return the offset of a non-NULL fixed-width attribute in a single-column tuple."
   (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
     (ereport "XX001" "invalid heap tuple bounds"))
   (let ((cursor (heap-tuple-data-offset bytes start limit 1 infomask)))
-    (if (and (logtest infomask +heap-hasnull+)
-             (logbitp 0 (aref bytes (+ start +size-of-heap-tuple-header+))))
-        +null+
-        (let ((offset (+ start (align-up (- cursor start) 4))))
-          (unless (<= (+ offset 4) limit)
-            (ereport "XX001" "truncated heap attribute"))
-          (heap-read-int4 bytes offset)))))
+    (unless (and (logtest infomask +heap-hasnull+)
+                 (logbitp 0 (aref bytes (+ start +size-of-heap-tuple-header+))))
+      (let ((offset (+ start (align-up (- cursor start) alignment))))
+        (unless (<= (+ offset width) limit)
+          (ereport "XX001" "truncated heap attribute"))
+        offset))))
+
+(defun single-int4-heap-tuple-value (bytes start limit infomask)
+  "Decode a single int4 SQL value, including NULL."
+  (let ((offset (single-fixed-heap-tuple-offset bytes start limit infomask 4 4)))
+    (if offset (heap-read-int4 bytes offset) +null+)))
 
 (defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value
                                           (start 0) (limit (length bytes)))

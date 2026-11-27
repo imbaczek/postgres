@@ -7,6 +7,10 @@
   (declare (ignore columns))
   nil)
 
+(defun make-fixed-hash-count-iterator (aggregate relations)
+  (declare (ignore aggregate relations))
+  nil)
+
 (defun wal-page-checksum (page relfilenode block &optional (fork :main))
   (let* ((main-p (eq fork :main))
          (identity-size (if main-p 8 12))

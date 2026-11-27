@@ -68,32 +68,103 @@
     (values (heap-tuple-visible-p xmin xmax cid snapshot my-xid infomask committed-xid-cache)
             xmin xmax cid infomask)))
 
-(defun map-visible-int4-page-key-batches (page snapshot my-xid committed-xid-cache keys consume)
-  "Send blocks of visible non-NULL int4 keys through caller-owned KEYS."
+(defmacro do-visible-fixed-page-key-batches ((page snapshot my-xid cache keys consume)
+                                             (start index width alignment words) &body decode)
+  "Feed visible non-NULL fixed heap keys into full and partial batches.
+DECODE writes WORDS signed 32-bit values beginning at INDEX. The result
+counts all visible rows, including NULLs excluded from the batches."
+  (let ((visible-count (gensym "VISIBLE-COUNT"))
+        (capacity (gensym "CAPACITY"))
+        (offnum (gensym "OFFNUM"))
+        (offset (gensym "OFFSET"))
+        (length (gensym "LENGTH")))
+    `(let ((,index 0) (,visible-count 0) (,capacity (length ,keys)))
+       (declare (type fixnum ,index ,visible-count))
+       (assert (and (plusp ,capacity) (zerop (mod ,capacity ,words))))
+       (do-live-page-items (,page ,offnum ,offset ,length)
+         (multiple-value-bind (visible xmin xmax cid infomask)
+             (heap-page-item-visibility ,page ,offset ,snapshot ,my-xid ,cache)
+           (declare (ignore xmin xmax cid))
+           (when visible
+             (incf ,visible-count)
+             (let ((,start (single-fixed-heap-tuple-offset
+                            ,page ,offset (+ ,offset ,length) infomask ,width ,alignment)))
+               (when ,start
+                 ,@decode
+                 (incf ,index ,words)
+                 (when (= ,index ,capacity)
+                   (funcall ,consume ,keys ,index)
+                   (setf ,index 0)))))))
+       (when (plusp ,index) (funcall ,consume ,keys ,index))
+       ,visible-count)))
+
+(defun map-visible-int4-page-key-batches (page snapshot my-xid committed-xid-cache keys consume &optional float-p)
+  "Send blocks of visible non-NULL four-byte keys through caller-owned KEYS."
   (declare (type (simple-array (signed-byte 32) (*)) keys)
            (dynamic-extent consume))
-  (let ((count 0)
-        (visible-count 0)
-        (capacity (length keys)))
-    (declare (type fixnum count visible-count))
-    (do-live-page-items (page offnum offset length)
-      (multiple-value-bind (visible xmin xmax cid infomask)
-          (heap-page-item-visibility page offset snapshot my-xid committed-xid-cache)
-        (declare (ignore xmin xmax cid))
-        (when visible
-          (incf visible-count)
-          (let ((key (single-int4-heap-tuple-value page offset (+ offset length) infomask)))
-            (unless (eq key +null+)
-              (setf (aref keys count) key)
-              (incf count)
-              (when (= count capacity)
-                (funcall consume keys count)
-                (setf count 0)))))))
-    (when (plusp count) (funcall consume keys count))
-    visible-count))
+  (do-visible-fixed-page-key-batches (page snapshot my-xid committed-xid-cache keys consume)
+      (start index 4 4 1)
+    (let ((key (heap-read-int4 page start)))
+      (setf (aref keys index)
+            (if float-p
+                (let ((magnitude (logand key #x7fffffff)))
+                  (cond ((zerop magnitude) 0)
+                        ((> magnitude #x7f800000) #x7fc00000)
+                        (t key)))
+                key)))))
 
-(defun map-visible-int4-heap-key-batches (table snapshot keys consume)
-  "Visit a one-column int4 heap within the caller's relation and snapshot domain.
+(defun map-visible-int8-page-key-batches (page snapshot my-xid committed-xid-cache keys consume &optional float-p)
+  "Visit eight-byte keys as pairs of signed 32-bit words."
+  (declare (type (simple-array (signed-byte 32) (*)) keys)
+           (dynamic-extent consume))
+  (do-visible-fixed-page-key-batches (page snapshot my-xid committed-xid-cache keys consume)
+      (start index 8 8 2)
+    (let ((low (heap-read-int4 page start))
+          (high (heap-read-int4 page (+ start 4))))
+      (when float-p
+        (let ((magnitude (logand high #x7fffffff)))
+          (cond ((and (zerop magnitude) (zerop low))
+                 (setf high 0))
+                ((or (> magnitude #x7ff00000)
+                     (and (= magnitude #x7ff00000) (not (zerop low))))
+                 (setf low 0 high #x7ff80000)))))
+      (setf (aref keys index) low
+            (aref keys (1+ index)) high))))
+
+(defun read-interval-hash-key (page start)
+  "Encode the PostgreSQL comparison span as whole days and subday microseconds.
+The 13-bit factor of a day lets us normalize the signed time using fixnums
+even when its full 64-bit heap value exceeds the fixnum range."
+  (declare (optimize (speed 3) (safety 1))
+           (type (simple-array (unsigned-byte 8) (*)) page)
+           (type fixnum start))
+  (let* ((low (ldb (byte 32 0) (heap-read-int4 page start)))
+         (high (heap-read-int4 page (+ start 4)))
+         (scaled (+ (ash high 19) (ash low -13))))
+    (multiple-value-bind (carry remainder) (floor scaled (ash +sql-microseconds-per-day+ -13))
+      (let ((days (+ (* 30 (heap-read-int4 page (+ start 12)))
+                     (heap-read-int4 page (+ start 8)) carry))
+            (micros (logior (ash remainder 13) (logand low #x1fff))))
+        (values (dpb (ldb (byte 31 0) micros) (byte 31 0)
+                     (- (ash (ldb (byte 1 31) micros) 31)))
+                (dpb (ldb (byte 31 0) days) (byte 31 0)
+                     (- (ash (ldb (byte 1 31) days) 31)))
+                (logior (ash (ash days -32) 5) (ash micros -32)))))))
+
+(defun map-visible-interval-page-key-batches (page snapshot my-xid committed-xid-cache keys consume &optional float-p)
+  "Visit canonical interval keys as three signed 32-bit words."
+  (declare (type (simple-array (signed-byte 32) (*)) keys)
+           (dynamic-extent consume)
+           (ignore float-p))
+  (do-visible-fixed-page-key-batches (page snapshot my-xid committed-xid-cache keys consume)
+      (start index 16 8 3)
+    (multiple-value-bind (low days high) (read-interval-hash-key page start)
+      (setf (aref keys index) low
+            (aref keys (+ index 1)) days
+            (aref keys (+ index 2)) high))))
+
+(defun map-visible-fixed-heap-key-batches (table snapshot keys consume map-page &optional float-p)
+  "Visit a one-column fixed-width heap within the caller's relation and snapshot domain.
 KEYS is writable, nonempty workspace. CONSUME may read but must not retain it."
   (declare (type (simple-array (signed-byte 32) (*)) keys)
            (dynamic-extent consume))
@@ -112,8 +183,18 @@ KEYS is writable, nonempty workspace. CONSUME may read but must not retain it."
            (let ((page (buf-acquire-read-page handle relfilenode block :main scratch)))
              (when page
                (incf visible-count
-                     (map-visible-int4-page-key-batches page snapshot my-xid committed-xid-cache keys consume))))
+                     (funcall map-page page snapshot my-xid committed-xid-cache keys consume float-p))))
         (buf-release-page handle)))))
+
+(defun map-visible-int4-heap-key-batches (table snapshot keys consume)
+  (declare (dynamic-extent consume))
+  (map-visible-fixed-heap-key-batches table snapshot keys consume #'map-visible-int4-page-key-batches
+                                      (eq (pg-column-type (aref (pg-class-columns table) 0)) :float4)))
+
+(defun map-visible-int8-heap-key-batches (table snapshot keys consume)
+  (declare (dynamic-extent consume))
+  (map-visible-fixed-heap-key-batches table snapshot keys consume #'map-visible-int8-page-key-batches
+                                      (eq (pg-column-type (aref (pg-class-columns table) 0)) :float8)))
 
 (defun make-visible-heap-page-iterator (page block columns snapshot &optional int4-values-p)
   "Visit visible heap tuples from PAGE one at a time.
@@ -1132,12 +1213,15 @@ also closes the active child and input, then removes its remaining files."
 (defun make-hash-distinct-iterator (input keys)
   (make-hash-aggregate-iterator input keys 0 :distinct-p t))
 
-(defun int4-hash-count-scan-table (node relations)
+(defun fixed-hash-count-scan-table (node relations type width)
   (when (eq (first node) :seq-scan)
     (let* ((relation (physical-scan-relation node relations))
            (table (getf relation :table))
            (columns (and table (pg-class-columns table))))
-      (when (and (single-int4-scan-layout-p columns)
+      (when (and (= (length columns) 1)
+                 (eq (pg-column-type (aref columns 0)) type)
+                 (= (column-fixed-size (aref columns 0)) width)
+                 (= (column-align (aref columns 0)) (min width 8))
                  (not (getf relation :row-source))
                  (not (getf relation :virtual-p)))
         table))))
@@ -1161,23 +1245,23 @@ also closes the active child and input, then removes its remaining files."
           (incf (plan-node-metadata-actual-row-count metadata) rows)
           (values result rows))))))
 
-(defun execute-int4-hash-count (node build-node probe-node build probe snapshot)
+(defun execute-fixed-hash-count (node build-node probe-node build probe snapshot count-join)
   (let* ((observer (make-plan-node-cardinality-observer node))
          (metadata (when observer (gethash node (query-plan-metadata *cte-active-plan*))))
          (stats (when metadata
                   (or (plan-node-metadata-hash-join-stats metadata)
                       (setf (plan-node-metadata-hash-join-stats metadata) (make-hash-join-stats))))))
     (flet ((run ()
-             (let ((count (count-int4-heap-hash-join
-                           build probe snapshot :stats stats
-                           :observe-build (make-plan-node-cardinality-observer build-node)
-                           :observe-probe (make-plan-node-cardinality-observer probe-node))))
+             (let ((count (funcall count-join
+                                   build probe snapshot :stats stats
+                                   :observe-build (make-plan-node-cardinality-observer build-node)
+                                   :observe-probe (make-plan-node-cardinality-observer probe-node))))
                (values count count))))
       (declare (dynamic-extent #'run))
       (if observer (funcall observer #'run) (run)))))
 
-(defun make-int4-hash-count-iterator (aggregate relations)
-  "Reduce a pure inner integer join directly to COUNT(*) when its build spills."
+(defun make-fixed-hash-count-iterator (aggregate relations)
+  "Reduce a pure fixed-width scalar equality join directly to COUNT(*) when its build spills."
   (let* ((node (fourth aggregate))
          (join (second node)))
     (when (and (null (second aggregate))
@@ -1190,13 +1274,23 @@ also closes the active child and input, then removes its remaining files."
                (not *query-temp-file-limit-bytes*)
                (not (and *query-temp-quota* (query-temp-quota-limit *query-temp-quota*))))
       (multiple-value-bind (left right equality-p) (equality-column-references (getf join :qual))
-        (when (and equality-p (eq (expr-type left) :int4) (eq (expr-type right) :int4)
+        (when (and equality-p (eq (expr-type left) (expr-type right))
+                   (member (expr-type left) '(:int4 :oid :float4 :date :int8 :float8 :time :timestamp :timestamptz :interval))
                    (or (and (= (second left) 1) (= (second right) 2))
                        (and (= (second left) 2) (= (second right) 1))))
-          (let* ((left-node (third node))
+          (let* ((type (expr-type left))
+                 (width (case type
+                          ((:int4 :oid :float4 :date) 4)
+                          (:interval 16)
+                          (otherwise 8)))
+                 (count-join (case width
+                               (4 #'count-int4-heap-hash-join)
+                               (8 #'count-int8-heap-hash-join)
+                               (16 #'count-interval-heap-hash-join)))
+                 (left-node (third node))
                  (right-node (fourth node))
-                 (left-table (int4-hash-count-scan-table left-node relations))
-                 (right-table (int4-hash-count-scan-table right-node relations))
+                 (left-table (fixed-hash-count-scan-table left-node relations type width))
+                 (right-table (fixed-hash-count-scan-table right-node relations type width))
                  (snapshot *current-snapshot*)
                  (done nil))
             (when (and left-table right-table)
@@ -1207,7 +1301,8 @@ also closes the active child and input, then removes its remaining files."
                (lambda ()
                  (unless done
                    (setf done t)
-                   (let ((count (execute-int4-hash-count node right-node left-node right-table left-table snapshot)))
+                   (let ((count (execute-fixed-hash-count
+                                 node right-node left-node right-table left-table snapshot count-join)))
                      (unless (typep count '(signed-byte 64))
                        (ereport "22003" "bigint out of range"))
                      (values (vector count) t))))))))))))
@@ -1280,7 +1375,7 @@ also closes the active child and input, then removes its remaining files."
     (:hash-distinct
      (make-hash-distinct-iterator (make-physical-plan-iterator (third node) relations) (second node)))
     (:hash-aggregate
-     (or (make-int4-hash-count-iterator node relations)
+     (or (make-fixed-hash-count-iterator node relations)
          (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
                                        (second node) (third node))))
     ((:sort :top-n)

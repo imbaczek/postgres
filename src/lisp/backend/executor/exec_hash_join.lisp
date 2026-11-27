@@ -4,7 +4,7 @@
 
 (defun hash-join-key-type-p (type)
   "Whether SQL equality on TYPE has a corresponding value hash."
-  (member type '(:int2 :int4 :int8 :date :time :timestamp :timestamptz :text :varchar :numeric)))
+  (member type '(:int2 :int4 :int8 :oid :float4 :float8 :interval :date :time :timestamp :timestamptz :text :varchar :numeric)))
 
 (defun hash-join-row-hash (row slots types)
   "Hash the indexed components without allocating an intermediate key."
@@ -13,7 +13,7 @@
           for type across types
           for value = (aref row slot)
           do (when (eq value +null+) (return-from hash-join-row-hash nil))
-             (setf hash (logand #x3fffffff (logxor (* hash 33) (if (eq type :numeric)
+             (setf hash (logand #x3fffffff (logxor (* hash 33) (if (member type '(:numeric :float4 :float8 :interval))
                                                                    (analyze-statistics-value-hash value)
                                                                    (sxhash value))))))
     hash))
@@ -29,6 +29,9 @@
                     (case type
                       ((:text :varchar) (string= lhs rhs))
                       (:numeric (zerop (sql-numeric-compare lhs rhs)))
+                      ((:float4 :float8) (zerop (sql-float-compare lhs rhs)))
+                      (:interval (= (sql-interval-comparison-value lhs)
+                                    (sql-interval-comparison-value rhs)))
                       (otherwise (= lhs rhs))))))
 
 (defstruct hash-join-row

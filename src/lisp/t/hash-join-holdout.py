@@ -17,7 +17,7 @@ CASES = (
     "int4_scan", "mixed_scan", "int4_projection", "int4_residual",
     "text_join", "wide_left", "typed_skew", "typed_sparse",
     "nested_cross", "nested_full", "lateral_index", "parameterized_index",
-    "int4_right", "int4_full",
+    "int4_right", "int4_full", "int8_rows", "int8_residual",
 )
 
 
@@ -50,8 +50,11 @@ def prepare_scan(connection, case):
 def prepare_join(connection, case):
     left_rows = 850 if case == "wide_left" else 900
     right_rows = 170 if case == "wide_left" else 1300
-    left = [(i, i * 13 % 211) for i in range(left_rows)]
-    right = [(i, i * 7 % 197) for i in range(right_rows)]
+    wide_key = case.startswith("int8_")
+    offset = 1 << 62 if wide_key else 0
+    key_type = "bigint" if wide_key else "int"
+    left = [(i, offset + i * 13 % 211) for i in range(left_rows)]
+    right = [(i, offset + i * 7 % 197) for i in range(right_rows)]
     matches = [(i, j, key) for i, key in left for j, other in right if key == other]
     join = "FROM hold_l l JOIN hold_r r ON l.k = r.k"
     if case in ("int4_right", "int4_full"):
@@ -69,14 +72,18 @@ def prepare_join(connection, case):
         load(connection, "hold_r", "k int", [(key,) for _, key in right])
         return (f"SELECT count(*), sum(l.k) {join}",
                 [len(matches), sum(key for _, _, key in matches)], 3)
+    if case == "int8_rows":
+        load(connection, "hold_l", "k bigint", [(key,) for _, key in left])
+        load(connection, "hold_r", "k bigint", [(key,) for _, key in right])
+        return f"SELECT l.k, r.k {join}", [(key, key) for _, _, key in matches], 3
     if case == "text_join":
         load(connection, "hold_l", "k text", [(f"'key{key}'",) for _, key in left])
         load(connection, "hold_r", "k text", [(f"'key{key}'",) for _, key in right])
         return (f"SELECT count(*), sum(length(l.k)) {join}",
                 [len(matches), sum(len(f"key{key}") for _, _, key in matches)], 3)
-    load(connection, "hold_l", "id int, k int", left)
-    if case == "int4_residual":
-        load(connection, "hold_r", "id int, k int", right)
+    load(connection, "hold_l", f"id int, k {key_type}", left)
+    if case in ("int4_residual", "int8_residual"):
+        load(connection, "hold_r", f"id int, k {key_type}", right)
         return f"SELECT count(*) {join} AND l.id < r.id", [sum(i < j for i, j, _ in matches)], 3
     payloads = [(i, key, "'" + ("abcde" + str(i).zfill(3)) * 800 + "'") for i, key in right]
     load(connection, "hold_r", "id int, k int, t text", payloads,
@@ -144,12 +151,17 @@ def benchmark(case, args):
                 if error.sqlstate not in ("42704", "0A000"):
                     raise
                 work_mem = None
-            expected = [list(map(str, result))]
+            if case == "int8_rows":
+                expected = sorted([str(left), str(right)] for left, right in result)
+            else:
+                expected = [list(map(str, result))]
             repeats = args.repeats or default_repeats
 
             def run(count):
                 for _ in range(count):
                     actual = connection.query(query)
+                    if case == "int8_rows":
+                        actual.sort()
                     assert actual == expected, (case, actual, expected)
 
             run(1)

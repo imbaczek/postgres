@@ -2225,6 +2225,108 @@ stayed within one CPU tick per batch, and the TOAST-heavy join fell
 from 44.7 to 43.0 ms. The exact million-row workload retained both
 2× stretch thresholds on rerun.
 
+### Fixed-width join keys
+
+The heap layout registry has ten scalar types in the 4-, 8-, and
+16-byte scope. The current key contracts are:
+
+| Width | Type | Equality key requirements |
+| --- | --- | --- |
+| 4 | `int4`, `date` | Signed scalar. Generic hash equality is available. |
+| 4 | `oid` | Unsigned catalog scalar. SQL table DDL rejects `oid`, so it has no user-table benchmark. |
+| 4 | `float4` | Canonicalize signed zero and NaNs before hashing. |
+| 8 | `int8`, `time`, `timestamp`, `timestamptz` | Signed scalar. Generic hash equality is available. |
+| 8 | `float8` | Canonicalize signed zero and NaNs before hashing. |
+| 16 | `interval` | Canonicalize the duration used for SQL comparison, including month/day equivalents. |
+
+The heap stores `timetz` in 12 bytes, and UUID has no registered heap
+layout. Both fall outside this inventory. The fused count path handles
+the signed integer and temporal domains, including interval, plus both
+float widths. Float keys normalize signed zero and NaN representations
+before partitioning. Integer, date, time, and both timestamp types retain
+their exact heap bits.
+
+The generic spill codec now stores wide signed integer keys with a
+single source identity in 13 bytes. The existing 9-byte frame continues
+to cover values in signed int32 range. With 100,000 distinct `int8`
+keys per side starting at 2^40 and 64 KiB of work memory, median time
+fell from 2.862 s to 0.315 s, allocation from 279 MB to 171 MB, peak RSS
+from 371 MiB to 268 MiB, and spill bytes from 49.8 MB to 7.8 MB in each
+direction. The comparable PostgreSQL C result was 0.020 s. The generic
+path still materializes rows, so this codec change alone falls short
+of the runtime and RSS targets.
+
+The fused eight-byte path reads each key as two signed 32-bit words,
+preserving the full range without boxing a SQL value. It spills eight
+bytes per key and uses the same partition lifecycle as the four-byte
+path. Its frequency table has 4,096 slots at 10 bytes per slot. Mixed
+leaves split before they reach 2,731 build rows, so a 16-bit frequency
+is sufficient. Single-key leaves multiply their full input counts.
+
+Interval comparison uses whole days and a nonnegative subday remainder.
+This represents the exact PostgreSQL comparison span even when adding
+the month, day, and time fields in microseconds would exceed signed
+64 bits. The private spill record uses ten bytes. The 48 KiB frequency
+table, up to sixteen 672-byte split writers, and a reusable 4 KiB reader
+fit within the 64 KiB workspace target for the table and buffers.
+Temporary file metadata is additional. If a split sends every build
+key to the same child, its next split starts at the highest bit that
+varies across the build keys. This bounds redundant rewrites for skewed
+keys that share the mixed 64-bit hash.
+
+Run `python3 src/lisp/t/hash-join-fixed-width.py --reference-bin /path/to/pg/bin`
+to reproduce the one-million-row-per-side comparisons. Pass type names
+to select cases. The harness warms each query, checks the input and
+result counts, and emits timings, CPU, memory, and the hash plan as JSON.
+The runs use 64 KiB work memory and serial execution. C uses its default
+hash memory multiplier and JIT is disabled. The reference build was
+PostgreSQL C 20devel. Times are medians of three
+Lisp and five C executions. RSS is the largest whole-server sample for
+Lisp and the largest query-backend sample for C.
+
+| Key | Lisp s | C s | Time ratio | Lisp MiB | C MiB | RSS ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `int4` | 0.271 | 0.292 | 0.93× | 117.4 | 93.1 | 1.26× |
+| `int8` starting at 2^62 | 0.338 | 0.202 | 1.67× | 111.8 | 93.2 | 1.20× |
+| `float4` | 0.286 | 0.205 | 1.40× | 117.0 | 93.3 | 1.25× |
+| `float8` | 0.380 | 0.207 | 1.84× | 118.0 | 93.5 | 1.26× |
+| `date` | 0.268 | 0.194 | 1.38× | 110.7 | 93.4 | 1.19× |
+| `time` | 0.343 | 0.204 | 1.68× | 118.0 | 93.4 | 1.26× |
+| `timestamp` | 0.355 | 0.205 | 1.73× | 118.1 | 93.2 | 1.27× |
+| `timestamptz` | 0.356 | 0.205 | 1.74× | 118.1 | 93.1 | 1.27× |
+| `interval` | 0.420 | 0.221 | 1.90× | 112.2 | 109.1 | 1.03× |
+
+The float fixtures vary the significand across both signs. The time
+fixture spans almost 24 hours, and both timestamp fixtures start in
+year 280000, beyond SBCL's signed fixnum range in epoch microseconds.
+The interval fixture uses two billion base months and represents each
+additional 32 days as one month plus two days on one side. All million
+keys match despite the different stored fields. Packing the key and
+reusing the reader reduced allocations from 24.2 MB to 13.6 MB and
+spill traffic from 48 MB to 40 MB in each direction.
+
+The holdout comparison used `a06eadacd44` as the baseline. Run
+`python3 src/lisp/t/hash-join-holdout.py --repeats 20 int4_projection int4_residual text_join wide_left typed_skew typed_sparse int8_rows int8_residual`
+and add `--engine-root` for a baseline checkout. Allocation and CPU are
+medians per query across three batches. RSS is the highest sample over
+the three batches and includes the whole Lisp server.
+
+| Holdout | Allocation MB, before → after | Peak RSS MiB, before → after | CPU ms, before → after |
+| --- | ---: | ---: | ---: |
+| `int4_projection` | 1.43 → 1.43 | 126.45 → 126.48 | 3.5 → 3.5 |
+| `int4_residual` | 1.77 → 1.77 | 133.04 → 133.27 | 14.5 → 14.0 |
+| `text_join` | 2.33 → 2.33 | 143.79 → 143.84 | 14.0 → 14.0 |
+| `wide_left` | 22.63 → 22.63 | 553.38 → 553.39 | 43.5 → 44.5 |
+| `typed_skew` | 0.69 → 0.69 | 112.39 → 112.59 | 3.0 → 3.0 |
+| `typed_sparse` | 0.70 → 0.70 | 113.63 → 113.83 | 4.5 → 4.5 |
+| `int8_rows` | 3.13 → 2.74 | 159.10 → 151.52 | 17.5 → 7.0 |
+| `int8_residual` | 1.98 → 1.98 | 137.13 → 137.36 | 16.0 → 16.0 |
+
+The spill codec improvement carries over to row-producing joins on
+single-column wide integer tables. The residual fixture spills wider
+rows and continues to use the general frame. The other holdouts show
+small variations and keep their prior execution paths.
+
 ### Other join paths
 
 Re-run the loop cases with
