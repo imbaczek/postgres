@@ -2932,6 +2932,33 @@ backend. Both rewrites remained above the 3× CPU and RSS targets.
   versus 0.41 and 0.32 ms. Peak RSS was about 411 MiB for the Lisp server
   process and 18–21 MiB for a C backend. These workloads missed the 3× targets.
 
+### P10 performance follow-up
+
+Use [the FK performance harness](t/foreign-key-performance.py) to measure
+server CPU, peak RSS and allocations against C PostgreSQL. Target at most 3×
+C server CPU, with 2× as a stretch goal. For the compact SBCL runtime, use
+provisional fresh-server RSS ceilings of 75 MiB for fixed-width keys and
+85 MiB for `varchar(127)` keys with 60–127 ASCII characters.
+
+- [ ] Reduce sparse CASCADE CPU across fixed-width keys. Test isolated point
+  deletes on integers, UUID and temporal types and range deletes on
+  `date_reverse` and `composite_reverse`. Preserve snapshot visibility and
+  concurrent rechecks.
+- [ ] Bring long ASCII `varchar(127)` inserts and cascades within the CPU target.
+  Exercise both short distinguishing prefixes and the long shared prefixes in
+  `varchar_prefix_reverse`.
+- [ ] Bring mixed interval inserts and cascades within the CPU target in
+  `interval_mixed_reverse`. Check fractional input, mixed signs and calendar
+  units alongside the existing single-unit interval workload.
+- [ ] Verify the Boolean `bool_reuse` cascade reaches the CPU target consistently
+  and retains its allocation reduction across repeated runs. Verify savepoint
+  rollback, concurrent child updates, and recovery for page-batched cascades.
+- [ ] Verify CPU and RSS across the supported key types up to 16 bytes and long
+  ASCII `varchar(127)` keys. Run the promoted cases with `--suite work` and
+  validate generalization separately with `--suite holdout`, which covers
+  permuted nullable composite rows, alternating varchar lengths, and
+  fractional timestamp expressions.
+
 ## Open development tasks
 
 - [x] Bring the legacy WAL slot retention fixture up to the current startup
