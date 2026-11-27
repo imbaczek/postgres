@@ -550,6 +550,7 @@ separate projection. Closing the result closes the sort and its source."
   ;; Each left row owns a fresh right iterator and parameter epoch.
   (let ((qual (getf join :qual))
         (right nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil) (matched nil)
+        (presence-cache (list nil))
         (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
      (lambda ()
@@ -566,7 +567,7 @@ separate projection. Closing the result closes the sort and its source."
            (if present
                (multiple-value-bind (joined origins presence)
                    (qualify-select-join-pair join qual current-left row left-origins right-origins
-                                             left-presence right-presence *datum-origin-capture*)
+                                             left-presence right-presence *datum-origin-capture* presence-cache)
                  (cond (joined
                         (setf matched t)
                         (return (values joined t origins nil presence)))
@@ -608,6 +609,7 @@ separate projection. Closing the result closes the sort and its source."
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (matches nil)
+         (presence-cache (list nil))
          (null-left (make-array (getf join :left-width) :initial-element +null+))
          (null-right (make-array (getf join :right-width) :initial-element +null+)))
     (make-sql-iterator
@@ -654,7 +656,7 @@ separate projection. Closing the result closes the sort and its source."
                 (multiple-value-bind (joined origins presence)
                     (when row
                       (qualify-select-join-pair join qual current-left row left-origins right-origins
-                                                left-presence right-presence *datum-origin-capture*))
+                                                left-presence right-presence *datum-origin-capture* presence-cache))
                   (cond (joined
                          (setf matched t)
                          (when matches (query-match-map-mark matches index))

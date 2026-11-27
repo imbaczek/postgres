@@ -6,7 +6,7 @@
      :relfilenode node :key key
      :stack (list (pg::make-btree-equal-cursor-frame
                    :level 0
-                   :entries (loop for block from 1 to count collect (list key block 1))
+                   :entries (loop for block from 1 to count collect (cons block 1))
                    :end (1- count))))))
 
 (defun detachment-test-tail (cursor)
@@ -21,7 +21,7 @@
             :relfilenode 901 :key key
             :stack (list
                     (pg::make-btree-equal-cursor-frame
-                     :level 0 :entries (list (list key 1 1) (list key 2 1)) :end 1)
+                     :level 0 :entries (list (cons 1 1) (cons 2 1)) :end 1)
                     (pg::make-btree-equal-cursor-frame
                      :level 1 :next 1 :end 2
                      :entries (list (cons key 501) (cons key 502) (cons key 503)))))))

@@ -602,6 +602,20 @@ def verify_reference_lateral(connection, reference):
         plan = connection.query("EXPLAIN " + query)[0][0]
         assert "Nested Loop" in plan and "Hash Join" not in plan, plan
         assert connection.query(query) == reference.query(query), work_mem
+    for peer in (connection, reference):
+        for start in range(320, 4320, 400):
+            rows = ",".join(f"({i},{i})" for i in range(start, start + 400))
+            peer.query("INSERT INTO diff_right VALUES " + rows)
+        peer.query("CREATE INDEX diff_right_probe ON diff_right(k)")
+        peer.query("ANALYZE diff_right")
+    for predicate in ("d.k = l.k", "l.k = d.k"):
+        indexed = query.replace("d.k = l.k", predicate)
+        plan = connection.query("EXPLAIN " + indexed)[0][0]
+        assert "Index Scan using diff_right_probe" in plan, plan
+        assert connection.query(indexed) == reference.query(indexed), predicate
+    for peer in (connection, reference):
+        peer.query("DROP INDEX diff_right_probe")
+        peer.query("DELETE FROM diff_right WHERE id >= 320")
 
 
 def verify_reference_keys(connection, reference):
@@ -658,7 +672,7 @@ def verify_reference_keys(connection, reference):
         for peer in (connection, reference):
             peer.query("DROP TABLE diff_left, diff_right")
     connection.query("RESET work_mem")
-    print("86 join differential cases matched PostgreSQL C", flush=True)
+    print("88 join differential cases matched PostgreSQL C", flush=True)
 
 
 def verify_compact_hash_count(server, connection, reference=None):

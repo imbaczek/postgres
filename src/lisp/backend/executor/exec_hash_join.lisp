@@ -163,19 +163,6 @@
           (unwind-protect (release-hash-join-partitions build)
             (release-hash-join-partitions probe)))))))
 
-(defun hash-join-output-presence (left right cache)
-  "Reuse the last immutable source identity vector, including across spill replay."
-  (when (and (simple-vector-p left) (simple-vector-p right))
-    (let ((previous (car cache))
-          (split (length left)))
-      (if (and previous
-               (= (length previous) (+ split (length right)))
-               (loop for i below split always (eql (svref left i) (svref previous i)))
-               (loop for i below (length right)
-                     always (eql (svref right i) (svref previous (+ split i)))))
-          previous
-          (setf (car cache) (combine-query-row-presence left right))))))
-
 (defun emit-hash-join-row (left left-origins left-presence entry residual build-left-p presence-cache)
   (let ((right (hash-join-row-values entry))
         (right-origins (hash-join-row-origins entry))
@@ -190,7 +177,7 @@
                         (when left-origins (replace result left-origins))
                         (when right-origins (replace result right-origins :start1 (length left)))
                         result)))
-           (presence (hash-join-output-presence left-presence right-presence presence-cache))
+           (presence (cached-query-row-presence left-presence right-presence presence-cache))
            (*query-row-origins* origins)
            (*query-row-presence* presence))
       (when (or (null residual) (eq t (funcall residual row)))

@@ -638,15 +638,14 @@ option false, no visibility check is performed."
                          (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+)))
                          (page-u16 page (+ off +heap-tuple-infomask-off+)))))
           (return-from heapam-get-tuple nil))
-        (let ((bytes (subseq page off (+ off len))))
-          (multiple-value-bind (values xmin xmax cid infomask
-                                ctid-block ctid-offnum physical-compressed)
-              (deform-heap-tuple bytes columns)
-            (make-htup :block block :offnum offnum
-                       :ctid-block ctid-block :ctid-offnum ctid-offnum
-                       :xmin (full-xid-from-32 xmin)
-                       :xmax (full-xid-from-32 xmax) :cid cid
-                       :infomask infomask :values values :physical-compressed physical-compressed)))))))
+        (multiple-value-bind (values xmin xmax cid infomask
+                              ctid-block ctid-offnum physical-compressed)
+            (deform-heap-tuple page columns :start off :limit (+ off len))
+          (make-htup :block block :offnum offnum
+                     :ctid-block ctid-block :ctid-offnum ctid-offnum
+                     :xmin (full-xid-from-32 xmin)
+                     :xmax (full-xid-from-32 xmax) :cid cid
+                     :infomask infomask :values values :physical-compressed physical-compressed))))))
 
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."

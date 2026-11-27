@@ -16,6 +16,8 @@ from parking_wire import WireError
 CASES = (
     "int4_scan", "mixed_scan", "int4_projection", "int4_residual",
     "text_join", "wide_left", "typed_skew", "typed_sparse",
+    "nested_cross", "nested_full", "lateral_index", "parameterized_index",
+    "int4_right", "int4_full",
 )
 
 
@@ -52,6 +54,16 @@ def prepare_join(connection, case):
     right = [(i, i * 7 % 197) for i in range(right_rows)]
     matches = [(i, j, key) for i, key in left for j, other in right if key == other]
     join = "FROM hold_l l JOIN hold_r r ON l.k = r.k"
+    if case in ("int4_right", "int4_full"):
+        load(connection, "hold_l", "id int, k int", left)
+        load(connection, "hold_r", "id int, k int", right)
+        missing_right = len(right) - len({j for _, j, _ in matches})
+        missing_left = len(left) - len({i for i, _, _ in matches}) if case == "int4_full" else 0
+        kind = "FULL" if case == "int4_full" else "RIGHT"
+        return (f"SELECT count(*), count(l.id), count(r.id) "
+                f"FROM hold_l l {kind} JOIN hold_r r ON l.k = r.k",
+                [len(matches) + missing_left + missing_right,
+                 len(matches) + missing_left, len(matches) + missing_right], 3)
     if case == "int4_projection":
         load(connection, "hold_l", "k int", [(key,) for _, key in left])
         load(connection, "hold_r", "k int", [(key,) for _, key in right])
@@ -88,6 +100,27 @@ def prepare_typed_join(connection, case):
     return "SELECT count(*) FROM hold_l l JOIN hold_r r ON l.k = r.k", [expected], 3
 
 
+def prepare_loop_join(connection, case):
+    if case == "nested_cross":
+        load(connection, "hold_l", "k int", [(i,) for i in range(240)])
+        load(connection, "hold_r", "k int", [(i,) for i in range(200)])
+        return ("SELECT count(*), sum(l.k + r.k) FROM hold_l l CROSS JOIN hold_r r",
+                [48000, 200 * sum(range(240)) + 240 * sum(range(200))], 5)
+    if case == "nested_full":
+        load(connection, "hold_l", "k int", [(i,) for i in range(121)])
+        load(connection, "hold_r", "k int", [(i,) for i in range(121)])
+        pairs = sum(range(121))
+        return ("SELECT count(*), count(l.k), count(r.k) FROM hold_l l FULL JOIN hold_r r ON l.k < r.k",
+                [pairs + 2, pairs + 1, pairs + 1], 5)
+    load(connection, "hold_l", "k int", [(i * 11,) for i in range(800)])
+    load(connection, "hold_r", "k int, v int", [(i, i + 7) for i in range(6000)])
+    connection.query("CREATE INDEX hold_r_key ON hold_r(k)")
+    source = ("LEFT JOIN LATERAL (SELECT v FROM hold_r WHERE k = l.k LIMIT 1) r ON true"
+              if case == "lateral_index" else "LEFT JOIN hold_r r ON l.k = r.k")
+    return (f"SELECT count(*), count(r.v), sum(r.v) FROM hold_l l {source}",
+            [800, 546, sum(i * 11 + 7 for i in range(546))], 7)
+
+
 def benchmark(case, args):
     server = MEMORY["OwnedLisp"]()
     try:
@@ -98,6 +131,8 @@ def benchmark(case, args):
                 query, result, default_repeats = prepare_scan(connection, case)
             elif case.startswith("typed_"):
                 query, result, default_repeats = prepare_typed_join(connection, case)
+            elif case in ("nested_cross", "nested_full", "lateral_index", "parameterized_index"):
+                query, result, default_repeats = prepare_loop_join(connection, case)
             else:
                 query, result, default_repeats = prepare_join(connection, case)
             if args.control_prelude:

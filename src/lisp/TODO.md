@@ -2225,6 +2225,42 @@ stayed within one CPU tick per batch, and the TOAST-heavy join fell
 from 44.7 to 43.0 ms. The exact million-row workload retained both
 2× stretch thresholds on rerun.
 
+### Other join paths
+
+Re-run the loop cases with
+`python3 src/lisp/t/hash-join-holdout.py nested_cross nested_full lateral_index parameterized_index`.
+The reference checkout was `976722fac52`. Allocation and CPU are medians
+per execution, and RSS is the largest whole-server sample across three
+batches at 64 KiB.
+
+| Holdout | Allocation, MB | Peak RSS, MiB | CPU, ms |
+| --- | ---: | ---: | ---: |
+| Cross join with 48k projected pairs | 23.01 → 21.48 | 213.3 → 201.6 | 84 → 84 |
+| Full nested loop with inequality | 6.94 → 6.47 | 132.3 → 130.0 | 22 → 24 |
+| Indexed LATERAL with 800 outer rows | 411.27 → 5.95 | 921.1 → 139.6 | 1,430 → 22.9 |
+| Parameterized index join with 800 probes | 30.01 → 4.52 | 300.4 → 130.1 | 28.6 → 20.0 |
+
+With 20 executions per sample, cross-join CPU moved from 87.5 to
+89.5 ms, and inequality full-join CPU moved from 24.5 to 24.0 ms.
+Their allocation reductions persisted.
+
+The correlated subquery uses the bound outer column as a runtime index
+equality. Forward full-key equality ranges use the point cursor, and
+point cursors retain only matching TIDs from each leaf. Heap lookup
+deforms tuple bytes directly from the borrowed page. Nested loops and
+LATERAL reuse their last immutable source-presence vector across pairs.
+The PostgreSQL C differential also checks both predicate orientations
+for a correlated indexed probe with NULL outer keys and an inner filter.
+
+The row-producing hash join holdouts covered integer projection, an
+integer join with a residual, text equality, and LEFT, RIGHT and FULL
+joins. In separate 20-execution samples, the narrow cases stayed within
+1 MiB peak RSS and 1 ms CPU per execution of the baseline. The
+external-text LEFT JOIN allocated 22.63 MB per execution versus 23.75 MB
+and peaked at 553 MiB versus 572 MiB. Its median CPU was 44.0 ms versus
+42.5 ms. The original million-row count still met the stretch thresholds
+at 0.290 s and 111 MiB in five warmed samples.
+
 In the same-SQL comparison with 10,000 probe rows and 256 build
 rows, all three plans returned 256 rows. At 64 KiB, the hash join
 processed 256 candidates in 7 ms and allocated 2.0 MB, with 37 kB

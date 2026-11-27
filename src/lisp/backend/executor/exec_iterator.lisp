@@ -82,6 +82,19 @@
          (values row present origins nil (and present presence))))
      (lambda () (close-sql-iterator input)))))
 
+(defun cached-query-row-presence (left right cache)
+  "Reuse the last immutable source identity vector, including across spill replay."
+  (when (and (simple-vector-p left) (simple-vector-p right))
+    (let ((previous (car cache))
+          (split (length left)))
+      (if (and previous
+               (= (length previous) (+ split (length right)))
+               (loop for i below split always (eql (svref left i) (svref previous i)))
+               (loop for i below (length right)
+                     always (eql (svref right i) (svref previous (+ split i)))))
+          previous
+          (setf (car cache) (combine-query-row-presence left right))))))
+
 (defun make-query-replay-store (producer &optional (memory-limit (effective-query-work-memory-bytes)) hash-spill-p)
   (%make-query-replay-store :producer producer :spool (make-query-row-spool memory-limit hash-spill-p) :capture-origins-p *datum-origin-capture* :capture-presence-p t))
 

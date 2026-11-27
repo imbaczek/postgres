@@ -569,7 +569,8 @@ whose other operand belongs to the already-built outer relation is considered."
           (multiple-value-bind (value literal-p) (simple-equality-constant right)
             (cond (literal-p
                    (values (second left) operator value (expr-type right)))
-                  ((eq (first right) :parameter)
+                  ((or (eq (first right) :parameter)
+                       (and (eq (first right) :outer-ref) (string= operator "=")))
                    (values (second left) operator nil (expr-type right) right)))))))))
 
 (defun index-range-value-p (value value-type index-type)
@@ -648,14 +649,24 @@ whose other operand belongs to the already-built outer relation is considered."
                  (progn
                    (push equality equalities)
                    (setf selectivity (* selectivity
-                                        (if (sixth equality) 0.1d0
-                                            (planner-equality-selectivity table attnum (third equality))))))
+                                        (case (first (sixth equality))
+                                          (:outer-ref
+                                           (let ((stats (table-statistics-column table attnum)))
+                                             (if stats
+                                                 (/ (- 1.0d0 (pg-column-statistics-null-fraction stats))
+                                                    (max 1 (pg-column-statistics-distinct-count stats)))
+                                                 0.1d0)))
+                                          (:parameter 0.1d0)
+                                          (otherwise
+                                           (planner-equality-selectivity table attnum (third equality)))))))
                  (progn
                    (setf endpoints terms)
                    (when terms
                      (setf selectivity (* selectivity (if (rest terms) 0.1d0 0.333333d0))))
                    (return))))
-    (when (or allow-unbounded-p endpoints (and equalities (rest (pg-index-columns index))))
+    (when (or allow-unbounded-p endpoints (and equalities
+                                               (or (rest (pg-index-columns index))
+                                                   (eq (first (sixth (first equalities))) :outer-ref))))
       (let* ((equalities (nreverse equalities))
              (terms (append equalities endpoints))
              (quals (mapcar #'fifth terms))
@@ -668,13 +679,16 @@ whose other operand belongs to the already-built outer relation is considered."
 
 (defun index-range-paths (table conjuncts offset allow-partial-p)
   (let ((indexes (table-indexes table)))
-    ;; A single-column index with only equality terms already has an
-    ;; equality path. Building range comparisons cannot add a candidate.
+    ;; Literal single-column equalities already have their own path.
+    ;; An outer reference needs a range template resolved for each cursor.
     (when (and indexes
                (or (some (lambda (index) (rest (pg-index-columns index))) indexes)
                    (some (lambda (qual)
                            (and (eq (first qual) :binop)
-                                (member (second qual) '("<" "<=" ">" ">=") :test #'equal)))
+                                (or (member (second qual) '("<" "<=" ">" ">=") :test #'equal)
+                                    (and (string= (second qual) "=")
+                                         (or (eq (first (third qual)) :outer-ref)
+                                             (eq (first (fourth qual)) :outer-ref))))))
                          conjuncts)))
       (let ((comparisons (index-range-comparisons conjuncts offset)))
         (when comparisons
@@ -1538,8 +1552,20 @@ registration-to-DDL handoff free of a lock-order inversion."
   (let ((parameter (select-scan-path-parameter-expr path)))
     (if (null parameter)
         (let ((range (select-scan-path-range path)))
-          (if range (resolve-select-index-range table path range environment)
-              (select-scan-path-key path)))
+          (if (null range)
+              (select-scan-path-key path)
+              (let* ((resolved (resolve-select-index-range table path range environment))
+                     (lower (and resolved (select-index-range-lower resolved))))
+                ;; A shared inclusive prefix bound with every column bound is
+                ;; a forward point probe. Reuse the equality cursor for it.
+                (if (and lower
+                         (eq lower (select-index-range-upper resolved))
+                         (btree-scan-bound-inclusive-p lower)
+                         (not (select-index-range-backward-p resolved))
+                         (= (select-index-range-equality-count resolved)
+                            (length (index-types (select-scan-path-index path) table))))
+                    (btree-scan-bound-prefix lower)
+                    resolved))))
         (let* ((value (eval-expr parameter environment))
                (types (index-types (select-scan-path-index path) table)))
           (when (indexable-equality-value-p value (first types))
@@ -2058,11 +2084,11 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (values values padded-origins)))
 
 (defun qualify-select-join-pair (join qual left right left-origins right-origins
-                                 left-presence right-presence capture-p)
+                                 left-presence right-presence capture-p presence-cache)
   "Return a matching joined row with its origins and source presence."
   (let* ((joined (combine-select-join-environment left right join))
          (origins (and capture-p (combine-select-join-origins left left-origins right right-origins join)))
-         (presence (combine-query-row-presence left-presence right-presence))
+         (presence (cached-query-row-presence left-presence right-presence presence-cache))
          (*query-row-origins* origins)
          (*query-row-presence* presence))
     (when (true-p (eval-expr qual joined))

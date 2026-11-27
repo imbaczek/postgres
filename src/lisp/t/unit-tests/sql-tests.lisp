@@ -297,7 +297,7 @@
                     :stack (list (make-btree-equal-cursor-frame
                                   :level 0 :end 2
                                   :entries (loop for offset from 1 to 3
-                                                 collect (list key 0 offset))))))
+                                                 collect (cons 0 offset))))))
                  (symbol-function 'btree-cursor-next-tid)
                  (lambda (cursor)
                    (incf candidate-visits)
