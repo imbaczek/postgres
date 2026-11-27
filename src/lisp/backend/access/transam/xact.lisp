@@ -31,6 +31,10 @@
   (dirty-relations '())
   (role-changes nil)
   (catalog-transaction nil)
+  (deferred-foreign-key-checks nil)
+  (foreign-key-constraint-modes nil)
+  (savepoints nil)
+  (heap-undo-log nil)
   ;; Per-transaction durable boundaries; reset detaches this context.
   (wal-obligation nil)
   (logical-spool nil)
@@ -488,6 +492,11 @@ OWNER may be an XID or backend; a token without an owner identifies itself."
 (defvar *relation-wait-dependencies* (make-hash-table :test #'eq)
   "Gate tokens, XIDs, and snapshots blocking each backend under the relation lock.")
 
+(defstruct referenced-key-wait
+  identity
+  xid
+  exclusive-p)
+
 (defun relation-wait-owner (dependency)
   "Resolve a dependency only while the corresponding resource is still held."
   (etypecase dependency
@@ -497,6 +506,9 @@ OWNER may be an XID or backend; a token without an owner identifies itself."
                       (sb-thread:with-mutex (*xid-lock*)
                         (gethash dependency *active-xid-backends*)))))
        (when (backend-p owner) owner)))
+    (referenced-key-wait
+     (let ((xid (referenced-key-wait-owner-xid dependency)))
+       (when xid (relation-wait-owner xid))))
     (relation-gate-token
      (when (or (gethash dependency *relation-build-groups*)
                (loop for token being the hash-values of *relation-maintainers*
@@ -1469,6 +1481,138 @@ prefer WITH-RELATION-MAINTENANCE-LOCKS."
   `(with-relation-maintenance-locks ((list ,relfilenode))
      ,@body))
 
+(defvar *referenced-key-grants* (make-hash-table :test #'equalp)
+  "Referenced index OID and canonical B-tree key to XID grants under the relation mutex.")
+
+(defvar *referenced-keys-by-xid* (make-hash-table :test #'eql)
+  "Reverse ownership for release after CLOG publication, under the relation mutex.")
+
+(defun referenced-key-wait-owner-xid (dependency)
+  "Resolve this edge only while the exact grant still conflicts."
+  (let* ((xid (referenced-key-wait-xid dependency))
+         (grant (assoc xid (gethash (referenced-key-wait-identity dependency) *referenced-key-grants*)
+                       :test #'=)))
+    (when (and grant (or (referenced-key-wait-exclusive-p dependency)
+                         (eq (cdr grant) :exclusive)))
+      xid)))
+
+(defun referenced-key-grant-checkpoint (xid)
+  "Snapshot the mode of each grant the transaction held at a savepoint."
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (loop for identity in (gethash xid *referenced-keys-by-xid*)
+          collect (cons identity (cdr (assoc xid (gethash identity *referenced-key-grants*) :test #'=))))))
+
+(defun restore-referenced-key-grants (xid checkpoint)
+  "Release younger grants and undo upgrades while retaining ancestor ownership."
+  (sb-thread:with-mutex (*relation-lock-mutex*)
+    (sb-sys:without-interrupts
+      (setf (gethash xid *referenced-keys-by-xid*)
+            (loop for identity in (gethash xid *referenced-keys-by-xid*)
+                  for grants = (gethash identity *referenced-key-grants*)
+                  for saved = (assoc identity checkpoint :test #'equalp)
+                  if saved
+                    do (setf (cdr (assoc xid grants :test #'=)) (cdr saved))
+                    and collect identity
+                  else do (let ((remaining (remove xid grants :key #'car :test #'=)))
+                            (if remaining
+                                (setf (gethash identity *referenced-key-grants*) remaining)
+                                (remhash identity *referenced-key-grants*)))))
+      (unless (gethash xid *referenced-keys-by-xid*)
+        (remhash xid *referenced-keys-by-xid*))
+      (sb-thread:condition-broadcast *relation-lock-cv*)))
+  (values))
+
+(defstruct foreign-key-savepoint-state
+  checks modes grants)
+
+(defstruct backend-savepoint
+  name heap-checkpoint foreign-key-state conflict-row-checkpoint
+  logical-checkpoint logical-bytes binary-required-database)
+
+(defun capture-backend-savepoint (backend name)
+  (make-backend-savepoint
+   :name name
+   :heap-checkpoint (backend-heap-undo-log backend)
+   :foreign-key-state (capture-foreign-key-savepoint-state backend)
+   :conflict-row-checkpoint (on-conflict-row-lock-checkpoint (backend-xid backend))
+   :logical-checkpoint (capture-logical-spool-checkpoint (backend-logical-spool backend))
+   :logical-bytes (backend-logical-change-bytes backend)
+   :binary-required-database
+   (sb-thread:with-mutex (*xid-lock*)
+     (gethash (backend-xid backend) *logical-binary-required-xids*))))
+
+(defun restore-backend-savepoint-logical-state (backend savepoint)
+  (setf (backend-logical-spool backend)
+        (restore-logical-spool-checkpoint (backend-logical-spool backend)
+                                          (backend-savepoint-logical-checkpoint savepoint))
+        (backend-logical-change-bytes backend)
+        (backend-savepoint-logical-bytes savepoint))
+  (let ((xid (backend-xid backend))
+        (database (backend-savepoint-binary-required-database savepoint)))
+    (when xid
+      (sb-thread:with-mutex (*xid-lock*)
+        (if database
+            (setf (gethash xid *logical-binary-required-xids*) database)
+            (remhash xid *logical-binary-required-xids*)))))
+  (values))
+
+(defun capture-foreign-key-savepoint-state (backend)
+  "Capture pending checks, timing overrides and referenced-key grants."
+  (make-foreign-key-savepoint-state
+   :checks (backend-deferred-foreign-key-checks backend)
+   :modes (backend-foreign-key-constraint-modes backend)
+   :grants (when (backend-xid backend) (referenced-key-grant-checkpoint (backend-xid backend)))))
+
+(defun restore-foreign-key-savepoint-state (backend state)
+  "Restore foreign-key state after the owning subtransaction's writes are undone."
+  (sb-sys:without-interrupts
+    (setf (backend-deferred-foreign-key-checks backend) (foreign-key-savepoint-state-checks state)
+          (backend-foreign-key-constraint-modes backend) (foreign-key-savepoint-state-modes state))
+    (when (backend-xid backend)
+      (restore-referenced-key-grants (backend-xid backend) (foreign-key-savepoint-state-grants state))))
+  (values))
+
+(defun acquire-referenced-key-lock (index-oid key mode)
+  "Hold a shared child probe or exclusive parent mutation lock until XID retirement.
+KEY is the packed, canonical B-tree key in the referenced index's column order.
+Call before taking heap, B-tree, catalog or WAL write locks."
+  (let ((xid (get-current-xid))
+        (identity (cons index-oid key))
+        (exclusive-p (ecase mode (:shared nil) (:exclusive t))))
+    (sb-thread:with-mutex (*relation-lock-mutex*)
+      (loop
+        (check-for-interrupts)
+        (let* ((grants (gethash identity *referenced-key-grants*))
+               (own (assoc xid grants :test #'=))
+               (blockers (loop for (owner . held-mode) in grants
+                               when (and (/= owner xid)
+                                         (or exclusive-p (eq held-mode :exclusive)))
+                                 collect (make-referenced-key-wait :identity identity
+                                                                   :xid owner :exclusive-p exclusive-p))))
+          (cond
+            ((and own (or (eq (cdr own) :exclusive) (not exclusive-p)))
+             (return))
+            (blockers (wait-for-relation-dependencies blockers))
+            (t
+             (sb-sys:without-interrupts
+               (if own
+                   (setf (cdr own) mode)
+                   (let ((owned-key (cons index-oid (copy-seq key))))
+                     (push owned-key (gethash xid *referenced-keys-by-xid*))
+                     (push (cons xid mode) (gethash owned-key *referenced-key-grants*)))))
+             (return)))))))
+  (values))
+
+(defun release-referenced-key-locks-under-relation-lock (xid)
+  "Remove all grants before waking waiters or retiring XID from the wait graph."
+  (dolist (identity (gethash xid *referenced-keys-by-xid*))
+    (let ((remaining (delete xid (gethash identity *referenced-key-grants*) :key #'car :test #'=)))
+      (if remaining
+          (setf (gethash identity *referenced-key-grants*) remaining)
+          (remhash identity *referenced-key-grants*))))
+  (remhash xid *referenced-keys-by-xid*)
+  (values))
+
 (defun release-relation-writer-xid (xid &optional backend)
   "Release XID's relation accesses and transaction registration.
 
@@ -1482,6 +1626,7 @@ XID lock.  Relation waiters are notified after the registrations are removed."
       (unless (eql xid (backend-virtual-reader-xid backend))
         (error "virtual reader cleanup identity mismatch"))
       (setf (backend-virtual-reader-xid backend) nil))
+    (release-referenced-key-locks-under-relation-lock xid)
     (remhash xid *recovery-reader-xids*)
     (sb-thread:with-mutex (*xid-lock*)
       (setf *active-xids* (delete xid *active-xids* :test #'=))
@@ -1529,6 +1674,24 @@ XID lock.  Relation waiters are notified after the registrations are removed."
             (setf (gethash key *on-conflict-row-locks*) xid)
             (pushnew key (gethash xid *on-conflict-xid-row-locks*) :test #'equal)
             nil)))))
+
+(defun on-conflict-row-lock-checkpoint (xid)
+  (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
+    (gethash xid *on-conflict-xid-row-locks*)))
+
+(defun restore-on-conflict-row-locks (xid checkpoint)
+  "Discard ON CONFLICT claims made after CHECKPOINT without releasing older claims."
+  (when xid
+    (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
+      (sb-sys:without-interrupts
+        (loop for tail on (gethash xid *on-conflict-xid-row-locks*)
+              until (eq tail checkpoint)
+              do (when (eql xid (gethash (first tail) *on-conflict-row-locks*))
+                   (remhash (first tail) *on-conflict-row-locks*)))
+        (if checkpoint
+            (setf (gethash xid *on-conflict-xid-row-locks*) checkpoint)
+            (remhash xid *on-conflict-xid-row-locks*)))))
+  (values))
 
 (defun release-on-conflict-row-locks (xid)
   (sb-thread:with-mutex (*on-conflict-row-lock-mutex*)
@@ -1631,13 +1794,14 @@ proceed, and scoped cleanup removes only the writer blocker."
     (wait-for-concurrent-index-users node)
     (funcall function)))
 
-(defun wait-for-xid (xid)
-  "Block until XID ends. Called without the write lock held."
+(defun wait-for-xid (xid &key recheck-on-wakeup-p)
+  "Wait without the write lock. Row waiters can recheck on a savepoint wakeup."
   (with-backend-wait-state (*backend* backend-waiting-xid xid)
     (sb-thread:with-mutex (*relation-lock-mutex*)
       (loop with blockers = (list xid)
             while (relation-user-active-under-lock-p xid)
-            do (wait-for-relation-dependencies blockers))))
+            do (wait-for-relation-dependencies blockers)
+               (when recheck-on-wakeup-p (return)))))
   (values))
 
 (defun logical-capture-xid-needed-p (xid)
@@ -2707,6 +2871,10 @@ reader release.  Mask interrupts until cleanup and the idle transition finish,
 so no interrupt can discard the owner of a virtual ID or its relation locks."
   (sb-sys:without-interrupts
     (clear-backend-command-id-used b)
+    (setf (backend-deferred-foreign-key-checks b) nil
+          (backend-foreign-key-constraint-modes b) nil
+          (backend-savepoints b) nil
+          (backend-heap-undo-log b) nil)
     (when (backend-logical-spool b)
       (close-logical-spool (backend-logical-spool b))
       (setf (backend-logical-spool b) nil))
@@ -2935,6 +3103,11 @@ Run outside publication locks, clean up the transaction, then handle the outcome
       (when (backend-role-changes *backend*)
         (ereport "0A000" "catalog and role changes cannot share a transaction"))
       (get-current-xid)))
+  (when (backend-deferred-foreign-key-checks *backend*)
+    (handler-case (run-deferred-foreign-key-checks)
+      (error (condition)
+        (unless (fatal-error-p condition) (abort-transaction))
+        (error condition))))
   (ensure-exported-snapshot-scope-can-end *backend*)
   (prepare-backend-portal-transaction-end *backend* t)
   (let ((b *backend*))
@@ -3026,6 +3199,9 @@ Run outside publication locks, clean up the transaction, then handle the outcome
 (defun abort-transaction-block ()
   "Abort resources immediately while retaining the explicit failed-block status."
   (let ((explicit (backend-explicit *backend*)))
+    (when (and explicit (backend-savepoints *backend*))
+      (set-backend-state *backend* :aborted)
+      (return-from abort-transaction-block (values)))
     (let ((*preserve-failed-extended-portals* explicit)
           (*preserve-failed-logical-info-backend* (and explicit *backend*)))
       (abort-transaction))

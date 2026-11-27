@@ -11,6 +11,7 @@
                (:file "t/rove/primitives-tests")
                (:file "t/rove/storage-tests")
                (:file "t/rove/column-evolution-tests")
+               (:file "t/rove/foreign-key-tests")
                (:file "t/rove/replication-slot-state-tests")
                (:file "t/rove/physical-slot-cleanup-refusal-tests")
                (:file "t/rove/promotion-directory-tests")

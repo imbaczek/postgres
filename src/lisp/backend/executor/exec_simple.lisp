@@ -49,6 +49,14 @@ precondition under the write and catalog locks, after acquiring the gates."
           (when toast (pg-toast-relfilenode toast))
           (when toast (pg-toast-index-relfilenode toast)))))
 
+(defun check-no-pending-foreign-key-events (table)
+  "Protect tuple identities in pending events from storage replacement."
+  (let ((oid (pg-class-oid table)))
+    (when (loop for (child parent) in (backend-deferred-foreign-key-checks *backend*)
+                  thereis (or (eql oid (pg-class-oid child)) (eql oid (pg-class-oid parent))))
+      (ereport "55006" "cannot change storage of table ~s because it has pending foreign key checks"
+               (pg-class-name table)))))
+
 (defun check-truncate-table-not-in-use (table)
   "Reject storage replacement while this backend retains an executor for TABLE.
 
@@ -81,6 +89,7 @@ Recheck identities after waiting and under catalog locks before changing storage
                  (mapcar
                   (lambda (name)
                     (let ((table (resolve-table-or-error name)))
+                      (check-no-pending-foreign-key-events table)
                       (check-truncate-table-not-in-use table)
                       (cons table (truncate-table-storage-state table))))
                   (remove-duplicates (getf ast :tables) :test #'equal :from-end t))))
@@ -96,6 +105,10 @@ Recheck identities after waiting and under catalog locks before changing storage
                              for state = (cdr entry)
                              append (cons (first state)
                                           (when (fourth state) (list (fourth state))))))))
+        (dolist (target targets)
+          (dolist (reference (referencing-foreign-keys target))
+            (unless (member (car reference) targets :test #'eq)
+              (ereport "0A000" "cannot truncate a table referenced in a foreign key constraint"))))
         (loop
           (acquire-transaction-relation-locks nodes)
           (let ((current
@@ -889,6 +902,379 @@ Do not perform wire I/O while restoring transaction state."
   (mapcar (lambda (n)
             (pg-column-attnum (resolve-column-or-error table n)))
           names))
+
+(defun resolve-foreign-key-target (table names &optional (indexes (table-indexes table)))
+  "Return the referenced attnums in SQL order and the supporting unique index.
+An omitted column list uses the primary key's order."
+  (let ((attnums (and names (resolve-attnums table names))))
+    (when (and attnums (/= (length attnums) (length (remove-duplicates attnums))))
+      (ereport "42830" "foreign key referenced-columns list must not contain duplicates"))
+    (let ((index
+            (find-if (lambda (candidate)
+                       (and (pg-index-live-p candidate)
+                            (pg-index-ready-p candidate)
+                            (pg-index-valid-p candidate)
+                            (pg-index-unique-p candidate)
+                            (not (index-has-expressions-p candidate))
+                            (if attnums
+                                (let ((keys (pg-index-columns candidate)))
+                                  (and (= (length keys) (length attnums))
+                                       (subsetp attnums keys :test #'eql)))
+                                (pg-index-primary-p candidate))))
+                     indexes)))
+      (unless index
+        (if names
+            (ereport "42830" "there is no unique constraint matching given keys for referenced table ~s"
+                     (pg-class-name table))
+            (ereport "42830" "there is no primary key for referenced table ~s" (pg-class-name table))))
+      (values (or attnums (copy-list (pg-index-columns index))) index))))
+
+(defun cook-foreign-key (child parent definition oid &optional (parent-indexes (table-indexes parent)))
+  "Bind a parsed constraint to the target index and to physical attribute identities."
+  (let* ((names (getf definition :columns))
+         (columns (resolve-attnums child names))
+         (base (format nil "~a_~{~a~^_~}_fkey" (pg-class-name child) names))
+         (name (or (getf definition :name)
+                   (loop for suffix from 0
+                         for candidate = (if (zerop suffix) base (format nil "~a~d" base suffix))
+                         unless (table-constraint-name-used-p child candidate) return candidate))))
+    (when (table-constraint-name-used-p child name)
+      (ereport "42710" "constraint ~a for relation ~a already exists" name (pg-class-name child)))
+    (multiple-value-bind (targets index)
+        (resolve-foreign-key-target parent (getf definition :referenced-columns) parent-indexes)
+      (unless (= (length columns) (length targets))
+        (ereport "42830" "number of referencing and referenced columns for foreign key disagree"))
+      (loop for child-slot in columns
+            for parent-slot in targets
+            for child-type = (pg-column-type (aref (pg-class-columns child) (1- child-slot)))
+            for parent-type = (pg-column-type (aref (pg-class-columns parent) (1- parent-slot)))
+            unless (or (eq child-type parent-type)
+                       (and (member child-type '(:int2 :int4 :int8))
+                            (member parent-type '(:int2 :int4 :int8)))
+                       (and (member child-type '(:text :varchar))
+                            (member parent-type '(:text :varchar))))
+              do (ereport "42804" "foreign key constraint ~a cannot match ~a to ~a"
+                          name child-type parent-type))
+      (make-pg-foreign-key :oid oid :name name :columns columns :referenced-columns targets
+                           :referenced-table-oid (pg-class-oid parent)
+                           :referenced-index-oid (pg-index-oid index)
+                           :update-action (getf definition :update-action :no-action)
+                           :delete-action (getf definition :delete-action :no-action)
+                           :match-type (getf definition :match-type :simple)
+                           :deferrable-p (getf definition :deferrable)
+                           :initially-deferred-p (getf definition :initially-deferred)
+                           :validated-p (not (getf definition :not-valid))))))
+
+(defun foreign-key-child-index-key (constraint parent index row)
+  "Encode a child reference in the parent index domain and key order.
+Return NIL and a reason when the reference is skipped or cannot match."
+  (let* ((child-columns (pg-foreign-key-columns constraint))
+         (values (mapcar (lambda (attnum) (aref row (1- attnum))) child-columns))
+         (nulls (count +null+ values :test #'eq)))
+    (when (plusp nulls)
+      (return-from foreign-key-child-index-key
+        (values nil (if (and (eq :full (pg-foreign-key-match-type constraint))
+                             (< nulls (length values)))
+                        :mixed-null
+                        :null))))
+    (let* ((mapping (pairlis (pg-foreign-key-referenced-columns constraint) values))
+           (ordered (mapcar (lambda (attnum) (cdr (assoc attnum mapping :test #'eql)))
+                            (pg-index-columns index)))
+           (types (index-types index parent)))
+      (loop for value in ordered for type in types
+            for width = (case type (:int2 16) (:int4 32) (:int8 64))
+            when (and width (not (typep value `(signed-byte ,width))))
+              do (return-from foreign-key-child-index-key (values nil :out-of-range)))
+      (values (encode-index-key ordered types) :key))))
+
+(defun foreign-key-parent-visible-p (parent index key snapshot)
+  "Probe the referenced index for a parent visible to SNAPSHOT."
+  (let ((node (pg-class-relfilenode parent))
+        (columns (pg-class-columns parent)))
+    (btree-scan-equal
+     (pg-index-relfilenode index) key
+     (lambda (tid)
+       (check-for-interrupts)
+       (let ((tuple (heapam-get-tuple node (car tid) (cdr tid) columns)))
+         (when (and tuple (htup-visible-p tuple snapshot))
+           (return-from foreign-key-parent-visible-p t))))))
+  nil)
+
+(defun check-foreign-key-parent (child parent constraint index key latest retained)
+  "Probe under already acquired key grants and the statement's check horizons."
+  (let ((has-parent (foreign-key-parent-visible-p parent index key latest)))
+    (when retained
+      (let ((previously-visible (foreign-key-parent-visible-p parent index key retained)))
+        (when (and previously-visible (not has-parent))
+          (ereport "40001" "could not serialize access due to concurrent update"))
+        (setf has-parent (and has-parent previously-visible))))
+    (unless has-parent
+      (ereport "23503" "insert or update on table ~s violates foreign key constraint ~s"
+               (pg-class-name child) (pg-foreign-key-name constraint)))))
+
+(defun lock-foreign-key-child-references (child row tid &optional old-row old-own-p)
+  "Hold new non-null child references before probing at statement end."
+  (loop for constraint in (pg-class-foreign-keys child)
+        unless (and old-row (not (and old-own-p (foreign-key-deferred-p constraint)))
+                    (loop for attnum in (pg-foreign-key-columns constraint)
+                          for before = (aref old-row (1- attnum))
+                          for after = (aref row (1- attnum))
+                          always (or (eql before after) (true-p (sql-compare "=" before after)))))
+          append
+          (let ((parent (find-table-by-oid (pg-foreign-key-referenced-table-oid constraint)))
+                (index (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint))))
+            (multiple-value-bind (key status) (foreign-key-child-index-key constraint parent index row)
+              (ecase status
+                (:null nil)
+                (:key
+                 (acquire-referenced-key-lock (pg-index-oid index) key :shared)
+                 (list (list parent constraint index key tid)))
+                ((:mixed-null :out-of-range)
+                 (cond ((foreign-key-deferred-p constraint)
+                        (list (list parent constraint index status tid)))
+                       ((eq status :mixed-null)
+                        (ereport "23503" "MATCH FULL does not allow mixing null and nonnull key values"))
+                       (t
+                        (ereport "23503" "insert or update on table ~s violates foreign key constraint ~s"
+                                 (pg-class-name child) (pg-foreign-key-name constraint))))))))))
+
+(defun foreign-key-deferred-p (constraint)
+  (when (pg-foreign-key-deferrable-p constraint)
+    (let* ((modes (backend-foreign-key-constraint-modes *backend*))
+           (override (or (assoc (pg-foreign-key-oid constraint) modes)
+                         (assoc :all modes))))
+      (if override (eq (cdr override) :deferred)
+          (pg-foreign-key-initially-deferred-p constraint)))))
+
+(defun queue-deferred-foreign-key-check (child parent constraint index key &optional child-tid)
+  (push (list child parent constraint index key child-tid)
+        (backend-deferred-foreign-key-checks *backend*)))
+
+(defun foreign-key-queued-child-visible-p (child identity snapshot)
+  "Check only the inserted version that queued the child-side event."
+  (destructuring-bind (block off cid) identity
+    (let ((tuple (heapam-get-tuple (pg-class-relfilenode child) block off (pg-class-columns child))))
+      (and tuple (eql (htup-xmin tuple) (backend-xid *backend*))
+           (htup-visible-p tuple snapshot)
+           (eql cid (htup-cid tuple))))))
+
+(defun check-deferred-foreign-key-event (event latest retained)
+  (destructuring-bind (child parent constraint index key child-tid) event
+    (when (if child-tid
+              (foreign-key-queued-child-visible-p child child-tid latest)
+              (foreign-key-child-visible-p child parent constraint index key latest))
+      (let* ((latest-parent (and (not (symbolp key))
+                                 (foreign-key-parent-visible-p parent index key latest)))
+             (retained-parent (and retained child-tid (not (symbolp key))
+                                   (foreign-key-parent-visible-p parent index key retained))))
+        (when (and retained
+                   (if child-tid
+                       (and retained-parent (not latest-parent))
+                       (and (not latest-parent)
+                            (not (foreign-key-child-visible-p child parent constraint index key retained)))))
+          (ereport "40001" "could not serialize access due to concurrent update"))
+        (unless (and latest-parent (or (null retained) (null child-tid) retained-parent))
+          (ereport "23503" "foreign key constraint ~s on table ~s has no referenced row in ~s"
+                   (pg-foreign-key-name constraint) (pg-class-name child) (pg-class-name parent)))))))
+
+(defmacro with-fresh-foreign-key-snapshot ((snapshot command-id) &body body)
+  "Read the current visibility horizon at COMMAND-ID, with registered cleanup."
+  (let ((registration (gensym "REGISTRATION-")))
+    `(with-statement-snapshot
+         (,snapshot (lambda (,registration) (make-snapshot ,command-id :register ,registration)))
+       ,@body)))
+
+(defun run-deferred-foreign-key-checks (&optional constraint-oids)
+  "Check surviving references for selected constraints, or all pending checks."
+  (let* ((cid (1+ (backend-command-id *backend*)))
+         (base (backend-transaction-snapshot *backend*))
+         (retained (when (and base (member (backend-isolation-level *backend*) '(:repeatable-read :serializable)))
+                     (copy-snapshot base)))
+         (remaining nil))
+    (when retained (setf (snapshot-curcid retained) cid))
+    (with-fresh-foreign-key-snapshot (latest cid)
+      (dolist (event (backend-deferred-foreign-key-checks *backend*))
+        (if (or (null constraint-oids) (member (pg-foreign-key-oid (third event)) constraint-oids))
+            (check-deferred-foreign-key-event event latest retained)
+            (push event remaining))))
+    (setf (backend-deferred-foreign-key-checks *backend*) (nreverse remaining)))
+  (values))
+
+(defun foreign-key-mode-targets (names mode)
+  "Resolve all visible foreign key constraints with each requested name."
+  (let ((matches (make-hash-table :test #'equal)))
+    (with-write-lock
+      (catalog-map-visible-relations
+       (lambda (name table)
+         (declare (ignore name))
+         (dolist (constraint (pg-class-foreign-keys table))
+           (when (member (pg-foreign-key-name constraint) names :test #'string=)
+             (push constraint (gethash (pg-foreign-key-name constraint) matches)))))
+       (current-database) :table))
+    (loop for name in names
+          for constraints = (gethash name matches)
+          unless constraints do (ereport "42704" "constraint ~s does not exist" name)
+            append (loop for constraint in constraints
+                         when (and (eq :deferred mode) (not (pg-foreign-key-deferrable-p constraint)))
+                           do (ereport "42809" "constraint ~s is not deferrable" name)
+                         collect (pg-foreign-key-oid constraint)))))
+
+(defun exec-set-constraints (stream ast)
+  "Change transaction-local timing, first checking events made immediate."
+  (let* ((names (getf ast :names))
+         (mode (getf ast :mode))
+         (targets (when names (foreign-key-mode-targets names mode))))
+    (when (and (eq mode :immediate) (backend-deferred-foreign-key-checks *backend*))
+      (run-deferred-foreign-key-checks targets))
+    (if names
+        (dolist (oid targets)
+          (push (cons oid mode) (backend-foreign-key-constraint-modes *backend*)))
+        (setf (backend-foreign-key-constraint-modes *backend*) (list (cons :all mode)))))
+  (send-command-complete stream "SET CONSTRAINTS"))
+
+(defun check-foreign-key-child-references (child references)
+  "Check immediate references under one fresh snapshot after acquiring all key grants."
+  (when references
+    (flet ((check-references (latest retained)
+             (dolist (reference references)
+               (destructuring-bind (parent constraint index key tid) reference
+                 (if (foreign-key-deferred-p constraint)
+                     (queue-deferred-foreign-key-check child parent constraint index key tid)
+                     (check-foreign-key-parent child parent constraint index key latest retained))))))
+      (if (every (lambda (reference) (foreign-key-deferred-p (second reference))) references)
+          (check-references nil nil)
+          (let ((cid (1+ (backend-command-id *backend*)))
+                (retained
+                  (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
+                    (copy-snapshot *current-snapshot*))))
+            (when retained (setf (snapshot-curcid retained) cid))
+            (with-fresh-foreign-key-snapshot (latest cid)
+              (check-references latest retained)))))))
+
+(defun referencing-foreign-keys-locked (parent)
+  "Read child constraints in the current catalog view while holding the write lock."
+  (let* ((transaction (backend-catalog-transaction *backend*))
+         (tables (if transaction
+                     (catalog-transaction-merged-name-map transaction :table)
+                     (database-tables (current-database)))))
+    (loop for child being the hash-values of tables
+          append (loop for constraint in (pg-class-foreign-keys child)
+                       when (eql (pg-class-oid parent) (pg-foreign-key-referenced-table-oid constraint))
+                         collect (cons child constraint)))))
+
+(defun referencing-foreign-keys (parent)
+  "Return child tables and constraints that use PARENT as their referenced relation."
+  (with-write-lock
+    (referencing-foreign-keys-locked parent)))
+
+(defun lock-foreign-key-parent-change (parent references tuple &optional new-values)
+  "Lock the old referenced keys of the actual version that will be changed."
+  (let ((old-values (htup-values (materialize-select-tuple parent tuple *current-snapshot*))))
+    (loop for (child . constraint) in references
+          for index = (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint))
+          for types = (index-types index parent)
+          for old = (index-values index old-values)
+          unless (member +null+ old :test #'eq)
+            append (let ((key (encode-index-key old types)))
+                     (unless (and new-values
+                                  (equalp key (encode-index-key (index-values index new-values) types)))
+                       (acquire-referenced-key-lock (pg-index-oid index) key :exclusive)
+                       (list (list child constraint index key
+                                   (loop for attnum in (pg-foreign-key-referenced-columns constraint)
+                                         collect (aref old-values (1- attnum)))
+                                   (when new-values
+                                     (loop for attnum in (pg-foreign-key-referenced-columns constraint)
+                                           collect (aref new-values (1- attnum)))))))))))
+
+(defun foreign-key-child-visible-p (child parent constraint index key snapshot)
+  "Find a referencing row using the same canonical encoding as the parent grant."
+  (let ((demand (cons child (pg-foreign-key-columns constraint))))
+    (heapam-scan
+     (pg-class-relfilenode child) (pg-class-columns child) snapshot
+     (lambda (tuple)
+       (check-for-interrupts)
+       (let ((row (htup-values (materialize-select-tuple child tuple snapshot :demand demand))))
+         (when (equalp key (foreign-key-child-index-key constraint parent index row))
+           (return-from foreign-key-child-visible-p t))))))
+  nil)
+
+(defun apply-foreign-key-action (parent child constraint action old new)
+  "Run the referential action through ordinary DML in the same transaction."
+  (let* ((parent-columns (pg-class-columns parent))
+         (child-columns (pg-class-columns child))
+         (attnums (pg-foreign-key-columns constraint))
+         (types (mapcar (lambda (attnum) (pg-column-type (aref parent-columns (1- attnum))))
+                        (pg-foreign-key-referenced-columns constraint)))
+         (delete-p (and (eq action :cascade) (null new)))
+         (conditions
+           (loop for attnum in attnums for value in old for type in types
+                 collect (list :binop "=" (list :column (pg-column-name (aref child-columns (1- attnum))))
+                               (list :foreign-key-datum value type))))
+         (sets
+           (unless delete-p
+             (loop for attnum in attnums for type in types for position from 0
+                   collect (list :column (pg-column-name (aref child-columns (1- attnum)))
+                                 :expr (ecase action
+                                         (:cascade (list :foreign-key-datum (nth position new) type))
+                                         (:set-null (list :const +null+))
+                                         (:set-default (list :default)))))))
+         (ast (list :type (if delete-p :delete :update) :table (pg-class-name child)
+                    :where (reduce (lambda (left right) (list :and left right)) conditions)
+                    :sets sets)))
+    (advance-used-backend-command-id)
+    (detach-select-index-scans)
+    (let ((*select-index-lease-domain* nil)
+          (*select-index-lease-groups* nil)
+          (*select-index-scans* nil)
+          (*select-suppress-description* nil)
+          (*select-expected-result-columns* nil))
+      (with-fresh-foreign-key-snapshot (snapshot (backend-command-id *backend*))
+        (note-backend-command-id-used)
+        (if delete-p
+            (exec-delete-subqueries (make-broadcast-stream) ast)
+            (exec-update-subqueries (make-broadcast-stream) ast))))))
+
+(defun reject-referenced-key-change (parent child constraint)
+  (ereport "23503" "update or delete on table ~s violates foreign key constraint ~s on table ~s"
+           (pg-class-name parent) (pg-foreign-key-name constraint) (pg-class-name child)))
+
+(defun check-foreign-key-set-default-result (parent child constraint index key)
+  "SET DEFAULT can leave an unchanged reference to the removed key."
+  (let ((cid (1+ (backend-command-id *backend*))))
+    (with-fresh-foreign-key-snapshot (latest cid)
+      (when (and (not (foreign-key-parent-visible-p parent index key latest))
+                 (foreign-key-child-visible-p child parent constraint index key latest))
+        (reject-referenced-key-change parent child constraint)))))
+
+(defun check-foreign-key-parent-changes (parent changes update-p)
+  "Run referential actions or verify immediate restrictions at statement end."
+  (when changes
+    (let ((retained
+            (when (member (backend-isolation-level *backend*) '(:repeatable-read :serializable))
+              (copy-snapshot *current-snapshot*))))
+      (loop for (child constraint index key old new) in changes
+            for action = (if update-p (pg-foreign-key-update-action constraint)
+                             (pg-foreign-key-delete-action constraint))
+            for cid = (1+ (backend-command-id *backend*))
+            do
+               (cond
+                 ((and (eq action :no-action) (foreign-key-deferred-p constraint))
+                  (queue-deferred-foreign-key-check child parent constraint index key))
+                 (t
+                  (when retained (setf (snapshot-curcid retained) cid))
+                  (with-fresh-foreign-key-snapshot (latest cid)
+                    (when (and (or (not (eq action :no-action))
+                                   (not (foreign-key-parent-visible-p parent index key latest)))
+                               (foreign-key-child-visible-p child parent constraint index key latest))
+                      (when (and retained
+                                 (not (foreign-key-child-visible-p child parent constraint index key retained)))
+                        (ereport "40001" "could not serialize access due to concurrent update"))
+                      (if (member action '(:no-action :restrict))
+                          (reject-referenced-key-change parent child constraint)
+                          (progn
+                            (apply-foreign-key-action parent child constraint action old new)
+                            (when (eq :set-default action)
+                              (check-foreign-key-set-default-result parent child constraint index key))))))))))))
 
 (defun check-distinct-constraint-columns (table attnums primary-p)
   (loop for attnum in attnums
@@ -1987,15 +2373,19 @@ old identity before publishing the event and replacement catalog object."
                                        (aref (pg-class-columns table)
                                              (1- attnum)))))
                               attnums)))
-                  (reserved-names (mapcar (lambda (check) (getf check :name))
-                                          (pg-class-checks table)))
+                  (reserved-names
+                    (append (mapcar (lambda (check) (getf check :name)) (pg-class-checks table))
+                            (mapcar #'pg-foreign-key-name (pg-class-foreign-keys table))))
+                  (constraint-name (getf ast :constraint-name))
+                  (index-name
+                    (cond ((member constraint-name reserved-names :test #'equal)
+                           (ereport "42710" "constraint ~s for relation ~s already exists"
+                                    constraint-name name))
+                          (constraint-name)
+                          (primary (generate-index-name db name "pkey" reserved-names))
+                          (t (generate-unique-index-name db name table attnums reserved-names))))
                   (idx (create-index*
-                        db
-                        (or (getf ast :constraint-name)
-                            (if primary
-                                (generate-index-name db name "pkey" reserved-names)
-                                (generate-unique-index-name
-                                 db name table attnums reserved-names)))
+                        db index-name
                         table attnums :unique t :primary primary
                         :constraint t
                         :nulls-not-distinct
@@ -2118,14 +2508,33 @@ completion after success; anonymous source cannot inherit Bind parameters."
                 (member (getf action :action) '(:add-column :drop-column :rename-column :set-not-null :drop-not-null :alter-column-type))))
          (or (supported-action-p ast) (some #'supported-action-p (getf ast :actions))))))
 
+(defun foreign-key-create-ddl-p (ast)
+  (and (eq (getf ast :type) :create-table)
+       (find :foreign-key (getf ast :constraints) :key (lambda (constraint) (getf constraint :kind)))))
+
+(defun foreign-key-add-ddl-p (ast)
+  (and (eq (getf ast :type) :alter-table)
+       (eq (getf ast :action) :add-foreign-key)))
+
+(defun foreign-key-validation-ddl-p (ast)
+  (and (eq (getf ast :type) :alter-table)
+       (eq (getf ast :action) :validate-constraint)
+       (with-write-lock
+         (let ((table (lookup-sql-user-relation (getf ast :table))))
+           (and table
+                (find (getf ast :constraint-name) (pg-class-foreign-keys table)
+                      :key #'pg-foreign-key-name :test #'string=))))))
+
 (defun stageable-catalog-ddl-p (ast)
   (or (column-evolution-ddl-p ast)
+      (foreign-key-add-ddl-p ast)
+      (foreign-key-validation-ddl-p ast)
       (and (member (getf ast :type) '(:create-table :drop-table :create-index :drop-index))
            (not (getf ast :concurrently)))))
 
 (defun staged-catalog-ddl-p (ast)
   (and (stageable-catalog-ddl-p ast)
-       (or (column-evolution-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
+       (or (column-evolution-ddl-p ast) (foreign-key-create-ddl-p ast) (foreign-key-add-ddl-p ast) (foreign-key-validation-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
 
 (defun append-staged-transaction-ddl (transaction ast)
   "Append a cooked operation beside the surrounding row changes."
@@ -2185,8 +2594,8 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
   "Create private empty B-trees for a newly staged table's key constraints."
   (let* ((database (catalog-transaction-database transaction))
          (table-name (pg-class-name table))
-         (indexes (remove-if (lambda (constraint) (eq (getf constraint :kind) :check))
-                             constraints))
+         (indexes (remove-if-not (lambda (constraint) (member (getf constraint :kind) '(:primary :unique)))
+                                 constraints))
          (reserved-names (table-constraint-reserved-names columns constraints))
          (inline (loop for column in columns
                        for primary = (getf column :primary)
@@ -2229,11 +2638,122 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
           (with-write-catalog-locks
             (catalog-transaction-stage transaction :index (pg-index-name index) index)))))))
 
+(defun validate-existing-foreign-key (child parent constraint index)
+  "Validate a frozen child heap against the referenced index after both writer gates drain."
+  (let ((demand (cons child (pg-foreign-key-columns constraint)))
+        (cid (1+ (backend-command-id *backend*))))
+    (with-fresh-foreign-key-snapshot (snapshot cid)
+      (heapam-scan
+       (pg-class-relfilenode child) (pg-class-columns child) snapshot
+       (lambda (tuple)
+         (check-for-interrupts)
+         (let ((row (htup-values (materialize-select-tuple child tuple snapshot :demand demand))))
+           (multiple-value-bind (key status) (foreign-key-child-index-key constraint parent index row)
+             (unless (or (eq status :null)
+                         (and (eq status :key) (foreign-key-parent-visible-p parent index key snapshot)))
+               (ereport "23503" "insert or update on table ~s violates foreign key constraint ~s"
+                        (pg-class-name child) (pg-foreign-key-name constraint))))))))))
+
+(defun exec-stage-add-foreign-key (stream ast)
+  "Retain both relation gates until the validating descriptor commits."
+  (let* ((transaction (begin-catalog-ddl))
+         (definition (getf ast :foreign-key))
+         (child (with-write-lock (lookup-sql-user-relation (getf ast :table)))))
+    (cond
+      (child
+       (let ((parent (with-write-lock (resolve-table-or-error (getf definition :referenced-table))))
+             (replacement nil)
+             (constraint nil)
+             (index nil))
+         (acquire-transaction-relation-locks
+          (append (catalog-relation-storage-nodes child)
+                  (catalog-relation-storage-nodes parent)))
+         (with-write-catalog-locks
+           (ensure-current-table child)
+           (ensure-current-table parent)
+           (reject-logical-transaction-ddl-private-table (pg-class-name child))
+           (admit-staged-catalog-change transaction)
+           (when (catalog-transaction-capture-ddl-p transaction)
+             (ereport "0A000" "foreign key DDL is unsupported during logical capture"))
+           (setf replacement (copy-pg-class child)
+                 constraint (cook-foreign-key child parent definition (allocate-oid))
+                 index (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint)))
+           (check-supported-foreign-key-options constraint)
+           (catalog-transaction-observe-table transaction parent))
+         (when (pg-foreign-key-validated-p constraint)
+           (validate-existing-foreign-key child parent constraint index))
+         (push constraint (pg-class-foreign-keys replacement))
+         (with-write-catalog-locks
+           (catalog-transaction-stage transaction :table (pg-class-name child) replacement))))
+      ((getf ast :if-exists)
+       (send-notice stream (format nil "relation ~s does not exist, skipping" (getf ast :table))))
+      (t (ereport "42P01" "relation ~s does not exist" (getf ast :table)))))
+  (send-command-complete stream "ALTER TABLE"))
+
+(defun exec-stage-validate-foreign-key (stream ast)
+  "Replace the constraint's validation flag only after scanning a stable pair of relations."
+  (let* ((transaction (begin-catalog-ddl))
+         (name (getf ast :constraint-name))
+         (child (with-write-lock (resolve-table-or-error (getf ast :table))))
+         (constraint (find name (pg-class-foreign-keys child) :key #'pg-foreign-key-name :test #'string=)))
+    (unless constraint
+      (ereport "42704" "constraint ~s of relation ~s does not exist" name (pg-class-name child)))
+    (unless (pg-foreign-key-validated-p constraint)
+      (multiple-value-bind (parent index)
+          (with-write-lock
+            (values (find-table-by-oid (pg-foreign-key-referenced-table-oid constraint))
+                    (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint))))
+        (acquire-transaction-relation-locks
+         (append (catalog-relation-storage-nodes child)
+                 (catalog-relation-storage-nodes parent)))
+        (with-write-catalog-locks
+          (ensure-current-table child)
+          (ensure-current-table parent)
+          (admit-staged-catalog-change transaction)
+          (when (catalog-transaction-capture-ddl-p transaction)
+            (ereport "0A000" "foreign key DDL is unsupported during logical capture"))
+          (catalog-transaction-observe-table transaction parent))
+        (validate-existing-foreign-key child parent constraint index)
+        (with-write-catalog-locks
+          (let ((replacement (copy-pg-class child))
+                (validated (copy-pg-foreign-key constraint)))
+            (setf (pg-foreign-key-validated-p validated) t
+                  (pg-class-foreign-keys replacement)
+                  (substitute validated constraint (pg-class-foreign-keys child)))
+            (catalog-transaction-stage transaction :table (pg-class-name child) replacement))))))
+  (send-command-complete stream "ALTER TABLE"))
+
+(defun check-supported-foreign-key-options (constraint)
+  (unless (and (member (pg-foreign-key-match-type constraint) '(:simple :full))
+               (member (pg-foreign-key-update-action constraint) '(:no-action :restrict :cascade :set-null :set-default))
+               (member (pg-foreign-key-delete-action constraint) '(:no-action :restrict :cascade :set-null :set-default)))
+    (ereport "0A000" "requested foreign key options are not supported")))
+
+(defun stage-new-table-foreign-keys (transaction child definitions)
+  "Resolve references after the new table's indexes are staged."
+  (let ((references
+          (with-write-lock
+            (loop for definition in definitions
+                  collect (cons definition
+                                (resolve-table-or-error (getf definition :referenced-table)))))))
+    (acquire-transaction-relation-locks
+     (loop for (nil . parent) in references
+           unless (eq child parent) append (catalog-relation-storage-nodes parent)))
+    (with-write-catalog-locks
+      (dolist (reference references)
+        (let ((parent (cdr reference)))
+          (ensure-current-table parent)
+          (catalog-transaction-observe-table transaction parent)
+          (let ((constraint (cook-foreign-key child parent (car reference) (allocate-oid))))
+            (check-supported-foreign-key-options constraint)
+            (push constraint (pg-class-foreign-keys child))))))))
+
 (defun exec-stage-create-table (stream ast)
   "Create table metadata and storage without publishing either before COMMIT."
   (let* ((name (getf ast :name))
          (columns (getf ast :columns))
          (constraints (getf ast :constraints))
+         (foreign-keys (remove-if-not (lambda (constraint) (eq :foreign-key (getf constraint :kind))) constraints))
          (transaction (begin-catalog-ddl))
          (class nil)
          (sequence-dependencies nil))
@@ -2241,6 +2761,8 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
       (reject-logical-transaction-ddl-private-table name)
       (unless (staged-relation-name-in-use-p transaction name)
         (admit-staged-catalog-change transaction)
+        (when (and foreign-keys (or *applying-transaction-ddl* (catalog-transaction-capture-ddl-p transaction)))
+          (ereport "0A000" "foreign key DDL is unsupported during logical capture"))
         (let ((names (mapcar (lambda (column) (getf column :name)) columns)))
           (unless (= (length names) (length (remove-duplicates names :test #'string=)))
             (ereport "42701" "column specified more than once")))
@@ -2254,6 +2776,8 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
            (when (or (some (lambda (column) (or (getf column :primary) (getf column :unique))) columns)
                      (some (lambda (constraint) (not (eq :check (getf constraint :kind)))) constraints))
              (stage-new-table-constraint-indexes transaction class columns constraints))
+           (when foreign-keys
+             (stage-new-table-foreign-keys transaction class foreign-keys))
            (when *applying-transaction-ddl*
              (retain-logical-table-sequence-dependencies transaction name sequence-dependencies))
            (capture-staged-transaction-ddl (transaction)
@@ -2395,6 +2919,12 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
     (let ((attnum (pg-column-attnum original)))
       (dolist (index (table-indexes table))
         (when (member attnum (or (pg-index-referenced-columns index) (pg-index-columns index)))
+          (loop for (child . constraint) in (referencing-foreign-keys-locked table)
+                when (and (eql (pg-index-oid index) (pg-foreign-key-referenced-index-oid constraint))
+                          (not (and (eql (pg-class-oid child) (pg-class-oid table))
+                                    (member attnum (pg-foreign-key-columns constraint)))))
+                  do (ereport "2BP01" "foreign key ~s on table ~s depends on column ~s"
+                              (pg-foreign-key-name constraint) (pg-class-name child) name))
           (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
       (with-copied-column-descriptor (replacement column) table original
         (setf (pg-column-name column) (format nil "........pg.dropped.~d........" attnum)
@@ -2405,6 +2935,9 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
               (pg-column-default-sequence-name column) nil
               (pg-column-missing-value column) +null+
               (pg-class-statistics replacement) nil
+              (pg-class-foreign-keys replacement)
+              (remove-if (lambda (constraint) (member attnum (pg-foreign-key-columns constraint)))
+                         (pg-class-foreign-keys table))
               (pg-class-checks replacement)
               (remove-if (lambda (check)
                            (stored-expression-references-attnum-p (getf check :expression) attnum))
@@ -2529,10 +3062,17 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
         (with-write-lock
           (append (catalog-relation-storage-nodes source)
                   (mapcar #'pg-index-relfilenode (table-indexes source)))))
+       (let ((attnum (pg-column-attnum (resolve-column-or-error source (getf ast :column)))))
+         (when (or (some (lambda (constraint) (member attnum (pg-foreign-key-columns constraint)))
+                         (pg-class-foreign-keys source))
+                   (some (lambda (reference) (member attnum (pg-foreign-key-referenced-columns (cdr reference))))
+                         (referencing-foreign-keys source)))
+           (ereport "0A000" "ALTER TYPE cannot yet rewrite a foreign key column")))
        (multiple-value-bind (target indexes attnum expression)
            (with-write-catalog-locks
              (ensure-current-table source)
              (reject-logical-transaction-ddl-private-table (pg-class-name source))
+             (check-no-pending-foreign-key-events source)
              (check-truncate-table-not-in-use source)
              (prepare-column-type-rewrite transaction source ast))
          (catalog-transaction-create-storage (pg-class-relfilenode target) :heap)
@@ -2630,6 +3170,10 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
           (ensure-current-table table)
           (reject-logical-transaction-ddl-private-table (pg-class-name table))
           (check-truncate-table-not-in-use table)
+          (loop for (child . constraint) in (referencing-foreign-keys-locked table)
+                unless (find (pg-class-oid child) tables :key #'pg-class-oid)
+                  do (ereport "2BP01" "foreign key ~s on table ~s depends on table ~s"
+                              (pg-foreign-key-name constraint) (pg-class-name child) (pg-class-name table)))
           (when (catalog-explicit-publication-table-p database table)
             (ereport "0A000" "transactional DROP TABLE does not yet support explicit publication membership")))
         (when tables (admit-staged-catalog-change transaction))
@@ -2703,7 +3247,11 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
                    (ereport "2BP01" "cannot drop index ~s because a table constraint requires it" name))
                  (let ((table (find-table-by-oid (pg-index-table-oid index))))
                    (reject-logical-transaction-ddl-private-table (pg-class-name table))
-                   (check-truncate-table-not-in-use table)))
+                   (check-truncate-table-not-in-use table)
+                   (loop for (child . constraint) in (referencing-foreign-keys-locked table)
+                         when (eql (pg-index-oid index) (pg-foreign-key-referenced-index-oid constraint))
+                           do (ereport "2BP01" "foreign key ~s on table ~s depends on index ~s"
+                                       (pg-foreign-key-name constraint) (pg-class-name child) name))))
       (when (some #'cdr entries) (admit-staged-catalog-change transaction))
       (loop for (nil . index) in entries
             when index do (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
@@ -2731,10 +3279,12 @@ without a change; each actual publication captures its own schema precondition."
                    (eq :read-committed (backend-isolation-level *backend*))))))
     (when (and (backend-transaction-read-only-p)
                (member (getf ast :type)
-                       '(:insert :update :delete :truncate :create-table :drop-table
+                       '(:insert :update :delete :copy-from :truncate :create-table :drop-table
                          :create-index :drop-index :alter-index :alter-table
                          :apply-sequence-state :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
+    (when (find :add-foreign-key (getf ast :actions) :key (lambda (action) (getf action :action)))
+      (ereport "0A000" "foreign key enforcement is not available"))
     (when (and (catalog-change-p ast) (backend-role-changes *backend*))
       (ereport "0A000" "role changes cannot share a transaction with other catalog changes"))
     (when (and (catalog-change-p ast) (not stage-ddl-p)
@@ -2750,8 +3300,12 @@ without a change; each actual publication captures its own schema precondition."
                    (case (getf ast :type)
                      (:select (exec-select stream ast))
                      (:do (exec-do stream ast))
+                     (:set-constraints (exec-set-constraints stream ast))
                      ((:create-role :alter-role :grant-role-function) (exec-role-change stream ast))
                      (:copy-to (setf copy-row-count (exec-copy-to stream ast)))
+                     (:copy-from
+                      (note-backend-command-id-used)
+                      (setf copy-row-count (exec-copy-from stream ast)))
                      (:explain (exec-explain stream ast))
                      (:analyze (exec-analyze stream ast))
                      (:insert (note-backend-command-id-used)
@@ -2782,9 +3336,12 @@ without a change; each actual publication captures its own schema precondition."
                                       (exec-stage-drop-index stream ast)
                                       (exec-drop-index stream ast)))
                      (:alter-index (exec-alter-index stream ast))
-                     (:alter-table (if (column-evolution-ddl-p ast)
-                                       (exec-stage-column-evolution stream ast)
-                                       (exec-alter-table stream ast)))
+                     (:alter-table
+                      (cond ((foreign-key-add-ddl-p ast) (exec-stage-add-foreign-key stream ast))
+                            ((and stage-ddl-p (eq :validate-constraint (getf ast :action)))
+                             (exec-stage-validate-foreign-key stream ast))
+                            ((column-evolution-ddl-p ast) (exec-stage-column-evolution stream ast))
+                            (t (exec-alter-table stream ast))))
                      (t (ereport "0A000" "unsupported statement")))))
             (if (and (ddl-p ast) (not stage-ddl-p))
                 (with-schema-write-lock
@@ -2857,21 +3414,64 @@ without a change; each actual publication captures its own schema precondition."
       (call-with-prepared-final-ddl (lambda () (execute-in-transaction-body stream ast)))
       (execute-in-transaction-body stream ast)))
 
+(defun exec-savepoint-command (stream ast)
+  "Manage named savepoints for heap writes and deferred foreign-key state."
+  (let* ((backend *backend*)
+         (name (getf ast :name))
+         (type (getf ast :type))
+         (stack (backend-savepoints backend)))
+    (unless (backend-explicit backend)
+      (ereport "25P01" "savepoint commands require an explicit transaction block"))
+    (if (eq type :savepoint)
+        (push (capture-backend-savepoint backend name) (backend-savepoints backend))
+        (let* ((tail (member name stack :key #'backend-savepoint-name :test #'string=))
+               (checkpoint (first tail)))
+          (unless checkpoint (ereport "3B001" "savepoint ~s does not exist" name))
+          (ecase type
+            (:release-savepoint
+             (setf (backend-savepoints backend) (rest tail))
+             (unless (backend-savepoints backend)
+               (setf (backend-heap-undo-log backend) nil)))
+            (:rollback-to-savepoint
+             (handler-case
+                 (progn
+                   (undo-heap-to-savepoint (backend-savepoint-heap-checkpoint checkpoint))
+                   (restore-backend-savepoint-logical-state backend checkpoint)
+                   (restore-on-conflict-row-locks
+                    (backend-xid backend) (backend-savepoint-conflict-row-checkpoint checkpoint))
+                   (restore-foreign-key-savepoint-state backend (backend-savepoint-foreign-key-state checkpoint))
+                   (setf (backend-savepoints backend) tail)
+                   (set-backend-state backend :in-progress))
+               (error (condition)
+                 (unless (fatal-error-p condition) (abort-transaction))
+                 (error condition))))))))
+  (send-command-complete stream (ecase (getf ast :type)
+                                  (:savepoint "SAVEPOINT")
+                                  (:release-savepoint "RELEASE")
+                                  (:rollback-to-savepoint "ROLLBACK"))))
+
 (defun execute-statement (stream ast)
   (let ((type (getf ast :type)))
     (when (and (eq (backend-state *backend*) :aborted)
-               (not (member type '(:commit :rollback))))
+               (not (member type '(:commit :rollback :rollback-to-savepoint))))
       (ereport "25P02"
                "current transaction is aborted, commands ignored until end of transaction block"))
     ;; Every command still passes the cluster recovery guard before dispatch.
     ;; A failed transaction exits above without executing any command.
     (recovery-check-statement ast)
+    (when (and (backend-savepoints *backend*)
+               (not (member type '(:select :explain :insert :update :delete :copy-to :copy-from
+                                   :savepoint :release-savepoint :rollback-to-savepoint
+                                   :set-constraints :show :begin :commit :rollback))))
+      (abort-transaction-block)
+      (ereport "0A000" "statement is unsupported inside an active savepoint"))
     (when (concurrent-index-ddl-p ast)
       (return-from execute-statement (execute-concurrent-index stream ast)))
     (case type
       (:begin (command-begin stream ast))
       (:commit (command-commit stream))
       (:rollback (command-rollback stream))
+      ((:savepoint :release-savepoint :rollback-to-savepoint) (exec-savepoint-command stream ast))
       (:checkpoint (command-checkpoint stream))
       (:vacuum (exec-vacuum stream ast))
       (:set (exec-set stream ast))
@@ -2887,7 +3487,7 @@ Transaction options and session characteristics are excluded."
   (and (rest statements)
        (every (lambda (statement)
                 (and (or (stageable-catalog-ddl-p statement)
-                         (member (getf statement :type) '(:select :insert :update :delete :truncate :set :reset :show :do
+                         (member (getf statement :type) '(:select :insert :update :delete :copy-from :truncate :set :set-constraints :reset :show :do
                                                           :create-role :alter-role :grant-role-function)))
                      (not (getf statement :transaction-options-p))
                      (not (getf statement :session-characteristics-p))))

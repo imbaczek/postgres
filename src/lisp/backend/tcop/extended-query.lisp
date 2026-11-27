@@ -686,6 +686,7 @@ Send its row description before execution and close it before reporting completi
   (case (getf ast :type)
     (:select (extended-select-result-columns ast register-p))
     (:do nil)
+    (:copy-from (copy-from-target ast) nil)
     (otherwise
      (mapcar #'target->result-column (getf (prepare-dml-subqueries ast) :returning)))))
 
@@ -824,7 +825,7 @@ Send its row description before execution and close it before reporting completi
            (types (map 'vector (lambda (oid) (unless (zerop oid) (extended-type-from-oid oid))) oids)))
       (check-rewind-sql-statements statements)
       (unless (and (= (length statements) 1)
-                   (or concurrent (member (getf ast :type) '(:insert :update :delete :select :do))))
+                   (or concurrent (member (getf ast :type) '(:insert :update :delete :select :do :copy-from))))
         (ereport "0A000" "unsupported statement in extended query"))
       (when (and (not concurrent) (eq (backend-state *backend*) :idle))
         (sb-sys:without-interrupts
@@ -991,7 +992,7 @@ Send its row description before execution and close it before reporting completi
                  (let* ((statement (extended-portal-statement portal))
                         (ast (extended-statement-ast statement))
                         (*statement-command-start-advance-p* nil))
-                   (if (eq (getf ast :type) :do)
+                   (if (member (getf ast :type) '(:do :copy-from))
                        (let ((*query-parameter-types* (extended-statement-types statement))
                              (*query-parameter-values* (extended-portal-values portal)))
                          (execute-statement stream ast))

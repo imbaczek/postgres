@@ -2690,6 +2690,8 @@ candidate selection."
     (:sublink (analyze-sublink expr table))
     (:window (analyze-window-call expr table))
     (:const (analyze-constant-expression expr))
+    ;; The executor builds this node from an already typed parent key.
+    (:foreign-key-datum (list :const (second expr) :type (third expr) :typmod -1))
     (:numeric-literal
      (list :const (sql-numeric-input (second expr)) :type :numeric :typmod -1))
     (:bit-literal

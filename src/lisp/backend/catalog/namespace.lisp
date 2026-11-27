@@ -464,6 +464,15 @@ synchronous_commit. Reject unsupported parameters and other local settings."
                                           ("indisvalid" :bool t 11) ("indkey" :int2vector t 16)
                                           ("indnkeyatts" :int2 t 4)
                                           ("indisready" :bool t 13) ("indislive" :bool t 14)))
+   (make-sql-system-relation-descriptor 2606 "pg_constraint" #\r 'sql-foreign-key-constraint-rows
+                                        '(("oid" :oid t 1) ("conname" :name t 2)
+                                          ("connamespace" :oid t 3) ("contype" :char t 4)
+                                          ("condeferrable" :bool t 5) ("condeferred" :bool t 6)
+                                          ("conenforced" :bool t 7) ("convalidated" :bool t 8)
+                                          ("conrelid" :oid t 9) ("conindid" :oid t 11)
+                                          ("confrelid" :oid t 13) ("confupdtype" :char t 14)
+                                          ("confdeltype" :char t 15) ("confmatchtype" :char t 16)
+                                          ("conkey" :int2-array nil 21) ("confkey" :int2-array nil 22)))
    (make-sql-system-relation-descriptor 2615 "pg_namespace" #\r 'sql-namespace-rows
                                         '(("oid" :oid t 1) ("nspname" :name t 2)))
    (make-sql-system-relation-descriptor 6104 "pg_publication" #\r 'sql-publication-rows
@@ -839,6 +848,37 @@ Capture policy and keep size once for every row in the snapshot."
                    (or (< (aref left 0) (aref right 0))
                        (and (= (aref left 0) (aref right 0))
                             (< (aref left 3) (aref right 3)))))))))
+
+(defun sql-foreign-key-constraint-rows ()
+  "Snapshot the foreign key constraints visible to this catalog transaction."
+  (with-write-lock
+    (let ((rows nil))
+      (flet ((action-code (action)
+               (char-code (ecase action (:no-action #\a) (:restrict #\r) (:cascade #\c)
+                                 (:set-null #\n) (:set-default #\d))))
+             (attnum-array (attnums)
+               (make-sql-array :element-type-id :int2 :elements (coerce attnums 'simple-vector)
+                               :dimensions (list (length attnums)) :lower-bounds '(1))))
+        (catalog-map-visible-relations
+         (lambda (name table)
+           (declare (ignore name))
+           (dolist (constraint (pg-class-foreign-keys table))
+             (push (vector (pg-foreign-key-oid constraint) (pg-foreign-key-name constraint)
+                           2200 (char-code #\f)
+                           (pg-foreign-key-deferrable-p constraint)
+                           (pg-foreign-key-initially-deferred-p constraint)
+                           t (pg-foreign-key-validated-p constraint)
+                           (pg-class-oid table) (pg-foreign-key-referenced-index-oid constraint)
+                           (pg-foreign-key-referenced-table-oid constraint)
+                           (action-code (pg-foreign-key-update-action constraint))
+                           (action-code (pg-foreign-key-delete-action constraint))
+                           (char-code (ecase (pg-foreign-key-match-type constraint)
+                                        (:simple #\s) (:full #\f) (:partial #\p)))
+                           (attnum-array (pg-foreign-key-columns constraint))
+                           (attnum-array (pg-foreign-key-referenced-columns constraint)))
+                   rows)))
+         (current-database) :table))
+      (sort rows #'< :key (lambda (row) (aref row 0))))))
 
 (defun sql-index-rows ()
   (with-write-lock

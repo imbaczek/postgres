@@ -2861,10 +2861,171 @@ Escape control bytes and backslashes, preserving all other bytes unchanged."
     (dotimes (index column-count) (payload-push-u16 payload 0))
     (copy-write-frame stream #\H payload)))
 
-(defun send-copy-command-complete (stream count)
+(defun send-copy-in-response (stream column-count)
   (let ((payload (make-payload)))
-    (payload-push-cstring payload (format nil "COPY ~d" count))
-    (copy-write-frame stream #\C payload)))
+    (payload-push-byte payload 0)
+    (payload-push-u16 payload column-count)
+    (dotimes (index column-count) (payload-push-u16 payload 0))
+    (copy-write-frame stream #\G payload)))
+
+(defun decode-copy-text-field (bytes start end)
+  "Decode one default text COPY field after recognizing its raw NULL marker."
+  (when (and (= (- end start) 2) (= (aref bytes start) 92) (= (aref bytes (1+ start)) 78))
+    (return-from decode-copy-text-field +null+))
+  (let ((output (make-array (- end start) :element-type '(unsigned-byte 8) :fill-pointer 0)))
+    (labels ((digit (byte radix)
+               (digit-char-p (code-char byte) radix))
+             (numeric-escape (offset radix limit)
+               (loop with number = 0
+                     repeat limit
+                     for value = (and (< offset end) (digit (aref bytes offset) radix))
+                     while value
+                     do (setf number (+ (* number radix) value))
+                        (incf offset)
+                     finally (return (values (logand number 255) offset)))))
+      (loop with offset = start
+            for byte = (and (< offset end) (aref bytes offset))
+            while byte
+            do (incf offset)
+               (when (and (= byte 92) (< offset end))
+                 (setf byte (aref bytes offset))
+                 (cond ((digit byte 8)
+                        (multiple-value-setq (byte offset) (numeric-escape offset 8 3)))
+                       ((and (= byte 120) (< (1+ offset) end)
+                             (digit (aref bytes (1+ offset)) 16))
+                        (multiple-value-setq (byte offset) (numeric-escape (1+ offset) 16 2)))
+                       (t
+                        (incf offset)
+                        (setf byte (case byte
+                                     (98 8) (102 12) (110 10) (114 13) (116 9) (118 11)
+                                     (otherwise byte))))))
+               (vector-push byte output)))
+    (when (find 0 output)
+      (ereport "22021" "null byte in COPY field"))
+    (handler-case (bytes->string output)
+      (sb-int:character-decoding-error ()
+        (ereport "22021" "invalid UTF-8 in COPY field")))))
+
+(defun decode-copy-text-row (bytes column-count)
+  "Split unescaped tabs before decoding fields so an escaped tab stays in its field."
+  (let ((start 0) (escaped-p nil) (fields nil))
+    (loop for byte across bytes for offset from 0
+          do (cond (escaped-p (setf escaped-p nil))
+                   ((= byte 92) (setf escaped-p t))
+                   ((= byte 9)
+                    (push (decode-copy-text-field bytes start offset) fields)
+                    (setf start (1+ offset)))))
+    (push (decode-copy-text-field bytes start (length bytes)) fields)
+    (unless (= (length fields) column-count)
+      (ereport "22P04" "COPY expected ~d fields, got ~d" column-count (length fields)))
+    (nreverse fields)))
+
+(defun send-copy-command-complete (stream count)
+  (send-command-complete stream (format nil "COPY ~d" count)))
+
+(defun map-copy-in-text-rows (stream column-count function)
+  "Read default text COPY to CopyDone, retaining at most one partial row."
+  (let ((line (make-payload))
+        (escaped-p nil)
+        (pending-cr-p nil)
+        (line-ending nil)
+        (end-marker-p nil))
+    (labels ((consume-line (&optional terminator)
+               (when terminator
+                 (when (and line-ending (not (eq terminator line-ending)))
+                   (ereport "22P04" "inconsistent line endings in COPY data"))
+                 (setf line-ending terminator))
+               (cond ((and (= (length line) 2) (= (aref line 0) 92) (= (aref line 1) 46))
+                      (setf end-marker-p t))
+                     (t (funcall function (decode-copy-text-row line column-count))))
+               (setf (fill-pointer line) 0 escaped-p nil))
+             (consume-byte (byte)
+               ;; An unescaped CR can be the start of CRLF in the next frame.
+               (when pending-cr-p
+                 (setf pending-cr-p nil)
+                 (let ((lf-p (= byte 10)))
+                   (consume-line (if lf-p :crlf :cr))
+                   (when (or lf-p end-marker-p)
+                     (return-from consume-byte))))
+               (cond ((and (= byte 13) (not escaped-p))
+                      (setf pending-cr-p t))
+                     ((and (= byte 10) (not escaped-p))
+                      (consume-line :lf))
+                     (t
+                      (when (>= (length line) +max-query-message-size+)
+                        (ereport "54000" "COPY row exceeds the size limit"))
+                      (vector-push-extend byte line)
+                      (setf escaped-p (and (= byte 92) (not escaped-p)))))))
+      (loop
+        (check-for-interrupts)
+        (multiple-value-bind (type length payload) (read-message-frame stream)
+          (unless type (ereport-fatal "08006" "connection ended during COPY"))
+          (decode-frontend-message type length payload)
+          (case (code-char type)
+            (#\d
+             (loop for byte across payload until end-marker-p do (consume-byte byte)))
+            (#\c
+             (unless (zerop (length payload)) (malformed-protocol-message "CopyDone has a payload"))
+             (cond (pending-cr-p (consume-line :cr))
+                   ((plusp (length line)) (consume-line)))
+             (return))
+            (#\f (ereport "57014" "COPY from stdin failed"))
+            (#\X (ereport-fatal "08006" "connection terminated during COPY"))
+            ((#\H #\S) nil)
+            (otherwise (malformed-protocol-message "unexpected frontend message during COPY"))))))))
+
+(defun copy-from-target (ast)
+  "Resolve the target and explicit input order without starting COPY."
+  (with-write-lock
+    (let* ((table (resolve-table-or-error (getf ast :table)))
+           (columns (pg-class-columns table))
+           (attnums (if (getf ast :columns)
+                        (resolve-attnums table (getf ast :columns))
+                        (loop for column across columns
+                              unless (pg-column-dropped-p column)
+                                collect (pg-column-attnum column)))))
+      (values table columns attnums))))
+
+(defun exec-copy-from (stream ast)
+  "Import text rows under one command and validate references before reporting success."
+  (multiple-value-bind (table columns attnums) (copy-from-target ast)
+    (let* ((prepared (prepare-dml-column-defaults
+                      (list :dml-type :insert :table table :columns columns :attnums attnums)
+                      (list :type :insert)))
+           (references nil)
+           (count 0))
+      (call-with-dml-subqueries
+       prepared
+       (lambda (table node xid)
+         (declare (ignore node xid))
+         (send-copy-in-response stream (length attnums))
+         (map-copy-in-text-rows
+          stream (length attnums)
+          (lambda (fields)
+            (check-for-interrupts)
+            (let ((row (make-array (length columns) :initial-element +null+)))
+              (loop for column across columns for attnum from 1
+                    for supplied = (member attnum attnums)
+                    unless (or supplied (pg-column-dropped-p column))
+                      do (setf (aref row (1- attnum)) (coerce-dml-column-default column)))
+              (loop for attnum in attnums for value in fields
+                    for column = (aref columns (1- attnum))
+                    do (setf (aref row (1- attnum))
+                             (if (eq value +null+) +null+
+                                 (coerce-dml-assignment-value value :text (pg-column-type column)
+                                                              (pg-column-typmod column) t))))
+              (check-not-null row columns)
+              (check-table-constraints table row)
+              (multiple-value-bind (block off publications)
+                  (insert-tuple-with-unique table row :publication-kind :insert)
+                (logical-note-row-change :insert table :new-values row :publication-selection publications)
+                (when (pg-class-foreign-keys table)
+                  (setf references (nconc (lock-foreign-key-child-references
+                                           table row (list block off (backend-command-id *backend*)))
+                                          references))))
+              (incf count))))
+         (check-foreign-key-child-references table references)))
+      count)))
 
 (defun exec-copy-to (stream ast)
   "Stream a SELECT plan's snapshot rows using C's default text COPY format."

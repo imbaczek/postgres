@@ -2902,18 +2902,35 @@ backend. Both rewrites remained above the 3× CPU and RSS targets.
 
 ## P10 — Foreign keys
 
-- [ ] Use P07 for transactional constraint metadata and dependencies. Validate
+- [x] Add default text `COPY FROM STDIN` and enforce foreign keys on imported
+  rows. Verify that an invalid reference or failed input rolls back the COPY
+  statement over simple and extended query protocol.
+- [x] Use P07 for transactional constraint metadata and dependencies. Validate
   referenced unique keys and expose the constraint state in `pg_constraint`.
-- [ ] Implement transaction-owned referenced-key locks with deadlock handling
+- [x] Implement transaction-owned referenced-key locks with deadlock handling
   and cancellation. Prove that a child insert racing a parent delete or
   key-changing update cannot commit an orphan before enabling enforcement.
-- [ ] Enforce immediate checks for single and composite keys across DML paths,
+- [x] Enforce immediate checks for single and composite keys across DML paths,
   including parent-side NO ACTION and RESTRICT, multirow writes and self-references.
-- [ ] Add NOT VALID/VALIDATE, CASCADE, SET NULL and SET DEFAULT. Verify concurrent
+- [x] Add NOT VALID/VALIDATE, CASCADE, SET NULL and SET DEFAULT. Verify concurrent
   validation, cascading chains and cycles, rollback and checks of default values.
-- [ ] Add deferrable checks and SET CONSTRAINTS using P07 subtransaction
+- [x] Add deferrable checks and SET CONSTRAINTS using transaction-local
   ownership. Verify commit-time checking, savepoint rollback, replay and the
   deferred cascading constraint used by upstream pg_partman.
+
+  Savepoints support DML and constraint modes. Physical recovery preserves
+  catalog and row changes, and logical decoding emits surviving DML after
+  savepoint rollback. Native logical schema replication of foreign-key DDL
+  remains unsupported, as do DROP CONSTRAINT and RENAME CONSTRAINT for foreign
+  keys.
+
+  The tuning pass shares a registered visibility snapshot across immediate
+  checks within each statement. Median allocations for 1,000 child inserts
+  fell from about 16.7 to 16.4 MB for integer keys and from 18.4 to 18.2 MB
+  for text keys. Median server CPU was 97 and 99 ms versus 2.1 and 2.2 ms for
+  C PostgreSQL. Deleting one referenced row with CASCADE took 1.8 and 2.3 ms
+  versus 0.41 and 0.32 ms. Peak RSS was about 411 MiB for the Lisp server
+  process and 18–21 MiB for a C backend. These workloads missed the 3× targets.
 
 ## Open development tasks
 

@@ -663,6 +663,11 @@ HANDLE-SIMPLE-QUERY-FRAME so decoding occurs after admission."
                (setf (extended-query-state-implicit-p *extended-query-state*) nil))
              (let ((*preserve-failed-extended-portals* (eq (backend-state *backend*) :aborted)))
                (extended-clear-portals-for-backend *backend*))))))
+    ;; COPY messages already queued by a client may outlive a failed COPY.
+    ((find (code-char type-byte) "dcf")
+     (with-live-operation
+       (decode-frontend-message type-byte length-bytes payload)
+       :continue))
     ((find (code-char type-byte) "PBESCHD")
      (handle-extended-query-frame stream type-byte length-bytes payload))
     ;; A captured active session may terminate during drain so its transaction

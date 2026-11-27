@@ -167,7 +167,8 @@ those arguments therefore occur before any row execution or sequence effects."
     (analyze-subquery-assignment expression column)))
 
 (defun table-constraint-name-used-p (table name)
-  (or (find name (pg-class-checks table) :key (lambda (check) (getf check :name)) :test #'string=)
+  (or (find name (pg-class-foreign-keys table) :key #'pg-foreign-key-name :test #'string=)
+      (find name (pg-class-checks table) :key (lambda (check) (getf check :name)) :test #'string=)
       (find name (remove-if-not #'pg-index-constraint-owned-p (table-indexes table))
             :key #'pg-index-name :test #'string=)))
 

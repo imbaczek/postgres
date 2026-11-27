@@ -320,7 +320,7 @@ Range and negative checks occur when the LIMIT executes."
     ((match-kw p "select") (parse-select p))
     ((kw-p p "values") (parse-select-expression p))
     ((punct-p p #\() (parse-select-expression p))
-    ((match-kw p "copy") (parse-copy-to p))
+    ((match-kw p "copy") (parse-copy p))
     ((match-kw p "insert") (parse-insert p))
     ((match-kw p "update") (parse-update p))
     ((match-kw p "delete") (parse-delete p))
@@ -342,8 +342,17 @@ Range and negative checks occur when the LIMIT executes."
                            (list :type :commit))
     ((match-kw p "end") (match-kw p "work") (match-kw p "transaction")
                         (list :type :commit))
-    ((match-kw p "rollback") (match-kw p "work") (match-kw p "transaction")
-                             (list :type :rollback))
+    ((match-kw p "savepoint")
+     (list :type :savepoint :name (pident p)))
+    ((match-kw p "release")
+     (match-kw p "savepoint")
+     (list :type :release-savepoint :name (pident p)))
+    ((match-kw p "rollback")
+     (or (match-kw p "work") (match-kw p "transaction"))
+     (if (match-kw p "to")
+         (progn (match-kw p "savepoint")
+                (list :type :rollback-to-savepoint :name (pident p)))
+         (list :type :rollback)))
     ((match-kw p "abort") (match-kw p "work") (match-kw p "transaction")
                           (list :type :rollback))
     ((match-kw p "checkpoint") (list :type :checkpoint))
@@ -692,27 +701,34 @@ Range and negative checks occur when the LIMIT executes."
 
 ;;; ---- INSERT / UPDATE / DELETE ----
 
-(defun parse-copy-to (p)
-  (let ((query
-          (if (match-punct p #\()
-              (with-parens (p :opening-consumed t) (parse-select-expression p))
-              (let* ((name (pident p))
-                     (table (if (match-punct p #\.)
-                                (make-sql-relation-name :schema name :name (pident p)) name))
-                     (columns (when (match-punct p #\()
-                                (with-parens (p :opening-consumed t) (parse-ident-list p)))))
-                (when (/= (length columns) (length (remove-duplicates columns :test #'string=)))
-                  (ereport "42701" "COPY column specified more than once"))
-                (list :type :select :from table
-                      :targets (if columns
-                                   (mapcar (lambda (column) (list :expr (list :column column)))
-                                           columns)
-                                   (list (list :star t))))))))
-    (unless (match-kw p "to") (ereport "0A000" "only COPY TO STDOUT is supported"))
-    (unless (match-kw p "stdout") (ereport "0A000" "only COPY TO STDOUT is supported"))
-    (when (match-kw p "with")
-      (ereport "0A000" "COPY options are not supported"))
-    (list :type :copy-to :query query)))
+(defun parse-copy (p)
+  (let* ((query (when (match-punct p #\()
+                  (with-parens (p :opening-consumed t) (parse-select-expression p))))
+         (table (unless query
+                  (let ((name (pident p)))
+                    (if (match-punct p #\.)
+                        (make-sql-relation-name :schema name :name (pident p))
+                        name))))
+         (columns (when (and table (match-punct p #\())
+                    (with-parens (p :opening-consumed t) (parse-ident-list p)))))
+    (when (/= (length columns) (length (remove-duplicates columns :test #'string=)))
+      (ereport "42701" "COPY column specified more than once"))
+    (let ((from-p (and table (match-kw p "from"))))
+      (if from-p
+          (unless (match-kw p "stdin") (ereport "0A000" "only COPY FROM STDIN is supported"))
+          (unless (and (match-kw p "to") (match-kw p "stdout"))
+            (ereport "0A000" "only COPY TO STDOUT is supported")))
+      (when (match-kw p "with")
+        (ereport "0A000" "COPY options are not supported"))
+      (if from-p
+          (list :type :copy-from :table table :columns columns)
+          (list :type :copy-to :query
+                (or query
+                    (list :type :select :from table
+                          :targets (if columns
+                                       (mapcar (lambda (column) (list :expr (list :column column)))
+                                               columns)
+                                       (list (list :star t))))))))))
 
 (defun parse-insert (p)
   (expect-kw p "into")
@@ -992,7 +1008,8 @@ Range and negative checks occur when the LIMIT executes."
         (constraints '()))
     (expect-punct p #\()
     (loop
-      (if (or (kw-p p "primary") (kw-p p "unique") (kw-p p "constraint") (kw-p p "check"))
+      (if (or (kw-p p "primary") (kw-p p "unique") (kw-p p "constraint") (kw-p p "check")
+              (kw-p p "foreign"))
           (push (parse-table-constraint p) constraints)
           (multiple-value-bind (column keys) (parse-column-def p)
             (push column columns)
@@ -1042,6 +1059,58 @@ Range and negative checks occur when the LIMIT executes."
     (expect-punct p #\))
     (list :kind :check :name name :expression expression :sql sql)))
 
+(defun parse-foreign-key-action (p)
+  (cond ((match-kw p "cascade") :cascade)
+        ((match-kw p "restrict") :restrict)
+        ((match-kw p "no") (expect-kw p "action") :no-action)
+        ((match-kw p "set")
+         (cond ((match-kw p "null") :set-null)
+               ((match-kw p "default") :set-default)
+               (t (syntax-error p))))
+        (t (syntax-error p))))
+
+(defun parse-foreign-key-reference (p name columns)
+  "Parse the common clause after REFERENCES in column and table constraints."
+  (let* ((table (parse-mutation-relation-identifier p))
+         (target-columns (when (punct-p p #\()
+                           (with-parens (p) (parse-ident-list p))))
+         (options nil))
+    (flet ((record (key value)
+             (when (get-properties options (list key))
+               (syntax-error p "repeated foreign key option"))
+             (setf options (list* key value options))))
+      (loop
+        (cond
+          ((match-kw p "match")
+           (record :match-type
+                   (cond ((match-kw p "simple") :simple)
+                         ((match-kw p "full") :full)
+                         ((match-kw p "partial") :partial)
+                         (t (syntax-error p)))))
+          ((match-kw p "on")
+           (let ((key (cond ((match-kw p "update") :update-action)
+                            ((match-kw p "delete") :delete-action)
+                            (t (syntax-error p)))))
+             (record key (parse-foreign-key-action p))))
+          ((match-kw p "deferrable") (record :deferrable t))
+          ((let ((start (sql-parser-pos p)))
+             (when (match-kw p "not")
+               (or (match-kw p "deferrable")
+                   (progn (setf (sql-parser-pos p) start) nil))))
+           (record :deferrable nil))
+          ((match-kw p "initially")
+           (record :initially-deferred
+                   (cond ((match-kw p "deferred") t)
+                         ((match-kw p "immediate") nil)
+                         (t (syntax-error p)))))
+          (t (return)))))
+    (when (getf options :initially-deferred)
+      (when (and (get-properties options '(:deferrable)) (not (getf options :deferrable)))
+        (syntax-error p "INITIALLY DEFERRED constraint must be DEFERRABLE"))
+      (setf (getf options :deferrable) t))
+    (list* :kind :foreign-key :name name :columns columns
+           :referenced-table table :referenced-columns target-columns options)))
+
 (defun parse-column-def (p)
   (let* ((name (pident p)) (type nil) (typmod -1))
     (multiple-value-setq (type typmod) (parse-type p))
@@ -1079,7 +1148,9 @@ Range and negative checks occur when the LIMIT executes."
           ((match-kw p "check")
            (push (parse-check-body p constraint-name) checks)
            (setf constraint-name nil))
-          ((match-kw p "references") (ereport "0A000" "foreign keys are not supported"))
+          ((match-kw p "references")
+           (push (parse-foreign-key-reference p constraint-name (list name)) keys)
+           (setf constraint-name nil))
           (t (when constraint-name (syntax-error p)) (return))))
       (values
        (list :name name :type type :typmod typmod :notnull notnull
@@ -1217,6 +1288,11 @@ Range and negative checks occur when the LIMIT executes."
       (setf cname (pident p)))
     (cond
       ((match-kw p "check") (parse-check-body p cname))
+      ((match-kw p "foreign")
+       (expect-kw p "key")
+       (let ((columns (with-parens (p) (parse-ident-list p))))
+         (expect-kw p "references")
+         (parse-foreign-key-reference p cname columns)))
       ((match-kw p "primary")
        (expect-kw p "key")
        (list :kind :primary :name cname
@@ -1474,6 +1550,15 @@ Range and negative checks occur when the LIMIT executes."
        (when (match-kw p "constraint")
          (setf cname (pident p)))
        (cond
+         ((match-kw p "foreign")
+          (expect-kw p "key")
+          (let ((columns (with-parens (p) (parse-ident-list p))))
+            (expect-kw p "references")
+            (let ((constraint (parse-foreign-key-reference p cname columns)))
+              (when (match-kw p "not")
+                (expect-kw p "valid")
+                (setf (getf constraint :not-valid) t))
+              (list :action :add-foreign-key :foreign-key constraint))))
          ((match-kw p "check")
           (let ((check (parse-check-body p cname)))
             (when (match-kw p "not") (expect-kw p "valid") (setf (getf check :not-valid) t))
@@ -1621,6 +1706,12 @@ Range and negative checks occur when the LIMIT executes."
         (return-from parse-set
           (list :type :set :name name :local-p t :value (parse-set-value p)))))
     (cond
+      ((and (not session-p) (match-kw p "constraints"))
+       (let ((names (unless (match-kw p "all") (parse-ident-list p))))
+         (list :type :set-constraints :names names
+               :mode (cond ((match-kw p "immediate") :immediate)
+                           ((match-kw p "deferred") :deferred)
+                           (t (syntax-error p))))))
       ((match-kw p "transaction")
        (when session-p
          (ereport "0A000" "session transaction characteristics are not supported"))

@@ -75,17 +75,20 @@
           copy)
         array)))
 
-(defun coerce-subquery-assignment-value (expression input-value)
-  (let* ((argument (second expression))
-         (target (expr-type expression))
-         (typmod (expr-typmod expression))
-         (value (pg.sql-runtime:sql-cast-value input-value (expr-type argument) target
-                                               (if (member target '(:varchar :varchar-array)) -1 typmod))))
+(defun coerce-dml-assignment-value (input source target typmod &optional interval-literal-p)
+  "Apply the destination's assignment rules to an input datum."
+  (let ((value (pg.sql-runtime:sql-cast-value input source target
+                                              (if (member target '(:varchar :varchar-array)) -1 typmod)
+                                              interval-literal-p)))
     (cond ((eq value +null+) +null+)
           ((eq target :varchar) (sql-varchar-assignment-value value typmod))
           ((and (eq target :varchar-array) (>= typmod 4))
            (constrain-varchar-array-assignment value typmod))
           (t value))))
+
+(defun coerce-subquery-assignment-value (expression input-value)
+  (coerce-dml-assignment-value input-value (expr-type (second expression))
+                               (expr-type expression) (expr-typmod expression)))
 
 (defun eval-subquery-assignment (expression environment)
   (coerce-subquery-assignment-value expression (eval-expr (second expression) environment)))
@@ -286,7 +289,7 @@
                                  (progn (setf (getf *select-analysis-frame* :kind) :on-conflict)
                                         (prepare-on-conflict table (getf ast :on-conflict) (getf ast :alias)))))
                      (returning (prepare-dml-returning ast table dml-source)))
-                (list :ctes definitions :sublinks (nreverse *select-sublinks*) :table table :columns columns :scope scope
+                (list :dml-type (getf ast :type) :ctes definitions :sublinks (nreverse *select-sublinks*) :table table :columns columns :scope scope
                       :source-relations (loop for child in (list source dml-source)
                                               when child collect (list :subquery-prepared child))
                       :relations nil :where where
@@ -390,6 +393,22 @@
   (revalidate-select-relations relations)
   relations)
 
+(defun dml-foreign-key-readers (table prepared)
+  "Resolve counterpart tables and indexes before joint relation admission."
+  (let* ((type (getf prepared :dml-type))
+         (incoming (when (or (member type '(:update :delete))
+                             (eq :update (getf (getf prepared :conflict) :action)))
+                     (referencing-foreign-keys table)))
+         (outgoing (unless (eq type :delete) (pg-class-foreign-keys table))))
+    (with-write-lock
+      (values (append (mapcar #'car incoming)
+                      (mapcar (lambda (constraint)
+                                (find-table-by-oid (pg-foreign-key-referenced-table-oid constraint)))
+                              outgoing))
+              (mapcar (lambda (constraint)
+                        (find-index-by-oid (pg-foreign-key-referenced-index-oid constraint)))
+                      (append outgoing (mapcar #'cdr incoming)))))))
+
 (defun register-dml-subquery-relations (prepared &optional xid)
   ;; Admit the target write and every source read together. Registering the target
   ;; first can deadlock with an index builder waiting on that writer while blocking
@@ -413,9 +432,20 @@
                                     (expression-subquery-relations prepared)
                                     (query-cte-relations prepared))))
          (xid (or xid (get-current-xid))))
-    (register-relation-accesses (list relfilenode)
-                                (append target-toast-nodes
-                                        (select-relation-reader-relfilenodes relations)) xid)
+    (multiple-value-bind (counterparts indexes) (dml-foreign-key-readers table prepared)
+      (register-relation-accesses
+       (list relfilenode)
+       (append target-toast-nodes
+               (select-relation-reader-relfilenodes relations)
+               (mapcan #'catalog-relation-storage-nodes counterparts)
+               (mapcar #'pg-index-relfilenode indexes))
+       xid)
+      (when (or counterparts indexes)
+        (with-write-lock
+          (dolist (counterpart counterparts) (ensure-current-table counterpart))
+          (dolist (index indexes)
+            (unless (eq index (find-index-by-oid (pg-index-oid index)))
+              (ereport "40001" "referenced index changed during write admission"))))))
     (with-write-lock
       (ensure-current-table table)
       (unless (and (eq target-toast (pg-class-toast table))
@@ -532,7 +562,11 @@ Assignment evaluation already coerces to the destination typmod and checks origi
        (declare (ignore rel xid))
        (let ((columns (getf prepared :columns)) (count 0)
                                                 (state (make-hash-table :test #'equal))
-                                                (returning (getf prepared :returning)))
+                                                (returning (getf prepared :returning))
+                                                (key-references nil)
+                                                (key-changes nil)
+                                                (parent-references (when (eq :update (getf (getf prepared :conflict) :action))
+                                                                     (referencing-foreign-keys table))))
          (send-dml-returning-description stream returning)
          (labels
              ((insert-row (expressions environment)
@@ -576,18 +610,24 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                  (check-table-constraints table values)
                                  values)))))
                       (detach-select-index-scans)
-                      (multiple-value-bind (action actual old)
+                      (multiple-value-bind (action actual old parent-changes block off old-own-p)
                           (if (getf prepared :conflict)
                               (insert-tuple-on-conflict table values (getf prepared :conflict) state
-                                                        :compressed-reuse compressed :datum-origins datum-origins)
+                                                        :compressed-reuse compressed :datum-origins datum-origins
+                                                        :parent-references parent-references)
                               (multiple-value-bind (block off publications)
                                   (insert-tuple-with-unique table values :publication-kind :insert
                                                                          :compressed-reuse compressed)
-                                (declare (ignore block off))
                                 (logical-note-row-change :insert table :new-values values
                                                          :publication-selection publications)
-                                (values :insert values nil)))
+                                (values :insert values nil nil block off)))
                         (unless (eq action :nothing)
+                          (setf key-changes (nreconc parent-changes key-changes))
+                          (when (pg-class-foreign-keys table)
+                            (setf key-references
+                                  (nconc (lock-foreign-key-child-references
+                                          table actual (list block off (backend-command-id *backend*)) old old-own-p)
+                                         key-references)))
                           (incf count)
                           (emit-dml-returning stream returning actual :old-values old :new-values actual))))))))
            ;; Stream the independent SELECT projection under the original snapshot,
@@ -604,6 +644,8 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                   (car row)))))
                  (let ((*datum-origin-capture* t))
                    (dolist (row (getf prepared :rows)) (insert-row row nil))))))
+         (check-foreign-key-child-references table key-references)
+         (check-foreign-key-parent-changes table (nreverse key-changes) t)
          (finish-dml-command stream returning (format nil "INSERT 0 ~a" count) count))))))
 
 (defun exec-delete-subqueries (stream ast)
@@ -612,7 +654,10 @@ Assignment evaluation already coerces to the destination typmod and checks origi
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
-       (let ((columns (getf prepared :columns)) (count 0))
+       (let ((columns (getf prepared :columns)) (count 0)
+                                                (references (referencing-foreign-keys table))
+                                                (prepared-changes nil)
+                                                (key-changes nil))
          (send-dml-returning-description stream (getf prepared :returning))
          (stream-joined-dml-candidates
           prepared table
@@ -621,6 +666,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
             (check-for-interrupts)
             (detach-select-index-scans)
             (unless modified-p
+              (setf prepared-changes nil)
               (multiple-value-bind (deleted tuple block off status publications)
                   (heapam-delete-tid
                    rel columns (htup-block candidate) (htup-offnum candidate) xid
@@ -634,10 +680,14 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                         (or (null where)
                             (true-p (eval-expr where (concatenate 'vector (htup-values tuple) source)))))))
                    (lambda () (logical-capture-publications (list table) :delete))
-                   t candidate)
+                   t candidate
+                   (when references
+                     (lambda (tuple)
+                       (setf prepared-changes (lock-foreign-key-parent-change table references tuple)))))
                 (declare (ignore block off))
                 (check-heapam-write-status status)
                 (when deleted
+                  (setf key-changes (nreconc prepared-changes key-changes))
                   (delete-tuple-toast-values table tuple xid (backend-command-id *backend*))
                   (materialize-select-tuple table tuple *current-snapshot*)
                   (logical-note-row-change :delete table :old-values (htup-values tuple)
@@ -646,6 +696,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                                       :old-values (htup-values tuple) :new-values nil :source-values source)
                   (incf count))
                 deleted))))
+         (check-foreign-key-parent-changes table (nreverse key-changes) nil)
          (finish-dml-command stream (getf prepared :returning) (format nil "DELETE ~a" count) count))))))
 
 (defun simple-update-toast-demand (prepared table xid)
@@ -747,7 +798,6 @@ Assignment evaluation already coerces to the destination typmod and checks origi
          (lambda (next-block next-offnum)
            (unless (heapam-set-ctid-unlocked rel old-block old-offnum next-block next-offnum)
              (ereport "XX000" "could not link updated heap tuple"))))
-      (declare (ignore block off))
       (logical-note-row-change
        :update table :old-values (htup-values tuple) :new-values new
        :toast-reuse reuse :publication-selection publications
@@ -759,7 +809,8 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                    when (heap-external-varlena-p (aref values i))
                      do (unless pointer (error "missing claimed TOAST reuse pointer"))
                         (setf (aref values i) pointer))
-             (htup-values (materialize-select-tuple table (make-htup :values values) snapshot)))))))))
+             (htup-values (materialize-select-tuple table (make-htup :values values) snapshot))))))
+      (values block off))))
 
 (defun exec-update-subqueries (stream ast)
   (let* ((*datum-origin-capture* t)
@@ -770,8 +821,13 @@ Assignment evaluation already coerces to the destination typmod and checks origi
     (call-with-dml-subqueries
      prepared
      (lambda (table rel xid)
-       (let ((columns (getf prepared :columns)) (count 0)
-                                                (toast-demand (simple-update-toast-demand prepared table xid)))
+       (let* ((columns (getf prepared :columns)) (count 0)
+                                                 (references (referencing-foreign-keys table))
+                                                 (toast-demand (unless (or references (pg-class-foreign-keys table))
+                                                                 (simple-update-toast-demand prepared table xid)))
+                                                 (prepared-changes nil)
+                                                 (key-changes nil)
+                                                 (key-references nil))
          (send-dml-returning-description stream (getf prepared :returning))
          (stream-joined-dml-candidates
           prepared table
@@ -785,6 +841,7 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                    (let ((*query-row-origins* (dml-target-row-origins candidate environment)))
                      (subquery-update-values table sets (htup-values candidate) environment))))
               (unless modified-p
+                (setf prepared-changes nil)
                 (multiple-value-bind (deleted tuple old-block old-offnum status)
                     (heapam-delete-tid
                      rel columns (htup-block candidate) (htup-offnum candidate) xid
@@ -802,14 +859,28 @@ Assignment evaluation already coerces to the destination typmod and checks origi
                               (multiple-value-setq (new compressed descriptors)
                                 (subquery-update-values table sets (htup-values tuple) environment))
                               t)))))
-                     nil t candidate)
+                     nil t candidate
+                     (when references
+                       (lambda (tuple)
+                         (setf prepared-changes
+                               (lock-foreign-key-parent-change table references tuple new)))))
                   (check-heapam-write-status status)
                   (when deleted
-                    (replace-claimed-dml-tuple table tuple old-block old-offnum xid new sets
-                                               compressed descriptors *current-snapshot* :toast-demand toast-demand)
+                    (setf key-changes (nreconc prepared-changes key-changes))
+                    (multiple-value-bind (block off)
+                        (replace-claimed-dml-tuple table tuple old-block old-offnum xid new sets
+                                                   compressed descriptors *current-snapshot* :toast-demand toast-demand)
+                      (when (pg-class-foreign-keys table)
+                        (setf key-references
+                              (nconc (lock-foreign-key-child-references
+                                      table new (list block off (backend-command-id *backend*))
+                                      (htup-values tuple) (eql (htup-xmin tuple) xid))
+                                     key-references))))
                     (emit-dml-returning stream (getf prepared :returning) new
                                         :old-values (htup-values tuple) :new-values new :source-values source)
                     (incf count))
                   deleted))))
           toast-demand)
+         (check-foreign-key-child-references table key-references)
+         (check-foreign-key-parent-changes table (nreverse key-changes) t)
          (finish-dml-command stream (getf prepared :returning) (format nil "UPDATE ~a" count) count))))))

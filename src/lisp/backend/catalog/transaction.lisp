@@ -45,6 +45,7 @@ Statistics and freeze horizons can advance without changing the definition."
            (map 'list #'column-to-sexp (pg-class-columns object))
            (copy-list (pg-class-indexes object))
            (catalog-expression-to-sexp (pg-class-checks object))
+           (mapcar #'foreign-key-to-sexp (pg-class-foreign-keys object))
            (let ((toast (pg-class-toast object)))
              (when toast
                (list (pg-toast-oid toast) (pg-toast-relfilenode toast)
@@ -355,6 +356,49 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
        tables)))
   (values))
 
+(defun catalog-foreign-key-columns-live-p (table attnums)
+  (let ((columns (pg-class-columns table)))
+    (every (lambda (attnum)
+             (and (<= 1 attnum (length columns))
+                  (not (pg-column-dropped-p (aref columns (1- attnum))))))
+           attnums)))
+
+(defun validate-catalog-foreign-key-dependencies (database)
+  "Reject a detached catalog image that would leave a surviving foreign key unresolved."
+  (let ((tables (database-tables database))
+        (indexes (database-indexes database))
+        (tables-by-oid nil)
+        (indexes-by-oid nil))
+    (loop for child being the hash-values of tables
+          do (dolist (constraint (pg-class-foreign-keys child))
+               (unless tables-by-oid
+                 (setf tables-by-oid (make-hash-table :test #'eql)
+                       indexes-by-oid (make-hash-table :test #'eql))
+                 (maphash (lambda (name table)
+                            (declare (ignore name))
+                            (setf (gethash (pg-class-oid table) tables-by-oid) table))
+                          tables)
+                 (maphash (lambda (name index)
+                            (declare (ignore name))
+                            (setf (gethash (pg-index-oid index) indexes-by-oid) index))
+                          indexes))
+               (let* ((parent-oid (pg-foreign-key-referenced-table-oid constraint))
+                      (parent (gethash parent-oid tables-by-oid))
+                      (index (gethash (pg-foreign-key-referenced-index-oid constraint) indexes-by-oid))
+                      (keys (pg-foreign-key-referenced-columns constraint)))
+                 (unless (and parent index (eql parent-oid (pg-index-table-oid index))
+                              (pg-index-valid-p index) (pg-index-live-p index)
+                              (pg-index-ready-p index) (pg-index-unique-p index)
+                              (null (pg-index-predicate index))
+                              (null (pg-index-expression-keys index))
+                              (= (length keys) (length (pg-index-columns index)))
+                              (subsetp keys (pg-index-columns index) :test #'eql)
+                              (catalog-foreign-key-columns-live-p parent keys)
+                              (catalog-foreign-key-columns-live-p child (pg-foreign-key-columns constraint)))
+                   (ereport "2BP01" "catalog change would remove a dependency of foreign key ~s on table ~s"
+                            (pg-foreign-key-name constraint) (pg-class-name child)))))))
+  (values))
+
 (defun catalog-transaction-prepare-database (transaction database)
   "Prepare a detached catalog image while holding the catalog and write locks."
   (catalog-transaction-validate transaction database)
@@ -363,6 +407,7 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
           (database-indexes view) (catalog-transaction-merged-name-map transaction :index)
           (database-publications view) (catalog-transaction-publications transaction database))
     (catalog-transaction-adjust-index-membership view transaction)
+    (validate-catalog-foreign-key-dependencies view)
     view))
 
 (defun catalog-transaction-deferred-deletes (transaction view)

@@ -676,6 +676,8 @@ the input page."
   "Deform a live line pointer in an already acquired page."
   (when (< len +size-of-heap-tuple-header+)
     (ereport "XX001" "invalid heap tuple bounds"))
+  (when (logtest +heap-xmin-invalid+ (page-u16 page (+ off +heap-tuple-infomask-off+)))
+    (return-from heapam-deform-page-item nil))
   (let ((xmin (full-xid-from-32 (page-u32 page (+ off +heap-tuple-xmin-off+)))))
     ;; An abandoned ALTER TABLE may have written a tuple in a different shape.
     (unless (if toast-visibility-p
@@ -703,6 +705,26 @@ visibility and protect the lifetime of the owning parent separately."
       (with-live-page-item (page offnum off len)
         (heapam-deform-page-item page block offnum off len columns toast-visibility-p)))))
 
+(defvar *heap-savepoint-undoing-p* nil)
+
+(defun heap-savepoint-recording-p ()
+  (and *backend* (backend-savepoints *backend*) (not *heap-savepoint-undoing-p*)))
+
+(defun publish-heap-insert-page (relfilenode block page offnum xmin)
+  "Publish the page and retain the new tuple identity when undo is active."
+  (flet ((publish ()
+           (with-wal-page-batch
+             (buf-write relfilenode block page :main :take-ownership)
+             (visibilitymap-clear relfilenode block))))
+    (if (heap-savepoint-recording-p)
+        (sb-sys:without-interrupts
+          (let ((journal (cons (list :insert relfilenode block offnum (xid32-of xmin))
+                               (backend-heap-undo-log *backend*))))
+            (publish)
+            (setf (backend-heap-undo-log *backend*) journal)))
+        (publish)))
+  (mark-dirty relfilenode))
+
 (defun heapam-insert (relfilenode columns values xmin cid)
   "Insert a tuple; return (values block offnum)."
   (let* ((tuple (form-heap-tuple values columns xmin 0 cid 0 0))
@@ -719,10 +741,7 @@ visibility and protect the lifetime of the owning parent separately."
                      (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+)
                                    offnum))
                    (let ((capacity (heap-page-insert-capacity page)))
-                     (with-wal-page-batch
-                       (buf-write relfilenode block page :main :take-ownership)
-                       (visibilitymap-clear relfilenode block))
-                     (mark-dirty relfilenode)
+                     (publish-heap-insert-page relfilenode block page offnum xmin)
                      (heap-fsm-record-page fsm block capacity)))
                  offnum)))
       (loop for block = (heap-fsm-take-page fsm required)
@@ -748,12 +767,20 @@ visibility and protect the lifetime of the owning parent separately."
           (page-set-u32 page (+ toff +heap-tuple-ctid-block-off+) block)
           (page-set-u16 page (+ toff +heap-tuple-ctid-offnum-off+) offnum))
         (let ((capacity (heap-page-insert-capacity page)))
-          (with-wal-page-batch
-            (buf-write relfilenode block page :main :take-ownership)
-            (visibilitymap-clear relfilenode block))
-          (mark-dirty relfilenode)
+          (publish-heap-insert-page relfilenode block page offnum xmin)
           (heap-fsm-record-page fsm block capacity))
         (values block offnum)))))
+
+(defun note-heap-savepoint-header (relfilenode block offnum page offset)
+  (when (heap-savepoint-recording-p)
+    (push (list :header relfilenode block offnum
+                (page-u32 page (+ offset +heap-tuple-xmin-off+))
+                (page-u32 page (+ offset +heap-tuple-xmax-off+))
+                (page-u32 page (+ offset +heap-tuple-cid-off+))
+                (page-u16 page (+ offset +heap-tuple-infomask-off+))
+                (page-u32 page (+ offset +heap-tuple-ctid-block-off+))
+                (page-u16 page (+ offset +heap-tuple-ctid-offnum-off+)))
+          (backend-heap-undo-log *backend*))))
 
 (defmacro with-heap-tuple-edit ((page offset relfilenode block offnum &optional owned-p)
                                 &body body)
@@ -776,6 +803,7 @@ With OWNED-P, BODY must keep the private page local to the edit."
              (ereport "XX001" "heap tuple header is truncated"))
            (let ((,page ,page-value)
                  (,offset ,tuple-offset))
+             (note-heap-savepoint-header ,relfilenode-value ,block-value ,offnum-value ,page ,offset)
              (multiple-value-prog1
                  (progn ,@body)
                (with-wal-page-batch
@@ -813,6 +841,45 @@ With OWNED-P, BODY must keep the private page local to the edit."
   (with-write-lock
     (heapam-set-ctid-unlocked relfilenode block offnum ctid-block ctid-offnum)))
 
+(defun undo-heap-savepoint-entry (entry xid)
+  "Undo a tuple in place without resetting unrelated edits on the same page."
+  (destructuring-bind (kind node block offnum xmin &optional xmax old-cid mask ctid-block ctid-offnum) entry
+    (unless
+        (with-heap-tuple-edit (page offset node block offnum :take-ownership)
+          (unless (= xmin (page-u32 page (+ offset +heap-tuple-xmin-off+)))
+            (ereport "XX001" "savepoint rollback lost its heap tuple version"))
+          (ecase kind
+            (:insert
+             ;; Index entries stay valid physical pointers to a dead tuple.
+             (let* ((cmin (page-u32 page (+ offset +heap-tuple-cid-off+)))
+                    (stored (make-combo-command-id xid cmin cmin)))
+               (page-set-u32 page (+ offset +heap-tuple-xmax-off+) (xid32-of xid))
+               (page-set-u32 page (+ offset +heap-tuple-cid-off+) stored)
+               (page-set-u16 page (+ offset +heap-tuple-infomask-off+)
+                             (logior +heap-combo-cid+ +heap-xmin-invalid+
+                                     (logandc2 (page-u16 page (+ offset +heap-tuple-infomask-off+))
+                                               +heap-xmin-committed+)))))
+            (:header
+             (page-set-u32 page (+ offset +heap-tuple-xmax-off+) xmax)
+             (page-set-u32 page (+ offset +heap-tuple-cid-off+) old-cid)
+             (page-set-u16 page (+ offset +heap-tuple-infomask-off+) mask)
+             (page-set-u32 page (+ offset +heap-tuple-ctid-block-off+) ctid-block)
+             (page-set-u16 page (+ offset +heap-tuple-ctid-offnum-off+) ctid-offnum)))
+          t)
+      (ereport "XX001" "savepoint rollback lost its heap tuple"))))
+
+(defun undo-heap-to-savepoint (checkpoint)
+  "Replay the undo journal back to CHECKPOINT under the heap writer lock."
+  (let ((*heap-savepoint-undoing-p* t)
+        (xid (backend-xid *backend*)))
+    (with-write-lock
+      (loop until (eq (backend-heap-undo-log *backend*) checkpoint)
+            do (let ((entry (first (backend-heap-undo-log *backend*))))
+                 (unless entry (error "savepoint checkpoint is outside the heap journal"))
+                 (undo-heap-savepoint-entry entry xid)
+                 (pop (backend-heap-undo-log *backend*))))))
+  (values))
+
 (defun fresh-delete-snapshot (fallback)
   (if *backend*
       (make-snapshot (backend-command-id *backend*))
@@ -832,9 +899,21 @@ With OWNED-P, BODY must keep the private page local to the edit."
   ;; aborted xmax changes and VACUUM freezing do not change the row version.
   (list (htup-block tuple) (htup-offnum tuple)))
 
+(defun heap-delete-committed-action (tuple block offnum)
+  "Classify a committed xmax under the writer lock before following an UPDATE."
+  (let ((updated-p (or (/= (htup-ctid-block tuple) block)
+                       (/= (htup-ctid-offnum tuple) offnum))))
+    (cond
+      ((repeatable-read-conflict-p (htup-xmax tuple))
+       (list (if updated-p :serialization-update-conflict :serialization-delete-conflict)
+             (htup-xmax tuple)))
+      ((and updated-p (not (and *backend* (eq (backend-isolation-level *backend*) :repeatable-read))))
+       (list :follow (htup-ctid-block tuple) (htup-ctid-offnum tuple) (htup-xmax tuple)))
+      (t :skip))))
+
 (defun heapam-delete-tid (relfilenode columns block offnum xid cid
                           &optional (matches-p (constantly t)) on-delete
-                            outside-lock-recheck-p qualified-tuple)
+                            outside-lock-recheck-p qualified-tuple before-claim)
   "Delete the latest qualifying version of TID, waiting for a writer.
 
 Under READ COMMITTED, follow a committed update's ctid chain and evaluate
@@ -842,15 +921,19 @@ MATCHES-P against the refreshed row before claiming it. Under REPEATABLE READ,
 return a serialization-conflict status when the row changed after the retained
 snapshot. Return T, the tuple whose xmax was set, its physical location, and a
 status keyword. ON-DELETE runs under the successful mutation\'s writer lock;
-when supplied, its result is returned as a sixth value."
+when supplied, its result is returned as a sixth value. BEFORE-CLAIM runs
+outside that lock on the qualified version, which is rechecked before writing
+xmax. It requires OUTSIDE-LOCK-RECHECK-P."
   ;; OUTSIDE-LOCK-RECHECK-P allows :QUALIFY to evaluate without the writer lock;
   ;; QUALIFIED-TUPLE identifies an already qualified version for TID revalidation.
+  (when before-claim (assert outside-lock-recheck-p))
   (register-relation-writer relfilenode xid)
   (let ((target-block block)
         (target-offnum offnum)
         (snapshot *current-snapshot*)
         (expected-xmin nil)
         (qualified-version (and qualified-tuple (heap-tuple-version-key qualified-tuple)))
+        (prepared-version nil)
         (visited (make-hash-table :test #'equal)))
     (loop
       (let ((key (cons target-block target-offnum)))
@@ -877,24 +960,7 @@ when supplied, its result is returned as a sixth value."
                      (list :wait (htup-xmax tuple)))
                     ((and (not (zerop (htup-xmax tuple)))
                           (xid-committed-p (htup-xmax tuple)))
-                     (let ((updated-p
-                             (or (/= (htup-ctid-block tuple) target-block)
-                                 (/= (htup-ctid-offnum tuple) target-offnum))))
-                       (cond
-                         ((repeatable-read-conflict-p (htup-xmax tuple))
-                          (list (if updated-p
-                                    :serialization-update-conflict
-                                    :serialization-delete-conflict)
-                                (htup-xmax tuple)))
-                         (updated-p
-                          (if (and *backend*
-                                   (eq (backend-isolation-level *backend*)
-                                       :repeatable-read))
-                              :skip
-                              (list :follow (htup-ctid-block tuple)
-                                    (htup-ctid-offnum tuple)
-                                    (htup-xmax tuple))))
-                         (t :skip))))
+                     (heap-delete-committed-action tuple target-block target-offnum))
                     ((not (heap-tuple-visible-p
                            (htup-xmin tuple) (htup-xmax tuple) (htup-cid tuple)
                            snapshot
@@ -906,6 +972,8 @@ when supplied, its result is returned as a sixth value."
                        ((and outside-lock-recheck-p
                              (not (equal qualified-version (heap-tuple-version-key tuple))))
                         (list :qualify tuple))
+                       ((and before-claim (not (equal prepared-version qualified-version)))
+                        (list :prepare-claim tuple))
                        ((or outside-lock-recheck-p (funcall matches-p tuple))
                         (if (heapam-set-xmax relfilenode target-block target-offnum xid cid)
                             (list :done tuple (when on-delete (funcall on-delete)))
@@ -922,13 +990,20 @@ when supplied, its result is returned as a sixth value."
              (setf qualified-version (heap-tuple-version-key tuple))
              (unless (funcall matches-p tuple)
                (return (values nil nil nil nil :skip)))
+             (when before-claim
+               (funcall before-claim tuple)
+               (setf prepared-version qualified-version))
              (remhash (cons target-block target-offnum) visited)))
+          (:prepare-claim
+           (funcall before-claim (second action))
+           (setf prepared-version qualified-version)
+           (remhash (cons target-block target-offnum) visited))
           (:serialization-update-conflict
            (return (values nil nil nil nil :serialization-update-conflict)))
           (:serialization-delete-conflict
            (return (values nil nil nil nil :serialization-delete-conflict)))
           (:wait
-           (wait-for-xid (second action))
+           (wait-for-xid (second action) :recheck-on-wakeup-p t)
            ;; Revisit this same TID after the writer ends; it is not a chain loop.
            (remhash (cons target-block target-offnum) visited)
            ;; READ COMMITTED rechecks a row after its conflicting writer ends.

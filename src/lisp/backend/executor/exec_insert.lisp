@@ -149,7 +149,7 @@ can claim an ON CONFLICT tuple or ask the released-lock loop to wait."
                             "duplicate key value violates unique constraint \"~a\""
                             (cdr check)))
                   (t (setf wait-xid (cdr check))))))))
-        (when wait-xid (wait-for-xid wait-xid))))))
+        (when wait-xid (wait-for-xid wait-xid :recheck-on-wakeup-p t))))))
 
 (defun exec-insert (stream ast)
   (call-with-observed-dml ast (lambda () (exec-insert-subqueries stream ast))))

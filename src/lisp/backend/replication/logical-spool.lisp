@@ -187,6 +187,57 @@ The caller must not mutate EVENT after passing it to this function."
              size))
       (unless complete (setf (logical-spool-failed-p spool) t)))))
 
+(defstruct logical-spool-checkpoint
+  spool events spilled-p bytes count)
+
+(defun capture-logical-spool-checkpoint (spool)
+  (when spool
+    (make-logical-spool-checkpoint :spool spool :events (logical-spool-events spool)
+                                   :spilled-p (not (null (logical-spool-stream spool)))
+                                   :bytes (logical-spool-bytes spool) :count (logical-spool-count spool))))
+
+(defun rewind-spilled-logical-spool (spool checkpoint)
+  "Keep the completed length/CRC frames in the checkpoint and release discarded quota."
+  (call-with-logical-spool-owner
+   spool
+   (lambda ()
+     (let* ((stream (logical-spool-stream spool))
+            (path (logical-spool-path spool))
+            (offset (+ (logical-spool-checkpoint-bytes checkpoint)
+                       (* 8 (logical-spool-checkpoint-count checkpoint)))))
+       (finish-output stream)
+       (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) offset)
+       (unless (file-position stream offset)
+         (error "cannot reposition the logical spool at its savepoint"))
+       (when *query-temp-quota*
+         (let* ((files (query-temp-quota-file-sizes *query-temp-quota*))
+                (charged (gethash path files 0)))
+           (decf (query-temp-quota-used-bytes *query-temp-quota*) (- charged offset))
+           (setf (gethash path files) offset)))))))
+
+(defun restore-logical-spool-checkpoint (spool checkpoint)
+  "Rewind a transaction spool, which may have spilled after the checkpoint."
+  (cond
+    ((null checkpoint)
+     (when spool (close-logical-spool spool))
+     nil)
+    (t
+     (let ((bytes (logical-spool-checkpoint-bytes checkpoint))
+           (count (logical-spool-checkpoint-count checkpoint)))
+       (cond
+         ((logical-spool-checkpoint-spilled-p checkpoint)
+          (unless (eq spool (logical-spool-checkpoint-spool checkpoint))
+            (error "logical spool savepoint lost its file owner"))
+          (rewind-spilled-logical-spool spool checkpoint))
+         ((or (null spool) (logical-spool-stream spool))
+          (when spool (close-logical-spool spool))
+          (setf spool (make-logical-spool))))
+       (setf (logical-spool-bytes spool) bytes
+             (logical-spool-count spool) count
+             (logical-spool-events spool) (logical-spool-checkpoint-events checkpoint)
+             (logical-spool-failed-p spool) nil)
+       spool))))
+
 (defun logical-spool-seal (spool)
   "Flush completed events before a caller enters the WAL critical section."
   (enter-query-temp-owner (logical-spool-owner spool))

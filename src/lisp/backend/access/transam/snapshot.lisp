@@ -414,6 +414,8 @@ or perform buffer hint-bit cleanup."
 COMMITTED-XID-CACHE, when provided, is private to a heap page visit. It holds
 only a full XID observed committed. Snapshot and command boundaries are checked
 for every tuple before the corresponding cached status is consulted."
+  (when (logtest +heap-xmin-invalid+ infomask)
+    (return-from heap-tuple-visible-p nil))
   (flet ((committed-p (xid)
            (or (and committed-xid-cache (eql xid (car committed-xid-cache)))
                (when (xid-committed-p xid)

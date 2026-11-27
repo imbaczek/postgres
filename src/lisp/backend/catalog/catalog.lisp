@@ -28,6 +28,19 @@
 (defstruct pg-toast
   oid relfilenode index-oid index-relfilenode relfrozenxid)
 
+(defstruct pg-foreign-key
+  oid name
+  columns
+  referenced-table-oid
+  referenced-index-oid
+  referenced-columns
+  (update-action :no-action)
+  (delete-action :no-action)
+  (match-type :simple)
+  deferrable-p
+  initially-deferred-p
+  validated-p)
+
 (defstruct pg-class
   oid
   name
@@ -37,6 +50,7 @@
   indexes           ; list of index OIDs
   statistics
   checks
+  foreign-keys
   toast)       ; derived ANALYZE estimates; raw samples remain transient
 
 (defstruct pg-index
@@ -334,6 +348,20 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
             :decode (lambda (columns)
                       (map 'vector #'column-statistics-from-sexp columns))))
 
+(define-catalog-codec foreign-key make-pg-foreign-key
+  (:oid pg-foreign-key-oid :oid)
+  (:name pg-foreign-key-name :name)
+  (:columns pg-foreign-key-columns :columns)
+  (:referenced-table-oid pg-foreign-key-referenced-table-oid :referenced-table-oid)
+  (:referenced-index-oid pg-foreign-key-referenced-index-oid :referenced-index-oid)
+  (:referenced-columns pg-foreign-key-referenced-columns :referenced-columns)
+  (:update-action pg-foreign-key-update-action :update-action :default :no-action)
+  (:delete-action pg-foreign-key-delete-action :delete-action :default :no-action)
+  (:match-type pg-foreign-key-match-type :match-type :default :simple)
+  (:deferrable pg-foreign-key-deferrable-p :deferrable-p)
+  (:initially-deferred pg-foreign-key-initially-deferred-p :initially-deferred-p)
+  (:validated pg-foreign-key-validated-p :validated-p))
+
 (define-catalog-codec toast make-pg-toast
   (:oid pg-toast-oid :oid)
   (:relfilenode pg-toast-relfilenode :relfilenode)
@@ -357,6 +385,10 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:toast pg-class-toast :toast :snapshot-copy #'catalog-mutation-copy-toast
                                 :encode (lambda (toast) (and toast (toast-to-sexp toast)))
                                 :decode (lambda (toast) (and toast (toast-from-sexp toast))))
+  (:foreign-keys pg-class-foreign-keys :foreign-keys :omit-default t
+                                                     :snapshot-copy #'copy-list
+                                                     :encode (lambda (keys) (mapcar #'foreign-key-to-sexp keys))
+                                                     :decode (lambda (keys) (mapcar #'foreign-key-from-sexp keys)))
   (:checks pg-class-checks :checks :snapshot-copy #'copy-tree
                                    :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
   (:statistics pg-class-statistics :statistics
@@ -720,7 +752,8 @@ cleanup, ordinary sequence and maintenance saves do not use this marker."
     (unless (and *backend* (eq (backend-state *backend*) :in-progress)
                  (backend-wal-obligation *backend*)
                  (transaction-wal-obligation-ddl-prepared-p (backend-wal-obligation *backend*)))
-      (error "Final DDL publication requires a prepared backend context")))
+      (error "Final DDL publication requires a prepared backend context"))
+    (validate-catalog-foreign-key-dependencies (current-database)))
   ;; Do fallible derived-state work before publication. Once WAL commits, the
   ;; generation update and cache assignment below must not signal: callers use
   ;; the generation to distinguish rollback-safe failures from durable ones.

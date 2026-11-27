@@ -210,7 +210,7 @@ ADMITTED contains arbiters already inferred after this writer registered."
           (when owner (return-from claim-on-conflict-candidate (values :wait owner))))))
     (values status candidate)))
 
-(defun insert-tuple-on-conflict (table values conflict state &key compressed-reuse datum-origins)
+(defun insert-tuple-on-conflict (table values conflict state &key compressed-reuse datum-origins parent-references)
   (declare (ignore state))
   (let ((*datum-origin-capture* t) (*query-row-origins* nil))
     (loop
@@ -230,10 +230,9 @@ ADMITTED contains arbiters already inferred after this writer registered."
                                                    (when (getf conflict :arbiters-admitted-p)
                                                      (getf conflict :arbiters)))))
                  (claim-on-conflict-candidate table values conflict indexes arbiters expression-keys)))))
-        (declare (ignore block off))
         (unless (eq action :conflict)
           (logical-note-row-change :insert table :new-values values :publication-selection publications)
-          (return (values :insert values nil)))
+          (return (values :insert values nil nil block off)))
         (when (eq (getf conflict :action) :nothing)
           (return (values :nothing nil nil)))
         ;; The claimed row cannot change while WHERE and SET are evaluated.
@@ -252,7 +251,9 @@ ADMITTED contains arbiters already inferred after this writer registered."
           (multiple-value-bind (new computed-compressed descriptors)
               (call-with-dml-expression-evaluation
                (lambda () (on-conflict-update-values table conflict old values)))
-            (let ((rel (pg-class-relfilenode table))
+            (let ((key-changes (when parent-references
+                                 (lock-foreign-key-parent-change table parent-references tuple new)))
+                  (rel (pg-class-relfilenode table))
                   (xid (backend-xid *backend*))
                   (protected-snapshot *current-snapshot*))
               ;; Refresh the claim snapshot while preserving the statement snapshot for subqueries.
@@ -263,6 +264,9 @@ ADMITTED contains arbiters already inferred after this writer registered."
                                        xid (backend-command-id *backend*))
                   (check-heapam-write-status write-status)
                   (when deleted
-                    (replace-claimed-dml-tuple table actual old-block old-offnum xid new
-                                               (getf conflict :sets) computed-compressed descriptors protected-snapshot)
-                    (return-from insert-tuple-on-conflict (values :update new (htup-values actual)))))))))))))
+                    (multiple-value-bind (next-block next-off)
+                        (replace-claimed-dml-tuple table actual old-block old-offnum xid new
+                                                   (getf conflict :sets) computed-compressed descriptors protected-snapshot)
+                      (return-from insert-tuple-on-conflict
+                        (values :update new (htup-values actual) key-changes next-block next-off
+                                (eql (htup-xmin actual) xid))))))))))))))
