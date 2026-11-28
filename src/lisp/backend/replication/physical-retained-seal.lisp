@@ -423,8 +423,9 @@ Return the prospective entry count and literal-byte total."
       (error "retained sealing metadata exceeds its bound"))
     (values count bytes)))
 
-(defun physical-retained-seal-publish-group (seal)
-  "Stage the validated extent under the hold and update the reverse-ordered index."
+(defun physical-retained-seal-publish-group (seal &key final-p)
+  "Stage the validated extent under the hold and update the reverse-ordered index.
+Keep its prefix only when the scan may start another group."
   (when (physical-retained-seal-bytes seal)
     (let* ((metadata (physical-retained-seal-metadata seal))
            (image (physical-retained-extent-encode metadata (physical-retained-seal-bytes seal)))
@@ -440,7 +441,8 @@ Return the prospective entry count and literal-byte total."
         (setf (physical-retained-seal-entries seal) (cons entry (if replacement (rest previous) previous))
               (physical-retained-seal-entry-count seal) count
               (physical-retained-seal-entry-bytes seal) bytes
-              (physical-retained-seal-prefix seal) (copy-seq (physical-retained-seal-bytes seal))
+              (physical-retained-seal-prefix seal)
+              (unless final-p (copy-seq (physical-retained-seal-bytes seal)))
               (physical-retained-seal-prefix-segment seal) (physical-retained-seal-segment seal)
               (physical-retained-seal-bytes seal) nil)))))
 
@@ -470,7 +472,7 @@ checks bound the index; final publication validates the full inventory and image
    :on-record (lambda (record raw)
                 (when (<= (wal-record-end record) cursor)
                   (physical-retained-seal-record seal record raw))))
-  (physical-retained-seal-publish-group seal)
+  (physical-retained-seal-publish-group seal :final-p t)
   (unless (and (= cursor (physical-retained-seal-cursor seal))
                (= digest (physical-retained-seal-digest seal)))
     (error "retained sealing lacks its exact receive boundary"))

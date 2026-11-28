@@ -35,7 +35,33 @@
       (rove:ok (equal (sql-group-value-key a :uuid) (sql-group-value-key b :uuid)))
       (rove:ok (= (analyze-statistics-value-hash a) (analyze-statistics-value-hash b)))
       (rove:ok (key< (encode-index-key (list b) '(:uuid))
-                     (encode-index-key (list higher) '(:uuid))))))
+                     (encode-index-key (list higher) '(:uuid)))))
+  (let ((left (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x7f))
+        (right (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dotimes (position 16)
+      (replace right left)
+      (setf (aref right position) #x80)
+      (when (< position 15)
+        (setf (aref right (1+ position)) 0))
+      (let ((a (sql-uuid-from-octets left))
+            (b (sql-uuid-from-octets right)))
+        (rove:ok (= -1 (sql-uuid-compare a b))
+                 (format nil "First difference at byte ~D determines UUID order" position))
+        (rove:ok (= 1 (sql-uuid-compare b a)))))))
+
+(rove:deftest heap-layout-scratch-preserves-owned-encoded-tuples
+    (let* ((columns (vector (make-pg-column :type :int4)
+                            (make-pg-column :type :varchar)
+                            (make-pg-column :type :int8)))
+           (scratch (cons (make-array 3) (make-array 3)))
+           (first-values (vector 1 "first" +int8-max+))
+           (second-values (vector +null+ "second" -2))
+           (first (form-heap-tuple first-values columns 1 0 0 0 1 nil scratch))
+           (second (form-heap-tuple second-values columns 1 0 0 0 2 nil scratch)))
+      (rove:ok (equalp first (form-heap-tuple first-values columns 1 0 0 0 1)))
+      (rove:ok (equalp second (form-heap-tuple second-values columns 1 0 0 0 2)))
+      (rove:ok (equalp first-values (deform-heap-tuple first columns)))
+      (rove:ok (equalp second-values (deform-heap-tuple second columns)))))
 
 (rove:deftest test-btree-scan-boundaries
     (let* ((lower (make-btree-scan-bound :prefix #(2) :inclusive-p nil))
@@ -66,6 +92,38 @@
                           (loop for tid = (btree-scan-next-tid cursor)
                                 while tid collect (cdr tid)))
                    "apply prefix inclusivity in both directions and skip dead slots")))))
+
+(rove:deftest page-u16-preserves-unaligned-and-boundary-loads
+    (let ((bytes (make-array 4 :element-type '(unsigned-byte 8)
+                               :initial-contents '(255 0 128 4))))
+      (rove:ok (= (page-u16 bytes 0) #x00ff))
+      (rove:ok (= (page-u16 bytes 1) #x8000))
+      (rove:ok (= (page-u16 bytes 2) #x0480))
+      (dolist (offset '(-1 3))
+        (rove:ok (handler-case (progn (page-u16 bytes offset) nil)
+                   (error () t))))))
+
+(rove:deftest page-u32-preserves-unaligned-and-boundary-loads
+    (let ((bytes (make-array 12 :element-type '(unsigned-byte 8)
+                                :initial-contents '(255 0 128 4 90 166 1 222 51 123 9 240))))
+      (loop for offset from 0 to (- (length bytes) 4)
+            do (rove:ok (= (page-u32 bytes offset)
+                           (loop for byte below 4
+                                 sum (ash (aref bytes (+ offset byte)) (* 8 byte))))))
+      (dolist (offset '(-1 9))
+        (rove:ok (handler-case (progn (page-u32 bytes offset) nil)
+                   (error () t))))))
+
+(rove:deftest page-u64-preserves-unaligned-and-boundary-loads
+    (let ((bytes (make-array 12 :element-type '(unsigned-byte 8)
+                                :initial-contents '(255 0 128 4 90 166 1 222 51 123 9 240))))
+      (loop for offset from 0 to (- (length bytes) 8)
+            do (rove:ok (= (page-u64 bytes offset)
+                           (loop for byte below 8
+                                 sum (ash (aref bytes (+ offset byte)) (* 8 byte))))))
+      (dolist (offset '(-1 5))
+        (rove:ok (handler-case (progn (page-u64 bytes offset) nil)
+                   (error () t))))))
 
 (rove:deftest test-live-page-items-stop
     (let ((page (page-init (make-page)))
@@ -170,15 +228,12 @@
                                              (rove:ok (= count 1))
                                              (push (aref batch 0) seen)))
         (rove:ok (equal (nreverse seen) '(-2147483648 2147483647))))
-      (let ((reader (make-visible-heap-page-iterator page 0 columns snapshot t)))
-        (unwind-protect
-             (progn
-               (dolist (key (list -2147483648 +null+ 2147483647))
-                 (multiple-value-bind (row present) (sql-iterator-next reader)
-                   (rove:ok present)
-                   (rove:ok (equalp row (vector key)))))
-               (rove:ok (not (nth-value 1 (sql-iterator-next reader)))))
-          (close-sql-iterator reader)))))
+      (let ((reader (make-visible-heap-page-reader page columns snapshot :int4)))
+        (dolist (key (list -2147483648 +null+ 2147483647))
+          (multiple-value-bind (row present) (funcall reader)
+            (rove:ok present)
+            (rove:ok (equalp row (vector key)))))
+        (rove:ok (not (nth-value 1 (funcall reader)))))))
 
 (rove:deftest test-scan-prefilters-before-full-deformation
     (let* ((columns (vector (make-pg-column :name "id" :type :int4 :attnum 1)
@@ -215,31 +270,24 @@
       (page-add-item page hidden)
       (page-add-item page first)
       (page-add-item page broken)
-      (let ((iterator (make-visible-heap-page-iterator page 7 columns snapshot)))
-        (unwind-protect
-             (progn
-               (multiple-value-bind (tuple present) (sql-iterator-next iterator)
-                 (rove:ok present)
-                 (rove:ok (= 7 (htup-block tuple)))
-                 (rove:ok (= 2 (htup-offnum tuple)))
-                 (rove:ok (equal "first" (aref (htup-values tuple) 0))))
-               (rove:ok (handler-case (progn (sql-iterator-next iterator) nil)
-                          (error () t))
-                        "the later malformed tuple is decoded on its own pull"))
-          (close-sql-iterator iterator))))
+      (let ((reader (make-visible-heap-page-reader page columns snapshot)))
+        (multiple-value-bind (row present) (funcall reader)
+          (rove:ok present)
+          (rove:ok (equal "first" (aref row 0))))
+        (rove:ok (handler-case (progn (funcall reader) nil)
+                   (simple-error (condition) (search "Unsupported external varlena tag"
+                                                     (princ-to-string condition))))
+                 "the later malformed tuple is decoded on its own pull")))
   (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
          (page (page-init (make-page)))
          (snapshot (make-snapshot-struct :xmin 3 :xmax 10 :xip nil :curcid 1)))
     (page-add-item page (form-heap-tuple (vector "one") columns +frozen-xid+ 0 0 0 0))
     (page-add-item page (form-heap-tuple (vector "two") columns +frozen-xid+ 0 0 0 0))
-    (let ((iterator (make-visible-heap-page-iterator page 0 columns snapshot)))
-      (unwind-protect
-           (progn
-             (rove:ok (equal "one" (aref (htup-values (sql-iterator-next iterator)) 0)))
-             (rove:ok (equal "two" (aref (htup-values (sql-iterator-next iterator)) 0)))
-             (rove:ok (not (nth-value 1 (sql-iterator-next iterator))))
-             (rove:ok (not (nth-value 1 (sql-iterator-next iterator)))))
-        (close-sql-iterator iterator)))))
+    (let ((reader (make-visible-heap-page-reader page columns snapshot)))
+      (rove:ok (equal "one" (aref (funcall reader) 0)))
+      (rove:ok (equal "two" (aref (funcall reader) 0)))
+      (rove:ok (not (nth-value 1 (funcall reader))))
+      (rove:ok (not (nth-value 1 (funcall reader)))))))
 
 (rove:deftest test-select-scan-iterator-defers-visible-tuple-decoding
     (let* ((columns (vector (make-pg-column :name "s" :type :varchar :typmod -1 :attnum 1)))
@@ -304,17 +352,15 @@
                      (push (list (eq page bytes) (getf bounds :start) (getf bounds :limit))
                            tuple-spans)
                      (apply old-deform bytes columns bounds)))
-             (let ((iterator (make-visible-heap-page-iterator page 0 columns snapshot)))
-               (unwind-protect
-                    (loop for expected in '("one" "two")
-                          for offnum from 1
-                          do (multiple-value-bind (tuple present) (sql-iterator-next iterator)
-                               (rove:ok (and present (equal expected (aref (htup-values tuple) 0)))))
-                             (multiple-value-bind (offset flags length) (page-get-lp page offnum)
-                               (declare (ignore flags))
-                               (rove:ok (equal (first tuple-spans) (list t offset (+ offset length)))
-                                        "deformation uses the original page and the line pointer bounds")))
-                 (close-sql-iterator iterator)))
+             (let ((reader (make-visible-heap-page-reader page columns snapshot)))
+               (loop for expected in '("one" "two")
+                     for offnum from 1
+                     do (multiple-value-bind (row present) (funcall reader)
+                          (rove:ok (and present (equal expected (aref row 0)))))
+                        (multiple-value-bind (offset flags length) (page-get-lp page offnum)
+                          (declare (ignore flags))
+                          (rove:ok (equal (first tuple-spans) (list t offset (+ offset length)))
+                                   "deformation uses the original page and the line pointer bounds"))))
              (rove:ok (equal lookups '(5))
                       "separate pulls reuse the committed status of the same XID"))
         (setf (symbol-function 'xid-committed-p) old-status

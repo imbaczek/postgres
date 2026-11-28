@@ -29,7 +29,7 @@ precondition under the write and catalog locks, after acquiring the gates."
 
 (defun ddl-p (ast)
   (member (getf ast :type)
-          '(:create-table :drop-table :create-index :drop-index
+          '(:create-table :drop-table :create-view :drop-view :create-index :drop-index
             :alter-index :alter-table :create-sequence :alter-sequence
             :drop-sequence :apply-sequence-state
             :create-publication :alter-publication
@@ -381,6 +381,14 @@ Recheck identities after waiting and under catalog locks before changing storage
          (let ((sequence (gethash name (database-sequences db))))
            (unless (or sequence if-exists)
              (ereport "42P01" "sequence \"~a\" does not exist" name))
+           (when (and sequence
+                      (loop for table being the hash-values of (database-tables db)
+                            for view = (pg-class-view-definition table)
+                              thereis (and view
+                                           (rassoc (pg-sequence-oid sequence)
+                                                   (pg-view-definition-sequence-dependencies view)
+                                                   :test #'eql))))
+             (ereport "2BP01" "cannot drop sequence \"~a\" because a view depends on it" name))
            (when (and sequence (sequence-default-references db name))
              (ereport "2BP01" "cannot drop sequence \"~a\" because a column default depends on it"
                       name))))
@@ -417,6 +425,8 @@ Recheck identities after waiting and under catalog locks before changing storage
          (filter (getf entry :filter)))
     (unless table
       (ereport "42P01" "publication table \"~a\" does not exist" name))
+    (when (pg-class-view-definition table)
+      (ereport "22023" "cannot add view \"~a\" to a publication" name))
     (setf (getf entry :table-oid) (pg-class-oid table))
     (when filter
       (unless (eq (expr-type (analyze-expr filter table)) :bool)
@@ -1728,6 +1738,16 @@ before this removal horizon is captured."
                           :on-record-appended (lambda () (setf terminal-appended t))))))
       (send-command-complete stream "CREATE TABLE"))))
 
+(defun check-no-dependent-view (relation relations)
+  (multiple-value-bind (oid kind name)
+      (etypecase relation
+        (pg-class (values (pg-class-oid relation) "table" (pg-class-name relation)))
+        (pg-index (values (pg-index-oid relation) "index" (pg-index-name relation))))
+    (let ((dependent (first (dependent-views relations oid))))
+      (when dependent
+        (ereport "2BP01" "cannot drop ~a ~s because view ~s depends on it"
+                 kind name (pg-class-name dependent))))))
+
 (defun exec-drop-table (stream ast)
   (let* ((names (getf ast :names))
          (if-exists (getf ast :if-exists))
@@ -1768,7 +1788,11 @@ before this removal horizon is captured."
                    (original (cdr entry))
                    (current (gethash name (database-tables db))))
               (if (and original (eq original current))
-                  (drop-table* db name)
+                  (progn
+                    (check-no-dependent-view current (database-tables db))
+                    (dolist (index (table-indexes current))
+                      (check-no-dependent-view index (database-tables db)))
+                    (drop-table* db name))
                   (send-notice stream
                                (format nil "table \"~a\" does not exist, skipping"
                                        name)))))
@@ -1965,7 +1989,9 @@ Release these locks before waiting for commit or sending replies."
       (with-logical-ddl-publication (ast)
         (dolist (entry entries)
           (when (cdr entry)
-            (setf (cdr entry) (refresh-index-ddl-target (car entry) (cdr entry) if-exists))))
+            (setf (cdr entry) (refresh-index-ddl-target (car entry) (cdr entry) if-exists))
+            (when (cdr entry)
+              (check-no-dependent-view (cdr entry) (database-tables database)))))
         ;; Preflight every dependency before changing any part of a multi-index drop.
         (loop for (name . index) in entries
               when (and index (pg-index-constraint-owned-p index))
@@ -2008,6 +2034,8 @@ Release these locks before waiting for commit or sending replies."
          (name (pg-index-name old)))
     (unless (eq old (gethash name indexes))
       (error "concurrent index phase lost catalog ownership"))
+    (when (and (pg-index-logical-visible-p old) (not (pg-index-logical-visible-p new)))
+      (check-no-dependent-view old (database-tables database)))
     (call-with-catalog-durability-rollback-under-lock
      (lambda () (setf (gethash name indexes) old))
      (lambda ()
@@ -2070,6 +2098,7 @@ old identity before publishing the event and replacement catalog object."
          (ensure-current-table table)
          (unless (eq index (lookup-index (pg-index-name index)))
            (error "concurrent index drop lost catalog ownership"))
+         (check-no-dependent-view index (database-tables database))
          (with-catalog-mutation-rollback (database)
            (drop-index* database (pg-index-name index))
            (save-catalog :final-ddl-p t :applied-logical-event-id nil)))))))
@@ -2325,6 +2354,7 @@ old identity before publishing the event and replacement catalog object."
             (:rename-constraint
              (rename-index* db name (getf ast :new-name)))
             (:drop-constraint
+             (check-no-dependent-view idx (database-tables db))
              (drop-index* db name)))
           (save-catalog :final-ddl-p t :logical-event
                         (logical-catalog-event-for-ast ast)))))
@@ -2406,6 +2436,7 @@ old identity before publishing the event and replacement catalog object."
           (ereport "42710" "constraint ~s already exists" new-name))
         (with-catalog-mutation-rollback (db)
           (when old-constraint
+            (check-no-dependent-view old-constraint (database-tables db))
             (drop-index* db old-name))
           (setf (pg-index-primary-p new-idx) t
                 (pg-index-constraint-p new-idx) t)
@@ -2655,12 +2686,14 @@ completion after success; anonymous source cannot inherit Bind parameters."
   (or (column-evolution-ddl-p ast)
       (foreign-key-add-ddl-p ast)
       (foreign-key-validation-ddl-p ast)
-      (and (member (getf ast :type) '(:create-table :drop-table :create-index :drop-index))
+      (and (member (getf ast :type) '(:create-table :drop-table :create-view :drop-view :create-index :drop-index))
            (not (getf ast :concurrently)))))
 
 (defun staged-catalog-ddl-p (ast)
   (and (stageable-catalog-ddl-p ast)
-       (or (column-evolution-ddl-p ast) (foreign-key-create-ddl-p ast) (foreign-key-add-ddl-p ast) (foreign-key-validation-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
+       (or (member (getf ast :type) '(:create-view :drop-view))
+           (and (member (getf ast :type) '(:drop-table :drop-index)) (getf ast :cascade))
+           (column-evolution-ddl-p ast) (foreign-key-create-ddl-p ast) (foreign-key-add-ddl-p ast) (foreign-key-validation-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
 
 (defun append-staged-transaction-ddl (transaction ast)
   "Append a cooked operation beside the surrounding row changes."
@@ -2875,6 +2908,148 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
             (check-supported-foreign-key-options constraint)
             (push constraint (pg-class-foreign-keys child))))))))
 
+(defun view-ddl-relation-name (reference creation-p)
+  (let ((schema (and (sql-relation-name-p reference)
+                     (sql-relation-name-schema reference))))
+    (cond ((and schema (not (string= schema "public")))
+           (ereport "0A000" "view DDL in schema \"~a\" is not supported" schema))
+          ((and creation-p (null schema)) (ensure-sql-creation-schema)))
+    (sql-relation-base-name reference)))
+
+(defun admit-staged-view-ddl (transaction)
+  (admit-staged-catalog-change transaction)
+  (when (or *applying-transaction-ddl* (catalog-transaction-capture-ddl-p transaction))
+    (ereport "0A000" "view DDL is unsupported during logical capture")))
+
+(defun view-output-columns (prepared aliases)
+  (let ((targets (getf prepared :targets))
+        (seen (make-hash-table :test #'equal)))
+    (when (> (length aliases) (length targets))
+      (ereport "42601" "CREATE VIEW specifies more column names than columns"))
+    (map 'vector #'identity
+         (loop for target in targets for attnum from 1
+               for name = (if aliases (pop aliases) (getf target :name))
+               do (when (gethash name seen)
+                    (ereport "42701" "column \"~a\" specified more than once" name))
+                  (setf (gethash name seen) t)
+               collect (make-pg-column :name name :attnum attnum
+                                       :type (getf target :type)
+                                       :typmod (getf target :typmod))))))
+
+(defun check-view-replacement-columns (previous columns)
+  (let ((old-columns (pg-class-columns previous)))
+    (when (> (length old-columns) (length columns))
+      (ereport "42P16" "cannot drop columns from view"))
+    (loop for old across old-columns for new across columns
+          unless (string= (pg-column-name old) (pg-column-name new))
+            do (ereport "42P16" "cannot change name of view column \"~a\" to \"~a\""
+                        (pg-column-name old) (pg-column-name new))
+          unless (and (eq (pg-column-type old) (pg-column-type new))
+                      (eql (pg-column-typmod old) (pg-column-typmod new)))
+            do (ereport "42P16" "cannot change data type of view column \"~a\""
+                        (pg-column-name old)))))
+
+(defun exec-stage-create-view (stream ast)
+  (let* ((name (view-ddl-relation-name (getf ast :name) t))
+         (transaction (begin-catalog-ddl)))
+    (with-write-catalog-locks
+      (let* ((previous (catalog-transaction-lookup transaction :table name))
+             (*expanding-view-oids* (when previous (list (pg-class-oid previous)))))
+        (when (and (staged-relation-name-in-use-p transaction name)
+                   (not (and previous (getf ast :replace))))
+          (ereport "42P07" "relation \"~a\" already exists" name))
+        (when (and previous (not (pg-class-view-definition previous)))
+          (ereport "42809" "\"~a\" is not a view" name))
+        (admit-staged-view-ddl transaction)
+        (multiple-value-bind (prepared query dependencies attribute-dependencies sequence-dependencies)
+            (analyze-view-query (getf ast :query))
+          (let ((columns (view-output-columns prepared (getf ast :aliases))))
+            (when previous (check-view-replacement-columns previous columns))
+            (dolist (oid dependencies)
+              (let ((relation (catalog-transaction-find-by-oid transaction :table oid)))
+                (when relation
+                  (catalog-transaction-observe-table transaction relation))))
+            (catalog-transaction-stage
+             transaction :table name
+             (make-pg-class :oid (if previous (pg-class-oid previous) (allocate-oid))
+                            :name name :columns columns
+                            :view-definition
+                            (make-pg-view-definition
+                             :query query :source (getf ast :source)
+                             :owner (if previous
+                                        (pg-view-definition-owner (pg-class-view-definition previous))
+                                        (current-user-name))
+                             :dependencies dependencies
+                             :attribute-dependencies attribute-dependencies
+                             :sequence-dependencies sequence-dependencies)))))))
+    (send-command-complete stream "CREATE VIEW")))
+
+(defun dependent-views (relations oid &optional attnum)
+  "Find views directly dependent on the relation or on its specified attribute."
+  (loop for candidate being the hash-values of relations
+        for definition = (pg-class-view-definition candidate)
+        when (and definition
+                  (if attnum
+                      (member (list oid attnum)
+                              (pg-view-definition-attribute-dependencies definition)
+                              :test #'equal)
+                      (member oid (pg-view-definition-dependencies definition))))
+          collect candidate))
+
+(defun stage-dependent-view-drops (transaction roots cascade-p &optional attnum)
+  "Check or stage views depending on relations or indexes in ROOTS."
+  (let ((relations (catalog-transaction-merged-name-map transaction :table))
+        (seen (make-hash-table :test #'eql))
+        (pending (mapcar (lambda (relation) (cons relation attnum)) roots))
+        (drops nil))
+    (labels ((object-oid (relation)
+               (etypecase relation
+                 (pg-class (pg-class-oid relation))
+                 (pg-index (pg-index-oid relation))))
+             (object-name (relation)
+               (etypecase relation
+                 (pg-class (pg-class-name relation))
+                 (pg-index (pg-index-name relation)))))
+      (dolist (root roots) (setf (gethash (object-oid root) seen) t))
+      (loop while pending
+            for (relation . attribute) = (pop pending)
+            do (dolist (dependent (dependent-views relations (object-oid relation) attribute))
+                 (unless (gethash (pg-class-oid dependent) seen)
+                   (unless cascade-p
+                     (ereport "2BP01" "view ~s depends on ~s" (pg-class-name dependent)
+                              (object-name relation)))
+                   (setf (gethash (pg-class-oid dependent) seen) t)
+                   (push dependent drops)
+                   (push (cons dependent nil) pending)))))
+    (when drops (admit-staged-view-ddl transaction))
+    (dolist (view drops)
+      (catalog-transaction-stage transaction :table (pg-class-name view) nil))))
+
+(defun exec-stage-drop-view (stream ast)
+  (let ((transaction (begin-catalog-ddl))
+        (roots nil))
+    (with-write-catalog-locks
+      (dolist (reference (getf ast :names))
+        (let* ((name (view-ddl-relation-name reference nil))
+               (relation (lookup-sql-relation reference)))
+          (cond ((and relation (pg-class-view-definition relation))
+                 (pushnew relation roots))
+                ((or relation
+                     (and (or (sql-relation-name-p reference)
+                              (member "public" (effective-sql-search-path) :test #'string=))
+                          (staged-relation-name-in-use-p transaction name)))
+                 (ereport "42809" "\"~a\" is not a view" name))
+                ((getf ast :if-exists)
+                 (send-notice stream (format nil "view ~s does not exist, skipping" name)
+                              "NOTICE" "42P01"))
+                (t (ereport "42P01" "view \"~a\" does not exist" name)))))
+      (when roots
+        (admit-staged-view-ddl transaction)
+        (stage-dependent-view-drops transaction roots (getf ast :cascade))
+        (dolist (view roots)
+          (catalog-transaction-stage transaction :table (pg-class-name view) nil))))
+    (send-command-complete stream "DROP VIEW")))
+
 (defun exec-stage-create-table (stream ast)
   "Create table metadata and storage without publishing either before COMMIT."
   (let* ((name (getf ast :name))
@@ -3044,6 +3219,7 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
       (ereport "0A000" "DROP COLUMN requires a logical protocol that can project dropped attributes"))
     (reject-drop-column-publication-dependency transaction table original (getf ast :cascade))
     (let ((attnum (pg-column-attnum original)))
+      (stage-dependent-view-drops transaction (list table) (getf ast :cascade) attnum)
       (dolist (index (table-indexes table))
         (when (member attnum (or (pg-index-referenced-columns index) (pg-index-columns index)))
           (loop for (child . constraint) in (referencing-foreign-keys-locked table)
@@ -3052,6 +3228,7 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
                                     (member attnum (pg-foreign-key-columns constraint)))))
                   do (ereport "2BP01" "foreign key ~s on table ~s depends on column ~s"
                               (pg-foreign-key-name constraint) (pg-class-name child) name))
+          (stage-dependent-view-drops transaction (list index) (getf ast :cascade))
           (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
       (with-copied-column-descriptor (replacement column) table original
         (setf (pg-column-name column) (format nil "........pg.dropped.~d........" attnum)
@@ -3201,6 +3378,9 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
              (reject-logical-transaction-ddl-private-table (pg-class-name source))
              (check-no-pending-foreign-key-events source)
              (check-truncate-table-not-in-use source)
+             (stage-dependent-view-drops
+              transaction (list source) nil
+              (pg-column-attnum (resolve-column-or-error source (getf ast :column))))
              (prepare-column-type-rewrite transaction source ast))
          (catalog-transaction-create-storage (pg-class-relfilenode target) :heap)
          (create-table-toast-storage target t)
@@ -3297,13 +3477,18 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
           (ensure-current-table table)
           (reject-logical-transaction-ddl-private-table (pg-class-name table))
           (check-truncate-table-not-in-use table)
+
           (loop for (child . constraint) in (referencing-foreign-keys-locked table)
                 unless (find (pg-class-oid child) tables :key #'pg-class-oid)
                   do (ereport "2BP01" "foreign key ~s on table ~s depends on table ~s"
                               (pg-foreign-key-name constraint) (pg-class-name child) (pg-class-name table)))
           (when (catalog-explicit-publication-table-p database table)
             (ereport "0A000" "transactional DROP TABLE does not yet support explicit publication membership")))
-        (when tables (admit-staged-catalog-change transaction))
+        (when tables
+          (admit-staged-catalog-change transaction)
+          (stage-dependent-view-drops
+           transaction (append tables (loop for table in tables append (table-indexes table)))
+           (getf ast :cascade)))
         (dolist (table tables)
           (catalog-transaction-stage transaction :table (pg-class-name table) nil)))
       (when tables
@@ -3379,7 +3564,10 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
                          when (eql (pg-index-oid index) (pg-foreign-key-referenced-index-oid constraint))
                            do (ereport "2BP01" "foreign key ~s on table ~s depends on index ~s"
                                        (pg-foreign-key-name constraint) (pg-class-name child) name))))
-      (when (some #'cdr entries) (admit-staged-catalog-change transaction))
+      (let ((indexes (remove nil (mapcar #'cdr entries))))
+        (when indexes
+          (admit-staged-catalog-change transaction)
+          (stage-dependent-view-drops transaction indexes (getf ast :cascade))))
       (loop for (nil . index) in entries
             when index do (catalog-transaction-stage transaction :index (pg-index-name index) nil)))
     (when (some #'cdr entries)
@@ -3407,7 +3595,7 @@ without a change; each actual publication captures its own schema precondition."
     (when (and (backend-transaction-read-only-p)
                (member (getf ast :type)
                        '(:insert :update :delete :copy-from :truncate :create-table :drop-table
-                         :create-index :drop-index :alter-index :alter-table
+                         :create-view :drop-view :create-index :drop-index :alter-index :alter-table
                          :apply-sequence-state :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
     (when (find :add-foreign-key (getf ast :actions) :key (lambda (action) (getf action :action)))
@@ -3448,6 +3636,8 @@ without a change; each actual publication captures its own schema precondition."
                      (:drop-table (if stage-ddl-p
                                       (exec-stage-drop-table stream ast)
                                       (exec-drop-table stream ast)))
+                     (:create-view (exec-stage-create-view stream ast))
+                     (:drop-view (exec-stage-drop-view stream ast))
                      (:create-sequence (exec-create-sequence stream ast))
                      (:alter-sequence (exec-alter-sequence stream ast))
                      (:apply-sequence-state

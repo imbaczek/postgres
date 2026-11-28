@@ -27,10 +27,11 @@ The caller checks their meaning; the CRC detects accidental corruption."
       (wal-set-u32 image (- size 4) (wal-crc32 image))
       image)))
 
-(defun physical-retained-envelope-decode (magic image)
+(defun physical-retained-envelope-decode (magic image &key borrow-image-p)
   "Check envelope framing, lengths and CRC, then return decoded metadata and bytes.
 
-The caller must validate their meaning."
+The caller must validate their meaning. BORROW-IMAGE-P returns a read-only
+slice backed by IMAGE, which must remain stable while the slice is used."
   (unless (and (typep image '(vector (unsigned-byte 8)))
                (<= 20 (length image) +physical-retained-image-limit+)
                (= 8 (length magic)) (equalp (subseq image 0 8) magic))
@@ -41,13 +42,18 @@ The caller must validate their meaning."
                  (<= data-size +wal-segment-size+)
                  (= (+ 20 metadata-size data-size) (length image)))
       (error "retained WAL envelope length mismatch"))
-    (let ((copy (copy-seq image)))
-      (wal-set-u32 copy crc-offset 0)
-      (unless (= (wal-u32 image crc-offset) (wal-crc32 copy))
+    ;; The encoder computes the CRC with the four-byte trailer still zero.
+    (let* ((zeros (load-time-value
+                   (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0) t))
+           (seed (logxor #xffffffff (wal-crc32 image 0 crc-offset))))
+      (unless (= (wal-u32 image crc-offset) (wal-crc32 zeros 0 4 seed))
         (error "retained WAL envelope checksum mismatch")))
-    (values (recovery-parse-manifest-text
-             (bytes->string (subseq image 16 (+ 16 metadata-size))))
-            (subseq image (+ 16 metadata-size) crc-offset))))
+    (let ((start (+ 16 metadata-size)))
+      (values (recovery-parse-manifest-text (bytes->string image :start 16 :end start))
+              (if borrow-image-p
+                  (make-array data-size :element-type '(unsigned-byte 8)
+                                        :displaced-to image :displaced-index-offset start)
+                  (subseq image start crc-offset))))))
 
 (defun physical-retained-extent-history (metadata)
   "Validate extent metadata and return its parsed lineage.
@@ -121,7 +127,8 @@ validation state, without external or durable side effects or store-lock reentry
                (unless (<= +wal-header-size+ size (- (length bytes) offset))
                  (error "truncated retained WAL record"))
                (let* ((raw (subseq bytes offset (+ offset size)))
-                      (record (wal-decode-record raw (+ origin offset))))
+                      (record (wal-decode-record raw (+ origin offset)
+                                                 :borrow-payload-p (null on-record))))
                  (when (< cursor (wal-record-start record))
                    (wal-lineage-check-gap cursor record history))
                  (setf timeline (physical-retained-extent-check-record
@@ -165,12 +172,15 @@ the initial digest do not prove the image against a base or receive history."
   (physical-retained-extent-check metadata bytes)
   (physical-retained-envelope-encode #(80 71 82 69 88 84 48 49) metadata bytes))
 
-(defun physical-retained-extent-decode (image)
-  "Decode and validate an extent, returning fresh metadata and byte storage.
+(defun physical-retained-extent-decode (image &key borrow-image-p)
+  "Decode and validate an extent, returning metadata and its payload.
+By default the payload owns its bytes. BORROW-IMAGE-P keeps a read-only view
+of the encoded image and requires stable input storage.
 
 The checksum detects accidental corruption; it does not authenticate the image."
   (multiple-value-bind (metadata bytes)
-      (physical-retained-envelope-decode #(80 71 82 69 88 84 48 49) image)
+      (physical-retained-envelope-decode #(80 71 82 69 88 84 48 49) image
+                                         :borrow-image-p borrow-image-p)
     (physical-retained-extent-check metadata bytes)
     (values metadata bytes)))
 

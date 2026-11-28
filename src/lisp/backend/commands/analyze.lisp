@@ -95,13 +95,14 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
            (decf (fill-pointer sample)))
   sample)
 
-(defun analyze-add-reservoir-row (row seen sample capacity)
-  "Add ROW to a fixed-size Algorithm R reservoir after SEEN eligible rows."
-  (if (< (fill-pointer sample) capacity)
-      (vector-push-extend (copy-seq row) sample)
-      (let ((slot (funcall *analyze-random-function* seen)))
-        (when (< slot capacity)
-          (setf (aref sample slot) (copy-seq row)))))
+(defun analyze-add-reservoir-tuple (page offset length seen sample capacity)
+  "Retain an owned tuple only when Algorithm R selects its page slice."
+  (let ((end (+ offset length)))
+    (if (< (fill-pointer sample) capacity)
+        (vector-push-extend (subseq page offset end) sample)
+        (let ((slot (funcall *analyze-random-function* seen)))
+          (when (< slot capacity)
+            (setf (aref sample slot) (subseq page offset end))))))
   sample)
 
 (defconstant +analyze-wide-value+ :analyze-wide-value
@@ -126,8 +127,8 @@ Lisp path also limits the reservoir's retained shallow-copy payload to 4 MiB."
                                           (and *backend* (backend-xid *backend*)) infomask)
                 (incf row-count)
                 (incf tuple-bytes len)
-                (analyze-add-reservoir-row (subseq page off (+ off len))
-                                           row-count sample +analyze-sample-size+)))))))
+                (analyze-add-reservoir-tuple page off len row-count sample
+                                             +analyze-sample-size+)))))))
     (values row-count (coerce sample 'vector) tuple-bytes)))
 
 (defun analyze-estimate-distinct-count (row-count sample-count observed

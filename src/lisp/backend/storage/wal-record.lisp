@@ -131,18 +131,19 @@ their scalar recurrence. Inputs are read only."
       (%wal-crc32c-arm-octets bytes start end nil nil seed)))
   (%wal-crc32-octets bytes start end table seed))
 
-(defun wal-crc32 (bytes &optional (start 0) (end (length bytes)))
+(defun wal-crc32 (bytes &optional (start 0) (end (length bytes)) (seed #xffffffff))
   "Return final CRC32C (Castagnoli) of BYTES from START inclusive to END exclusive.
-The initial raw state and final XOR are #xffffffff, as in PostgreSQL C.
+The final XOR is #xffffffff. SEED is the raw initial state before that XOR.
 Validated octet slices use available native instructions with a canonical table;
 other inputs and modified tables use the scalar recurrence. BYTES is read only."
+  (declare (type (unsigned-byte 32) seed))
   (let ((table (and (boundp '*wal-crc32-table*) *wal-crc32-table*)))
     (if (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep table '(simple-array (unsigned-byte 32) (256)))
              (typep start 'fixnum) (typep end 'fixnum)
              (<= 0 start end (length bytes)))
-        (wal-crc32-typed-range bytes start end table)
-        (let ((crc #xFFFFFFFF))
+        (wal-crc32-typed-range bytes start end table seed)
+        (let ((crc seed))
           (loop for i from start below end
                 for slot = (logand (logxor crc (aref bytes i)) #xFF)
                 do (setf crc (logxor (ash crc -8) (aref *wal-crc32-table* slot))))
@@ -398,9 +399,10 @@ copying the complete image."
                      +wal-record-full-page-writes-change+ +wal-record-logical-decoding-status-change+)
           :test #'=))
 
-(defun wal-decode-record (bytes expected-lsn)
+(defun wal-decode-record (bytes expected-lsn &key borrow-payload-p)
   "Validate the record header and checksum at EXPECTED-LSN and decode it.
-The returned record owns a separate payload subsequence of BYTES."
+The payload owns its bytes by default. With BORROW-PAYLOAD-P, callers must
+keep the octet input unchanged for the lifetime of the read-only payload."
   (let ((version (and (>= (length bytes) +wal-header-size+)
                       (wal-u16 bytes 4))))
     (unless (and (>= (length bytes) +wal-header-size+)
@@ -412,7 +414,11 @@ The returned record owns a separate payload subsequence of BYTES."
         (error "WAL checksum mismatch at LSN ~a" expected-lsn)))
     (let* ((type (wal-u16 bytes 6))
            (xid (wal-u64 bytes 20))
-           (payload (subseq bytes +wal-header-size+))
+           (payload (if borrow-payload-p
+                        (make-array (- (length bytes) +wal-header-size+)
+                                    :element-type '(unsigned-byte 8)
+                                    :displaced-to bytes :displaced-index-offset +wal-header-size+)
+                        (subseq bytes +wal-header-size+)))
            (end (+ expected-lsn (length bytes))))
       (let ((record (make-wal-record :version version :type type :xid xid
                                      :start expected-lsn :end end :payload payload)))

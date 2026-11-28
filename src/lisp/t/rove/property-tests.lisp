@@ -254,6 +254,26 @@
 (rove:deftest generated-unit-top-n
     (unit-check-property 'unit-top-n-matches-stable-sort))
 
+(rove:deftest top-n-single-key-order-matches-generic-order
+    (loop for (type . keys) in
+                            (list (cons :int8 (list (- (ash 1 63)) most-negative-fixnum -1 0 1
+                                                    most-positive-fixnum (1- (ash 1 63)) +null+))
+                                  (cons :uuid (cons +null+
+                                                    (mapcar #'sql-uuid-input
+                                                            '("7fffffff-0000-0000-0000-000000000000"
+                                                              "80000000-0000-0000-0000-000000000000"
+                                                              "80000000-0000-0000-0000-000000000001")))))
+          for items = (loop for key in keys
+                            append (list (make-select-top-n-item :keys (vector key) :sequence 0)
+                                         (make-select-top-n-item :keys (vector key) :sequence 1)))
+          do (dolist (direction '(nil t :asc-nulls-first :desc-nulls-last))
+               (let* ((order (list (cons (list :col 1 :type type) direction)))
+                      (less-p (make-select-top-n-item-order order)))
+                 (dolist (left items)
+                   (dolist (right items)
+                     (rove:ok (eql (funcall less-p left right)
+                                   (select-top-n-item-less-p left right order)))))))))
+
 (rove:deftest unit-comparison-boundaries
     (dolist (type '(:int4 :int8))
       (let* ((minimum (if (eq type :int4) -2147483648 -9223372036854775808))

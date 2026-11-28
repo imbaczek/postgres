@@ -339,6 +339,46 @@ def check_column_type_replay(source, target):
     print("physical-readers: ALTER TYPE replays descriptor, heap, index and TOAST PASS", flush=True)
 
 
+def check_view_replay(source, target):
+    query(source, "CREATE TABLE replay_view_base (id int)")
+    query(source, "INSERT INTO replay_view_base VALUES (7)")
+    query(source, "CREATE VIEW replay_view AS SELECT * FROM replay_view_base")
+    query(source, "CREATE VIEW replay_view_nested AS SELECT id FROM replay_view")
+    query(source, "CREATE VIEW replay_view_row AS SELECT row_to_json(replay_view_base) AS doc FROM replay_view_base")
+    query(source, "CREATE SEQUENCE replay_view_sequence")
+    query(source, "CREATE VIEW replay_view_sequence_ref AS SELECT nextval('replay_view_sequence') AS number")
+    applied(source, target)
+    assert query(target, "SELECT * FROM replay_view_nested") == [(7,)]
+    assert query(target, """
+        SELECT relkind, relnatts FROM pg_class
+        WHERE relname IN ('replay_view', 'replay_view_nested')
+        ORDER BY relname
+    """) == [("v", 1), ("v", 1)]
+
+    query(source, "ALTER TABLE replay_view_base RENAME COLUMN id TO renamed")
+    query(source, "ALTER TABLE replay_view_base ADD COLUMN extra int")
+    applied(source, target)
+    assert query(target, "SELECT * FROM replay_view") == [(7,)]
+    assert "renamed" in scalar(target, "SELECT definition FROM pg_views WHERE viewname='replay_view'")
+    assert scalar(target, "SELECT doc FROM replay_view_row") == {"renamed": 7, "extra": None}
+    sequence_definition = scalar(
+        target, "SELECT definition FROM pg_views WHERE viewname='replay_view_sequence_ref'"
+    )
+    assert '"nextval"' in sequence_definition and "'replay_view_sequence'" in sequence_definition
+
+    query(source, "CREATE OR REPLACE VIEW replay_view AS SELECT renamed + 1 AS id FROM replay_view_base")
+    applied(source, target)
+    assert query(target, "SELECT * FROM replay_view_nested") == [(8,)]
+
+    query(source, "ALTER TABLE replay_view_base DROP COLUMN renamed CASCADE")
+    applied(source, target)
+    assert query(target, """
+        SELECT viewname FROM pg_views WHERE viewname IN ('replay_view', 'replay_view_nested')
+    """) == []
+    assert scalar(target, "SELECT doc FROM replay_view_row") == {"extra": None}
+    print("physical-readers: view creation, replacement and dependency drops replay PASS", flush=True)
+
+
 def main():
     base, root = Path(sys.argv[1]), Path(sys.argv[2])
     source = connect(int(sys.argv[3]))
@@ -359,6 +399,7 @@ def main():
         else:
             check(base, root, source, target, readers, older)
             check_column_type_replay(source, target)
+            check_view_replay(source, target)
     finally:
         for connection in [source, target, older, *readers]:
             connection.close()

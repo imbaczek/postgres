@@ -227,7 +227,7 @@ The CRC detects accidental corruption; it does not authenticate the payload."
       (error "retained WAL inventory differs from required identity or history"))
     payload))
 
-(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record on-extent)
+(defun physical-retained-inventory-verify-entries (entries history loader &optional overlap on-record on-extent borrow-images-p)
   "Validate checked, ordered entries using bounded LOADER reads.
 Keep only the current segment's shared prefix between images. ON-RECORD receives
 each validated record and its original bytes; validation continues through every
@@ -236,7 +236,8 @@ callbacks must keep partial results private until this function returns. ON-EXTE
 receives validated metadata and decoded bytes as read-only provisional data.
 Return T and the longest checked prefix of the final segment, not of all
 segments. With no entries, the second value is the supplied overlap buffer or NIL.
-The overlap is borrowed. An extent-decoded buffer is fresh relative to the encoded loader image.
+The overlap is borrowed. Decoded payloads own their bytes unless BORROW-IMAGES-P
+is true, in which case LOADER must return independent, immutable images.
 The prefix contains bytes only; callers must establish metadata, base and fork
 proof, logical coverage and source authority."
   (let ((segment (when overlap (floor (1- (getf (first overlap) :base)) +wal-segment-size+)))
@@ -246,7 +247,8 @@ proof, logical coverage and source authority."
         (unless (and (= (length image) (second entry))
                      (= (first entry) (physical-store-update-digest #xCBF29CE484222325 image)))
           (error "retained WAL inventory image reference differs"))
-        (multiple-value-bind (metadata bytes) (physical-retained-extent-decode image)
+        (multiple-value-bind (metadata bytes)
+            (physical-retained-extent-decode image :borrow-image-p borrow-images-p)
           (unless (equal metadata (third entry))
             (error "retained WAL image differs from indexed metadata"))
           (physical-retained-extent-scan metadata bytes history nil on-record)
@@ -360,7 +362,7 @@ payload. The overlap does not add logical coverage."
     (physical-retained-inventory-verify-entries
      (getf payload :entries) history
      (lambda (id) (physical-retained-object-read directory :extent id +physical-retained-image-limit+))
-     (physical-retained-inventory-read-overlap directory payload))
+     (physical-retained-inventory-read-overlap directory payload) nil nil t)
     (funcall protect (physical-store-update-digest #xCBF29CE484222325 image) (getf payload :entries))
     (let ((id (physical-retained-object-publish directory :inventory image +physical-retained-inventory-limit+)))
       (physical-retained-inventory-test-point :after-inventory-publication id)

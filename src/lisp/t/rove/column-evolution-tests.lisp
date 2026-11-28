@@ -20,10 +20,34 @@
         (rove:ok (equalp (concatenate 'vector old-row (vector nil "original" +null+))
                          (deform-heap-tuple old-tuple new-columns))
                  "an older tuple has one bitmap byte and three missing attributes")
+        (rove:ok (equalp (deform-heap-tuple old-tuple new-columns)
+                         (deform-heap-tuple old-tuple new-columns :metadata :none))
+                 "values-only deformation preserves defaults from the current descriptor")
         (rove:ok (equalp new-row (deform-heap-tuple new-tuple new-columns))
                  "physically present NULLs take precedence over missing values")
         (rove:ok (equalp (subseq new-row 0 8) (deform-heap-tuple new-tuple old-columns))
                  "a narrower descriptor reads only its prefix but checks the physical bitmap"))))
+
+(rove:deftest fixed-heap-row-layout-respects-tuple-boundaries
+    (let* ((columns (map 'vector (lambda (type) (make-pg-column :type type))
+                         '(:int4 :int8 :uuid)))
+           (layout (make-fixed-heap-row-layout columns))
+           (row (vector -5 4294967298 (sql-uuid-input "01234567-89ab-cdef-0123-456789abcdef")))
+           (tuple (form-heap-tuple row columns 1 0 0 0 1))
+           (start 13)
+           (limit (+ start (length tuple)))
+           (page (make-array limit :element-type '(unsigned-byte 8)))
+           (nullable (form-heap-tuple (vector +null+ (aref row 1) (aref row 2))
+                                      columns 1 0 0 0 1))
+           (older (form-heap-tuple (subseq row 0 2) (subseq columns 0 2) 1 0 0 0 1)))
+      (replace page tuple :start1 start)
+      (rove:ok (equalp row (decode-fixed-heap-row page start limit 0 layout)))
+      (rove:ok (null (decode-fixed-heap-row nullable 0 (length nullable) +heap-hasnull+ layout)))
+      (rove:ok (null (decode-fixed-heap-row older 0 (length older) 0 layout)))
+      (rove:ok (equal "XX001"
+                      (handler-case
+                          (progn (decode-fixed-heap-row page start (1- limit) 0 layout) nil)
+                        (pg-error (condition) (pg-error-sqlstate condition)))))))
 
 (rove:deftest catalog-preserves-typed-missing-column-values
     (let* ((column (make-pg-column :name "flag" :type :bool :attnum 9

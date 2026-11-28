@@ -303,7 +303,8 @@ referenced fork."
        (maphash
         (lambda (name table)
           (declare (ignore name))
-          (replay-heap (pg-class-relfilenode table))
+          (when (pg-class-relfilenode table)
+            (replay-heap (pg-class-relfilenode table)))
           (let ((toast (pg-class-toast table)))
             (when toast (replay-heap (pg-toast-relfilenode toast)))))
         (database-tables database)))

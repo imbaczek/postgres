@@ -1889,7 +1889,9 @@ the checkpoint or scanned WAL contains a policy witness."
                (declare (ignore database-name))
                (maphash (lambda (table-name table)
                           (declare (ignore table-name))
-                          (push (pg-class-relfilenode table) relfilenodes))
+                          (let ((relfilenode (pg-class-relfilenode table)))
+                            (when relfilenode
+                              (push relfilenode relfilenodes))))
                         (database-tables database))
                (maphash (lambda (index-name index)
                           (declare (ignore index-name))

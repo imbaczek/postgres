@@ -188,7 +188,7 @@ physical two-way nested loop can apply a supported integer equality at the join.
       ((getf relation :cte-worktable) (list :worktable-scan relation-index 0))
       ((getf relation :cte) (list :cte-scan relation-index 0))
       ((getf relation :subquery-plan)
-       (list :subquery-scan relation-index 0
+       (list :subquery-scan relation-index (pg-class-oid table)
              (getf relation (if physical-p :subquery-physical :subquery-logical))))
       ((not physical-p) (list :scan relation-index (pg-class-oid table)))
       ((eq (select-scan-path-kind path) :index-scan)
@@ -1196,6 +1196,48 @@ as well. A physical ordered limit can use the bounded top-N node."
           (unless (eq value +null+)
             (return-from having-input-gate (values gate nil))))))))
 
+(defun view-pushdown-comparison-p (form relation)
+  "Recognize comparisons on the view's output that are safe to evaluate twice."
+  (and (eq (first form) :binop)
+       (member (second form) '("=" "<>" "<" "<=" ">" ">=") :test #'string=)
+       (let ((left (first (third form))) (right (first (fourth form))))
+         (or (and (eq left :col) (member right '(:col :const :parameter)))
+             (and (eq right :col) (member left '(:const :parameter)))))
+       (cte-reference-filter-p form relation)))
+
+(defun push-view-reference-filters (prepared)
+  "Give eligible view children access to the caller's scan comparisons."
+  (when (and (getf prepared :where)
+             (every (lambda (join) (member (getf join :type) '(:inner :cross)))
+                    (getf prepared :joins))
+             (not (cte-expression-volatile-p (getf prepared :where))))
+    (dolist (relation (getf prepared :relations))
+      (let ((child (getf relation :subquery-prepared)))
+        (when (and child (getf child :stored-view-expansion-p)
+                   (not (or (getf child :set-operation) (getf child :aggregate-p)
+                            (getf child :has-having) (getf child :windows)
+                            (getf child :window-keys) (getf child :set-functions)
+                            (getf child :distinct) (getf child :limit)
+                            (getf child :joins) (getf child :order)))
+                   (every (lambda (target) (eq (first (getf target :expr)) :col))
+                          (getf child :targets))
+                   (not (cte-expression-volatile-p (getf child :where))))
+          (let ((all-pushed-p t))
+            (dolist (qual (where-conjuncts (getf prepared :where)))
+              (if (view-pushdown-comparison-p qual relation)
+                  (let ((translated (substitute-query-output-columns
+                                     qual relation (getf child :targets)))
+                        (existing (getf child :where)))
+                    (setf (getf child :where)
+                          (if existing
+                              (list :and existing translated :type :bool :typmod -1)
+                              translated)))
+                  (setf all-pushed-p nil)))
+            ;; Inner and cross joins cannot reintroduce rows rejected by the child.
+            (when all-pushed-p
+              (setf (getf prepared :where) nil)
+              (return))))))))
+
 (defun plan-prepared-select (prepared)
   "Build child plans without the catalog lock, then flatten their registration."
   ;; A false or null gate suppresses input; retain it above grouping when it
@@ -1226,6 +1268,7 @@ as well. A physical ordered limit can use the bounded top-N node."
     (return-from plan-prepared-select (plan-prepared-union prepared)))
   (plan-expression-subqueries prepared)
   (plan-cte-reference-filters prepared)
+  (push-view-reference-filters prepared)
   (dolist (relation (getf prepared :relations))
     (when (getf relation :subquery-prepared)
       (setf (getf relation :subquery-plan)
@@ -1559,12 +1602,56 @@ is raised only if comparison reaches it."
          origins)))
 
 (defun top-n-spill-item (item)
-  (make-query-sort-item-with-metadata (select-top-n-item-sequence item)
-                                      (select-top-n-item-keys item) (select-top-n-item-row item)
-                                      (datum-origins-for-spill (select-top-n-item-origins item))
-                                      (select-top-n-item-presence item)))
+  (let ((row (select-top-n-item-row item)))
+    (make-query-sort-item-with-metadata (select-top-n-item-sequence item)
+                                        (select-top-n-item-keys item)
+                                        (if (consp row) row (cons row row))
+                                        (datum-origins-for-spill (select-top-n-item-origins item))
+                                        (select-top-n-item-presence item))))
 
-(defun prepare-select-sort (input order arena limit projected-only-p)
+(defun top-n-spill-item-size (item)
+  "Charge the spill record and metadata vector without constructing that vector."
+  (let ((row (select-top-n-item-row item)))
+    (+ (load-time-value (query-spill-record-size #()) t)
+       (query-spill-value-size (select-top-n-item-sequence item))
+       (query-spill-value-size (select-top-n-item-keys item))
+       (cond ((simple-vector-p row)
+              (+ +query-spill-cons-overhead+ (* 2 (query-spill-value-size row))))
+             ((and (consp row) (simple-vector-p (car row)) (simple-vector-p (cdr row)))
+              (let ((projected-bytes (query-spill-value-size (car row))))
+                ;; A shared vector is still serialized in both positions.
+                (+ +query-spill-cons-overhead+ projected-bytes
+                   (if (eq (car row) (cdr row))
+                       projected-bytes
+                       (query-spill-value-size (cdr row))))))
+             (t (query-spill-value-size row)))
+       (query-spill-value-size (datum-origins-for-spill (select-top-n-item-origins item)))
+       (query-spill-value-size (select-top-n-item-presence item)))))
+
+(defun top-n-fixed-item-size-bound (columns slot)
+  "Bound the spill charge for one single-key row from a fixed identity scan."
+  (let* ((null-size (load-time-value (query-spill-value-size +null+) t))
+         (integer-size (load-time-value (query-spill-value-size #xffffffffffffffff) t))
+         (uuid-size (load-time-value
+                     (query-spill-value-size (sql-uuid-input "00000000-0000-0000-0000-000000000000")) t))
+         (sizes (map 'vector
+                     (lambda (column)
+                       (case (pg-column-type column)
+                         ((:int2 :int4 :int8) (max null-size integer-size))
+                         (:uuid (max null-size uuid-size))))
+                     columns)))
+    (when (and (< -1 slot (length sizes)) (every #'identity sizes))
+      ;; A scan visits each line pointer once in a 32-bit block address space.
+      ;; Source presence contains one fixnum ID and origin capture is disabled.
+      (+ (load-time-value (query-spill-record-size #()) t)
+         integer-size
+         (+ +query-spill-vector-overhead+ (aref sizes slot))
+         +query-spill-cons-overhead+
+         (* 2 (+ +query-spill-vector-overhead+ (reduce #'+ sizes)))
+         (load-time-value (query-spill-value-size nil) t)
+         (+ +query-spill-vector-overhead+ integer-size)))))
+
+(defun prepare-select-sort (input order arena limit projected-only-p &optional scratch)
   "Consume INPUT and return an iterator over sorted items.
 The second value names the method selected for this invocation.
 LIMIT bounds the initial top-N collector. If it exceeds the memory budget,
@@ -1581,9 +1668,12 @@ iterator. In-memory arena items are copied out before the arena is destroyed."
                                 (every (lambda (entry) (eq (caar entry) :sort-output)) order)))
          (runs nil)
          (memory-limit (max 1 (effective-query-work-memory-bytes)))
+         (item-size-bound (and (cdr scratch) (top-n-key-cutoff-item-size-bound (cdr scratch))))
          (top-n (when limit
                   (make-select-top-n-collector
-                   limit order (lambda (item) (query-spill-record-size (top-n-spill-item item)))))))
+                   limit order
+                   (unless (and item-size-bound (< (* limit item-size-bound) memory-limit))
+                     #'top-n-spill-item-size)))))
     (labels ((own-run ()
                ;; Batch allocations in the sort arena to avoid switching per item.
                (when arena
@@ -1613,24 +1703,25 @@ iterator. In-memory arena items are copied out before the arena is destroyed."
                                  (map 'vector (lambda (entry) (select-order-value (car entry) row)) order)))))
                  (incf sequence)
                  (if projected-only-p
-                     (make-query-sort-item sequence-number keys (car row))
+                     (make-query-sort-item sequence-number keys (if (consp row) (car row) row))
                      (make-query-sort-item-with-metadata
-                      sequence-number keys row
+                      sequence-number keys (if (consp row) row (cons row row))
                       (and *datum-origin-capture* (datum-origins-for-spill *query-row-origins*))
                       *query-row-presence*))))
              (consume (row)
                (if top-n
                    (progn
-                     (offer-select-top-n-row top-n row)
+                     (offer-select-top-n-row top-n row scratch)
                      (when (>= (select-top-n-collector-bytes top-n) memory-limit)
                        ;; Transfer evaluated keys and tie breakers for the surviving rows.
                        (let ((heap (select-top-n-collector-heap top-n)))
+                         (when (cdr scratch) (setf (top-n-key-cutoff-value (cdr scratch)) nil))
                          (setf sequence (select-top-n-collector-next-sequence top-n)
                                top-n nil)
                          (loop for item across heap
                                do (buffer-item (top-n-spill-item item)
                                                (select-top-n-item-bytes item))))))
-                   (let ((item (make-item row)))
+                   (let ((item (make-item (if (and scratch (eq row (car scratch))) (copy-seq row) row))))
                      (buffer-item item (query-spill-record-size item))))
                nil))
       (unwind-protect

@@ -196,40 +196,306 @@ KEYS is writable, nonempty workspace. CONSUME may read but must not retain it."
   (map-visible-fixed-heap-key-batches table snapshot keys consume #'map-visible-int8-page-key-batches
                                       (eq (pg-column-type (aref (pg-class-columns table) 0)) :float8)))
 
-(defun make-visible-heap-page-iterator (page block columns snapshot &optional int4-values-p)
+(defun heap-page-xid-fields (page offset)
+  "Read the adjacent raw xmin and xmax fields without boxing a combined XID word."
+  #+x86-64
+  (return-x86-page-word heap-page-xid-fields page offset 8
+                        (lambda (sap start)
+                          (let ((word (sb-sys:sap-ref-64 sap start)))
+                            (values (ldb (byte 32 0) word) (ldb (byte 32 32) word)))))
+  (values (page-u32 page offset) (page-u32 page (+ offset 4))))
+
+(defun make-heap-page-visibility-reader (page snapshot)
+  "Cache visibility of undeleted, committed insertions for the page's fixed snapshot."
+  (let ((committed-xid-cache (list nil))
+        (cached-xmin nil)
+        (cached-reference nil))
+    (lambda (offset my-xid)
+      (multiple-value-bind (raw-xmin raw-xmax)
+          (heap-page-xid-fields page (+ offset +heap-tuple-xmin-off+))
+        (let ((infomask (page-u16 page (+ offset +heap-tuple-infomask-off+)))
+              (reference *next-xid*))
+          (cond ((logtest +heap-xmin-invalid+ infomask)
+                 (values nil infomask))
+                ((and (null my-xid) (zerop raw-xmax)
+                      (eql raw-xmin cached-xmin) (eql reference cached-reference))
+                 (values t infomask))
+                (t
+                 (let* ((xmin (full-xid-from-32 raw-xmin reference))
+                        (xmax (full-xid-from-32 raw-xmax reference))
+                        (cid (page-u32 page (+ offset +heap-tuple-cid-off+)))
+                        (visible (heap-tuple-visible-p xmin xmax cid snapshot my-xid
+                                                       infomask committed-xid-cache)))
+                   (when (and visible (null my-xid) (zerop raw-xmax))
+                     (setf cached-xmin raw-xmin cached-reference reference))
+                   (values visible infomask)))))))))
+
+(declaim (inline inline-text-field-cursor))
+
+(defun inline-text-field-cursor (page start limit prefix alignment)
+  "Locate an inline text header, skipping padding when present."
+  (let ((cursor (+ start prefix)))
+    (if (and (< cursor limit) (zerop (aref page cursor)))
+        (+ start (align-up prefix alignment))
+        cursor)))
+
+(defun make-inline-text-key-reader (columns text-slot key-slot)
+  "Prepare an integer projection for tuples accepted by the inline text predicate."
+  (when key-slot
+    (let* ((column (aref columns key-slot))
+           (reader (case (pg-column-type column)
+                     (:int4 #'heap-read-int4)
+                     (:int8 #'heap-read-int8)))
+           (text-prefix (heap-fixed-prefix-end columns text-slot)))
+      (when (and reader text-prefix)
+        (let ((alignment (column-align column))
+              (width (column-fixed-size column))
+              (text-alignment (column-align (aref columns text-slot)))
+              (max-alignment (maxalign 1))
+              (natts (length columns)))
+          (flet ((key-offset (first cursor)
+                   (let ((prefix (heap-fixed-prefix-end columns key-slot first cursor)))
+                     (when prefix (align-up prefix alignment)))))
+            (let* ((fixed-offset (when (< key-slot text-slot)
+                                   (key-offset 0 (maxalign +size-of-heap-tuple-header+))))
+                   (offsets (when (> key-slot text-slot)
+                              (coerce
+                               (loop for remainder below max-alignment
+                                     for offset = (key-offset (1+ text-slot) remainder)
+                                     unless offset return nil
+                                       collect (- offset remainder))
+                               'simple-vector))))
+              (when (or fixed-offset (plusp (length offsets)))
+                (lambda (page start limit)
+                  ;; Skip layout discovery for every field except the text header.
+                  (let ((offset
+                          (if fixed-offset
+                              (+ start fixed-offset)
+                              (let* ((cursor (inline-text-field-cursor
+                                              page start limit text-prefix text-alignment))
+                                     (end (nth-value 1 (heap-inline-varlena-range page cursor limit))))
+                                (+ end (svref offsets (mod (- end start) max-alignment)))))))
+                    (unless (<= (+ offset width) limit)
+                      (ereport "XX001" "truncated heap attribute"))
+                    (let ((row (make-array natts :initial-element +null+)))
+                      (setf (aref row key-slot) (funcall reader page offset))
+                      row)))))))))))
+
+(defun make-inline-text-page-predicate (columns slot constant-compare)
+  "Locate an inline text predicate after a fixed-width prefix in canonical rows."
+  (let ((prefix (heap-fixed-prefix-end columns slot))
+        (natts (length columns))
+        (alignment (column-align (aref columns slot)))
+        (header (maxalign +size-of-heap-tuple-header+)))
+    (when prefix
+      (lambda (page start limit infomask)
+        (when (and (not (logtest +heap-hasnull+ infomask))
+                   (<= (+ start header) limit (length page))
+                   (= (aref page (+ start +heap-tuple-hoff-off+)) header)
+                   (= (page-u16 page (+ start +heap-tuple-natts-off+)) natts))
+          (let ((cursor (inline-text-field-cursor page start limit prefix alignment)))
+            (when (< cursor limit)
+              (let ((tag (aref page cursor)))
+                (when (and (/= tag 1) (/= (logand tag 3) 2))
+                  (multiple-value-bind (first end)
+                      (heap-inline-varlena-range page cursor limit)
+                    (when (%octet-span-ascii-p page first end)
+                      (values (funcall constant-compare page first end) t))))))))))))
+
+(defun make-top-n-text-rejector (columns cutoff)
+  "Reject canonical ASCII rows whose single sort key cannot enter the full heap."
+  (when cutoff
+    (let ((slot (top-n-key-cutoff-slot cutoff))
+          (descending-p (top-n-key-cutoff-descending-p cutoff)))
+      (when (and (< slot (length columns))
+                 (member (pg-column-type (aref columns slot)) '(:text :varchar)))
+        (let ((predicate
+                (make-inline-text-page-predicate
+                 columns slot
+                 (lambda (page start end)
+                   (declare (type (simple-array (unsigned-byte 8) (*)) page)
+                            (type fixnum start end)
+                            (optimize (speed 3)))
+                   (let* ((key (the simple-base-string (top-n-key-cutoff-value cutoff)))
+                          (width (the fixnum (- end start)))
+                          (key-width (length key))
+                          (comparison
+                            (loop for i of-type fixnum below (min width key-width)
+                                  for difference = (- (aref page (the fixnum (+ start i)))
+                                                      (char-code (schar key i)))
+                                  unless (zerop difference) return difference
+                                    finally (return (- width key-width)))))
+                     ;; An equal key would lose the arrival-order tie breaker.
+                     (if descending-p (<= comparison 0) (>= comparison 0)))))))
+          (when predicate
+            (lambda (page start limit infomask)
+              (and (typep (top-n-key-cutoff-value cutoff) 'simple-base-string)
+                   (funcall predicate page start limit infomask)))))))))
+
+(defun decode-inline-select-row (page columns start limit)
+  (let ((row (deform-heap-tuple page columns :start start :limit limit :metadata :none)))
+    (when (some #'heap-external-varlena-p row)
+      (ereport "XX001" "external value has no owning TOAST relation"))
+    row))
+
+(defun make-fixed-uuid-page-predicate (layout slot span-compare)
+  "Compare an already bounded UUID field without allocating a SQL UUID."
+  (let ((offset (car (aref (cdr layout) slot))))
+    (lambda (page start limit infomask)
+      (when (canonical-fixed-heap-row-p page start limit infomask layout)
+        (let ((first (+ start offset)))
+          (values (funcall span-compare page first (+ first +sql-uuid-size+)) t))))))
+
+(defun make-top-n-uuid-rejector (columns fixed-layout cutoff)
+  "Reject canonical UUID rows whose key cannot enter the full heap.
+A later row with an equal key loses the arrival-order tie breaker."
+  (when (and cutoff fixed-layout)
+    (let ((slot (top-n-key-cutoff-slot cutoff))
+          (descending-p (top-n-key-cutoff-descending-p cutoff)))
+      (when (and (< slot (length columns))
+                 (eq (pg-column-type (aref columns slot)) :uuid))
+        (let ((predicate
+                (make-fixed-uuid-page-predicate
+                 fixed-layout slot
+                 (lambda (page start end)
+                   (declare (ignore end)
+                            (type (simple-array (unsigned-byte 8) (*)) page)
+                            (type fixnum start)
+                            (optimize (speed 3)))
+                   (let* ((key (sql-uuid-bytes (top-n-key-cutoff-value cutoff)))
+                          (comparison
+                            (loop for i of-type fixnum below +sql-uuid-size+
+                                  for difference = (- (aref page (the fixnum (+ start i)))
+                                                      (aref key i))
+                                  unless (zerop difference) return difference
+                                    finally (return 0))))
+                     (if descending-p (<= comparison 0) (>= comparison 0)))))))
+          (lambda (page start limit infomask)
+            (and (sql-uuid-p (top-n-key-cutoff-value cutoff))
+                 (funcall predicate page start limit infomask))))))))
+
+(defun make-adaptive-top-n-page-predicate (reject-row-p)
+  "Pause cutoff comparisons when consecutive comparable rows pass the cutoff."
+  (let ((misses 0)
+        (skip 0))
+    (declare (type fixnum misses skip))
+    (lambda (page start limit infomask)
+      (if (plusp skip)
+          (progn (decf skip) (values nil nil))
+          (multiple-value-bind (reject comparable)
+              (funcall reject-row-p page start limit infomask)
+            (cond (reject (setf misses 0))
+                  ((and comparable (= (incf misses) 8))
+                   (setf misses 0 skip 64)))
+            (values nil reject))))))
+
+(defun decode-page-filter-match (page columns start limit fixed-layout key-slot)
+  "Decode an accepted tuple, skipping unused payload values for a count join.
+KEY-SLOT may be a decoder specialized for the accepted inline tuple."
+  (cond ((functionp key-slot) (funcall key-slot page start limit))
+        ((and fixed-layout key-slot)
+         (let ((row (make-array (length columns) :initial-element +null+)))
+           (fill-fixed-heap-row row page start (cdr fixed-layout) key-slot (1+ key-slot))
+           row))
+        (fixed-layout
+         (let ((row (make-array (length columns))))
+           ;; The page predicate already validated the fixed layout.
+           (fill-fixed-heap-row row page start (cdr fixed-layout) 0 (length row))
+           row))
+        (key-slot
+         ;; The span comparison already tested the predicate. A demand for an
+         ;; integer slot lets the general decoder step over all varlena data.
+         (deform-heap-tuple page columns :start start :limit limit
+                                         :metadata :none :demand key-slot))
+        (t (decode-inline-select-row page columns start limit))))
+
+(defun make-visible-heap-page-reader (page columns snapshot
+                                      &optional values-mode fixed-layout filter-slot accept-value count-only-p page-predicate key-slot scratch)
   "Visit visible heap tuples from PAGE one at a time.
 
 Check tuple visibility before deforming it, and leave later tuples untouched
-until their next pull. SNAPSHOT must remain registered for this iterator.
-INT4-VALUES-P returns a one-column SQL row without materializing an HTUP."
+until their next pull. The enclosing scan owns the page handle and snapshot.
+PAGE-PREDICATE can accept or discard a visible row before decoding; its second
+return value reports whether it handled that tuple layout.
+If ACCEPT-VALUE is supplied, read FILTER-SLOT before decoding a canonical row.
+COUNT-ONLY-P tallies matches for the page and returns their count in one pull.
+When KEY-SLOT or a specialized decoder is supplied, a match may yield only its key.
+Return the row, a presence flag, and optional compression provenance."
+  (declare (inline page-get-lp))
   (let ((offnum 0)
         (count (page-lp-count page))
-        (committed-xid-cache (list nil)))
-    (make-sql-iterator
-     (lambda ()
-       (loop while (< offnum count)
-             do (check-for-interrupts)
-                (incf offnum)
-                (with-live-page-item (page offnum offset length)
-                  (multiple-value-bind (visible xmin xmax cid infomask)
-                      (heap-page-item-visibility page offset snapshot
-                                                 (and *backend* (backend-xid *backend*)) committed-xid-cache)
-                    (when visible
-                      (when int4-values-p
-                        (return (values (vector (single-int4-heap-tuple-value
-                                                 page offset (+ offset length) infomask))
-                                        t)))
-                      (multiple-value-bind (values raw-xmin raw-xmax raw-cid raw-infomask
-                                            ctid-block ctid-offnum physical-compressed)
-                          (deform-heap-tuple page columns :start offset :limit (+ offset length))
-                        (declare (ignore raw-xmin raw-xmax raw-cid raw-infomask))
-                        (return
-                          (values (make-htup :block block :offnum offnum
-                                             :ctid-block ctid-block :ctid-offnum ctid-offnum
-                                             :xmin xmin :xmax xmax :cid cid :infomask infomask
-                                             :values values :physical-compressed physical-compressed)
-                                  t))))))))
-     (lambda () (setf page nil)))))
+        (visible-row (make-heap-page-visibility-reader page snapshot)))
+    (declare (type fixnum offnum count))
+    (lambda ()
+      (loop with matches of-type fixnum = 0
+            while (< offnum count)
+            do (check-for-interrupts)
+               (incf offnum)
+               (with-live-page-item (page offnum offset length count)
+                 (multiple-value-bind (visible infomask)
+                     (funcall visible-row offset (and *backend* (backend-xid *backend*)))
+                   (when (and visible
+                              (or (not page-predicate)
+                                  (multiple-value-bind (matched handled)
+                                      (funcall page-predicate page offset (+ offset length) infomask)
+                                    (when (and handled matched)
+                                      (if count-only-p
+                                          (incf matches)
+                                          (return
+                                            (values
+                                             (decode-page-filter-match page columns offset (+ offset length)
+                                                                       fixed-layout key-slot)
+                                             t))))
+                                    (not handled))))
+                     (if accept-value
+                         (let* ((limit (+ offset length))
+                                (canonical (and fixed-layout
+                                                (canonical-fixed-heap-row-p
+                                                 page offset limit infomask fixed-layout)))
+                                (attribute (when canonical (aref (cdr fixed-layout) filter-slot)))
+                                (row (unless canonical
+                                       (deform-heap-tuple page columns :start offset
+                                         :limit limit :metadata :none)))
+                                (value (if canonical
+                                           (funcall (cdr attribute) page (+ offset (car attribute)))
+                                           (aref row filter-slot))))
+                           (when (and (eq values-mode :inline)
+                                      (some #'heap-external-varlena-p row))
+                             (ereport "XX001" "external value has no owning TOAST relation"))
+                           (when (funcall accept-value value)
+                             (if count-only-p
+                                 (incf matches)
+                                 (return
+                                   (values (or row
+                                               (if key-slot
+                                                   (decode-page-filter-match
+                                                    page columns offset limit fixed-layout key-slot)
+                                                   (decode-canonical-fixed-heap-row
+                                                    page offset fixed-layout filter-slot value)))
+                                           t)))))
+                         (progn
+                           (case values-mode
+                             (:int4
+                              (return (values (vector (single-int4-heap-tuple-value
+                                                       page offset (+ offset length) infomask))
+                                              t)))
+                             ((:fixed :inline)
+                              (let* ((limit (+ offset length))
+                                     (decoded
+                                       (and fixed-layout
+                                            (decode-fixed-heap-row page offset limit infomask fixed-layout (car scratch)))))
+                                (when decoded (return (values decoded t)))
+                                (let ((row (deform-heap-tuple page columns :start offset
+                                                                           :limit limit :metadata :none :destination (car scratch))))
+                                  (when (and (eq values-mode :inline)
+                                             (some #'heap-external-varlena-p row))
+                                    (ereport "XX001" "external value has no owning TOAST relation"))
+                                  (return (values row t))))))
+                           (multiple-value-bind (values physical-compressed)
+                               (deform-heap-tuple page columns :start offset :limit (+ offset length)
+                                 :metadata :compression)
+                             (return (values values t physical-compressed))))))))
+            finally (return (if (plusp matches) (values matches t) (values nil nil)))))))
 
 (defun make-buffered-select-index-tid-iterator (table path environment &optional (key nil key-p))
   ;; Buffer matching TIDs under the index lease, then release the lease before
@@ -322,7 +588,8 @@ releases it; closing an active scan discards its unread cursor without a copy."
   ;; Fetch and check one TID at a time against the scan snapshot. Closing this
   ;; iterator releases its cursor or detached TID store.
   (let ((tids (make-select-index-tid-iterator table path environment))
-        (presence (vector (ensure-select-source-identity relation))))
+        (presence (vector (ensure-select-source-identity relation)))
+        (placement (make-select-scan-row-placement relations relation)))
     (make-sql-iterator
      (lambda ()
        (loop
@@ -336,7 +603,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
                (let ((row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
                      (origins (and capture-p (htup-origins tuple))))
                  (multiple-value-bind (projected-row projected-origins)
-                     (project-select-scan-row relations relation row origins)
+                     (if placement (funcall placement row origins) (values row origins))
                    (return (values projected-row t projected-origins nil presence)))))))))
      (lambda () (close-sql-iterator tids)))))
 
@@ -345,7 +612,17 @@ releases it; closing an active scan discards its unread cursor without a copy."
        (eq (pg-column-type (aref columns 0)) :int4)
        (= (column-align (aref columns 0)) 4)))
 
-(defun make-select-scan-iterator (node relations)
+(defun make-scan-span-page-predicate (columns filter-slot span-compare values-mode fixed-layout)
+  (when (and span-compare (< filter-slot (length columns)))
+    (case (pg-column-type (aref columns filter-slot))
+      ((:text :varchar)
+       (when (eq values-mode :inline)
+         (make-inline-text-page-predicate columns filter-slot span-compare)))
+      (:uuid
+       (when fixed-layout
+         (make-fixed-uuid-page-predicate fixed-layout filter-slot span-compare))))))
+
+(defun make-select-scan-iterator (node relations &optional filter-slot accept-value count-only-p span-compare key-slot scratch)
   ;; Capture the parameter environment and statement snapshot for this scan's
   ;; lifetime; later outer rows must not change its index key or visibility.
   ;; The page handle keeps one immutable version across pulls.  Release it when
@@ -357,6 +634,7 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (path (physical-scan-path node relation))
          (environment (copy-query-sort-value *lateral-outer-environment*))
          (source (getf relation :row-source))
+         (placement (make-select-scan-row-placement relations relation))
          (block 0) (nblocks nil) (rows nil) (page-reader nil) (initialized nil)
          (page-handle (make-buf-page-handle))
          (snapshot *current-snapshot*)
@@ -364,14 +642,52 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (demand *select-toast-demand*)
          (slice-plan *select-toast-slice-plan*)
          (columns (and table (pg-class-columns table)))
-         (int4-values-p (and (not capture-p) (not slice-plan)
-                             (single-int4-scan-layout-p columns))))
+         (key-slot (when (and key-slot (< key-slot (length columns))
+                              (member (pg-column-type (aref columns key-slot))
+                                      '(:int2 :int4 :int8)))
+                     key-slot))
+         ;; A TOAST demand limits varlena materialization only.
+         (values-mode (and (not capture-p) (not slice-plan)
+                           (cond ((single-int4-scan-layout-p columns) :int4)
+                                 ((and (not (pg-class-toast table))
+                                       (notany #'pg-column-dropped-p columns))
+                                  (if (some (lambda (column)
+                                              (heap-varlena-type-p (pg-column-type column)))
+                                            columns)
+                                      (when (or (not demand) count-only-p key-slot) :inline)
+                                      :fixed)))))
+         (fixed-layout (when (eq values-mode :fixed)
+                         (make-fixed-heap-row-layout columns)))
+         (span-page-predicate
+           (make-scan-span-page-predicate columns filter-slot span-compare values-mode fixed-layout))
+         (scratch (and (not placement) (not source) (member values-mode '(:fixed :inline))
+                       (eql (length (car scratch)) (length columns)) scratch))
+         (page-predicate
+           (or span-page-predicate
+               (let ((reject-row-p (case values-mode
+                                     (:inline (make-top-n-text-rejector columns (cdr scratch)))
+                                     (:fixed (make-top-n-uuid-rejector columns fixed-layout (cdr scratch))))))
+                 (when reject-row-p
+                   (make-adaptive-top-n-page-predicate reject-row-p)))))
+         (key-projection
+           (or (when (and page-predicate (eq values-mode :inline))
+                 (make-inline-text-key-reader columns filter-slot key-slot))
+               key-slot)))
+    (when (and accept-value
+               (not (and (or fixed-layout page-predicate (and count-only-p (eq values-mode :inline)))
+                         (not placement) (not source)
+                         (eq (select-scan-path-kind path) :seq-scan)
+                         (< filter-slot (length columns)))))
+      (return-from make-select-scan-iterator nil))
     (when (eq (select-scan-path-kind path) :index-scan)
       (return-from make-select-scan-iterator
         (make-select-index-scan-iterator table path snapshot relation relations
                                          environment capture-p demand)))
     (unless (eq (select-scan-path-kind path) :seq-scan)
       (error "A resumable producer requires a SeqScan plan"))
+    (when (and fixed-layout (cdr scratch))
+      (setf (top-n-key-cutoff-item-size-bound (cdr scratch))
+            (top-n-fixed-item-size-bound columns (top-n-key-cutoff-slot (cdr scratch)))))
     (make-sql-iterator
      (lambda ()
        (unless initialized
@@ -379,47 +695,48 @@ releases it; closing an active scan discards its unread cursor without a copy."
          (if source (setf rows (funcall source))
              (setf nblocks (buf-nblocks (pg-class-relfilenode table)))))
        (loop
-         (check-for-interrupts)
          (when rows
+           (check-for-interrupts)
            (let ((row (pop rows)))
-             (return (values (project-select-scan-row relations relation row nil)
+             (return (values (if placement (funcall placement row nil) row)
                              t nil nil presence))))
          (when page-reader
-           (multiple-value-bind (tuple present) (sql-iterator-next page-reader)
+           (multiple-value-bind (values present physical-compressed) (funcall page-reader)
              (when present
-               (when int4-values-p
-                 (return (values (project-select-scan-row relations relation tuple nil)
+               (when values-mode
+                 (return (values (if placement (funcall placement values nil) values)
                                  t nil nil presence)))
                (let* ((*datum-origin-capture* capture-p)
-                      (values (htup-values tuple))
                       (toast-context
                         (when (and slice-plan (eq table (car slice-plan)))
                           (loop for (expression . slot) in (cdr slice-plan)
                                 for value = (aref values (1- slot))
                                 when (heap-external-varlena-p value)
                                   collect (cons expression
-                                                (list (pg-class-toast table) value snapshot values)))))
-                      (row (htup-values (materialize-select-tuple table tuple snapshot :demand demand)))
-                      (origins (and capture-p (htup-origins tuple))))
-                 (multiple-value-bind (projected-row projected-origins)
-                     (project-select-scan-row relations relation row origins)
-                   (return (values projected-row t projected-origins toast-context presence)))))
-             (close-sql-iterator page-reader)
+                                                (list (pg-class-toast table) value snapshot values))))))
+                 (multiple-value-bind (row origins)
+                     (materialize-select-row table values snapshot physical-compressed :demand demand)
+                   (multiple-value-bind (projected-row projected-origins)
+                       (if placement (funcall placement row origins) (values row origins))
+                     (return (values projected-row t projected-origins toast-context presence))))))
              (setf page-reader nil)
              (buf-release-page page-handle)))
+         ;; The page reader checks each line pointer before decoding it.
+         ;; Check again only when leaving that reader or fetching another page.
+         (check-for-interrupts)
          (when (or source (>= block nblocks)) (return (values nil nil)))
          (let* ((current block)
                 (page (buf-acquire-read-page page-handle
                                              (pg-class-relfilenode table) current)))
            (incf block)
            (when page
-             (setf page-reader (make-visible-heap-page-iterator
-                                page current columns snapshot int4-values-p))))))
+             (setf page-reader (make-visible-heap-page-reader
+                                page columns snapshot values-mode fixed-layout filter-slot accept-value
+                                count-only-p page-predicate key-projection scratch))))))
      nil
      (lambda ()
-       (unwind-protect (close-sql-iterator page-reader)
-         (setf rows nil page-reader nil)
-         (buf-release-page page-handle))))))
+       (setf rows nil page-reader nil)
+       (buf-release-page page-handle)))))
 
 (defun make-append-sql-iterator (arms relations)
   (let ((remaining arms) (input nil) (coercions nil))
@@ -671,22 +988,44 @@ separate projection. Closing the result closes the sort and its source."
   (let ((a (aref left (car offsets)))
         (b (aref right (cdr offsets))))
     (cond ((or (eq a +null+) (eq b +null+)) nil)
-          ((and (integerp a) (integerp b)) (= a b))
+          ((and (integerp a) (integerp b)) (values (= a b) t))
           (t t))))
+
+(defun cached-integer-join-counts (store right-offset)
+  "Index a small, sealed inner replay by non-NULL integer key."
+  (let ((rows (query-replay-store-memory-rows store))
+        (metadata-p (or (query-replay-store-capture-origins-p store)
+                        (query-replay-store-capture-presence-p store))))
+    (when (<= (length rows) 32)
+      (let ((counts (make-hash-table :test #'eql)))
+        (loop for value across rows
+              for right = (if metadata-p (first value) value)
+              for key = (aref right right-offset)
+              do (cond ((integerp key) (incf (gethash key counts 0)))
+                       ((not (eq key +null+))
+                        (return-from cached-integer-join-counts nil))))
+        counts))))
 
 ;; The join owns LEFT and a replay store owning RIGHT.  A fresh reader scans
 ;; RIGHT for each left row; right/full joins make one final pass for unmatched
 ;; rows.  Closing the join closes the active reader, both inputs and match map.
-(defun make-nested-loop-iterator (join left right &optional metadata)
+(defun make-nested-loop-iterator (join left right &optional metadata count-only-p)
   (let* ((qual (getf join :qual))
          (outer-p (member (getf join :type) '(:right :full)))
          (spool-memory (nested-loop-spool-memory outer-p))
          (match-memory (nested-loop-match-memory spool-memory))
          (store (make-query-replay-store right spool-memory))
-         (reader nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil)
+         (reader nil) (rewind-reader nil) (current-left nil) (left-origins nil) (left-presence nil) (left-present nil)
          (key-offsets (integer-join-key-offsets join qual))
+         (batch-count-p (and count-only-p key-offsets (eq (getf join :type) :inner)))
+         (inner-counts :unbuilt)
+         (candidate-proven-p nil)
          (candidate-p (when key-offsets
-                        (lambda (row) (integer-join-candidate-p current-left row key-offsets))))
+                        (lambda (row)
+                          (multiple-value-bind (candidate proven)
+                              (integer-join-candidate-p current-left row key-offsets)
+                            (setf candidate-proven-p proven)
+                            (if (and candidate proven count-only-p) :count-match candidate)))))
          (left-done nil) (left-seen nil) (matched nil) (right-phase nil)
          (right-index 0)
          (matches nil)
@@ -705,13 +1044,26 @@ separate projection. Closing the result closes the sort and its source."
            (when left-present
              (when (and outer-p (not left-seen))
                (setf matches (make-query-match-map match-memory)))
-             (setf left-seen t matched nil right-index 0
-                   reader (make-query-replay-reader store :candidate-p candidate-p))))
+             (setf left-seen t matched nil right-index 0)
+             ;; A retained reader was rewound after exhausting a memory replay.
+             (when (and batch-count-p reader)
+               (when (eq inner-counts :unbuilt)
+                 (setf inner-counts (cached-integer-join-counts store (cdr key-offsets))))
+               (when inner-counts
+                 (let ((key (aref current-left (car key-offsets))))
+                   (when (or (integerp key) (eq key +null+))
+                     (setf left-present nil)
+                     (return (values (gethash key inner-counts 0) t))))))
+             (unless reader
+               (multiple-value-setq (reader rewind-reader)
+                 (make-query-replay-reader store :candidate-p candidate-p :rewind-memory-p t)))))
          (when (and left-done (not outer-p)) (return (values nil nil)))
          (when (and left-done (not right-phase))
            (setf right-phase t right-index 0)
            (when left-seen
-             (setf reader (make-query-replay-reader store))
+             (close-sql-iterator reader)
+             (setf reader (make-query-replay-reader store)
+                   rewind-reader nil)
              (query-match-map-finish matches)))
          ;; With no left rows, nothing will replay the right input or consult the match map.
          (multiple-value-bind (row present right-origins toast right-presence)
@@ -736,8 +1088,12 @@ separate projection. Closing the result closes the sort and its source."
                 ;; The reader still counts a rejected candidate as a right row.
                 (multiple-value-bind (joined origins presence)
                     (when row
-                      (qualify-select-join-pair join qual current-left row left-origins right-origins
-                                                left-presence right-presence *datum-origin-capture* presence-cache))
+                      (if (and count-only-p candidate-proven-p)
+                          #()
+                          (qualify-select-join-pair
+                           join qual current-left row left-origins right-origins
+                           left-presence right-presence *datum-origin-capture* presence-cache
+                           candidate-proven-p)))
                   (cond (joined
                          (setf matched t)
                          (when matches (query-match-map-mark matches index))
@@ -745,8 +1101,10 @@ separate projection. Closing the result closes the sort and its source."
                         (metadata
                          (incf (plan-node-metadata-filtered-row-count metadata)))))))
              (t
-              (close-sql-iterator reader)
-              (setf reader nil left-present nil)
+              (unless (and rewind-reader (funcall rewind-reader))
+                (close-sql-iterator reader)
+                (setf reader nil rewind-reader nil))
+              (setf left-present nil)
               (when (and (not matched) (member (getf join :type) '(:left :full)))
                 (multiple-value-bind (values origins)
                     (null-extend-select-join-row current-left left-origins null-right nil *datum-origin-capture*)
@@ -782,7 +1140,9 @@ separate projection. Closing the result closes the sort and its source."
           (- (statement-resource-usage-wal-bytes usage) wal-bytes))))
 
 (defun instrument-physical-plan-iterator (node input)
-  "Count and time pulls from INPUT for NODE; closing the wrapper closes INPUT."
+  "Count and time pulls from INPUT when execution instrumentation is enabled."
+  (unless *query-plan-instrumentation-p*
+    (return-from instrument-physical-plan-iterator input))
   (let* ((metadata (and *cte-active-plan* (gethash node (query-plan-metadata *cte-active-plan*))))
          (started-p nil))
     (if (null metadata) input
@@ -879,10 +1239,35 @@ separate projection. Closing the result closes the sort and its source."
                         (funcall function row))))
                 (close-sql-iterator iterator))))))))))
 
-(defun make-subquery-scan-iterator (node relations)
+(defun identity-projection-input (project relations)
+  "Return the input node when PROJECT exposes exactly its scan's slots in order."
+  (when (eq (first project) :project)
+    (let* ((input (third project))
+           (scan (loop for step = input then (third step)
+                       while (eq (first step) :filter)
+                       finally (return step)))
+           (relation (when (member (first scan) '(:seq-scan :index-scan :subquery-scan))
+                       (physical-scan-relation scan relations)))
+           (targets (second project)))
+      (when (and relation (not (getf relation :join-order-base))
+                 (eql (length targets) (getf relation :width))
+                 (loop for target in targets for slot from 1
+                       for expr = (getf target :expr)
+                       always (and (eq (first expr) :col) (eql (second expr) slot))))
+        input))))
+
+(defun view-identity-projection-input (node relations)
+  "Return the row-vector producer when a view projects every slot unchanged."
+  (when (and (not *datum-origin-capture*) (not *query-plan-instrumentation-p*)
+             (getf (getf (physical-scan-relation node relations) :subquery-prepared)
+                   :stored-view-expansion-p))
+    (identity-projection-input (fourth node) relations)))
+
+(defun make-subquery-scan-iterator (node relations &optional count-only-p key-slot scratch)
   (multiple-value-bind (frame presence)
       (make-physical-subquery-scan-frame node relations *lateral-outer-environment*)
     (let ((frames (cons frame *subquery-outer-frames*))
+          (raw-input (view-identity-projection-input node relations))
           (input nil)
           (iterator nil))
       (flet ((close-input (owned)
@@ -890,16 +1275,32 @@ separate projection. Closing the result closes the sort and its source."
                  (close-cte-frame-cache (cdr frame)))))
         (unwind-protect
              (let ((*subquery-outer-frames* frames))
-               (setf input (make-physical-plan-iterator (fourth node) relations))
+               (setf input (cond ((and raw-input count-only-p)
+                                  (make-count-input-iterator raw-input relations))
+                                 ((and raw-input key-slot)
+                                  (make-count-join-probe-iterator raw-input relations key-slot))
+                                 ((and raw-input scratch)
+                                  (make-top-n-identity-scan-iterator raw-input relations scratch))
+                                 (t (make-physical-plan-iterator
+                                     (or raw-input (fourth node)) relations))))
                (let ((owned input))
                  (setf iterator
                        (make-sql-iterator
                         (lambda ()
                           (let ((*subquery-outer-frames* frames))
-                            (multiple-value-bind (row present origins) (sql-iterator-next owned)
-                              (values (car row) present origins nil (and present presence)))))
+                            (multiple-value-bind (row present origins)
+                                (sql-iterator-next-after-poll owned)
+                              (values (if raw-input row (car row))
+                                      present origins nil (and present presence)))))
                         (lambda () (close-input owned))))))
           (unless iterator (close-input input)))))))
+
+(defun make-top-n-identity-scan-iterator (node relations scratch)
+  "Pass SCRATCH through row-preserving scans only. The sorter owns retained rows."
+  (case (first node)
+    (:seq-scan (make-select-scan-iterator node relations nil nil nil nil nil scratch))
+    (:subquery-scan (make-subquery-scan-iterator node relations nil nil scratch))
+    (otherwise (make-physical-plan-iterator node relations))))
 
 (defun make-physical-hash-join-iterator (node relations)
   (let* ((join (second node))
@@ -945,7 +1346,14 @@ separate projection. Closing the result closes the sort and its source."
         (unwind-protect (close-sql-iterator probe)
           (close-sql-iterator build))))))
 
-(defun make-physical-join-iterator (node relations)
+(defun make-count-join-probe-iterator (node relations key-slot)
+  "Carry a count-only equality join's key demand through transparent view projections."
+  (case (first node)
+    (:subquery-scan (make-subquery-scan-iterator node relations nil key-slot))
+    (:filter (make-physical-filter-iterator node relations nil key-slot))
+    (otherwise (make-physical-plan-iterator node relations))))
+
+(defun make-physical-join-iterator (node relations &optional count-only-p)
   ;; A parameterized index scan needs a new key and iterator for each left
   ;; row, just as a LATERAL input does (cf. ExecReScanIndexScan).
   (let ((metadata (and *query-plan-instrumentation-p* *cte-active-plan*
@@ -959,12 +1367,19 @@ separate projection. Closing the result closes the sort and its source."
                  (*query-row-presence* presence))
              (make-physical-plan-iterator (fourth node) relations)))
          metadata)
-        (make-nested-loop-iterator
-         (second node) (make-physical-plan-iterator (third node) relations)
-         (make-physical-plan-iterator (fourth node) relations)
-         metadata))))
+        (let* ((join (second node))
+               (left-node (third node))
+               (offsets (when (and count-only-p (eq (getf join :type) :inner)
+                                   (not *datum-origin-capture*))
+                          (integer-join-key-offsets join (getf join :qual)))))
+          (make-nested-loop-iterator
+           join (if offsets
+                    (make-count-join-probe-iterator left-node relations (car offsets))
+                    (make-physical-plan-iterator left-node relations))
+           (make-physical-plan-iterator (fourth node) relations)
+           metadata count-only-p)))))
 
-(defun make-select-sort-iterator (input order &key limit projected-only-p metadata)
+(defun make-select-sort-iterator (input order &key limit projected-only-p metadata scratch)
   "Prepare the sort on the first pull and return one sorted row per call.
 The reader retains its runs until close. If there is no enclosing temporary
 owner, the iterator creates one and closes it after the reader and input."
@@ -995,7 +1410,7 @@ owner, the iterator creates one and closes it after the reader and input."
                 (multiple-value-bind (sorted method)
                     (call-with-query-sort-arena
                      (lambda (arena)
-                       (prepare-select-sort input order arena limit projected-only-p)))
+                       (prepare-select-sort input order arena limit projected-only-p scratch)))
                   (setf reader sorted)
                   (when metadata
                     (pushnew method (plan-node-metadata-sort-methods metadata))))
@@ -1190,6 +1605,26 @@ also closes the active child and input, then removes its remaining files."
                 (hash-aggregate-delete-partitions partitions))
            (close-sql-iterator input)))))))
 
+(defun make-ungrouped-count-iterator (input aggregate-count)
+  "Consume INPUT into one COUNT(*) state, including when the input is empty."
+  (let ((done-p nil))
+    (make-sql-iterator
+     (lambda ()
+       (unless done-p
+         (setf done-p t)
+         (let ((rows 0))
+           (unwind-protect
+                (loop
+                  (multiple-value-bind (row present) (sql-iterator-next input)
+                    (unless present (return))
+                    ;; Eligible inner joins can return a whole match count at once.
+                    (incf rows (if (integerp row) row 1))))
+             (close-sql-iterator input))
+           (values (make-array aggregate-count :initial-element rows)
+                   t (when *datum-origin-capture*
+                       (make-array aggregate-count :initial-element nil))))))
+     (lambda () (close-sql-iterator input)))))
+
 (defun make-hash-aggregate-iterator (input group-keys aggregate-count &key distinct-p)
   "Consume INPUT into hash batches and return one aggregate group per pull."
   (let* ((keys (loop for key in group-keys for slot from 1
@@ -1307,6 +1742,176 @@ also closes the active child and input, then removes its remaining files."
                        (ereport "22003" "bigint out of range"))
                      (values (vector count) t))))))))))))
 
+(defun scalar-scan-comparator (type)
+  "Select a comparator for values whose SQL type is established by the scan."
+  (case type
+    ((:int2 :int4 :int8 :oid :oid8 :date :time :timestamp :timestamptz)
+     (lambda (left right)
+       (declare (type integer left right))
+       (cond ((< left right) -1) ((> left right) 1) (t 0))))
+    ((:text :varchar :name) #'sql-string-compare)
+    ((:float4 :float8 :numeric :uuid :timetz :interval) #'compare-3way)))
+
+(defun make-octet-span-comparison (literal accept)
+  (declare (type (simple-array (unsigned-byte 8) (*)) literal))
+  (let ((length (length literal)))
+    (declare (type fixnum length))
+    (lambda (page start end)
+      (declare (type (simple-array (unsigned-byte 8) (*)) page)
+               (type fixnum start end))
+      (funcall accept
+               (let ((span (the fixnum (- end start))))
+                 (loop for index fixnum from start below end
+                       for position fixnum from 0 below length
+                       for difference fixnum = (- (aref page index) (aref literal position))
+                       unless (zerop difference) return difference
+                         finally (return (- span length))))))))
+
+(defun make-uuid-span-comparison (literal accept)
+  "Compare a validated sixteen-byte heap span with a UUID's owned octets.
+Check the first byte before loading words, which skip shared UUID prefixes."
+  (declare (type (simple-array (unsigned-byte 8) (16)) literal))
+  #+x86-64
+  (let ((head (aref literal 0)))
+    (sb-sys:with-pinned-objects (literal)
+      (let* ((sap (sb-sys:vector-sap literal))
+             (key-first (sb-sys:sap-ref-64 sap 0))
+             (key-last (sb-sys:sap-ref-64 sap 8)))
+        (declare (type (unsigned-byte 64) key-first key-last)
+                 (type (unsigned-byte 8) head)
+                 (optimize (speed 3) (safety 1)))
+        (flet ((compare-word (a b)
+                 (declare (type (unsigned-byte 64) a b))
+                 (let ((difference (logxor a b)))
+                   (if (zerop difference)
+                       0
+                       ;; XOR with the predecessor marks the first differing bit
+                       ;; and every lower bit. Round its position down to a byte.
+                       (let* ((bits (logxor difference (1- difference)))
+                              (offset (logand (1- (logcount bits)) -8)))
+                         (- (ldb (byte 8 offset) a) (ldb (byte 8 offset) b)))))))
+          (declare (inline compare-word))
+          (lambda (page start end)
+            (declare (ignore end)
+                     (type (simple-array (unsigned-byte 8) (*)) page)
+                     (type fixnum start))
+            (let ((lead (- (aref page start) head)))
+              (funcall accept
+                       (if (zerop lead)
+                           (sb-sys:with-pinned-objects (page)
+                             (let* ((sap (sb-sys:vector-sap page))
+                                    (first (compare-word (sb-sys:sap-ref-64 sap start) key-first)))
+                               (if (zerop first)
+                                   (compare-word (sb-sys:sap-ref-64 sap (the fixnum (+ start 8))) key-last)
+                                   first)))
+                           lead))))))))
+  #-x86-64
+  (make-octet-span-comparison literal accept))
+
+(defun make-ascii-span-comparison (constant accept)
+  (when (and (stringp constant)
+             (every (lambda (character) (< (char-code character) 128)) constant))
+    (make-octet-span-comparison
+     (map '(simple-array (unsigned-byte 8) (*)) #'char-code constant) accept)))
+
+(defun signed-integer-filter-operator (operator reversed-p)
+  (cond ((string= operator "=") #'=)
+        ((string= operator "<>") #'/=)
+        ((string= operator "<") (if reversed-p #'> #'<))
+        ((string= operator ">") (if reversed-p #'< #'>))
+        ((string= operator "<=") (if reversed-p #'>= #'<=))
+        ((string= operator ">=") (if reversed-p #'<= #'>=))))
+
+(defun make-scalar-column-comparison-filter (expression &optional heap-filter-p)
+  "Resolve slots and operator spelling once for a scalar column-to-literal filter."
+  (when (eq (first expression) :binop)
+    (let* ((operator (second expression))
+           (left (third expression))
+           (right (fourth expression))
+           (reversed-p (eq (first right) :col))
+           (column (if reversed-p right left))
+           (literal (if reversed-p left right))
+           (compare (scalar-scan-comparator (expr-type column)))
+           (accept
+             (cond ((string= operator "=") #'zerop)
+                   ((string= operator "<>") (complement #'zerop))
+                   ((string= operator "<") (if reversed-p #'plusp #'minusp))
+                   ((string= operator ">") (if reversed-p #'minusp #'plusp))
+                   ((string= operator "<=") (complement (if reversed-p #'minusp #'plusp)))
+                   ((string= operator ">=") (complement (if reversed-p #'plusp #'minusp))))))
+      (when (and compare accept (eq (first column) :col) (eq (first literal) :const)
+                 (or (eq (expr-type column) (expr-type literal))
+                     (and (member (expr-type column) '(:int2 :int4 :int8))
+                          (member (expr-type literal) '(:int2 :int4 :int8)))))
+        (let* ((slot (1- (second column)))
+               (constant (second literal))
+               (integer-operator (when (member (expr-type column) '(:int2 :int4 :int8))
+                                   (signed-integer-filter-operator operator reversed-p)))
+               (accept-value
+                 (if integer-operator
+                     (lambda (value)
+                       (and (not (eq value +null+)) (not (eq constant +null+))
+                            (funcall integer-operator value constant)))
+                     (lambda (value)
+                       (and (not (eq value +null+)) (not (eq constant +null+))
+                            (funcall accept (funcall compare value constant)))))))
+          (values (lambda (row) (funcall accept-value (aref row slot)))
+                  slot accept-value
+                  (when heap-filter-p
+                    (case (expr-type column)
+                      ((:text :varchar) (make-ascii-span-comparison constant accept))
+                      (:uuid (when (sql-uuid-p constant)
+                               (make-uuid-span-comparison
+                                (sql-uuid-bytes constant) accept)))))))))))
+
+(defun make-physical-filter-iterator (node relations &optional count-only-p key-slot)
+  (let* ((qual (second node))
+         (child (third node))
+         (metadata (and *query-plan-instrumentation-p* *cte-active-plan*
+                        (gethash node (query-plan-metadata *cte-active-plan*)))))
+    (multiple-value-bind (fast-filter slot accept-value span-compare)
+        (make-scalar-column-comparison-filter
+         qual (and (not *query-plan-instrumentation-p*) (eq (first child) :seq-scan)))
+      (or (and accept-value (not *query-plan-instrumentation-p*)
+               (eq (first child) :seq-scan)
+               (make-select-scan-iterator child relations slot accept-value count-only-p span-compare key-slot))
+          (make-mapping-sql-iterator
+           (make-physical-plan-iterator child relations)
+           (lambda (row)
+             (let ((accepted-p (if fast-filter (funcall fast-filter row)
+                                   (true-p (eval-expr qual row)))))
+               (when (and metadata (not accepted-p))
+                 (incf (plan-node-metadata-filtered-row-count metadata)))
+               (values row accepted-p *query-row-origins*)))
+           :preserve-toast-context t)))))
+
+(defun make-count-input-iterator (node relations)
+  "Request match markers from eligible filters, identity views and joins."
+  (if *query-plan-instrumentation-p*
+      (make-physical-plan-iterator node relations)
+      (case (first node)
+        (:filter (make-physical-filter-iterator node relations t))
+        (:subquery-scan (make-subquery-scan-iterator node relations t))
+        (:nested-loop-join (make-physical-join-iterator node relations t))
+        (otherwise (make-physical-plan-iterator node relations)))))
+
+(defun make-top-n-input-iterator (project relations order)
+  "Return the input iterator and, for identity scans, its mutable scan state.
+The state's CAR holds a reusable row and its CDR holds an optional key cutoff.
+The sorter takes ownership of retained vectors before the scanner can overwrite them."
+  (let ((input (and (not *datum-origin-capture*) (not *query-plan-instrumentation-p*)
+                    (not *query-sort-project*)
+                    (identity-projection-input project relations))))
+    (if input
+        (let* ((key (and (null (cdr order)) (caar order)))
+               (cutoff (when (and (member (first key) '(:col :sort-output))
+                                  (member (expr-type key) '(:text :varchar :uuid :int2 :int4 :int8)))
+                         (make-top-n-key-cutoff :slot (1- (second key))
+                                                :descending-p (order-descending-p (cdar order)))))
+               (scratch (cons (make-array (length (second project))) cutoff)))
+          (values (make-top-n-identity-scan-iterator input relations scratch) scratch))
+        (make-physical-plan-iterator project relations))))
+
 (defun %make-physical-plan-iterator (node relations)
   (case (first node)
     (:result
@@ -1319,17 +1924,7 @@ also closes the active child and input, then removes its remaining files."
     (:with-ctes (make-with-ctes-iterator (second node) (third node) relations))
     (:append (make-append-sql-iterator (second node) relations))
     (:subquery-scan (make-subquery-scan-iterator node relations))
-    (:filter
-     (let ((metadata (and *query-plan-instrumentation-p* *cte-active-plan*
-                          (gethash node (query-plan-metadata *cte-active-plan*)))))
-       (make-mapping-sql-iterator
-        (make-physical-plan-iterator (third node) relations)
-        (lambda (row)
-          (let ((accepted-p (true-p (eval-expr (second node) row))))
-            (when (and metadata (not accepted-p))
-              (incf (plan-node-metadata-filtered-row-count metadata)))
-            (values row accepted-p *query-row-origins*)))
-        :preserve-toast-context t)))
+    (:filter (make-physical-filter-iterator node relations))
     (:project
      (let* ((targets (second node))
             (deferred (and *query-sort-project*
@@ -1376,8 +1971,14 @@ also closes the active child and input, then removes its remaining files."
      (make-hash-distinct-iterator (make-physical-plan-iterator (third node) relations) (second node)))
     (:hash-aggregate
      (or (make-fixed-hash-count-iterator node relations)
-         (make-hash-aggregate-iterator (make-physical-plan-iterator (fourth node) relations)
-                                       (second node) (third node))))
+         (let* ((child (fourth node))
+                (groups (second node))
+                (input (if groups
+                           (make-physical-plan-iterator child relations)
+                           (make-count-input-iterator child relations))))
+           (if groups
+               (make-hash-aggregate-iterator input groups (third node))
+               (make-ungrouped-count-iterator input (third node))))))
     ((:sort :top-n)
      (let ((child (physical-buffered-node-child node))
            (metadata (when (and *query-plan-instrumentation-p* *cte-active-plan*)
@@ -1390,21 +1991,25 @@ also closes the active child and input, then removes its remaining files."
              (make-sorted-project-set-iterator node child set-node width calls relations metadata))))
        (let* ((deferred (sort-projection-deferred-slots node child))
               (*query-sort-project* (and deferred (cons child deferred)))
-              (input (make-physical-plan-iterator child relations))
-              (buffer (make-select-sort-iterator
-                       input (second node)
-                       :limit (and (eq (first node) :top-n) (third node))
-                       :metadata metadata
-                       :projected-only-p (and (eq node *select-terminal-sort-node*)
-                                              (eq (first node) :sort)
-                                              (null deferred)
-                                              (not *datum-origin-capture*)))))
-         (if deferred
-             (make-mapping-sql-iterator
-              buffer
-              (lambda (row)
-                (multiple-value-bind (projected origins)
-                    (finish-sort-project-row row (second child) deferred)
-                  (values projected t origins))))
-             buffer))))
+              (bounded-p (eq (first node) :top-n)))
+         (multiple-value-bind (input scratch)
+             (if bounded-p
+                 (make-top-n-input-iterator child relations (second node))
+                 (make-physical-plan-iterator child relations))
+           (let ((buffer (make-select-sort-iterator
+                          input (second node) :scratch scratch
+                          :limit (and bounded-p (third node))
+                          :metadata metadata
+                          :projected-only-p (and (eq node *select-terminal-sort-node*)
+                                                 (eq (first node) :sort)
+                                                 (null deferred)
+                                                 (not *datum-origin-capture*)))))
+             (if deferred
+                 (make-mapping-sql-iterator
+                  buffer
+                  (lambda (row)
+                    (multiple-value-bind (projected origins)
+                        (finish-sort-project-row row (second child) deferred)
+                      (values projected t origins))))
+                 buffer))))))
     (otherwise (ereport "0A000" "unsupported resumable producer node ~a" (first node)))))

@@ -8,18 +8,32 @@
   "Test a stable, validated simple octet span for ASCII without allocation."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
            (type fixnum start end))
+  #+x86-64
+  (when (>= (- end start) 32)
+    (sb-sys:with-pinned-objects (bytes)
+      (let ((sap (sb-sys:vector-sap bytes))
+            (last-word (the fixnum (- end 8))))
+        (loop while (<= start last-word)
+              do (unless (zerop (logand #x8080808080808080
+                                        (sb-sys:sap-ref-64 sap start)))
+                   (return-from %octet-span-ascii-p nil))
+                 (incf start 8)))))
   (loop for index fixnum from start below end
         always (< (aref bytes index) 128)))
 
 (defun %octet-span-copy-ascii (bytes start end output)
-  "Copy a stable, validated ASCII span without allocation.
-OUTPUT is a preallocated simple CHARACTER array of exactly END - START elements."
+  "Copy a stable, validated ASCII span into a preallocated simple string."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
-           (type (simple-array character (*)) output)
            (type fixnum start end))
-  (loop for index fixnum from start below end
-        for destination fixnum from 0
-        do (setf (aref output destination) (code-char (aref bytes index))))
+  (etypecase output
+    (simple-base-string
+     (loop for index fixnum from start below end
+           for destination fixnum from 0
+           do (setf (aref output destination) (code-char (aref bytes index)))))
+    ((simple-array character (*))
+     (loop for index fixnum from start below end
+           for destination fixnum from 0
+           do (setf (aref output destination) (code-char (aref bytes index))))))
   output)
 
 (defun %string-span-utf8-size (string start end)

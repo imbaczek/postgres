@@ -2,10 +2,6 @@
 
 (in-package #:pg)
 
-(defstruct sql-relation-name schema name)
-
-(defstruct sql-derived-relation query)
-
 (defstruct sql-record fields values)
 
 (defparameter +physical-slot-create-result-fields+
@@ -479,6 +475,9 @@ synchronous_commit. Reject unsupported parameters and other local settings."
                                         '(("oid" :oid t 1) ("nspname" :name t 2)))
    (make-sql-system-relation-descriptor 6104 "pg_publication" #\r 'sql-publication-rows
                                         +sql-publication-fields+)
+   (make-sql-system-relation-descriptor 12072 "pg_views" #\v 'sql-view-rows
+                                        '(("schemaname" :name nil 1) ("viewname" :name nil 2)
+                                          ("viewowner" :name nil 3) ("definition" :text nil 4)))
    (make-sql-system-relation-descriptor 12073 "pg_publication_sequences" #\v
                                         'sql-publication-sequence-rows
                                         '(("pubname" :name nil 1) ("schemaname" :name nil 2)
@@ -755,6 +754,33 @@ Capture policy and keep size once for every row in the snapshot."
                     t))
           (values nil nil)))))
 
+(defun sql-view-rows ()
+  "Snapshot public view metadata using the session's transaction-private catalog."
+  (with-write-lock
+    (let ((rows nil))
+      (catalog-map-visible-relations
+       (lambda (name relation)
+         (let ((definition (pg-class-view-definition relation)))
+           (when definition
+             (push (vector "public" name (pg-view-definition-owner definition)
+                           (view-definition-display-sql relation))
+                   rows))))
+       (current-database) :table)
+      (sort rows #'string< :key (lambda (row) (aref row 1))))))
+
+(defun sql-get-view-definition (identity &optional pretty-or-width)
+  "Return a view definition by OID or SQL relation name in the current catalog."
+  (declare (ignore pretty-or-width))
+  (flet ((lookup ()
+           (let* ((relation (etypecase identity
+                              (integer (find-table-by-oid identity))
+                              (string (sql-relation-or-error (parse-view-reference-text identity)))))
+                  (definition (and relation (pg-class-view-definition relation))))
+             (or (and definition (view-definition-display-sql relation)) +null+))))
+    (if (sb-thread:holding-mutex-p *write-lock*)
+        (lookup)
+        (with-write-lock (lookup)))))
+
 (defun sql-class-rows ()
   "Snapshot implemented catalog relations and persisted user objects."
   (with-write-lock
@@ -770,8 +796,11 @@ Capture policy and keep size once for every row in the snapshot."
         (catalog-map-visible-relations (lambda (name table)
                                          (let* ((toast (pg-class-toast table))
                                                 (parent-oid (pg-class-oid table)))
-                                           (add-object parent-oid name #\r (length (pg-class-columns table))
-                                                       (if toast (pg-toast-oid toast) 0))
+                                           (let ((view-p (pg-class-view-definition table)))
+                                             (add-object parent-oid name (if view-p #\v #\r)
+                                                         (length (pg-class-columns table))
+                                                         (if toast (pg-toast-oid toast) 0)
+                                                         2200 (if view-p #\n #\d)))
                                            (when toast
                                              (let ((toast-name (format nil "pg_toast_~d" parent-oid)))
                                                (add-object (pg-toast-oid toast) toast-name #\t 3 0 99 #\n)
@@ -1009,6 +1038,9 @@ Capture policy and keep size once for every row in the snapshot."
   (let ((table (lookup-sql-relation name)))
     (when (and table (sql-system-relation-p table))
       (ereport "0A000" "operation on read-only catalog relation is not supported"))
+    (when (and table (pg-class-view-definition table))
+      (ereport "42809" "operation on read-only view \"~a\" is not supported"
+               (pg-class-name table)))
     table))
 
 (defun resolve-table-or-error (name)

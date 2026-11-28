@@ -23,10 +23,16 @@
     (when *sql-open-iterators* (setf (gethash iterator *sql-open-iterators*) t))
     iterator))
 
-(defun sql-iterator-next (iterator)
-  (check-for-interrupts)
+(declaim (inline sql-iterator-next-after-poll))
+
+(defun sql-iterator-next-after-poll (iterator)
+  "Forward a pull from a wrapper that already checked for interrupts."
   (unless (sql-iterator-closed-p iterator)
     (funcall (sql-iterator-next-function iterator))))
+
+(defun sql-iterator-next (iterator)
+  (check-for-interrupts)
+  (sql-iterator-next-after-poll iterator))
 
 (defun close-sql-iterator (iterator)
   (sb-sys:without-interrupts
@@ -65,7 +71,9 @@
 (defstruct (query-replay-store (:constructor %make-query-replay-store))
   ;; Capture flags describe the spool layout.  An adopted RETURNING spool has
   ;; raw rows and must not be decoded as a metadata-bearing spool.
-  producer spool eof-p readers closed-p capture-origins-p capture-presence-p
+  producer spool eof-p readers closed-p
+  (capture-origins-p nil :read-only t)
+  (capture-presence-p nil :read-only t)
   (memory-rows (make-array 0 :adjustable t :fill-pointer 0)))
 
 (defun combine-query-row-presence (left right)
@@ -180,14 +188,19 @@ ownership is claimed, close the newly created store."
         (setf (query-replay-store-memory-rows store) nil)
         (vector-push-extend copy (query-replay-store-memory-rows store)))))
 
-(defun make-query-replay-reader (store &key candidate-p)
+(defun make-query-replay-reader (store &key candidate-p rewind-memory-p)
   "Read owned rows. CANDIDATE-P may inspect, but must not retain or modify,
 the borrowed row before copying it. A rejected row advances the position and
 returns NIL with PRESENT-P true, preserving its ordinal for callers tracking
-matches across replays."
+matches across replays. :COUNT-MATCH returns an empty vector without copying the row.
+With REWIND-MEMORY-P, also return a function that
+rewinds a fully cached reader and reports whether reuse was possible."
   ;; Each reader keeps its own position and input stream. Closing a reader
   ;; releases that stream; closing the store also closes every live reader.
-  (let ((index 0) (input nil) (offset nil) (reader nil))
+  (let* ((index 0) (input nil) (offset nil) (reader nil)
+                   (capture-origins-p (query-replay-store-capture-origins-p store))
+                   (capture-presence-p (query-replay-store-capture-presence-p store))
+                   (metadata-p (or capture-origins-p capture-presence-p)))
     (setf reader
           (make-sql-iterator
            (lambda ()
@@ -224,21 +237,28 @@ matches across replays."
                                        (setf offset (file-position input))))))
                              (aref (query-replay-store-memory-rows store) index))))
                    (incf index)
-                   (let* ((metadata (or (query-replay-store-capture-origins-p store)
-                                        (query-replay-store-capture-presence-p store)))
-                          (row (if metadata (first value) value))
-                          (disk-p (query-row-spool-pathname spool)))
-                     (if (and candidate-p (not (funcall candidate-p row)))
-                         (values nil t)
-                         (values (if disk-p row (copy-query-sort-value row)) t
-                                 (when (and metadata (query-replay-store-capture-origins-p store))
-                                   (datum-origins-from-spill (second value)))
-                                 nil
-                                 (when (and metadata (query-replay-store-capture-presence-p store))
-                                   (if disk-p (third value) (copy-query-sort-value (third value)))))))))))
+                   (let ((row (if metadata-p (first value) value))
+                         (disk-p (query-row-spool-pathname spool)))
+                     (case (if candidate-p (funcall candidate-p row) t)
+                       ((nil) (values nil t))
+                       (:count-match (values #() t))
+                       (otherwise
+                        (values (if disk-p row (copy-query-sort-value row)) t
+                                (when capture-origins-p
+                                  (datum-origins-from-spill (second value)))
+                                nil
+                                (when capture-presence-p
+                                  (if disk-p (third value) (copy-query-sort-value (third value))))))))))))
            (lambda ()
              (when input (finish-query-temp-stream input nil))
              (setf (query-replay-store-readers store)
                    (delete reader (query-replay-store-readers store) :test #'eq)))))
     (push reader (query-replay-store-readers store))
-    reader))
+    (if rewind-memory-p
+        (values reader
+                (lambda ()
+                  (when (and (query-replay-store-eof-p store)
+                             (not (query-row-spool-pathname (query-replay-store-spool store))))
+                    (setf index 0)
+                    t)))
+        reader)))

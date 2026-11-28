@@ -47,37 +47,50 @@ preceding segment. STATE must already have verified recovery provenance."
 (defun physical-recovery-wal-prefix-under-lock (store cursor)
   "Reconstruct a complete final-segment prefix from authenticated anchors and records.
 The caller owns admission/quiescence and STORE's mutex at an applied terminal.
-NIL means a legacy compacted image lacks its pre-floor proof; #() is known empty.
-No raw pre-floor spool bytes are trusted, and no data or receive state is changed."
-  (let* ((state *physical-recovery-state*) (floor (physical-store-floor-lsn store))
-                                           (segment (floor cursor +wal-segment-size+)) (offset (mod cursor +wal-segment-size+))
-                                           (same-segment (= segment (floor floor +wal-segment-size+)))
-                                           (covered (if same-segment (mod floor +wal-segment-size+) 0))
-                                           (prefix (make-array offset :element-type '(unsigned-byte 8)))
-                                           (anchor (when (plusp covered) (physical-recovery-prefix-anchor store cursor)))
-                                           (available (or (zerop covered) anchor)))
+An exact anchor may be returned as read-only bytes. NIL means a legacy compacted
+image lacks its pre-floor proof; #() is known empty. Do not trust raw pre-floor
+spool bytes or change the receive state."
+  (let* ((state *physical-recovery-state*)
+         (floor (physical-store-floor-lsn store))
+         (segment (floor cursor +wal-segment-size+))
+         (offset (mod cursor +wal-segment-size+))
+         (same-segment (= segment (floor floor +wal-segment-size+)))
+         (covered (if same-segment (mod floor +wal-segment-size+) 0)))
     (unless (and (typep cursor '(unsigned-byte 64))
                  (<= floor cursor (physical-store-flushed-lsn store))
                  (= (physical-store-system-id store) (getf state :system-id))
                  (= (physical-store-timeline store) (getf state :timeline))
                  (= (physical-store-base-lsn store) (getf state :end)))
       (error "WAL prefix does not belong to current recovery progress"))
-    (when anchor (replace prefix anchor :end1 covered :end2 covered))
-    (let ((digest
-            (nth-value 1
-                       (physical-store-validate-prefix
-                        store :digest-cursor cursor
-                        :on-record
-                        (lambda (record raw)
-                          (when (and (= segment (floor (wal-record-start record) +wal-segment-size+))
-                                     (<= (wal-record-end record) cursor))
-                            (unless (= covered (mod (wal-record-start record) +wal-segment-size+))
-                              (error "noncontiguous applied WAL prefix"))
-                            (when available (replace prefix raw :start1 covered))
-                            (incf covered (length raw))))))))
-      (unless (and digest (= covered offset))
-        (error "applied WAL prefix lacks an exact durable boundary")))
-    (when available prefix)))
+    (let* ((anchor (when (plusp covered)
+                     (physical-recovery-prefix-anchor store cursor)))
+           (prefix (cond ((and anchor (= (length anchor) offset)) anchor)
+                         ((or anchor (zerop covered))
+                          (make-array offset :element-type '(unsigned-byte 8))))))
+      (when (and anchor (not (eq anchor prefix)))
+        (replace prefix anchor :end1 covered :end2 covered))
+      (let ((digest
+              (nth-value 1
+                         (physical-store-validate-prefix
+                          store :digest-cursor cursor
+                          :on-record
+                          (lambda (record raw)
+                            (when (and (= segment (floor (wal-record-start record) +wal-segment-size+))
+                                       (<= (wal-record-end record) cursor))
+                              (unless (= covered (mod (wal-record-start record) +wal-segment-size+))
+                                (error "noncontiguous applied WAL prefix"))
+                              (when (and anchor (eq prefix anchor)
+                                         (mismatch raw anchor :start2 covered
+                                                              :end2 (+ covered (length raw))))
+                                ;; The receive spool remains authoritative after the floor.
+                                (setf prefix (make-array offset :element-type '(unsigned-byte 8)))
+                                (replace prefix anchor :end1 covered :end2 covered))
+                              (when (and prefix (not (eq prefix anchor)))
+                                (replace prefix raw :start1 covered))
+                              (incf covered (length raw))))))))
+        (unless (and digest (= covered offset))
+          (error "applied WAL prefix lacks an exact durable boundary")))
+      prefix)))
 
 (defun physical-restartpoint-check-wal-prefix (metadata bytes)
   "Bind an optional captured prefix to the selected generation's exact boundary."

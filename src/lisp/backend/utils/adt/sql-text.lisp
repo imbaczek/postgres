@@ -58,7 +58,7 @@
       (when (> (logical-utf8-size stream) (sql-array-jsonb-count-limit stream))
         (ereport "54000" "array output exceeds maximum size")))))
 
-(defun sql-array-output (array)
+(defun sql-array-output (array &optional (render-element #'value->text))
   "Render an array while enforcing the PostgreSQL varlena output bound."
   (let ((elements (sql-array-elements array))
         (element-type (sql-array-element-type-id array))
@@ -98,7 +98,7 @@
                                            (+ 2 (* 2 (length value))))))
                              (when (> (+ used size) *sql-array-output-max-bytes*)
                                (ereport "54000" "array output exceeds maximum size")))))
-                       (let* ((text (value->text value element-type))
+                       (let* ((text (funcall render-element value element-type))
                               (quote-p (or (zerop (length text)) (string-equal text "NULL")))
                               (escapes 0))
                          (loop for character across text for index from 0

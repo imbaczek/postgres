@@ -258,10 +258,10 @@
                                         (where-conjuncts (getf prepared :where)))))
               (when quals
                 (setf (getf relation :cte-filter)
-                      (substitute-cte-output-columns
+                      (substitute-query-output-columns
                        (reduce (lambda (left right) (list :and left right :type :bool :typmod -1))
                                (rest quals) :initial-value (first quals))
-                       relation)))))
+                       relation (getf body :targets))))))
           (let* ((tree (copy-tree (cte-reference-producer-tree
                                    (query-plan-physical (sql-cte-plan definition))
                                    (getf relation :cte-filter))))

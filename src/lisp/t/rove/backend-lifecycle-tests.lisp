@@ -607,6 +607,273 @@
                            (pg-error (condition) (pg-error-sqlstate condition)))))
          (rove:ok (eq :idle (backend-state *backend*)))))))
 
+(rove:deftest view-ddl-parsing-preserves-query-source
+    (destructuring-bind (create replace drop)
+        (parse-statements
+         "CREATE VIEW public.v (a) AS SELECT 1 /* retained */;
+CREATE OR REPLACE VIEW v AS WITH x AS (SELECT 2) SELECT * FROM x;
+DROP VIEW IF EXISTS v, w CASCADE")
+      (rove:ok (eq :create-view (getf create :type)))
+      (rove:ok (equal "public" (sql-relation-name-schema (getf create :name))))
+      (rove:ok (equal "v" (sql-relation-name-name (getf create :name))))
+      (rove:ok (equal '("a") (getf create :aliases)))
+      (rove:ok (equal "SELECT 1 /* retained */" (getf create :source)))
+      (rove:ok (eq :select (getf (getf replace :query) :type)))
+      (rove:ok (getf replace :replace))
+      (rove:ok (equal '(:type :drop-view :names ("v" "w") :if-exists t :cascade t)
+                      drop))))
+
+(rove:deftest stored-view-relation-reference-resolves-by-oid
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "view_test"))
+           (database (make-database :oid 80 :name "view_test"))
+           (original (make-pg-class
+                      :oid 81 :name "renamed" :relfilenode 91
+                      :columns (vector (make-pg-column :name "renamed_column" :attnum 1 :type :int4)
+                                       (make-pg-column :name "added_column" :attnum 2 :type :int4))))
+           (replacement (make-pg-class :oid 82 :name "original" :columns #() :relfilenode 92))
+           (definition
+             (make-pg-view-definition
+              :query (list :type :select :from
+                           (make-sql-derived-relation
+                            :query (list :type :select :from
+                                         (make-view-relation-reference :oid 81 :name "original"
+                                                                       :attributes '((1 "old_column"))))))
+              :source "SELECT * FROM (SELECT * FROM original) AS nested"
+              :dependencies '((81))))
+           (restored (view-definition-from-sexp (view-definition-to-sexp definition)))
+           (derived (getf (pg-view-definition-query restored) :from))
+           (reference (getf (sql-derived-relation-query derived) :from)))
+      (setf (gethash "view_test" (catalog-databases *catalog*)) database
+            (gethash "renamed" (database-tables database)) original
+            (gethash "original" (database-tables database)) replacement)
+      (let ((source (prepare-select-source reference nil 0)))
+        (rove:ok (eq original (getf source :table)))
+        (rove:ok (equal "original" (getf source :name)))
+        (rove:ok (= 2 (getf source :width)))
+        (let ((columns (select-relation-columns (select-source-scope-relation source))))
+          (rove:ok (equal '("old_column") (mapcar #'select-column-name columns)))
+          (rove:ok (equal '(1) (mapcar #'select-column-attnum columns)))))))
+
+(rove:deftest nested-stored-view-expansion-and-cycle-detection
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "view_test"))
+           (database (make-database :oid 80 :name "view_test")))
+      (setf (gethash "view_test" (catalog-databases *catalog*)) database)
+      (flet ((install-view (oid name sql)
+               (multiple-value-bind (prepared bound)
+                   (analyze-view-query (first (parse-statements sql)))
+                 (declare (ignore prepared))
+                 (setf (gethash name (database-tables database))
+                       (make-pg-class
+                        :oid oid :name name
+                        :columns (vector (make-pg-column :name "a" :attnum 1 :type :int4))
+                        :view-definition (make-pg-view-definition :query bound :source sql))))))
+        (install-view 81 "inner_view" "SELECT 42")
+        (install-view 82 "outer_view" "SELECT a FROM inner_view")
+        (let* ((query (first (parse-statements
+                              "WITH inner_view AS (SELECT 0 AS a) SELECT a FROM outer_view")))
+               (prepared (prepare-select query))
+               (outer (first (getf prepared :relations)))
+               (inner (first (getf (getf outer :subquery-prepared) :relations))))
+          (rove:ok (= 82 (pg-class-oid (getf outer :table))))
+          (rove:ok (= 81 (pg-class-oid (getf inner :table))))
+          (rove:ok (equal "a" (getf (first (getf prepared :targets)) :name))))
+        (install-view 81 "inner_view" "SELECT a FROM outer_view")
+        (rove:ok (equal "42P17"
+                        (handler-case
+                            (progn (prepare-select (first (parse-statements "SELECT * FROM outer_view")))
+                                   nil)
+                          (pg-error (condition) (pg-error-sqlstate condition))))))))
+
+(rove:deftest view-catalog-entries-are-skipped-by-heap-maintenance
+    (let* ((*catalog* (make-catalog))
+           (*physical-replay-seen-relfilenodes* (make-hash-table :test #'eql))
+           (database (make-database :name "view_test" :oid 80))
+           (view (make-pg-class :name "v" :oid 81 :columns #()
+                                :view-definition (make-pg-view-definition
+                                                  :query '(:type :select)))))
+      (setf (gethash "view_test" (catalog-databases *catalog*)) database
+            (gethash "v" (database-tables database)) view)
+      (physical-replay-create-heap-forks *catalog*)
+      (vacuum-all-relations-for-xid-wraparound 100)
+      (rove:ok (zerop (hash-table-count *physical-replay-seen-relfilenodes*)))
+      (rove:ok (eq view (gethash "v" (database-tables database))))))
+
+(rove:deftest view-definition-captures-attribute-dependencies
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "view_test"))
+           (database (make-database :oid 80 :name "view_test"))
+           (base (make-pg-class :oid 81 :name "base" :relfilenode 91
+                                :columns (vector
+                                          (make-pg-column :name "a" :attnum 1 :type :int4)
+                                          (make-pg-column :name "b" :attnum 2 :type :int4)
+                                          (make-pg-column :name "c" :attnum 3 :type :int4)))))
+      (setf (gethash "view_test" (catalog-databases *catalog*)) database
+            (gethash "base" (database-tables database)) base)
+      (multiple-value-bind (prepared bound dependencies attributes)
+          (analyze-view-query
+           (first (parse-statements "SELECT a FROM base WHERE EXISTS (SELECT 1 WHERE base.b > 0)")))
+        (declare (ignore prepared bound))
+        (rove:ok (equal '(81) dependencies))
+        (rove:ok (equal '((81 1) (81 2)) attributes)))))
+
+(rove:deftest page-visibility-cache-does-not-hide-tuple-state
+    (dolist (base '(0 #xf0000000))
+      (let* ((*next-xid* (+ base 110))
+             (columns (vector (make-pg-column :type :int4)))
+             (snapshot (make-snapshot-struct :xmin (+ base 100) :xmax *next-xid* :curcid 2))
+             (delete-xid (+ base 105))
+             (insert (form-heap-tuple #(7) columns +frozen-xid+ 0 0 0 1))
+             (invalid (copy-seq insert))
+             (deleted (form-heap-tuple #(7) columns +frozen-xid+ delete-xid 1 0 1))
+             (width (length insert)))
+        (page-set-u16 invalid +heap-tuple-infomask-off+ +heap-xmin-invalid+)
+        (let* ((page (concatenate '(vector (unsigned-byte 8)) insert invalid deleted))
+               (reader (make-heap-page-visibility-reader page snapshot)))
+          (rove:ok (funcall reader 0 nil))
+          (rove:ok (funcall reader 0 nil))
+          (rove:ok (null (funcall reader width nil)))
+          (rove:ok (null (funcall reader (* 2 width) delete-xid)))
+          (let ((*next-xid* (1+ *next-xid*)))
+            (rove:ok (funcall reader 0 nil)))))))
+
+(rove:deftest inline-text-projection-reads-canonical-join-key
+    (dolist (layout '(((:int4 :varchar) 1 0 -17 -17)
+                      ((:varchar :int8) 0 1 -9223372036854775808 -9223372036854775808)
+                      ((:int4 :varchar :int2 :int8) 1 3 -23 -23)
+                      ((:varchar :text :int4) 0 2 -17 nil)))
+      (destructuring-bind (types text-slot key-slot key expected) layout
+        (let* ((columns (map 'vector (lambda (type) (make-pg-column :type type)) types))
+               (predicate (make-inline-text-page-predicate columns text-slot (constantly t)))
+               (key-reader (make-inline-text-key-reader columns text-slot key-slot))
+               (row (map 'vector (lambda (type) (if (eq type :text) "middle" 7)) types)))
+          (setf (aref row key-slot) key)
+          (dolist (length '(0 1 2 7 8 126 127))
+            (setf (aref row text-slot) (make-string length :initial-element #\a))
+            (let* ((tuple (form-heap-tuple row columns +frozen-xid+ 0 0 0 1))
+                   (page (concatenate '(vector (unsigned-byte 8)) #(1 2 3) tuple)))
+              (multiple-value-bind (matched handled)
+                  (funcall predicate page 3 (length page)
+                           (page-u16 tuple +heap-tuple-infomask-off+))
+                (rove:ok matched)
+                (rove:ok handled)
+                (rove:ok (eql expected (and key-reader
+                                            (aref (funcall key-reader page 3 (length page))
+                                                  key-slot)))))))))))
+
+(rove:deftest page-filter-match-decodes-the-integer-join-key
+    (dolist (payload-type '(:int8 :varchar))
+      (let* ((columns (vector (make-pg-column :name "payload" :attnum 1 :type payload-type)
+                              (make-pg-column :name "key" :attnum 2 :type :int4)))
+             (payload (if (eq payload-type :varchar) (make-string 127 :initial-element #\p)
+                          (- (ash 1 63))))
+             (layout (make-fixed-heap-row-layout columns)))
+        (dolist (key (if layout (list -17) (list -17 +null+)))
+          (let* ((tuple (form-heap-tuple (vector payload key) columns +frozen-xid+ 0 0 0 1))
+                 (page (concatenate '(vector (unsigned-byte 8)) #(1 2 3) tuple))
+                 (projected (decode-page-filter-match page columns 3 (length page) layout 1))
+                 (full (decode-page-filter-match page columns 3 (length page) layout nil)))
+            (rove:ok (eql key (aref projected 1)))
+            (rove:ok (eq +null+ (aref projected 0)))
+            (rove:ok (equalp payload (aref full 0)))
+            (rove:ok (eql key (aref full 1))))))))
+
+(rove:deftest scalar-column-filter-matches-expression-evaluation
+    (dolist (operator '("=" "<>" "<" "<=" ">" ">="))
+      (dolist (reversed-p '(nil t))
+        (dolist (constant '(7 :null))
+          (let* ((column '(:col 2 :type :int8))
+                 (literal (list :const (if (eq constant :null) +null+ constant) :type :int4))
+                 (expression (list :binop operator
+                                   (if reversed-p literal column) (if reversed-p column literal)
+                                   :type :bool :typmod -1))
+                 (filter (make-scalar-column-comparison-filter expression)))
+            (rove:ok filter)
+            (dolist (value '(5 7 9 :null))
+              (let ((row (vector 0 (if (eq value :null) +null+ value))))
+                (rove:ok (eql (funcall filter row)
+                              (true-p (eval-expr expression row)))))))))))
+
+(rove:deftest view-filter-pushdown-respects-limit-and-outer-joins
+    (let* ((*catalog* (make-catalog))
+           (*backend* (make-backend :database "view_test"))
+           (database (make-database :name "view_test" :oid 80))
+           (columns (vector (make-pg-column :name "a" :attnum 1 :type :int4)))
+           (base (make-pg-class :oid 81 :name "base" :columns columns :relfilenode 91)))
+      (setf (gethash "view_test" (catalog-databases *catalog*)) database
+            (gethash "base" (database-tables database)) base)
+      (flet ((install-view (oid name sql)
+               (multiple-value-bind (prepared query)
+                   (analyze-view-query (first (parse-statements sql)))
+                 (declare (ignore prepared))
+                 (setf (gethash name (database-tables database))
+                       (make-pg-class :oid oid :name name :columns columns
+                                      :view-definition (make-pg-view-definition :query query))))))
+        (install-view 82 "v" "SELECT a FROM base")
+        (install-view 83 "limited" "SELECT a FROM base LIMIT 1"))
+      (flet ((pushed-qual (sql name)
+               (let* ((prepared (prepare-select (first (parse-statements sql))))
+                      (view (find name (getf prepared :relations)
+                                  :key (lambda (source) (getf source :name)) :test #'equal)))
+                 (push-view-reference-filters prepared)
+                 (values (getf (getf view :subquery-prepared) :where)
+                         (getf prepared :where)))))
+        (multiple-value-bind (inner outer)
+            (pushed-qual "SELECT * FROM v WHERE a = 3" "v")
+          (rove:ok (eq :binop (first inner)))
+          (rove:ok (= 81 (getf (cddr (third inner)) :table-oid)))
+          (rove:ok (null outer)))
+        (rove:ok (null (pushed-qual "SELECT * FROM limited WHERE a = 3" "limited")))
+        (rove:ok (null (pushed-qual
+                        "SELECT base.a FROM base LEFT JOIN v ON base.a = v.a WHERE v.a = 3"
+                        "v"))))))
+
+(rove:deftest suspended-view-portal-retains-admitted-definition
+    (call-with-select-portal-test
+     (lambda (stream)
+       (let* ((*catalog* (make-catalog))
+              (database (make-database :name "view_test" :oid 80))
+              (columns (vector (make-pg-column :name "a" :attnum 1 :type :int4))))
+         (setf (backend-database *backend*) "view_test"
+               (gethash "view_test" (catalog-databases *catalog*)) database)
+         (flet ((make-definition (sql)
+                  (make-pg-class
+                   :oid 81 :name "v" :columns columns
+                   :view-definition (make-pg-view-definition
+                                     :query (first (parse-statements sql)) :source sql))))
+           (let ((original (make-definition "SELECT 1 AS a UNION ALL SELECT 2"))
+                 (replacement (make-definition "SELECT 9 AS a")))
+             (setf (gethash "v" (database-tables database)) original)
+             (extended-apply-operation stream '(:parse "s" "SELECT a FROM v" ()) #())
+             (extended-apply-operation stream '(:bind "held" "s" () () ()) #())
+             (extended-apply-operation stream '(:execute "held" 1) #())
+             (sb-thread:join-thread
+              (sb-thread:make-thread
+               (lambda ()
+                 (with-write-lock
+                   (setf (gethash "v" (database-tables database)) replacement)))))
+             (let* ((portal (gethash "held" (extended-query-state-portals *extended-query-state*)))
+                    (execution (extended-select-execution-for portal))
+                    (plan (extended-select-execution-plan execution)))
+               (rove:ok (equal "42P01"
+                               (handler-case
+                                   (progn
+                                     (with-write-lock
+                                       (revalidate-select-relations
+                                        (getf (query-plan-prepared plan) :relations)))
+                                     nil)
+                                 (pg-error (condition) (pg-error-sqlstate condition))))))
+             (extended-apply-operation stream '(:execute "held" 0) #())
+             (extended-apply-operation stream '(:bind "fresh" "s" () () ()) #())
+             (extended-apply-operation stream '(:execute "fresh" 0) #())
+             (let ((frames (select-portal-test-frames stream)))
+               (rove:ok (find #\s frames :key #'car))
+               (rove:ok (equal '(#\1 #\2 #\9)
+                               (loop for (type . payload) in frames
+                                     when (char= type #\D)
+                                       collect (code-char (aref payload (1- (length payload))))))))))))))
+
 (rove:deftest select-portal-implicit-sync-retires-owner
     (call-with-select-portal-test
      (lambda (stream)
@@ -1303,6 +1570,23 @@
               (pg-error (condition) condition)))
       (rove:ok (null unexpected)
                "the queued interrupt does not deliver a second FATAL")))
+
+(rove:deftest backend-interrupt-check-preserves-latched-failure-priority
+    (let* ((*backend* (make-backend :termination-pending t :cancel-pending t
+                                    :statement-deadline 0
+                                    :frontend-output-suppressed-reason :unconfirmed))
+           (*physical-slot-cold-cleanup-owner* *backend*))
+      (flet ((sqlstate ()
+               (handler-case (progn (check-for-interrupts) nil)
+                 (pg-error (condition) (pg-error-sqlstate condition)))))
+        (rove:ok (null (sqlstate)) "cold cleanup retains the pending interrupts")
+        (let ((*physical-slot-cold-cleanup-owner* nil))
+          (setf (backend-wal-failure *backend*) (make-condition 'simple-error))
+          (rove:ok (null (sqlstate)) "a latched WAL failure takes precedence")
+          (setf (backend-wal-failure *backend*) nil)
+          (rove:ok (equal "08006" (sqlstate)) "frontend suppression takes precedence")
+          (rove:ok (backend-termination-pending *backend*))
+          (rove:ok (backend-cancel-pending *backend*))))))
 
 (rove:deftest backend-termination-is-checked-before-reload-admission
     (dolist (entry '(wait-for-live-operation-admission try-enter-live-operation))

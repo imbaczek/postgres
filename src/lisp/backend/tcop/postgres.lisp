@@ -251,7 +251,7 @@ Capture the replication source identity for later sender registration."
 (defun query-string (message)
   (let* ((payload (frontend-message-payload message))
          (end (or (position 0 payload) (length payload))))
-    (bytes->string payload :start 0 :end end)))
+    (bytes->string payload :start 0 :end end :compact-ascii-p t)))
 
 (defun transaction-ending-statement-p (statement)
   (member (getf statement :type) '(:commit :rollback)))

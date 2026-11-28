@@ -35,11 +35,12 @@
 (defun string->bytes (string)
   (sb-ext:string-to-octets string :external-format :utf-8))
 
-(defun bytes->string (bytes &key (start 0) (end (length bytes)))
+(defun bytes->string (bytes &key (start 0) (end (length bytes)) compact-ascii-p)
   "Decode UTF-8 from the byte span [START, END) into a new string.
 BYTES must remain stable during decoding; the returned string owns its contents.
 A validated simple octet span uses the fast path only when all bytes are ASCII.
-Other inputs, including invalid spans, go through the SBCL UTF-8 decoder."
+Other inputs, including invalid spans, go through the SBCL UTF-8 decoder.
+COMPACT-ASCII-P stores verified ASCII in a base string for callers that accept it."
   (when (and (typep bytes '(simple-array (unsigned-byte 8) (*)))
              (typep start 'fixnum)
              (or (null end) (typep end 'fixnum)))
@@ -48,7 +49,8 @@ Other inputs, including invalid spans, go through the SBCL UTF-8 decoder."
                  (%octet-span-ascii-p bytes start limit))
         (return-from bytes->string
           (%octet-span-copy-ascii bytes start limit
-                                  (make-string (- limit start) :element-type 'character))))))
+                                  (make-string (- limit start) :element-type
+                                               (if compact-ascii-p 'base-char 'character)))))))
   (sb-ext:octets-to-string bytes :start start :end end :external-format :utf-8))
 
 ;;; ---- reading ----

@@ -361,14 +361,14 @@
               (otherwise (cte-volatile-call-p node))))
           form))))
 
-(defun substitute-cte-output-columns (form relation)
+(defun substitute-query-output-columns (form relation targets)
+  "Replace reference-local Vars with the producing query's target expressions."
   (cond ((atom form) form)
         ((eq (first form) :col)
-         (copy-tree (getf (nth (- (second form) (getf relation :offset) 1)
-                               (getf (sql-cte-prepared (getf relation :cte)) :targets))
+         (copy-tree (getf (nth (- (second form) (getf relation :offset) 1) targets)
                           :expr)))
         (t (map-local-expression-operands
-            (lambda (operand) (substitute-cte-output-columns operand relation)) form))))
+            (lambda (operand) (substitute-query-output-columns operand relation targets)) form))))
 
 (defun cte-reference-producer-tree (tree qual)
   (cond ((null qual) tree)

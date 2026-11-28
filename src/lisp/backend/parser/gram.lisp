@@ -193,6 +193,13 @@ Range and negative checks occur when the LIMIT executes."
       (let* ((start (sql-parser-pos p))
              (*statement-structural-tokens* (when collect-statement-text-p '(nil)))
              (statement (parse-statement p)))
+        (when (eq (getf statement :type) :create-view)
+          (let ((from (token-pos (nth (getf statement :view-query-start) tokens)))
+                (through (token-pos (nth (sql-parser-pos p) tokens))))
+            (remf statement :view-query-start)
+            (setf (getf statement :source)
+                  (string-right-trim '(#\Space #\Tab #\Newline #\Return)
+                                     (subseq sql from through)))))
         (when (and collect-statement-text-p
                    (member (getf statement :type) '(:select :insert :update :delete)))
           (let ((statement-tokens (nthcdr start tokens))
@@ -864,12 +871,53 @@ Range and negative checks occur when the LIMIT executes."
                (push (cons attribute value) options)))
     (list :type type :name name :options (nreverse options))))
 
+(defun parse-view-name (p)
+  (let ((name (pident p)))
+    (if (match-punct p #\.)
+        (make-sql-relation-name :schema name :name (pident p))
+        name)))
+
+(defun parse-view-reference-text (name)
+  "Read the identifier syntax accepted by the name-based view inspection functions."
+  (handler-case
+      (let* ((parser (make-sql-parser :tokens (tokenize name)))
+             (reference (parse-view-name parser)))
+        (unless (at-eof-p parser)
+          (syntax-error parser "expected end of relation name"))
+        reference)
+    (pg-error ()
+      (ereport "42602" "invalid relation name ~s" name))))
+
+(defun parse-create-view (p replace-p)
+  (let* ((name (parse-view-name p))
+         (aliases (when (punct-p p #\()
+                    (with-parens (p) (parse-ident-list p)))))
+    (expect-kw p "as")
+    (let ((start (sql-parser-pos p)))
+      (list :type :create-view :name name :replace replace-p :aliases aliases
+            :query (parse-select-expression p) :view-query-start start))))
+
+(defun parse-drop-view (p)
+  (let* ((if-exists (when (match-kw p "if")
+                      (expect-kw p "exists")
+                      t))
+         (names (loop collect (parse-view-name p)
+                      while (match-punct p #\,)))
+         (cascade (match-kw p "cascade")))
+    (unless cascade (match-kw p "restrict"))
+    (list :type :drop-view :names names :if-exists if-exists :cascade cascade)))
+
 (defun parse-create (p)
   (cond
     ((match-kw p "role") (parse-role-options p :create-role))
     ((match-kw p "sequence") (parse-create-sequence p))
     ((match-kw p "publication") (parse-create-publication p))
     ((match-kw p "table") (parse-create-table p))
+    ((match-kw p "view") (parse-create-view p nil))
+    ((match-kw p "or")
+     (expect-kw p "replace")
+     (expect-kw p "view")
+     (parse-create-view p t))
     ((match-kw p "unique")
      (expect-kw p "index")
      (parse-create-index p t))
@@ -1383,6 +1431,7 @@ Range and negative checks occur when the LIMIT executes."
 
 (defun parse-drop (p)
   (cond
+    ((match-kw p "view") (parse-drop-view p))
     ((match-kw p "publication")
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")
@@ -1403,11 +1452,12 @@ Range and negative checks occur when the LIMIT executes."
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")
                         t)))
-       (let ((names (loop collect (parse-mutation-relation-identifier p)
-                          while (match-punct p #\,))))
-         (match-kw p "cascade")
-         (match-kw p "restrict")
-         (list :type :drop-table :names names :if-exists if-exists))))
+       (let* ((names (loop collect (parse-mutation-relation-identifier p)
+                           while (match-punct p #\,)))
+              (cascade (match-kw p "cascade")))
+         (unless cascade (match-kw p "restrict"))
+         (list* :type :drop-table :names names :if-exists if-exists
+                (when cascade (list :cascade t))))))
     ((match-kw p "index")
      (let* ((concurrently (match-kw p "concurrently"))
             (if-exists (when (match-kw p "if")
@@ -1422,8 +1472,8 @@ Range and negative checks occur when the LIMIT executes."
            (ereport "0A000" "DROP INDEX CONCURRENTLY does not support dropping multiple objects"))
          (when cascade
            (ereport "0A000" "DROP INDEX CONCURRENTLY does not support CASCADE")))
-       (list :type :drop-index :names names :if-exists if-exists
-             :concurrently concurrently)))
+       (list* :type :drop-index :names names :if-exists if-exists
+              :concurrently concurrently (when cascade (list :cascade t)))))
     (t
      (ereport "0A000" "unsupported DROP statement"))))
 

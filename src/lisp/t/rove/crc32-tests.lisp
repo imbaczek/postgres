@@ -56,6 +56,43 @@
   (progv '(*wal-crc32-table*) nil
     (rove:ok (zerop (wal-crc32 (make-array 0 :element-type '(unsigned-byte 8)))))))
 
+(rove:deftest crc32-can-continue-from-a-prefix
+    (let* ((bytes (make-array 512 :element-type '(unsigned-byte 8)
+                                  :initial-contents (loop for i below 512 collect (mod (* i 19) 256))))
+           (displaced (make-array 512 :element-type '(unsigned-byte 8) :displaced-to bytes))
+           (expected (wal-crc32 bytes)))
+      (dolist (input (list bytes displaced))
+        (dolist (split '(0 31 64 129 480 512))
+          (let ((raw (logxor #xffffffff (wal-crc32 input 0 split))))
+            (rove:ok (= expected (wal-crc32 input split (length input) raw))))))))
+
+(rove:deftest retained-wal-envelope-can-borrow-stable-payload
+    (let* ((magic #(80 71 82 69 88 84 48 49))
+           (payload (make-array 4 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(4 1 0 7)))
+           (image (physical-retained-envelope-encode magic '(:test 1) payload)))
+      (multiple-value-bind (metadata owned) (physical-retained-envelope-decode magic image)
+        (multiple-value-bind (borrowed-metadata borrowed)
+            (physical-retained-envelope-decode magic image :borrow-image-p t)
+          (rove:ok (equal metadata borrowed-metadata))
+          (rove:ok (and (equalp owned payload) (equalp borrowed payload)))
+          (rove:ok (null (array-displacement owned)))
+          (rove:ok (eq image (array-displacement borrowed)))))))
+
+(rove:deftest wal-record-decoder-can-borrow-stable-payload
+    (let* ((payload (make-array 3 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(11 0 255)))
+           (bytes (wal-encode-record +wal-record-pages+ 7 42 payload))
+           (owned (wal-record-payload (wal-decode-record bytes 42)))
+           (borrowed (wal-record-payload
+                      (wal-decode-record bytes 42 :borrow-payload-p t))))
+      (rove:ok (equalp owned payload))
+      (rove:ok (equalp borrowed payload))
+      (rove:ok (null (array-displacement owned)))
+      (multiple-value-bind (underlying offset) (array-displacement borrowed)
+        (rove:ok (eq underlying bytes))
+        (rove:ok (= offset +wal-header-size+)))))
+
 (rove:deftest crc32-preserves-generic-ranges-and-table-bindings
     (flet ((outcome (function bytes start end)
              (handler-case (list :value (funcall function bytes start end))

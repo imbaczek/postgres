@@ -14,7 +14,13 @@ def main():
     parser.add_argument("output", type=Path, help="New directory for the core, FASLs, and launcher")
     parser.add_argument("--sbcl", default=os.environ.get("SBCL", "sbcl"),
                         help="SBCL executable, preferably with a compact dynamic-space build")
+    parser.add_argument("--heap-mib", type=int, default=72,
+                        help="Dynamic-space limit in MiB for the launcher (default: 72)")
+    parser.add_argument("--gc-threshold-kib", type=int, default=7 * 1024,
+                        help="Allocation threshold between collections in KiB (default: 7168)")
     args = parser.parse_args()
+    if args.heap_mib < 1 or args.gc_threshold_kib < 1:
+        parser.error("heap size and GC threshold must be positive")
     executable = shutil.which(args.sbcl)
     if not executable:
         parser.error(f"SBCL executable {args.sbcl!r} was not found")
@@ -55,9 +61,9 @@ def main():
         + f"core={shlex.quote(str(output / 'pg.core'))}\n"
         + 'if [ "${1-}" = --script ] && [ "${2##*/}" = boot.lisp ]; then\n'
         + "  shift 2\n"
-        + '  exec "$runtime" --core "$core" --dynamic-space-size 72 --noinform \\\n'
+        + f'  exec "$runtime" --core "$core" --dynamic-space-size {args.heap_mib} --noinform \\\n'
         + "    --no-sysinit --no-userinit --non-interactive \\\n"
-        + "    --eval '(setf (sb-ext:bytes-consed-between-gcs) (* 7 1024 1024))' \\\n"
+        + f"    --eval '(setf (sb-ext:bytes-consed-between-gcs) {args.gc_threshold_kib * 1024})' \\\n"
         + "    --eval '(pg:main)' --end-toplevel-options \"$@\"\n"
         + "fi\n"
         + 'exec "$runtime" "$@"\n'

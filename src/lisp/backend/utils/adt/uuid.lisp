@@ -13,9 +13,12 @@
   "Read one UUID from SOURCE without retaining the input buffer."
   (unless (<= 0 start (+ start +sql-uuid-size+) (length source))
     (error "invalid UUID byte range"))
-  (let ((bytes (make-array +sql-uuid-size+ :element-type '(unsigned-byte 8))))
-    (replace bytes source :start2 start :end2 (+ start +sql-uuid-size+))
-    (%make-sql-uuid bytes)))
+  (%make-sql-uuid
+   (if (typep source '(simple-array (unsigned-byte 8) (*)))
+       (subseq source start (+ start +sql-uuid-size+))
+       (let ((bytes (make-array +sql-uuid-size+ :element-type '(unsigned-byte 8))))
+         (replace bytes source :start2 start :end2 (+ start +sql-uuid-size+))
+         bytes))))
 
 (defun sql-uuid-copy-octets (value target &optional (start 0))
   "Copy VALUE to writable octets in TARGET at START."
@@ -76,12 +79,23 @@
 
 (defun sql-uuid-compare (left right)
   "Compare UUIDs in unsigned octet order."
-  (let ((a (sql-uuid-bytes left))
-        (b (sql-uuid-bytes right)))
-    (dotimes (i +sql-uuid-size+ 0)
-      (let ((difference (- (aref a i) (aref b i))))
-        (unless (zerop difference)
-          (return (if (minusp difference) -1 1)))))))
+  (declare (optimize (speed 3) (safety 1)))
+  (let* ((a (sql-uuid-bytes left)) (b (sql-uuid-bytes right))
+                                   (difference (- (aref a 0) (aref b 0))))
+    (unless (zerop difference)
+      (return-from sql-uuid-compare (if (minusp difference) -1 1)))
+    (let ((start #-(and sbcl 64-bit) 1
+                 #+(and sbcl 64-bit)
+                 ;; Word equality skips shared octets independently of endianness.
+                 (cond ((/= (sb-kernel:%vector-raw-bits a 0)
+                            (sb-kernel:%vector-raw-bits b 0)) 1)
+                       ((/= (sb-kernel:%vector-raw-bits a 1)
+                            (sb-kernel:%vector-raw-bits b 1)) 8)
+                       (t (return-from sql-uuid-compare 0)))))
+      (loop for i of-type fixnum from start below 16
+            for diff = (- (aref a i) (aref b i))
+            unless (zerop diff) return (if (minusp diff) -1 1)
+              finally (return 0)))))
 
 (defun sql-uuid-hash-state (value seed)
   "Return the high and low words of hash_bytes_extended for a 16-byte UUID.

@@ -44,7 +44,7 @@
 
 (defun scan-sql-number (sql start)
   "Preserve C scan.l numeric spelling; no decimal conversion or Lisp reader is used."
-  (let ((i start) (size (length sql)) (numeric-p nil))
+  (let ((i start) (size (length sql)) (numeric-p nil) (separated-p nil))
     (labels ((peek (&optional (offset 0))
                (when (< (+ i offset) size) (char sql (+ i offset))))
              (invalid () (scan-error "invalid numeric literal" start))
@@ -54,8 +54,13 @@
                        do (incf i)
                           (when (and (eql (peek) #\_)
                                      (sql-number-digit-p (peek 1) radix))
+                            (setf separated-p t)
                             (incf i)))
                  (when (= before i) (invalid))))
+             (integer-at (begin radix)
+               (if separated-p
+                   (parse-integer (remove #\_ (subseq sql begin i)) :radix radix)
+                   (parse-integer sql :start begin :end i :radix radix)))
              (junk-p ()
                (let ((character (peek)))
                  (and character
@@ -70,7 +75,7 @@
             (digits radix)
             (when (junk-p) (invalid))
             (return-from scan-sql-number
-              (values :integer (parse-integer (remove #\_ (subseq sql begin i)) :radix radix) i)))))
+              (values :integer (integer-at begin radix) i)))))
       (if (eql (peek) #\.)
           (progn (setf numeric-p t) (incf i) (digits 10))
           (progn
@@ -87,7 +92,7 @@
       (when (junk-p) (invalid))
       (values (if numeric-p :numeric :integer)
               (if numeric-p (subseq sql start i)
-                  (parse-integer (remove #\_ (subseq sql start i))))
+                  (integer-at start 10))
               i))))
 
 (defun sql-dollar-tag-character-p (character &optional continuation-p)
@@ -165,7 +170,10 @@ A dollar after the digits begins the next token."
       (loop
         (skip-space)
         (when (>= i n) (return))
-        (let ((c (char sql i)))
+        (let* ((c (char sql i))
+               (punctuation (case c
+                              (#\( "(") (#\) ")") (#\[ "[") (#\] "]")
+                              (#\, ",") (#\; ";") (#\. "."))))
           (cond
             ((and (find c "bBxX") (eql (peek 1) #\'))
              (let ((start i))
@@ -211,8 +219,8 @@ A dollar after the digits begins the next token."
                                    :quoted-p (char= c #\")
                                    :value value :pos start)
                        out))))
-            ((member c '(#\( #\) #\[ #\] #\, #\; #\.))
-             (push (make-token :kind :punct :value (string c) :pos i) out)
+            (punctuation
+             (push (make-token :kind :punct :value punctuation :pos i) out)
              (incf i))
             ((member c '(#\= #\< #\> #\! #\+ #\- #\* #\/ #\% #\: #\| #\^ #\& #\# #\@ #\~ #\? #\`))
              (let ((start i))

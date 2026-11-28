@@ -37,6 +37,7 @@
   (identity nil :read-only t)
   alias
   table
+  whole-row-table
   origins
   lateral-forbidden-p
   ;; Distinguish a scalar function source from a one-column derived record.
@@ -139,6 +140,9 @@
           (resolve-select-whole-row scope name)
           (ereport "42703" "column \"~a\" does not exist" name))))
 
+(defvar *select-live-whole-row-fields-p* t
+  "Use live field names for whole-row values; explicit field access uses bound names.")
+
 (defun resolve-select-whole-row (scope qualifier)
   ;; A scalar function alias denotes its scalar column, even with a column alias.
   ;; Other sources build a record, including one-column derived relations.
@@ -150,7 +154,10 @@
         (select-outer-reference (select-column-expr (first (select-relation-columns relation))) depth)))
     (when (eq (getf (select-scope-analysis-frame owner) :kind) :returning)
       (ereport "0A000" "whole-row RETURNING requires named composite types"))
-    (let* ((columns (select-relation-columns relation))
+    (let* ((columns (select-relation-columns
+                     relation (or (and *select-live-whole-row-fields-p*
+                                       (select-relation-whole-row-table relation))
+                                  (select-relation-table relation))))
            (identity (select-relation-identity relation))
            (expression
              (list :whole-row identity (mapcar #'select-column-expr columns)
@@ -446,6 +453,21 @@
                                         :volatility :volatile :strict-p t :evaluator 'sql-current-wal-flush-lsn)
                    (make-scalar-builtin :name "pg_last_xact_replay_timestamp" :result-type :timestamptz
                                         :volatility :volatile :strict-p t :evaluator 'sql-last-xact-replay-timestamp)
+                   (make-scalar-builtin :name "pg_get_viewdef" :argument-types '(:text)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-view-definition)
+                   (make-scalar-builtin :name "pg_get_viewdef" :argument-types '(:text :bool)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-view-definition)
+                   (make-scalar-builtin :name "pg_get_viewdef" :argument-types '(:oid)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-view-definition)
+                   (make-scalar-builtin :name "pg_get_viewdef" :argument-types '(:oid :bool)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-view-definition)
+                   (make-scalar-builtin :name "pg_get_viewdef" :argument-types '(:oid :int4)
+                                        :result-type :text :volatility :stable :strict-p t
+                                        :evaluator 'sql-get-view-definition)
                    (make-scalar-builtin :name "pg_postmaster_start_time" :result-type :timestamptz
                                         :volatility :stable :strict-p t :evaluator 'postmaster-start-timestamp)
                    (make-replay-control-builtin "pg_wal_replay_pause" :void)
@@ -497,16 +519,16 @@
                                         :evaluator 'set-config-value :implicit-arguments-p t)
                    (make-scalar-builtin :name "nextval" :argument-types '(:text)
                                         :result-type :int8 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-nextval :implicit-arguments-p :sequence)
+                                        :evaluator '(:call eval-sql-nextval) :implicit-arguments-p :sequence)
                    (make-scalar-builtin :name "currval" :argument-types '(:text)
                                         :result-type :int8 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-currval :implicit-arguments-p :sequence)
+                                        :evaluator '(:call eval-sql-currval) :implicit-arguments-p :sequence)
                    (make-scalar-builtin :name "setval" :argument-types '(:text :int8)
                                         :result-type :int8 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-setval :implicit-arguments-p :sequence)
+                                        :evaluator '(:call eval-sql-setval) :implicit-arguments-p :sequence)
                    (make-scalar-builtin :name "setval" :argument-types '(:text :int8 :bool)
                                         :result-type :int8 :volatility :volatile :strict-p t
-                                        :evaluator 'sql-setval :implicit-arguments-p :sequence)
+                                        :evaluator '(:call eval-sql-setval) :implicit-arguments-p :sequence)
                    (make-scalar-builtin :name "pg_cancel_backend" :argument-types '(:int4)
                                         :result-type :bool :volatility :volatile
                                         :evaluator 'sql-cancel-backend :implicit-arguments-p :admin)
@@ -1599,18 +1621,46 @@ so a nested argument error keeps its own diagnostics."
       (report-qualified-numeric-call-error name schema (third expr) table
                                            (getf (cdddr expr) :call-order)))))
 
+(defvar *view-literal-bindings* nil
+  "Map view syntax nodes to constants resolved at definition time.")
+
+(defun record-view-regclass-literal (syntax name sequence relation &optional numeric-oid)
+  (when syntax
+    (when (and (typep relation 'pg-index) (not (pg-index-logical-visible-p relation)))
+      (ereport "42P01" "index \"~a\" is not available" name))
+    (setf (gethash syntax *view-literal-bindings*)
+          (cond (sequence (list :view-bound-sequence (pg-sequence-name sequence)
+                                (pg-sequence-oid sequence) numeric-oid))
+                (relation (list :view-bound-nonsequence name
+                                (etypecase relation
+                                  (pg-class (pg-class-oid relation))
+                                  (pg-index (pg-index-oid relation)))
+                                numeric-oid))
+                (t (list :view-unresolved-regclass name numeric-oid))))))
+
 (defun coerce-sequence-builtin-arguments (arguments types)
-  "Validate unknown sequence names at analysis time without changing stored names.
-Numeric OIDs and the dash can pass regclass input without a catalog lookup."
+  "Validate sequence-function literals and bind their regclass identity in views."
   (let ((argument (first arguments)))
     (when (and (not *defer-function-constant-coercion-p*)
                (in-unknown-constant-p argument) (stringp (second argument)))
-      (let ((literal (second argument)))
-        (cond ((string= literal "-"))
+      (let ((literal (second argument))
+            (syntax (and *view-literal-bindings* (view-constant-source argument))))
+        (cond ((string= literal "-")
+               (record-view-regclass-literal syntax literal nil nil 0))
               ((and (plusp (length literal))
                     (every (lambda (character) (char<= #\0 character #\9)) literal))
-               (sql-oid-input literal))
-              (t (check-sequence-function-relation literal)))))
+               (let ((oid (sql-oid-input literal)))
+                 (when syntax
+                   (record-view-regclass-literal
+                    syntax literal
+                    (loop for sequence being the hash-values of (database-sequences (current-database))
+                          when (eql oid (pg-sequence-oid sequence)) return sequence)
+                    (or (find-table-by-oid oid) (find-index-by-oid oid)
+                        (lookup-sql-system-relation oid))
+                    oid))))
+              (t
+               (multiple-value-bind (name sequence relation) (check-sequence-function-relation literal)
+                 (record-view-regclass-literal syntax name sequence relation))))))
     (cons argument (mapcar #'coerce-common-expression (rest arguments) (rest types)))))
 
 (defun check-sequence-function-relation (name &optional require-sequence-p)
@@ -1624,11 +1674,11 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
              (unless (or sequence relation)
                (ereport "42P01" "relation \"~a\" does not exist" name))
              (when (and require-sequence-p (not sequence))
-               (ereport "42809" "\"~a\" is not a sequence" name)))))
+               (ereport "42809" "\"~a\" is not a sequence" name))
+             (values name sequence relation))))
     (if (sb-thread:holding-mutex-p *write-lock*)
         (check-relation)
-        (with-write-lock (check-relation))))
-  name)
+        (with-write-lock (check-relation)))))
 
 (defun analyze-json-constructor (name candidates args variadic)
   "Resolve a variadic-any JSON constructor while retaining the caller's argument types."
@@ -1703,10 +1753,32 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
        (not (getf (cddr expr) :explicit-cast))
        (or (stringp (second expr)) (eq (second expr) +null+))))
 
+(defvar *view-constant-sources* nil
+  "Map analyzed unknown strings back to their original view syntax nodes.")
+
+(defun view-constant-source (expression)
+  ;; UNION planning may copy the analyzed constant but keeps its string.
+  (when *view-constant-sources*
+    (or (gethash expression *view-constant-sources*)
+        (and (stringp (second expression))
+             (gethash (second expression) *view-constant-sources*)))))
+
+(defun record-view-temporal-constant (syntax constant)
+  "Record a typed temporal value without changing the target's inferred name."
+  (when (and *view-literal-bindings* syntax
+             (member (or (sql-array-element-type (expr-type constant)) (expr-type constant))
+                     '(:date :time :timetz :timestamp :timestamptz :interval)))
+    (setf (gethash syntax *view-literal-bindings*)
+          (list :view-bound-constant constant (target-default-name syntax))))
+  constant)
+
 (defun coerce-in-constant (expr type &optional (typmod -1))
   "Coerce unknown literals through the shared SQL type input functions."
   (if (in-unknown-constant-p expr)
-      (list :const (pg.sql-runtime:sql-cast-value (second expr) :text type typmod t) :type type :typmod typmod)
+      (record-view-temporal-constant
+       (view-constant-source expr)
+       (list :const (pg.sql-runtime:sql-cast-value (second expr) :text type typmod t)
+             :type type :typmod typmod))
       expr))
 
 (defun coerce-numeric-expression-to-oid (expression)
@@ -1855,9 +1927,11 @@ Visit present uppers before lowers and preserve omitted bounds."
     (when (and (eq (first raw) :const)
                (or (stringp (second raw)) (eq (second raw) +null+)))
       (sql-expression-type-description target)
-      (return-from analyze-cast-expression
-        (list :const (sql-cast-value (second raw) :text target typmod t) :explicit-cast t
-              :type target :typmod typmod)))
+      (let ((constant
+              (list :const (sql-cast-value (second raw) :text target typmod t)
+                    :explicit-cast t :type target :typmod typmod)))
+        (return-from analyze-cast-expression
+          (record-view-temporal-constant expression constant))))
     (let* ((int2vector-literal (and (eq target :int2vector) (eq (first raw) :array-literal)))
            (argument
              (if (and (or (sql-array-element-type target) int2vector-literal)
@@ -2634,7 +2708,12 @@ candidate selection."
           (setf array (list :scalar-array-const
                             (map 'vector (lambda (value) (sql-cast-value value :text target -1))
                                  (second array)))
-                element target)))
+                element target)
+          (when *view-literal-bindings*
+            (let ((array-type (sql-array-type target)))
+              (when array-type
+                (record-view-temporal-constant
+                 raw (append array (list :type array-type :typmod -1))))))))
       (list (first expression) (second expression) (first operands) array
             :element-source element :element-target (expr-type (second operands))
             :type :bool :typmod -1))))
@@ -2692,7 +2771,33 @@ candidate selection."
        (list :parameter (second expr) :type type :typmod -1)))
     (:sublink (analyze-sublink expr table))
     (:window (analyze-window-call expr table))
-    (:const (analyze-constant-expression expr))
+    (:const
+     (let ((constant (analyze-constant-expression expr)))
+       (when (and *view-constant-sources* (stringp (second expr)))
+         (setf (gethash constant *view-constant-sources*) expr
+               (gethash (second constant) *view-constant-sources*) expr))
+       constant))
+    (:view-bound-constant (copy-list (second expr)))
+    (:view-unresolved-regclass
+     (list :const (second expr) :type :text :typmod -1 :explicit-cast t
+           :view-missing-regclass-oid (third expr)))
+    (:view-bound-nonsequence
+     (let* ((oid (third expr))
+            (table (or (find-table-by-oid oid) (lookup-sql-system-relation oid)))
+            (index (unless table (find-index-by-oid oid)))
+            (name (cond (table (pg-class-name table)) (index (pg-index-name index)))))
+       (unless name (ereport "42P01" "view references missing relation with OID ~d" oid))
+       (list :const name :type :text :typmod -1 :explicit-cast t :view-nonsequence-oid oid
+             :view-regclass-literal (when (fourth expr) (format nil "~d" oid)))))
+    (:view-bound-sequence
+     (destructuring-bind (tag name oid &optional numeric-oid) expr
+       (declare (ignore tag))
+       (multiple-value-bind (resolved sequence) (check-sequence-function-relation name t)
+         (unless (eql oid (pg-sequence-oid sequence))
+           (ereport "42P01" "view references missing sequence with OID ~d" oid))
+         (list :const resolved :type :text :typmod -1 :explicit-cast t
+               :view-sequence-oid oid
+               :view-regclass-literal (when numeric-oid (format nil "~d" numeric-oid))))))
     ;; The executor builds this node from an already typed parent key.
     (:foreign-key-datum (list :const (second expr) :type (third expr) :typmod -1))
     (:numeric-literal
@@ -2801,6 +2906,7 @@ candidate selection."
     (:func (second ast))
     (:record-field (third ast))
     (:cast (cast-target-default-name ast))
+    (:view-bound-constant (third ast))
     (t "?column?")))
 
 (defun analyze-target (target table)
@@ -2947,17 +3053,27 @@ checks still apply."
               (list :array arguments :type :text-array :typmod -1)))))
     (let ((inputs (if filtered (list array (coerce-catalog-oid-argument (second arguments) name))
                       (list array))))
-      (make-record-set-call (scalar-builtin-for-evaluation candidates (length inputs) (first inputs))
-                            inputs))))
+      (let ((call (make-record-set-call
+                   (scalar-builtin-for-evaluation candidates (length inputs) (first inputs))
+                   inputs)))
+        (unless filtered
+          (setf (getf (cdddr call) :variadic) t))
+        call))))
 
 (defun analyze-record-field (raw scope)
-  (let* ((record (analyze-expr (second raw) scope))
+  (let* ((operand (let ((*select-live-whole-row-fields-p* nil))
+                    (analyze-expr (second raw) scope)))
+         (outer-p (eq (first operand) :outer-ref))
+         (record (if outer-p (third operand) operand))
          (fields (getf (cdddr record) :fields))
          (position (position (third raw) fields :key #'first :test #'string=)))
     (unless (eq (expr-type record) :record)
       (ereport "42809" "expression is not a composite type"))
     (unless position (ereport "42703" "record has no field \"~a\"" (third raw)))
-    (list :record-field record position :type (second (nth position fields)) :typmod -1)))
+    ;; A selected whole-row field is an ordinary attribute reference.
+    (if (eq (first record) :whole-row)
+        (select-outer-reference (nth position (third record)) (if outer-p (second operand) 0))
+        (list :record-field operand position :type (second (nth position fields)) :typmod -1))))
 
 (defun analyze-expanded-target (target scope)
   "Keep already analyzed star columns, including merged JOIN USING expressions."
@@ -3444,8 +3560,10 @@ still requires deferred sort projection."
         (source (getf target :type)))
     (cond
       ((in-unknown-constant-p expression)
-       (list :const (sql-cast-value (second expression) :text type -1)
-             :type type :typmod -1 :explicit-cast t))
+       (record-view-temporal-constant
+        (view-constant-source expression)
+        (list :const (sql-cast-value (second expression) :text type -1)
+              :type type :typmod -1 :explicit-cast t)))
       ((eq source type) (list :col slot :type type :typmod typmod))
       ((and (member source '(:text :varchar)) (member type '(:text :varchar)))
        (list :join-relabel (list :col slot :type source :typmod (getf target :typmod))
@@ -3607,6 +3725,17 @@ Stop at the first difference, leaving later field types and counts unchecked."
     (ereport "42804" "cannot compare record types with different numbers of columns"))
   0)
 
+(declaim (inline sql-string-compare))
+
+(defun sql-string-compare (left right)
+  "Return a three-way result using the first differing character or length."
+  (let ((difference (string/= left right)))
+    (cond ((null difference) 0)
+          ((= difference (length left)) -1)
+          ((= difference (length right)) 1)
+          ((char< (char left difference) (char right difference)) -1)
+          (t 1))))
+
 (defun compare-3way (a b)
   (cond
     ((and (sql-jsonb-p a) (sql-jsonb-p b)) (sql-jsonb-compare a b))
@@ -3623,7 +3752,7 @@ Stop at the first difference, leaving later field types and counts unchecked."
     ((and (numberp a) (numberp b))
      (cond ((< a b) -1) ((> a b) 1) (t 0)))
     ((and (stringp a) (stringp b))
-     (cond ((string< a b) -1) ((string> a b) 1) (t 0)))
+     (sql-string-compare a b))
     ((and (vectorp a) (vectorp b)
           (every #'integerp a) (every #'integerp b))
      (compare-integer-vectors a b))
@@ -3812,6 +3941,8 @@ Stop at the first difference, leaving later field types and counts unchecked."
     (let ((table (lookup-table name)))
       (unless table
         (ereport "42P01" "table \"~a\" does not exist" name))
+      (when (pg-class-view-definition table)
+        (ereport "42809" "relation \"~a\" is a view" name))
       (catalog-table-definition-sql table))))
 
 (defun sql-logical-sequence-state (name)
@@ -3907,18 +4038,46 @@ the full 64-bit ID as a signed value."
 (defun sql-terminate-backend (pid &optional (timeout 0))
   (admin-terminate-backend (admin-pid-arg pid) (admin-timeout-arg timeout)))
 
-(defun sql-nextval (name)
+(defun sql-nextval (name &optional expected-oid)
   (unless (stringp name) (ereport "42883" "nextval expects one sequence name string"))
-  (sequence-nextval (check-sequence-function-relation name t)))
+  (if expected-oid
+      (sequence-nextval name expected-oid)
+      (sequence-nextval (check-sequence-function-relation name t))))
 
-(defun sql-currval (name)
+(defun sql-currval (name &optional expected-oid)
   (unless (stringp name) (ereport "42883" "currval expects one sequence name string"))
-  (sequence-currval (check-sequence-function-relation name t)))
+  (if expected-oid
+      (if (sb-thread:holding-mutex-p *write-lock*)
+          (sequence-currval name expected-oid)
+          (with-write-lock (sequence-currval name expected-oid)))
+      (sequence-currval (check-sequence-function-relation name t))))
 
-(defun sql-setval (name value &optional (is-called t))
+(defun sql-setval (name value &optional (is-called t) expected-oid)
   (unless (and (stringp name) (integerp value) (member is-called '(t nil)))
     (ereport "42883" "setval expects a sequence name, int8 value, and optional boolean"))
-  (sequence-setval (check-sequence-function-relation name t) value is-called))
+  (if expected-oid
+      (sequence-setval name value is-called expected-oid)
+      (sequence-setval (check-sequence-function-relation name t) value is-called)))
+
+(defun view-call-sequence-oid (call)
+  (let ((name (first (third call))))
+    (when (eq (first name) :const)
+      (when (getf (cddr name) :view-missing-regclass-oid)
+        (ereport "XX000" "could not open relation with OID ~d"
+                 (getf (cddr name) :view-missing-regclass-oid)))
+      (when (getf (cddr name) :view-nonsequence-oid)
+        (ereport "42809" "\"~a\" is not a sequence" (second name)))
+      (getf (cddr name) :view-sequence-oid))))
+
+(defun eval-sql-nextval (call arguments)
+  (sql-nextval (first arguments) (view-call-sequence-oid call)))
+
+(defun eval-sql-currval (call arguments)
+  (sql-currval (first arguments) (view-call-sequence-oid call)))
+
+(defun eval-sql-setval (call arguments)
+  (destructuring-bind (name value &optional (is-called t)) arguments
+    (sql-setval name value is-called (view-call-sequence-oid call))))
 
 (defun scalar-builtin-for-call (name arguments first-argument)
   (let ((candidates (gethash name *scalar-builtin-descriptors*)))

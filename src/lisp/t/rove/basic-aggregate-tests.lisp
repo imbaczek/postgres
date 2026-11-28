@@ -1747,6 +1747,33 @@
                     ("SELECT 1e-2::text" "0.01")))
       (rove:ok (equal (list (list (second case))) (subquery-test-rows (first case))) (first case))))
 
+(rove:deftest scanned-integers-respect-token-boundaries-and-radix
+    (dolist (case '(("123" :integer 123) ("1_234" :integer 1234)
+                    ("0xFF" :integer 255) ("0x_F_F" :integer 255)
+                    ("0o77" :integer 63) ("0o_7_7" :integer 63)
+                    ("0b101" :integer 5) ("0b_1_0_1" :integer 5)
+                    ("1_2.3_4e-5" :numeric "1_2.3_4e-5")
+                    ("9223372036854775808" :integer 9223372036854775808)))
+      (destructuring-bind (token kind value) case
+        (let ((sql (concatenate 'string "( " token ", 99)")))
+          (rove:ok (equal (list kind value (+ 2 (length token)))
+                          (multiple-value-list (scan-sql-number sql 2)))
+                   token))))
+  (dolist (token '("12__3" "0x__1" "0b_2" "99_" "123suffix"))
+    (rove:ok (handler-case (progn (scan-sql-number (concatenate 'string "( " token) 2) nil)
+               (pg-error (condition)
+                 (and (string= "42601" (pg-error-sqlstate condition))
+                      (= 3 (pg-error-position condition)))))
+             token)))
+
+(rove:deftest punctuation-follows-leading-dot-number-detection
+    (let ((tokens (butlast (tokenize "(.5,[.]) ;"))))
+      (rove:ok (equal '(:punct :numeric :punct :punct :punct :punct :punct :punct)
+                      (mapcar #'token-kind tokens)))
+      (rove:ok (equal '("(" ".5" "," "[" "." "]" ")" ";")
+                      (mapcar #'token-value tokens)))
+      (rove:ok (equal '(0 1 3 4 5 6 7 9) (mapcar #'token-pos tokens)))))
+
 (rove:deftest generated-numeric-literal-roundtrip
     (let ((data (cl-spec:result-data
                  (cl-spec:run-property 'numeric-literal-roundtrip :seed 42))))

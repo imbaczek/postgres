@@ -42,6 +42,7 @@ Statistics and freeze horizons can advance without changing the definition."
     (pg-index (copy-tree (index-to-sexp object)))
     (pg-class
      (list (pg-class-relfilenode object)
+           (view-definition-to-sexp (pg-class-view-definition object))
            (map 'list #'column-to-sexp (pg-class-columns object))
            (copy-list (pg-class-indexes object))
            (catalog-expression-to-sexp (pg-class-checks object))
@@ -128,7 +129,8 @@ Statistics and freeze horizons can advance without changing the definition."
        (if toast
            (list (pg-class-relfilenode object) (pg-toast-relfilenode toast)
                  (pg-toast-index-relfilenode toast))
-           (list (pg-class-relfilenode object)))))))
+           (when (pg-class-relfilenode object)
+             (list (pg-class-relfilenode object))))))))
 
 (defun catalog-transaction-displace-relation (transaction previous replacement)
   "Remove owned indexes on table replacement and release abandoned private forks."
@@ -149,11 +151,14 @@ Statistics and freeze horizons can advance without changing the definition."
           (catalog-transaction-drop-provisional-storage node))))))
 
 (defun catalog-table-sequence-dependencies (database table)
-  "Record the sequence identities seen by a staged table definition."
-  (loop for name in (catalog-table-sequence-names table)
-        for sequence = (gethash name (database-sequences database))
-        unless sequence do (ereport "42P01" "sequence ~s does not exist" name)
-          collect (cons name (pg-sequence-oid sequence))))
+  "Return sequence identities bound by a staged table or view definition."
+  (let ((view (pg-class-view-definition table)))
+    (if view
+        (pg-view-definition-sequence-dependencies view)
+        (loop for name in (catalog-table-sequence-names table)
+              for sequence = (gethash name (database-sequences database))
+              unless sequence do (ereport "42P01" "sequence ~s does not exist" name)
+                collect (cons name (pg-sequence-oid sequence))))))
 
 (defun catalog-transaction-stage (transaction kind name object)
   "Stage OBJECT, or NIL for a drop, retaining the first base definition.
@@ -266,6 +271,38 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
     (validate-catalog-sequence-dependencies
      database name (catalog-transaction-entry-sequence-dependencies entry))))
 
+(defun validate-catalog-view-dependencies (transaction)
+  "Ensure the commit image retains objects used by staged and concurrent views."
+  (let* ((tables (catalog-transaction-merged-name-map transaction :table))
+         (views (loop for table being the hash-values of tables
+                      when (pg-class-view-definition table) collect table)))
+    (when views
+      (let ((table-oids (make-hash-table :test #'eql))
+            (index-oids (make-hash-table :test #'eql)))
+        (maphash (lambda (name table)
+                   (declare (ignore name))
+                   (setf (gethash (pg-class-oid table) table-oids) table))
+                 tables)
+        (maphash (lambda (name index)
+                   (declare (ignore name))
+                   (when (and (pg-index-logical-visible-p index)
+                              (gethash (pg-index-table-oid index) table-oids))
+                     (setf (gethash (pg-index-oid index) index-oids) t)))
+                 (catalog-transaction-merged-name-map transaction :index))
+        (dolist (view views)
+          (let ((definition (pg-class-view-definition view)))
+            (dolist (oid (pg-view-definition-dependencies definition))
+              (unless (or (gethash oid table-oids) (gethash oid index-oids)
+                          (lookup-sql-system-relation oid))
+                (ereport "40001" "relation with OID ~d referenced by view ~a changed during transaction"
+                         oid (pg-class-name view))))
+            (loop for (oid attnum) in (pg-view-definition-attribute-dependencies definition)
+                  for table = (or (gethash oid table-oids) (lookup-sql-system-relation oid))
+                  for column = (and table (find attnum (pg-class-columns table) :key #'pg-column-attnum))
+                  unless (and column (not (pg-column-dropped-p column)))
+                    do (ereport "40001" "column of relation with OID ~d referenced by view ~a changed during transaction"
+                                oid (pg-class-name view)))))))))
+
 (defun catalog-transaction-validate (transaction database)
   "Reject conflicts under the catalog lock before publishing any WAL."
   (unless (eq database (catalog-transaction-database transaction))
@@ -307,6 +344,8 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
                                                                           (pg-index-table-oid object)))))
                    (ereport "40001" "catalog index ~a has an incompatible owning table" name)))))
            (catalog-transaction-names transaction))
+  (when (plusp (hash-table-count (catalog-transaction-names transaction)))
+    (validate-catalog-view-dependencies transaction))
   (loop for (name . dependencies) in (catalog-transaction-logical-sequence-dependencies transaction)
         do (validate-catalog-sequence-dependencies database name dependencies))
   (values))

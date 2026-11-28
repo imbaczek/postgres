@@ -198,8 +198,9 @@ references expose the operand evaluated in the outer frame."
   (dolist (item (getf prepared :order)) (funcall function (car item)))
   (values))
 
-(defun visit-prepared-query-expressions (function prepared &optional (depth 0) query-function)
-  "Visit executable nodes and query scopes without changing prepared storage."
+(defun visit-prepared-query-expressions (function prepared &optional (depth 0) query-function descend-p expression-leaf-p)
+  "Visit executable nodes and query scopes, pruning scopes rejected by DESCEND-P.
+EXPRESSION-LEAF-P can stop descent beneath an already visited node."
   (labels ((expression (form level)
              (some-local-plan-expression
               (lambda (node walk)
@@ -213,9 +214,13 @@ references expose the operand evaluated in the outer frame."
                      (query (sql-subplan-prepared descriptor) (1+ level)))
                    (funcall function node level)
                    (values nil t))
-                  (otherwise (funcall function node level) nil)))
+                  (otherwise
+                   (funcall function node level)
+                   (values nil (and expression-leaf-p (funcall expression-leaf-p node))))))
               form))
            (query (state level)
+             (when (and descend-p (not (funcall descend-p state)))
+               (return-from query nil))
              (when query-function (funcall query-function state level))
              (dolist (definition (getf state :ctes))
                (query (sql-cte-prepared definition) (1+ level)))

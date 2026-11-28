@@ -918,8 +918,10 @@ stored as column defaults and CHECK constraints. An unknown name literal is
 resolved to an existing relation during analysis; numeric OID literals and `'-'`
 do not require a catalog lookup then. The relation's sequence kind is checked
 when the function runs. An explicit `::text` argument is resolved when the
-function runs. Stored expressions retain sequence names,
-not full `regclass` OID identity. Sequence names in stored expressions must be
+function runs. Views bind bare sequence-function literals to the resolved
+sequence, table or index OID at definition time. Digit-only string arguments
+in views are emitted as OID literals. Column default and CHECK expressions retain
+sequence names. Sequence names in those expressions must be
 literal strings or NULL. Sequence values use the signed `int8`
 range and are persisted separately from transaction rollback, as in PostgreSQL.
 See [defaults, checks and aggregates](t/DEFAULTS-CHECKS-AGGREGATES.md) for scope,

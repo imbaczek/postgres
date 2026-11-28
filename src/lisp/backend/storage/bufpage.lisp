@@ -15,6 +15,19 @@
 ;;; On-disk integers are native-endian in PostgreSQL; this box is x86_64
 ;;; (little-endian), so page accessors use little-endian.
 
+(defmacro return-x86-page-word (name page offset width reader)
+  "Use a pinned little-endian load when all requested bytes are in bounds."
+  #+x86-64
+  `(when (and (typep ,page '(simple-array (unsigned-byte 8) (*)))
+              (typep ,offset 'fixnum)
+              (<= 0 ,offset (- (length ,page) ,width)))
+     (return-from ,name
+       (sb-sys:with-pinned-objects (,page)
+         (,reader (sb-sys:vector-sap ,page) ,offset))))
+  #-x86-64
+  (declare (ignore name page offset width reader))
+  #-x86-64 nil)
+
 (defun page-u16 (page off)
   (flet ((load-word (page off)
            (logior (aref page off)
@@ -31,11 +44,13 @@
                    (ash (aref page (+ off 2)) 16)
                    (ash (aref page (+ off 3)) 24))))
     (declare (inline load-word))
+    (return-x86-page-word page-u32 page off 4 sb-sys:sap-ref-32)
     (if (and (typep page '(simple-array (unsigned-byte 8) (*))) (typep off 'fixnum))
         (locally (declare (optimize (speed 3))) (load-word page off))
         (load-word page off))))
 
 (defun page-u64 (page off)
+  (return-x86-page-word page-u64 page off 8 sb-sys:sap-ref-64)
   (logior (page-u32 page off)
           (ash (page-u32 page (+ off 4)) 32)))
 
@@ -122,6 +137,9 @@ The caller bounds both spans. Word equality is independent of byte order."
 (defun page-lp-count (page)
   (floor (- (page-lower page) +size-of-page-header+) +size-of-item-id+))
 
+#+sbcl
+(declaim (sb-ext:maybe-inline page-get-lp))
+
 (defun page-get-lp (page offnum)
   "Return (values lp_off lp_flags lp_len) for 1-based OFFNUM."
   (let ((v (page-u32 page (+ +size-of-page-header+
@@ -130,17 +148,18 @@ The caller bounds both spans. Word equality is independent of byte order."
             (logand (ash v -15) #x3)
             (logand (ash v -17) #x3FFF))))
 
-(defmacro with-live-page-item ((page offnum off len) &body body)
+(defmacro with-live-page-item ((page offnum off len &optional line-pointer-count) &body body)
   "Run BODY when OFFNUM on PAGE has a normal line pointer.
 
 PAGE and OFFNUM are each evaluated once. OFF and LEN are bound to the line
-pointer's tuple offset and length; invalid, unused, and dead slots are skipped."
+pointer's tuple offset and length; invalid, unused, and dead slots are skipped.
+Supply LINE-POINTER-COUNT when iterating over an immutable page version."
   (let ((page-value (gensym "PAGE-"))
         (offnum-value (gensym "OFFNUM-"))
         (flags (gensym "FLAGS-")))
     `(let ((,page-value ,page)
            (,offnum-value ,offnum))
-       (when (<= 1 ,offnum-value (page-lp-count ,page-value))
+       (when (<= 1 ,offnum-value ,(or line-pointer-count `(page-lp-count ,page-value)))
          (multiple-value-bind (,off ,flags ,len)
              (page-get-lp ,page-value ,offnum-value)
            (declare (ignorable ,len))

@@ -2,6 +2,7 @@
 
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import json
 import runpy
 import shutil
 import struct
@@ -309,6 +310,882 @@ def verify_crash_boundary(server, point, table, committed):
             assert reader.query(f"SELECT id FROM {table}") == [["7"]]
         else:
             absent(reader, table)
+
+
+def verify_view_transaction_visibility(port):
+    with contextlib.closing(Connection(port)) as writer, contextlib.closing(
+        Connection(port)
+    ) as reader:
+        writer.query("CREATE TABLE view_tx_base (seed int)")
+        writer.query("INSERT INTO view_tx_base VALUES (1), (2), (3)")
+        expected = writer.query("SELECT seed + 1 FROM view_tx_base WHERE seed > 1 ORDER BY 1")
+        catalog = (
+            "SELECT relname FROM pg_class WHERE relname IN ('view_tx','view_tx_child') "
+            "ORDER BY relname"
+        )
+        present = [["view_tx"], ["view_tx_child"]]
+        for outcome in ("ROLLBACK", "COMMIT"):
+            writer.query("BEGIN")
+            writer.query("CREATE VIEW view_tx (id) AS SELECT seed FROM view_tx_base WHERE seed > 1")
+            writer.query("CREATE VIEW view_tx_child (id) AS SELECT id + 1 FROM view_tx")
+            assert writer.query("SELECT id FROM view_tx_child ORDER BY id") == expected
+            assert reader.query(catalog) == []
+            absent(reader, "view_tx_child")
+            writer.query(outcome)
+        assert reader.query(catalog) == present
+        assert reader.query("SELECT id FROM view_tx_child ORDER BY id") == expected
+
+        for outcome in ("ROLLBACK", "COMMIT"):
+            writer.query("BEGIN")
+            writer.query("DROP VIEW view_tx CASCADE")
+            assert writer.query(catalog) == []
+            assert reader.query(catalog) == present
+            writer.query(outcome)
+            if outcome == "ROLLBACK":
+                assert reader.query("SELECT id FROM view_tx_child ORDER BY id") == expected
+        assert reader.query(catalog) == []
+        absent(reader, "view_tx_child")
+        absent(reader, "view_tx")
+
+
+def verify_view_read_only_and_acyclic(port):
+    with contextlib.closing(Connection(port)) as reader:
+        reader.query("CREATE TABLE view_guard_base (id int)")
+        reader.query("INSERT INTO view_guard_base VALUES (7)")
+        reader.query("CREATE VIEW view_guard AS SELECT id FROM view_guard_base")
+        reader.query("CREATE VIEW view_guard_child AS SELECT id FROM view_guard")
+        for sql, sqlstate in (
+            ("CREATE OR REPLACE VIEW view_guard AS SELECT id FROM view_guard_child", "42P17"),
+            ("INSERT INTO view_guard VALUES (8)", "42809"),
+            ("UPDATE view_guard SET id = 8", "42809"),
+            ("DELETE FROM view_guard", "42809"),
+            ("TRUNCATE view_guard", "42809"),
+        ):
+            try:
+                reader.query(sql)
+            except WireError as error:
+                assert error.sqlstate == sqlstate, error
+            else:
+                raise AssertionError(f"unexpectedly accepted: {sql}")
+        assert reader.query("SELECT id FROM view_guard_child") == [["7"]]
+        assert reader.query("SELECT id FROM view_guard_base") == [["7"]]
+
+
+def verify_view_definition_context(port, *, create=False):
+    with contextlib.closing(Connection(port)) as reader:
+        if create:
+            reader.query("SET TIME ZONE 'UTC'")
+            reader.query(
+                "CREATE VIEW view_typed_temporal_array AS SELECT "
+                "'[0:1]={\"2000-01-01 00:00:00\",NULL}'::timestamptz[] AS instants"
+            )
+            reader.query(
+                "CREATE VIEW view_definition_context AS "
+                "SELECT * FROM (SELECT '2000-01-01 00:00:00'::timestamptz AS instant) AS logged"
+            )
+            reader.query("CREATE TABLE view_temporal_source (instant timestamptz)")
+            reader.query("INSERT INTO view_temporal_source VALUES ('2000-01-01 00:00:00+00')")
+            reader.query(
+                "CREATE VIEW view_implicit_context AS SELECT instant FROM view_temporal_source "
+                "WHERE instant = '2000-01-01 00:00:00'"
+            )
+            reader.query(
+                "CREATE VIEW view_array_context AS SELECT instant FROM view_temporal_source "
+                "WHERE instant = ANY ('{2000-01-01 00:00:00}')"
+            )
+            reader.query(
+                "CREATE VIEW view_union_context AS SELECT '2000-01-01 00:00:00' AS instant "
+                "UNION ALL SELECT '2000-01-02 00:00:00+00'::timestamptz"
+            )
+            reader.query("SET search_path = pg_catalog")
+            reader.query("DROP VIEW IF EXISTS view_definition_context")
+        reader.query("SET TIME ZONE 'America/New_York'")
+        array_test = (
+            "SELECT instants[0] = '2000-01-01 00:00:00+00'::timestamptz, "
+            "instants[1] IS NULL FROM "
+        )
+        assert reader.query(array_test + "public.view_typed_temporal_array") == [["t", "t"]]
+        if create:
+            reader.query("SET search_path = public")
+            definition = reader.query(
+                "SELECT pg_get_viewdef(oid) FROM pg_catalog.pg_class "
+                "WHERE relname = 'view_typed_temporal_array'"
+            )[0][0]
+            reader.query("CREATE VIEW view_temporal_array_copy AS " + definition)
+            assert reader.query(array_test + "view_temporal_array_copy") == [["t", "t"]]
+        assert reader.query(
+            "SELECT instant = '2000-01-01 00:00:00+00'::timestamptz "
+            "FROM public.view_definition_context"
+        ) == [["t"]]
+        assert reader.query("SELECT count(*) FROM public.view_implicit_context") == [["1"]]
+        assert reader.query("SELECT count(*) FROM public.view_array_context") == [["1"]]
+        assert reader.query(
+            "SELECT count(*) FROM public.view_union_context "
+            "WHERE instant = '2000-01-01 00:00:00+00'::timestamptz"
+        ) == [["1"]]
+        statement = b"view_context_parameter"
+        assert cycle(reader, [
+            parse("SELECT count(*) FROM public.view_implicit_context WHERE instant = $1",
+                  (1184,), name=statement),
+        ], with_message=True) == []
+        for instant, expected in ((b"2000-01-01 00:00:00+00", 1), (None, 0)):
+            messages = cycle(reader, [bind((instant,), statement=statement), frame(b"E", bytes(5))])
+            assert all(kind != b"E" for kind, _ in messages), messages
+            assert [int(body[6:]) for kind, body in messages if kind == b"D"] == [expected]
+
+
+def verify_whole_row_view_definition(port, *, create=False, duplicate_roundtrip=True):
+    with contextlib.closing(Connection(port)) as reader:
+        if create:
+            reader.query("CREATE TABLE view_row_source (id int, payload int, expendable int)")
+            reader.query("INSERT INTO view_row_source VALUES (1, 2, 3)")
+            reader.query(
+                "CREATE VIEW view_whole_row AS SELECT id, row_to_json(view_row_source) AS doc "
+                "FROM view_row_source"
+            )
+            reader.query(
+                "CREATE VIEW view_derived_row AS SELECT row_to_json(d) AS doc "
+                "FROM (SELECT id, payload FROM view_row_source) AS d"
+            )
+            reader.query("CREATE VIEW view_record_target AS SELECT view_row_source AS rec FROM view_row_source")
+            reader.query(
+                "CREATE VIEW view_duplicate_row AS SELECT a.n, d.tag, row_to_json(d) AS doc "
+                "FROM (SELECT 1 AS n UNION ALL SELECT 2) AS a "
+                "LEFT JOIN (SELECT id AS key, id + 10 AS key, payload AS tag "
+                "FROM view_row_source UNION ALL SELECT NULL::int, NULL::int, NULL::int) "
+                "AS d ON a.n = 1"
+            )
+            reader.query(
+                "CREATE VIEW view_selected_row_field AS "
+                "SELECT (view_row_source).expendable AS field, "
+                "(SELECT (view_row_source).expendable) AS outer_field FROM view_row_source"
+            )
+            reader.query("ALTER TABLE view_row_source RENAME COLUMN id TO renamed")
+            reader.query("ALTER TABLE view_row_source ADD COLUMN r0_1 int DEFAULT 5")
+            reader.query("ALTER TABLE view_row_source RENAME COLUMN expendable TO unwanted")
+            assert reader.query("SELECT field, outer_field FROM view_selected_row_field") == [["3", "3"]]
+            try:
+                reader.query("ALTER TABLE view_row_source DROP COLUMN unwanted")
+            except WireError as error:
+                assert error.sqlstate == "2BP01", error
+            else:
+                raise AssertionError("dropped a field explicitly selected from a whole row")
+            reader.query("DROP VIEW view_selected_row_field")
+            reader.query("ALTER TABLE view_row_source DROP COLUMN unwanted")
+        for name, expected in (
+            ("view_whole_row", {"renamed": 1, "payload": 2, "r0_1": 5}),
+            ("view_derived_row", {"id": 1, "payload": 2}),
+        ):
+            assert json.loads(reader.query(f"SELECT doc FROM {name}")[0][0]) == expected
+            definition = reader.query(
+                f"SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = '{name}'"
+            )[0][0]
+            reader.query(f"CREATE VIEW view_row_copy AS {definition}")
+            assert reader.query(f"SELECT * FROM {name}") == reader.query("SELECT * FROM view_row_copy")
+            reader.query("DROP VIEW view_row_copy")
+        for name, suffix in (("view_record_target", ""), ("view_duplicate_row", " ORDER BY n, tag NULLS LAST")):
+            original = reader.query(f"SELECT * FROM {name}" + suffix)
+            if name == "view_duplicate_row":
+                assert original == [
+                    ["1", "2", '{"key":1,"key":11,"tag":2}'],
+                    ["1", None, '{"key":null,"key":null,"tag":null}'],
+                    ["2", None, None],
+                ]
+                if not duplicate_roundtrip:
+                    # C's deparser disambiguates the field aliases on recreation.
+                    continue
+            definition = reader.query(
+                f"SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = '{name}'"
+            )[0][0]
+            reader.query(f"CREATE VIEW view_row_copy AS {definition}")
+            assert reader.query("SELECT * FROM view_row_copy" + suffix) == original
+            if create and name == "view_duplicate_row":
+                reader.query("ALTER TABLE view_row_source RENAME COLUMN renamed TO renamed_again")
+                emitted = reader.query(
+                    "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_row_copy'"
+                )[0][0]
+                reader.query("CREATE VIEW view_row_copy_again AS " + emitted)
+                assert reader.query("SELECT * FROM view_row_copy_again" + suffix) == original
+                reader.query("DROP VIEW view_row_copy_again")
+                reader.query("ALTER TABLE view_row_source RENAME COLUMN renamed_again TO renamed")
+            reader.query("DROP VIEW view_row_copy")
+
+
+def verify_view_sequence_dependencies(port, *, create=False, race=False):
+    with contextlib.closing(Connection(port)) as reader:
+        if create:
+            reader.query("CREATE SEQUENCE view_sequence_source")
+            reader.query("CREATE VIEW view_sequence AS SELECT nextval('view_sequence_source') AS number")
+            assert reader.query("SELECT number FROM view_sequence") == [["1"]]
+            reader.query("CREATE VIEW view_currval AS SELECT currval('view_sequence_source') AS number")
+            assert reader.query("SELECT number FROM view_currval") == [["1"]]
+            reader.query("CREATE VIEW view_setval AS SELECT setval('view_sequence_source', 5) AS number")
+            assert reader.query("SELECT number FROM view_setval") == [["5"]]
+            reader.query("CREATE SEQUENCE view_sequence_late")
+            reader.query(
+                "CREATE VIEW view_late_sequence AS "
+                "SELECT nextval('view_sequence_late'::text) AS number"
+            )
+            reader.query("DROP SEQUENCE view_sequence_late")
+            reader.query("CREATE SEQUENCE view_sequence_late START WITH 40")
+            assert reader.query("SELECT number FROM view_late_sequence") == [["40"]]
+        try:
+            reader.query("DROP SEQUENCE view_sequence_source")
+        except WireError as error:
+            assert error.sqlstate == "2BP01", error
+        else:
+            raise AssertionError("dropped a sequence bound by a view")
+        definition = reader.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_sequence'"
+        )[0][0]
+        reader.query(f"CREATE VIEW view_sequence_copy AS {definition}")
+        reader.query("DROP VIEW view_sequence")
+        if create:
+            reader.query("DROP VIEW view_currval, view_setval")
+        try:
+            reader.query("DROP SEQUENCE view_sequence_source")
+        except WireError as error:
+            assert error.sqlstate == "2BP01", error
+        else:
+            raise AssertionError("the recreated view lost its sequence dependency")
+        reader.query(f"CREATE VIEW view_sequence AS {definition}")
+        reader.query("DROP VIEW view_sequence_copy")
+        if race:
+            reader.query("CREATE SEQUENCE view_sequence_race")
+            reader.query("BEGIN")
+            reader.query("CREATE VIEW view_racing_sequence AS SELECT nextval('view_sequence_race')")
+            with contextlib.closing(Connection(port)) as concurrent:
+                concurrent.query("DROP SEQUENCE view_sequence_race")
+                concurrent.query("CREATE SEQUENCE view_sequence_race")
+            try:
+                reader.query("COMMIT")
+            except WireError as error:
+                assert error.sqlstate == "40001", error
+            else:
+                raise AssertionError("view commit accepted a replaced sequence")
+
+
+def verify_view_nonsequence_dependencies(port, *, create=False, race=False):
+    with contextlib.closing(Connection(port)) as reader:
+        if create:
+            reader.query("CREATE TABLE view_sequence_table (id int)")
+            reader.query("CREATE TABLE view_index_owner (id int)")
+            reader.query("CREATE INDEX view_sequence_index ON view_index_owner (id)")
+            reader.query("CREATE VIEW view_table_regclass AS SELECT nextval('view_sequence_table') AS n")
+            reader.query("CREATE VIEW view_index_regclass AS SELECT nextval('view_sequence_index') AS n")
+            reader.query("CREATE INDEX view_sequence_drop_ix ON view_index_owner (id)")
+            reader.query("CREATE VIEW view_index_direct_drop AS SELECT nextval('view_sequence_drop_ix') AS n")
+            reader.query("DROP INDEX view_sequence_drop_ix CASCADE")
+            absent(reader, "view_index_direct_drop")
+            reader.query("CREATE TABLE view_constraint_owner (id int CONSTRAINT view_backing UNIQUE)")
+            reader.query("CREATE VIEW view_constraint_regclass AS SELECT nextval('view_backing') AS n")
+            reader.query("CREATE INDEX view_sequence_rename_ix ON view_index_owner (id)")
+            reader.query("CREATE VIEW view_index_rename_ref AS SELECT nextval('view_sequence_rename_ix') AS n")
+            reader.query("ALTER INDEX view_sequence_rename_ix RENAME TO view_sequence_renamed_ix")
+            reader.query("CREATE SEQUENCE view_sequence_rename_ix START WITH 9")
+            definition = reader.query(
+                "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_index_rename_ref'"
+            )[0][0]
+            reader.query("CREATE VIEW view_index_renamed_copy AS " + definition)
+            reader.query("DROP VIEW view_index_rename_ref")
+            assert reader.query("SELECT nextval('view_sequence_rename_ix')") == [["9"]]
+            reader.query("CREATE SEQUENCE view_numeric_oid_source")
+            oid = reader.query("SELECT oid FROM pg_class WHERE relname = 'view_numeric_oid_source'")[0][0]
+            reader.query(f"CREATE VIEW view_numeric_oid AS SELECT nextval('{oid}') AS n")
+            assert reader.query("SELECT n FROM view_numeric_oid") == [["1"]]
+            system_oid = reader.query("SELECT oid FROM pg_class WHERE relname = 'pg_class'")[0][0]
+            reader.query(f"CREATE VIEW view_system_regclass AS SELECT nextval('{system_oid}') AS n")
+            definition = reader.query(
+                "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_system_regclass'"
+            )[0][0]
+            reader.query("CREATE VIEW view_system_regclass_copy AS " + definition)
+            reader.query('CREATE SEQUENCE "123"')
+            reader.query("CREATE VIEW view_numeric_oid_missing AS SELECT nextval('123') AS n")
+            reader.query('DROP SEQUENCE "123"')
+        for statement, state in (
+            ("SELECT n FROM view_table_regclass", "42809"),
+            ("SELECT n FROM view_index_regclass", "42809"),
+            ("DROP TABLE view_sequence_table", "2BP01"),
+            ("DROP INDEX view_sequence_index", "2BP01"),
+            ("DROP INDEX CONCURRENTLY view_sequence_index", "2BP01"),
+            ("DROP TABLE view_index_owner", "2BP01"),
+            ("ALTER TABLE view_constraint_owner DROP CONSTRAINT view_backing", "2BP01"),
+            ("SELECT n FROM view_index_renamed_copy", "42809"),
+            ("DROP INDEX view_sequence_renamed_ix", "2BP01"),
+            ("DROP SEQUENCE view_numeric_oid_source", "2BP01"),
+            ("SELECT n FROM view_numeric_oid_missing", "XX000"),
+            ("SELECT n FROM view_system_regclass_copy", "42809"),
+        ):
+            try:
+                reader.query(statement)
+            except WireError as error:
+                assert error.sqlstate == state, error
+            else:
+                raise AssertionError(f"unexpectedly accepted: {statement}")
+        if not create:
+            reader.query("DROP TABLE view_sequence_table, view_index_owner CASCADE")
+            absent(reader, "view_table_regclass")
+            absent(reader, "view_index_regclass")
+        if race:
+            reader.query("CREATE TABLE view_index_race_table (id int)")
+            reader.query("CREATE INDEX view_index_race ON view_index_race_table (id)")
+            reader.query("BEGIN")
+            reader.query("DROP INDEX view_index_race")
+            with contextlib.closing(Connection(port)) as other:
+                other.query("CREATE VIEW view_index_race_ref AS SELECT nextval('view_index_race') AS n")
+            try:
+                reader.query("COMMIT")
+            except WireError as error:
+                assert error.sqlstate == "40001", error
+            else:
+                raise AssertionError("index drop committed despite a concurrent view dependency")
+
+
+def verify_view_sequence_portal_identity(port):
+    with contextlib.closing(Connection(port)) as reader, contextlib.closing(Connection(port)) as writer:
+        writer.query("CREATE SEQUENCE view_sequence_portal_source")
+        writer.query("CREATE TABLE view_sequence_portal_rows (id int)")
+        writer.query("INSERT INTO view_sequence_portal_rows VALUES (1), (2), (3), (4)")
+        writer.query(
+            "CREATE VIEW view_sequence_portal AS "
+            "SELECT nextval('view_sequence_portal_source') AS number FROM view_sequence_portal_rows"
+        )
+        statement = b"view_sequence_portal_plan"
+        assert cycle(reader, [parse("SELECT number FROM view_sequence_portal", (), name=statement)]) == []
+        reader.socket.sendall(
+            bind(statement=statement) + frame(b"E", struct.pack("!BI", 0, 1)) + frame(b"H", b"")
+        )
+        results = []
+        while True:
+            kind, body = reader.receive()
+            assert kind not in (b"C", b"E"), (kind, body)
+            if kind == b"s":
+                break
+            if kind == b"D":
+                results.append(int(body[6:]))
+        assert results == [1]
+        writer.query("CREATE OR REPLACE VIEW view_sequence_portal AS SELECT 0::bigint AS number")
+        writer.query("DROP SEQUENCE view_sequence_portal_source")
+        writer.query("CREATE SEQUENCE view_sequence_portal_source START WITH 70")
+        assert cycle(reader, [frame(b"E", bytes(5))]) == [(b"E", "42P01")]
+        assert writer.query("SELECT nextval('view_sequence_portal_source')") == [["70"]]
+
+
+def verify_view_replacement_contract(port):
+    with contextlib.closing(Connection(port)) as reader, contextlib.closing(
+        Connection(port)
+    ) as writer:
+        writer.query("CREATE TABLE replace_view_base (id int, label varchar(8))")
+        writer.query("INSERT INTO replace_view_base VALUES (7, 'seven')")
+        writer.query("CREATE VIEW replace_view AS SELECT * FROM replace_view_base")
+        writer.query("ALTER TABLE replace_view_base ADD COLUMN extra int DEFAULT 11")
+        writer.query("ALTER TABLE replace_view_base RENAME COLUMN id TO seed")
+        assert reader.query("SELECT * FROM replace_view") == [["7", "seven"]]
+        statement = b"replace_view_prepared"
+        assert cycle(reader, [parse("SELECT id, label FROM replace_view", (), name=statement)]) == []
+
+        def execute():
+            return cycle(reader, [bind((), statement=statement), frame(b"E", bytes(5))])
+
+        def row(value):
+            return [(b"D", struct.pack("!Hi1si5s", 2, 1, value, 5, b"seven"))]
+
+        assert execute() == row(b"7")
+        for target in (
+            "seed AS id",
+            "seed, label",
+            "seed::bigint AS id, label",
+            "seed AS id, label::varchar(9) AS label",
+        ):
+            try:
+                writer.query(
+                    f"CREATE OR REPLACE VIEW replace_view AS SELECT {target} FROM replace_view_base"
+                )
+            except WireError as error:
+                assert error.sqlstate == "42P16", error
+            else:
+                raise AssertionError(f"view replacement accepted incompatible output: {target}")
+            assert execute() == row(b"7")
+
+        writer.query(
+            "CREATE OR REPLACE VIEW replace_view AS "
+            "SELECT seed + 1 AS id, label, extra FROM replace_view_base"
+        )
+        assert reader.query("SELECT * FROM replace_view") == [["8", "seven", "11"]]
+        assert execute() == row(b"8")
+        writer.query("CREATE VIEW replace_view_child AS SELECT id FROM replace_view")
+        try:
+            writer.query("DROP VIEW replace_view RESTRICT")
+        except WireError as error:
+            assert error.sqlstate == "2BP01", error
+        else:
+            raise AssertionError("DROP VIEW RESTRICT removed a depended-on view")
+        assert reader.query("SELECT id FROM replace_view_child") == [["8"]]
+        writer.query("DROP VIEW replace_view CASCADE")
+        absent(reader, "replace_view_child")
+        absent(reader, "replace_view")
+
+
+def verify_view_portal_during_replacement(port):
+    with contextlib.closing(Connection(port)) as reader, contextlib.closing(
+        Connection(port)
+    ) as writer:
+        writer.query("CREATE TABLE view_portal_base (bucket int, amount int)")
+        writer.query("INSERT INTO view_portal_base VALUES (1, 1), (1, 2), (2, 3), (2, 4), (3, 5)")
+        writer.query("CREATE TABLE view_portal_groups (bucket int)")
+        writer.query("INSERT INTO view_portal_groups VALUES (1), (2), (3)")
+        writer.query("CREATE VIEW view_portal_input AS SELECT bucket, amount FROM view_portal_base")
+        writer.query("CREATE VIEW view_portal_nested AS SELECT * FROM view_portal_input")
+        statement = b"view_portal_statement"
+        sql = (
+            "SELECT g.bucket, sum(v.amount) FROM view_portal_nested v "
+            "JOIN view_portal_groups g ON v.bucket = g.bucket WHERE v.amount >= $1 "
+            "GROUP BY g.bucket ORDER BY g.bucket LIMIT 2"
+        )
+
+        def row(bucket, amount):
+            return struct.pack("!Hi1si", 2, 1, bucket, len(amount)) + amount
+
+        def suspend(args):
+            reader.socket.sendall(args + frame(b"E", struct.pack("!BI", 0, 1)) + frame(b"H", b""))
+            rows = []
+            while True:
+                kind, body = reader.receive()
+                assert kind not in (b"C", b"E"), (kind, body)
+                if kind == b"s":
+                    return rows
+                if kind == b"D":
+                    rows.append((kind, body))
+
+        def replace(increment):
+            writer.query(
+                "CREATE OR REPLACE VIEW view_portal_input AS "
+                f"SELECT bucket, amount + {increment} AS amount FROM view_portal_base"
+            )
+
+        assert cycle(reader, [parse(sql, (23,), name=statement)], with_message=True) == []
+        args = bind((b"2",), statement=statement)
+        writer.query("SET statement_timeout = '2s'")
+        assert suspend(args) == [(b"D", row(b"1", b"2"))]
+        replace(10)
+        finish = frame(b"E", bytes(5))
+        assert cycle(reader, [finish], with_message=True) == [(b"D", row(b"2", b"7"))]
+        assert cycle(reader, [args, finish], with_message=True) == [
+            (b"D", row(b"1", b"23")), (b"D", row(b"2", b"27")),
+        ]
+
+        stream = b"view_portal_stream"
+        sql = "SELECT bucket, amount FROM view_portal_nested WHERE bucket = 2 AND amount >= $1"
+        assert cycle(reader, [parse(sql, (23,), name=stream)], with_message=True) == []
+        args = bind((b"12",), statement=stream)
+        first = suspend(args)
+        assert len(first) == 1
+        replace(20)
+        last = cycle(reader, [finish], with_message=True)
+        assert len(last) == 1
+        assert sorted(first + last) == [(b"D", row(b"2", b"13")), (b"D", row(b"2", b"14"))]
+        assert sorted(cycle(reader, [args, finish], with_message=True)) == [
+            (b"D", row(b"2", b"23")), (b"D", row(b"2", b"24")),
+        ]
+
+
+def verify_bounded_view_sort(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query("CREATE TABLE bounded_view_base (id int, payload varchar(127))")
+        # Fill the heap with small rows, then admit wider rows that can force a spill.
+        payloads = [f"{i:08d}" + "x" * (119 * (i % 2)) for i in range(320)]
+        payloads[317] = "Ω"
+        values = ", ".join(f"({i}, '{payloads[i]}')" for i in range(0, 320, 2))
+        connection.query("INSERT INTO bounded_view_base VALUES " + values)
+        values = ", ".join(f"({i}, '{payloads[i]}')" for i in range(319, 0, -2))
+        connection.query("INSERT INTO bounded_view_base VALUES " + values + ", (-1, NULL)")
+        connection.query("CREATE VIEW bounded_view_source AS SELECT * FROM bounded_view_base")
+        connection.query(
+            "CREATE VIEW bounded_view_result AS "
+            "SELECT * FROM bounded_view_source ORDER BY payload DESC NULLS LAST LIMIT 64"
+        )
+        expected_ids = sorted(range(len(payloads)), key=payloads.__getitem__, reverse=True)[:64]
+        expected = [[str(i)] for i in expected_ids]
+        for work_mem in ("64kB", "4MB"):
+            connection.query(f"SET work_mem = '{work_mem}'")
+            assert connection.query(
+                "SELECT id FROM bounded_view_result ORDER BY payload DESC NULLS LAST"
+            ) == expected
+
+
+def verify_view_crash_boundaries(server):
+    with contextlib.closing(Connection(server.port)) as writer:
+        writer.query("CREATE TABLE crash_view_base (id int, flag int)")
+        writer.query("INSERT INTO crash_view_base VALUES (7, 1)")
+        writer.query("CREATE VIEW crash_view AS SELECT id FROM crash_view_base WHERE flag = 1")
+        writer.query("CREATE VIEW crash_view_nested AS SELECT id FROM crash_view")
+        writer.query("ALTER TABLE crash_view_base RENAME COLUMN id TO renamed")
+        writer.query("ALTER TABLE crash_view_base ADD COLUMN extra int")
+        definition, = writer.query(
+            "SELECT definition FROM pg_views WHERE viewname = 'crash_view'"
+        )[0]
+        assert "renamed" in definition
+        assert writer.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'crash_view'"
+        ) == [[definition]]
+        assert writer.query(
+            f"SELECT id FROM ({definition.rstrip(';')}) AS reconstructed"
+        ) == [["7"]]
+    for point, expected in (
+        ("before-terminal-append", "7"),
+        ("after-catalog-transaction-wal-flush", "8"),
+    ):
+        with contextlib.closing(Connection(server.port)) as writer, contextlib.closing(
+            Connection(server.port)
+        ) as observer:
+            writer.query("BEGIN")
+            writer.query(
+                "CREATE OR REPLACE VIEW crash_view AS "
+                "SELECT renamed + 1 AS id FROM crash_view_base WHERE flag = 1"
+            )
+            assert writer.query("SELECT * FROM crash_view_nested") == [["8"]]
+            assert observer.query("SELECT * FROM crash_view_nested") == [["7"]]
+            crash_during_statement(server, writer, point, "COMMIT")
+        server.start()
+        with contextlib.closing(Connection(server.port)) as reader:
+            assert reader.query("SELECT * FROM crash_view_nested") == [[expected]]
+            assert reader.query("""
+                SELECT relname, attname, attnum, atttypid, atttypmod
+                FROM pg_attribute JOIN pg_class ON attrelid = oid
+                WHERE relname IN ('crash_view', 'crash_view_nested') AND attnum > 0
+                ORDER BY relname, attnum
+            """) == [
+                ["crash_view", "id", "1", "23", "-1"],
+                ["crash_view_nested", "id", "1", "23", "-1"],
+            ]
+            recovered_sql, = reader.query(
+                "SELECT definition FROM pg_views WHERE viewname = 'crash_view'"
+            )[0]
+            assert "renamed" in recovered_sql
+            assert reader.query(
+                "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'crash_view'"
+            ) == [[recovered_sql]]
+            assert reader.query(
+                f"SELECT id FROM ({recovered_sql.rstrip(';')}) AS reconstructed"
+            ) == [[expected]]
+            views = reader.query(
+                "SELECT oid, relkind FROM pg_class "
+                "WHERE relname IN ('crash_view', 'crash_view_nested') ORDER BY relname"
+            )
+            assert len(views) == 2
+            for oid, kind in views:
+                assert kind == "v"
+                assert not (server.data / "base" / oid).exists()
+            try:
+                reader.query("ALTER TABLE crash_view_base DROP COLUMN flag")
+            except WireError as error:
+                assert error.sqlstate == "2BP01", error
+            else:
+                raise AssertionError("recovered view lost its attribute dependency")
+
+
+def verify_view_logical_ddl_rejected(server):
+    with contextlib.closing(Connection(server.port)) as writer:
+        writer.query("CREATE VIEW view_before_capture AS SELECT 1 AS id")
+        writer.query("CREATE TABLE view_capture_table (id int)")
+        try:
+            writer.query("CREATE PUBLICATION view_capture_invalid FOR TABLE view_before_capture")
+        except WireError as error:
+            assert error.sqlstate == "22023", error
+        else:
+            raise AssertionError("an explicit publication accepted a view")
+        writer.query("CREATE PUBLICATION view_capture_all FOR ALL TABLES")
+        assert writer.query(
+            "SELECT c.relname FROM pg_get_publication_tables('view_capture_all') p "
+            "JOIN pg_class c ON c.oid = p.relid "
+            "WHERE c.relname IN ('view_before_capture', 'view_capture_table')"
+        ) == [["view_capture_table"]]
+        bootstrap, = writer.query("SELECT pg_lisp_replication_bootstrap()")[0]
+        assert "view_capture_table" in bootstrap
+        assert "view_before_capture" not in bootstrap
+        create_confirmed_transactional_slot(server, "view_capture")
+        try:
+            for statement in (
+                "CREATE VIEW view_during_capture AS SELECT 2 AS id",
+                "CREATE OR REPLACE VIEW view_before_capture AS SELECT 2 AS id",
+                "DROP VIEW view_before_capture",
+            ):
+                try:
+                    writer.query(statement)
+                except WireError as error:
+                    assert error.sqlstate == "0A000" and "view DDL" in str(error), error
+                else:
+                    raise AssertionError(f"publisher admitted unsupported logical DDL: {statement}")
+            assert writer.query("SELECT id FROM view_before_capture") == [["1"]]
+            absent(writer, "view_during_capture")
+        finally:
+            deadline = time.monotonic() + 10
+            while writer.query(
+                "SELECT active FROM pg_replication_slots WHERE slot_name='view_capture'"
+            ) == [["t"]]:
+                assert time.monotonic() < deadline, "view capture sender did not release the slot"
+                time.sleep(0.05)
+            writer.query("SELECT pg_drop_replication_slot('view_capture')")
+            writer.query("DROP PUBLICATION view_capture_all")
+
+
+def verify_joined_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_join_left (id int)")
+        connection.query("CREATE TABLE view_join_right (id int)")
+        connection.query("INSERT INTO view_join_left VALUES (1), (2)")
+        connection.query("INSERT INTO view_join_right VALUES (2), (3)")
+        connection.query(
+            "CREATE VIEW view_joined AS "
+            "SELECT id FROM view_join_left FULL JOIN view_join_right USING (id)"
+        )
+        connection.query("ALTER TABLE view_join_right RENAME COLUMN id TO new_id")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_joined'"
+        )[0]
+        assert "new_id" in definition
+        assert connection.query(
+            f"SELECT id FROM ({definition.rstrip(';')}) AS reconstructed ORDER BY id"
+        ) == connection.query("SELECT id FROM view_joined ORDER BY id") == [["1"], ["2"], ["3"]]
+
+
+def verify_ordered_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_order_base (id int, score int)")
+        connection.query("INSERT INTO view_order_base VALUES (1, 20), (2, NULL), (3, 30), (4, 10)")
+        connection.query(
+            "CREATE VIEW view_ordered AS "
+            "SELECT id FROM view_order_base ORDER BY score DESC NULLS LAST LIMIT 2"
+        )
+        connection.query(
+            "CREATE VIEW view_distinct_ordered AS "
+            "SELECT DISTINCT score AS points FROM view_order_base ORDER BY points NULLS FIRST LIMIT 2"
+        )
+        connection.query("ALTER TABLE view_order_base RENAME COLUMN score TO renamed_score")
+        for view, expected in (("view_ordered", [["3"], ["1"]]),
+                               ("view_distinct_ordered", [[None], ["10"]])):
+            definition, = connection.query(
+                f"SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = '{view}'"
+            )[0]
+            assert "renamed_score" in definition
+            assert connection.query(definition) == connection.query(f"SELECT * FROM {view}") == expected
+
+
+def verify_grouped_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_group_base (amount int, category int)")
+        connection.query("INSERT INTO view_group_base VALUES (2, 1), (3, 1), (8, 2), (9, 0)")
+        connection.query(
+            "CREATE VIEW view_grouped AS "
+            "SELECT category, count(*) AS records, sum(amount) AS total "
+            "FROM view_group_base WHERE amount > 0 GROUP BY category "
+            "HAVING category > 0 AND sum(amount) > 3 ORDER BY total DESC"
+        )
+        connection.query("ALTER TABLE view_group_base RENAME COLUMN amount TO renamed_amount")
+        connection.query("ALTER TABLE view_group_base RENAME COLUMN category TO renamed_category")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_grouped'"
+        )[0]
+        assert "renamed_amount" in definition and "renamed_category" in definition
+        assert connection.query(definition) == connection.query("SELECT * FROM view_grouped") == [
+            ["2", "1", "8"], ["1", "2", "5"]
+        ]
+
+
+def verify_union_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_union_left (id int)")
+        connection.query("CREATE TABLE view_union_right (id int)")
+        connection.query("INSERT INTO view_union_left VALUES (1), (2)")
+        connection.query("INSERT INTO view_union_right VALUES (2), (3)")
+        connection.query(
+            "CREATE VIEW view_union (value) AS "
+            "(SELECT id FROM view_union_left ORDER BY id DESC LIMIT 1) "
+            "UNION SELECT id FROM view_union_right UNION ALL SELECT '4' "
+            "ORDER BY id DESC LIMIT 3"
+        )
+        connection.query("ALTER TABLE view_union_left RENAME COLUMN id TO left_id")
+        connection.query("ALTER TABLE view_union_right RENAME COLUMN id TO right_id")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_union'"
+        )[0]
+        assert "left_id" in definition and "right_id" in definition
+        assert connection.query(definition) == connection.query("SELECT value FROM view_union") == [
+            ["4"], ["3"], ["2"]
+        ]
+
+
+def verify_cte_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_cte_base (id int)")
+        connection.query("INSERT INTO view_cte_base VALUES (1)")
+        connection.query(
+            "CREATE VIEW view_cte AS WITH src(value) AS MATERIALIZED "
+            "(SELECT id FROM view_cte_base), step AS (SELECT value + 1 AS value FROM src) "
+            "SELECT value FROM step"
+        )
+        connection.query(
+            "CREATE VIEW view_recursive AS "
+            "WITH RECURSIVE chain(value) AS (SELECT id FROM view_cte_base "
+            "UNION ALL SELECT value + 1 FROM chain WHERE value < 3) "
+            "SELECT value FROM chain ORDER BY value"
+        )
+        connection.query("ALTER TABLE view_cte_base RENAME COLUMN id TO seed")
+        for view, expected, keyword in (
+            ("view_cte", [["2"]], "MATERIALIZED"),
+            ("view_recursive", [["1"], ["2"], ["3"]], "WITH RECURSIVE"),
+        ):
+            definition, = connection.query(
+                f"SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = '{view}'"
+            )[0]
+            assert "seed" in definition and keyword in definition
+            assert connection.query(definition) == connection.query(f"SELECT * FROM {view}") == expected
+
+
+def verify_derived_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_derived_base (id int)")
+        connection.query("INSERT INTO view_derived_base VALUES (1), (2)")
+        connection.query(
+            "CREATE VIEW view_derived (first_value, second_value) AS SELECT d.* FROM "
+            "(SELECT id AS repeated, id + 10 AS repeated "
+            "FROM view_derived_base ORDER BY id DESC LIMIT 1) AS d"
+        )
+        connection.query("ALTER TABLE view_derived_base RENAME COLUMN id TO seed")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_derived'"
+        )[0]
+        assert "seed" in definition
+        assert connection.query(definition) == connection.query("SELECT * FROM view_derived") == [["2", "12"]]
+
+
+def verify_lateral_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_lateral_outer (id int)")
+        connection.query("CREATE TABLE view_lateral_inner (id int)")
+        connection.query("INSERT INTO view_lateral_outer VALUES (1), (3)")
+        connection.query("INSERT INTO view_lateral_inner VALUES (2), (4), (5)")
+        connection.query(
+            "CREATE VIEW view_lateral AS SELECT o.id, d.next_id "
+            "FROM view_lateral_outer o CROSS JOIN LATERAL "
+            "(SELECT i.id AS next_id FROM view_lateral_inner i WHERE i.id > o.id "
+            "ORDER BY i.id LIMIT 1) d ORDER BY o.id"
+        )
+        connection.query("ALTER TABLE view_lateral_outer RENAME COLUMN id TO outer_id")
+        connection.query("ALTER TABLE view_lateral_inner RENAME COLUMN id TO inner_id")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_lateral'"
+        )[0]
+        assert "outer_id" in definition and "inner_id" in definition and "LATERAL" in definition
+        assert connection.query(definition) == connection.query("SELECT * FROM view_lateral") == [
+            ["1", "2"], ["3", "4"]
+        ]
+
+
+def verify_sublink_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_subquery_out (id int)")
+        connection.query("CREATE TABLE view_subquery_in (id int)")
+        connection.query("INSERT INTO view_subquery_out VALUES (1), (2), (4)")
+        connection.query("INSERT INTO view_subquery_in VALUES (2), (4), (5)")
+        connection.query(
+            "CREATE VIEW view_subquery AS SELECT o.id, "
+            "(SELECT min(i.id) FROM view_subquery_in i WHERE i.id > o.id) AS next_id "
+            "FROM view_subquery_out o WHERE EXISTS "
+            "(SELECT 1 FROM view_subquery_in i WHERE i.id > o.id) "
+            "AND o.id = ANY (SELECT i.id FROM view_subquery_in i) ORDER BY o.id"
+        )
+        connection.query("ALTER TABLE view_subquery_out RENAME COLUMN id TO outer_id")
+        connection.query("ALTER TABLE view_subquery_in RENAME COLUMN id TO inner_id")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_subquery'"
+        )[0]
+        assert all(term in definition for term in ("outer_id", "inner_id", "EXISTS", "ANY"))
+        assert connection.query(definition) == connection.query("SELECT * FROM view_subquery") == [
+            ["2", "4"], ["4", "5"]
+        ]
+
+
+def verify_window_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_window_base (grp int, val int)")
+        connection.query("INSERT INTO view_window_base VALUES (1, 2), (1, 3), (2, 1)")
+        connection.query(
+            "CREATE VIEW view_window AS SELECT grp, val, row_number() OVER window_keys AS pos, "
+            "sum(val) OVER (window_keys ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS total "
+            "FROM view_window_base WINDOW window_keys AS (PARTITION BY grp ORDER BY val) "
+            "ORDER BY grp, pos"
+        )
+        connection.query("ALTER TABLE view_window_base RENAME COLUMN grp TO category")
+        connection.query("ALTER TABLE view_window_base RENAME COLUMN val TO amount")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_window'"
+        )[0]
+        assert all(term in definition for term in ("category", "amount", "ROWS BETWEEN"))
+        assert connection.query(definition) == connection.query("SELECT * FROM view_window") == [
+            ["1", "2", "1", "2"], ["1", "3", "2", "5"], ["2", "1", "1", "1"]
+        ]
+
+
+def verify_set_returning_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_series_base (n int)")
+        connection.query("INSERT INTO view_series_base VALUES (pg_backend_pid())")
+        pid, = connection.query("SELECT n FROM view_series_base")[0]
+        connection.query(
+            "CREATE VIEW view_series AS SELECT n, (pg_stat_get_activity(n)).pid AS pid "
+            "FROM view_series_base"
+        )
+        connection.query(
+            "CREATE VIEW view_series_from AS SELECT b.n, activity.pid "
+            "FROM view_series_base b CROSS JOIN pg_stat_get_activity(b.n) AS activity"
+        )
+        connection.query("ALTER TABLE view_series_base RENAME COLUMN n TO bound")
+        for view in ("view_series", "view_series_from"):
+            definition, = connection.query(
+                f"SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = '{view}'"
+            )[0]
+            assert "bound" in definition and "pg_stat_get_activity" in definition
+            assert connection.query(definition) == connection.query(f"SELECT * FROM {view}") == [
+                [pid, pid]
+            ]
+
+
+def verify_variadic_view_definition(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query("CREATE TABLE view_published (id int)")
+        connection.query("CREATE PUBLICATION view_variadic_pub FOR TABLE view_published")
+        connection.query("CREATE TABLE view_publications (pubname text)")
+        connection.query("INSERT INTO view_publications VALUES ('view_variadic_pub')")
+        connection.query(
+            "CREATE VIEW view_variadic AS SELECT p.relid FROM view_publications v "
+            "CROSS JOIN pg_get_publication_tables(v.pubname) AS p"
+        )
+        connection.query("ALTER TABLE view_publications RENAME COLUMN pubname TO publication")
+        definition, = connection.query(
+            "SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname = 'view_variadic'"
+        )[0]
+        expected = connection.query("SELECT oid FROM pg_class WHERE relname = 'view_published'")
+        assert "publication" in definition and "VARIADIC" in definition
+        assert connection.query(definition) == connection.query("SELECT * FROM view_variadic") == expected
+
+
+def verify_view_definition_by_name(server):
+    with contextlib.closing(Connection(server.port)) as connection:
+        connection.query('CREATE VIEW public."Mixed.View" AS SELECT 17 AS id')
+        qualified, unqualified, oid = connection.query("""
+            SELECT pg_get_viewdef('public."Mixed.View"'),
+                   pg_get_viewdef('"Mixed.View"', true), pg_get_viewdef(oid)
+            FROM pg_class WHERE relname = 'Mixed.View'
+        """)[0]
+        assert qualified == unqualified == oid
+        assert connection.query(qualified) == [["17"]]
+        try:
+            connection.query("SELECT pg_get_viewdef('missing_view')")
+        except WireError as error:
+            assert error.sqlstate == "42P01", error
+        else:
+            raise AssertionError("pg_get_viewdef resolved a missing relation")
 
 
 def verify_expression_index_crash_boundaries(server):
@@ -1272,11 +2149,23 @@ def main():
         verify_apply_requires_schema_contract(server)
         verify_commit_dependency_races(server)
         verify_legacy_slot_noops(server)
+        verify_view_logical_ddl_rejected(server)
+        verify_view_transaction_visibility(server.port)
+        verify_view_read_only_and_acyclic(server.port)
+        verify_view_definition_context(server.port, create=True)
+        verify_whole_row_view_definition(server.port, create=True)
+        verify_view_sequence_dependencies(server.port, create=True, race=True)
+        verify_view_nonsequence_dependencies(server.port, create=True, race=True)
+        verify_view_sequence_portal_identity(server.port)
+        verify_view_replacement_contract(server.port)
+        verify_view_portal_during_replacement(server.port)
+        verify_bounded_view_sort(server.port)
         verify_ordered_catalog_capture(server)
         transactional_birth = verify_transactional_slot_handshake(server)
         server.stop(immediate=True)
         server.start()
         verify_catalog_capture_records(server)
+        verify_view_definition_context(server.port)
         with contextlib.closing(Connection(server.port)) as connection:
             assert connection.query(
                 "SELECT plugin,confirmed_flush_lsn FROM pg_replication_slots "
@@ -1298,6 +2187,22 @@ def main():
             server, "after-catalog-transaction-wal-flush", "durable_heap", True
         )
         verify_expression_index_crash_boundaries(server)
+        verify_view_crash_boundaries(server)
+        verify_whole_row_view_definition(server.port)
+        verify_view_sequence_dependencies(server.port)
+        verify_view_nonsequence_dependencies(server.port)
+        verify_joined_view_definition(server)
+        verify_ordered_view_definition(server)
+        verify_grouped_view_definition(server)
+        verify_union_view_definition(server)
+        verify_cte_view_definition(server)
+        verify_derived_view_definition(server)
+        verify_lateral_view_definition(server)
+        verify_sublink_view_definition(server)
+        verify_window_view_definition(server)
+        verify_set_returning_view_definition(server)
+        verify_variadic_view_definition(server)
+        verify_view_definition_by_name(server)
         verify_logical_column_type_rewrite()
     finally:
         server.stop()

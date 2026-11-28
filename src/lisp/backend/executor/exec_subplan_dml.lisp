@@ -576,17 +576,21 @@ Assignment evaluation already coerces to the destination typmod and checks origi
            (ensure-current-table table)
            (null (table-indexes table nil #'pg-index-ready-p))))))
 
-(defun prepare-literal-heap-insert (expressions columns xid cid)
+(defun prepare-literal-heap-insert (expressions columns xid cid &optional values-buffer layout-scratch)
   "Prepare one inline row without publishing it.
+With VALUES-BUFFER, return only the owned tuple octets and reuse the buffer
+on the next call. Otherwise return the values, tuple, and varlena as a list.
 Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
   (handler-case
-      (let ((values (map 'vector (lambda (expression) (eval-subquery-assignment expression nil))
-                         expressions)))
+      (let* ((evaluate (lambda (expression) (eval-subquery-assignment expression nil)))
+             (values (if values-buffer
+                         (map-into values-buffer evaluate expressions)
+                         (map 'vector evaluate expressions))))
         (check-not-null values columns)
         (multiple-value-bind (tuple varlena)
-            (form-heap-tuple values columns xid 0 cid 0 0 t)
+            (form-heap-tuple values columns xid 0 cid 0 0 (not values-buffer) layout-scratch)
           (when (<= (length tuple) +toast-tuple-target+)
-            (list values tuple varlena))))
+            (if values-buffer tuple (list values tuple varlena)))))
     (pg-error (condition)
       ;; Interrupt delivery may already have consumed the pending request.
       (when (or (fatal-error-p condition)
@@ -595,24 +599,33 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
         (error condition))
       nil)))
 
-(defun insert-literal-heap-batches (table relfilenode xid columns rows scalar inserted)
-  "Write bounded literal batches, using SCALAR for any chunk that cannot batch."
-  (let ((cid (backend-command-id *backend*)))
+(defun insert-literal-heap-batches (table relfilenode xid columns rows scalar inserted retain-values-p)
+  "Write bounded literal batches, using SCALAR for any chunk that cannot batch.
+When INSERTED only counts rows, reuse the evaluation and layout vectors."
+  (let* ((cid (backend-command-id *backend*))
+         (width (length columns))
+         (values-buffer (unless retain-values-p (make-array width)))
+         (layout-scratch (unless retain-values-p
+                           (cons (make-array width) (make-array width)))))
     (loop while rows
           for chunk = (progn
                         (check-for-interrupts)
                         (loop repeat 64 while rows collect (pop rows)))
           for prepared = (loop for expressions in chunk
-                               for row = (prepare-literal-heap-insert expressions columns xid cid)
+                               for row = (prepare-literal-heap-insert expressions columns xid cid values-buffer layout-scratch)
                                while row collect row)
           for tids = (when (= (length prepared) (length chunk))
                        (with-write-lock
                          (ensure-current-table table)
                          (unless (table-indexes table nil #'pg-index-ready-p)
-                           (heapam-insert-formed-tuples relfilenode (mapcar #'second prepared) xid))))
+                           (heapam-insert-formed-tuples relfilenode
+                                                        (if retain-values-p (mapcar #'second prepared) prepared)
+                                                        xid))))
           do (if tids
                  (loop for row in prepared for (block . offnum) in tids
-                       do (funcall inserted (first row) (third row) block offnum cid))
+                       do (if retain-values-p
+                              (funcall inserted (first row) (third row) block offnum cid)
+                              (funcall inserted nil nil block offnum cid)))
                  (dolist (expressions chunk) (funcall scalar expressions nil))))))
 
 (defun exec-insert-subqueries (stream ast)
@@ -715,7 +728,8 @@ Return NIL for a scalar retry if coercion, row checks, or the size limit fail."
                                   (nconc (lock-foreign-key-child-references
                                           table child-probes values (list block offnum cid) nil nil varlena)
                                          key-references)))
-                          (incf count)))
+                          (incf count))
+                        (not (null child-probes)))
                        (dolist (row (getf prepared :rows)) (insert-row row nil)))))))
          (check-foreign-key-child-references table key-references)
          (check-foreign-key-parent-changes table (nreverse key-changes) t)

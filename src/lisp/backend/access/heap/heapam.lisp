@@ -233,19 +233,22 @@
          1)
         (t 4)))
 
-(defun heap-tuple-layout (values columns &optional cached-varlena)
+(defun heap-tuple-layout (values columns &optional cached-varlena scratch)
   "Compute the exact physical layout used to form a heap tuple.
 Return size, attribute offsets, encoded varlena data and infomask.
 CACHED-VARLENA, when supplied, must correspond to the same columns and unchanged
 inline values at each cached index. Clear an entry when its inline value or type
 changes; external descriptors are always encoded afresh. The cache vector is
 copied, but its payloads are not: inline bytea payloads may alias VALUES and
-must remain stable while the layout is used."
+must remain stable while the layout is used. SCRATCH, when supplied, holds
+caller-owned offset and varlena vectors that can be overwritten next time."
   (let* ((natts (length columns))
          (hoff (heap-tuple-header-size values))
-         (offsets (make-array natts :initial-element nil))
-         (varlena-data (if cached-varlena (copy-seq cached-varlena)
-                           (make-array natts :initial-element nil)))
+         (offsets (if scratch (fill (car scratch) nil)
+                      (make-array natts :initial-element nil)))
+         (varlena-data (cond (cached-varlena (copy-seq cached-varlena))
+                             (scratch (fill (cdr scratch) nil))
+                             (t (make-array natts :initial-element nil))))
          (cursor hoff)
          (infomask 0)
          (has-null nil))
@@ -285,15 +288,16 @@ must remain stable while the layout is used."
       (setf infomask (logior infomask +heap-hasvarwidth+)))
     (values cursor offsets varlena-data infomask)))
 
-(defun form-heap-tuple (values columns xmin xmax cid block off &optional return-varlena-p)
+(defun form-heap-tuple (values columns xmin xmax cid block off &optional return-varlena-p layout-scratch)
   "Build a HeapTupleHeaderData + null bitmap + attribute data byte vector.
 Inline :bytea values are octet vectors copied into the returned tuple; callers
 must keep them stable during this call. :varchar, :text, :json, :jsonb, :bytea and :numeric may instead be
 physical external descriptors, written unaligned with HEAP_HASEXTERNAL set.
 This codec does not create or fetch TOAST data. RETURN-VARLENA-P also returns
-the encoded varlena payloads for reuse within this row."
+the encoded varlena payloads for reuse within this row. A caller supplying
+LAYOUT-SCRATCH may reuse it once it has consumed the returned payloads."
   (multiple-value-bind (cursor offsets varlena-data infomask)
-      (heap-tuple-layout values columns)
+      (heap-tuple-layout values columns nil layout-scratch)
     (let ((natts (length columns))
           (hoff (heap-tuple-header-size values))
           (bytes (make-array cursor :element-type '(unsigned-byte 8)
@@ -542,12 +546,14 @@ reject external and compressed datums and lengths outside BYTES."
     cursor))
 
 (defun heap-read-int4 (bytes offset)
+  (return-x86-page-word heap-read-int4 bytes offset 4 sb-sys:signed-sap-ref-32)
   (let ((value (page-u32 bytes offset)))
     (if (logbitp 31 value) (- value #x100000000) value)))
 
 (declaim (inline heap-read-int8))
 
 (defun heap-read-int8 (bytes offset)
+  (return-x86-page-word heap-read-int8 bytes offset 8 sb-sys:signed-sap-ref-64)
   (let ((bits (page-u64 bytes offset)))
     (if (logbitp 63 bits) (- bits #x10000000000000000) bits)))
 
@@ -578,8 +584,76 @@ reject external and compressed datums and lengths outside BYTES."
   (let ((offset (single-fixed-heap-tuple-offset bytes start limit infomask 4 4)))
     (if offset (heap-read-int4 bytes offset) +null+)))
 
-(defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value
-                                          (start 0) (limit (length bytes)))
+(defun heap-fixed-prefix-end (columns slot &optional (first 0)
+                                             (cursor (maxalign +size-of-heap-tuple-header+)))
+  "Advance over the fixed-width attributes before SLOT, without padding for SLOT."
+  (loop for position from first below slot
+        for column = (aref columns position)
+        for size = (column-fixed-size column)
+        unless size return nil
+          do (setf cursor (+ (align-up cursor (column-align column)) size))
+        finally (return cursor)))
+
+(defun make-fixed-heap-row-layout (columns)
+  "Precompute offsets and readers for fixed-width rows with a canonical header."
+  (let ((cursor (maxalign +size-of-heap-tuple-header+))
+        (layout (make-array (length columns))))
+    (dotimes (slot (length columns))
+      (let* ((column (aref columns slot))
+             (reader (case (pg-column-type column)
+                       ((:int4 :date) #'heap-read-int4)
+                       ((:int8 :time :timestamp :timestamptz) #'heap-read-int8)
+                       (:oid #'page-u32)
+                       (:uuid #'sql-uuid-from-octets))))
+        (unless reader (return-from make-fixed-heap-row-layout nil))
+        (setf cursor (align-up cursor (column-align column))
+              (aref layout slot) (cons cursor reader))
+        (incf cursor (column-fixed-size column))))
+    (cons cursor layout)))
+
+(declaim (inline canonical-fixed-heap-row-p))
+
+(defun canonical-fixed-heap-row-p (bytes start limit infomask layout)
+  "Validate tuple bounds and recognize rows addressed by the fixed layout."
+  (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
+    (ereport "XX001" "invalid heap tuple bounds"))
+  (when (and (not (logtest +heap-hasnull+ infomask))
+             (= (aref bytes (+ start +heap-tuple-hoff-off+))
+                (maxalign +size-of-heap-tuple-header+))
+             (= (page-u16 bytes (+ start +heap-tuple-natts-off+)) (length (cdr layout))))
+    (when (> (+ start (car layout)) limit)
+      (ereport "XX001" "truncated heap attribute"))
+    t))
+
+(declaim (inline fill-fixed-heap-row))
+
+(defun fill-fixed-heap-row (values bytes start slots first end)
+  (loop for slot from first below end
+        for attribute = (aref slots slot)
+        do (setf (aref values slot)
+                 (funcall (cdr attribute) bytes (+ start (car attribute))))))
+
+(defun decode-canonical-fixed-heap-row (bytes start layout predicate-slot predicate-value)
+  "Decode an already validated tuple, retaining its decoded predicate value."
+  (let* ((slots (cdr layout))
+         (count (length slots))
+         (values (make-array count)))
+    (fill-fixed-heap-row values bytes start slots 0 predicate-slot)
+    (setf (aref values predicate-slot) predicate-value)
+    (fill-fixed-heap-row values bytes start slots (1+ predicate-slot) count)
+    values))
+
+(defun decode-fixed-heap-row (bytes start limit infomask layout &optional destination)
+  "Decode a canonical row, or return NIL when NULLs or schema evolution need the general decoder."
+  (when (canonical-fixed-heap-row-p bytes start limit infomask layout)
+    (let* ((slots (cdr layout))
+           (count (length slots))
+           (values (or destination (make-array count))))
+      (fill-fixed-heap-row values bytes start slots 0 count)
+      values)))
+
+(defun deform-heap-tuple (bytes columns &key demand max-varlena-size wide-value (metadata :full)
+                                          (start 0) (limit (length bytes)) destination)
   "Return values, XIDs, command ID, infomask, and successor TID.
 Inline compressed attributes are decompressed, and inline :bytea values are
 fresh octet vectors independent of BYTES. External :varchar, :text, :json,
@@ -588,18 +662,17 @@ external decompression are deferred. START and LIMIT give the inclusive start an
 exclusive end of the tuple. Use the physical attribute count to locate its
 bitmap and decode the descriptor prefix. Attributes added after tuple
 formation use the descriptor's missing values. Decoded values do not retain
-the input page."
+the input page. METADATA :NONE returns only values. :COMPRESSION also returns
+compressed-datum provenance as its second value, without reading identity fields.
+DESTINATION, when supplied, is a caller-owned row vector with one slot per column."
   (unless (<= 0 start (+ start +size-of-heap-tuple-header+) limit (length bytes))
     (ereport "XX001" "invalid heap tuple bounds"))
   (let* ((natts (length columns))
          (physical-natts (page-u16 bytes (+ start +heap-tuple-natts-off+)))
-         (xmin (page-u32 bytes (+ start +heap-tuple-xmin-off+)))
-         (xmax (page-u32 bytes (+ start +heap-tuple-xmax-off+)))
-         (cid (page-u32 bytes (+ start +heap-tuple-cid-off+)))
-         (ctid-block (page-u32 bytes (+ start +heap-tuple-ctid-block-off+)))
-         (ctid-offnum (page-u16 bytes (+ start +heap-tuple-ctid-offnum-off+)))
          (infomask (page-u16 bytes (+ start +heap-tuple-infomask-off+)))
-         (values (make-array natts :initial-element +null+))
+         (values (if destination
+                     (fill destination +null+)
+                     (make-array natts :initial-element +null+)))
          (physical-compressed nil)
          (cursor (heap-tuple-data-offset bytes start limit physical-natts infomask)))
     (loop for i from 0 below (min natts physical-natts)
@@ -651,7 +724,7 @@ the input page."
                               (setf (aref values i)
                                     (if (eq type :numeric)
                                         (sql-numeric-from-varlena-payload bytes :start start :end end)
-                                        (bytes->string bytes :start start :end end))
+                                        (bytes->string bytes :start start :end end :compact-ascii-p t))
                                     cursor end))
                             (multiple-value-bind (physical-end raw-size)
                                 (heap-varlena-physical-end-and-raw-size bytes cursor limit)
@@ -664,7 +737,8 @@ the input page."
                                              (setf (aref values i) pointer cursor end))
                                            (multiple-value-bind (payload end)
                                                (heap-inline-varlena-bytes bytes cursor limit)
-                                             (when (= (logand (aref bytes cursor) 3) 2)
+                                             (when (and (not (eq metadata :none))
+                                                        (= (logand (aref bytes cursor) 3) 2))
                                                (unless physical-compressed
                                                  (setf physical-compressed (make-array natts :initial-element nil)))
                                                (setf (aref physical-compressed i)
@@ -673,7 +747,18 @@ the input page."
                                                    cursor end))))))))))))))
     (loop for i from physical-natts below natts
           do (setf (aref values i) (pg-column-missing-value (aref columns i))))
-    (values values xmin xmax cid infomask ctid-block ctid-offnum physical-compressed)))
+    (ecase metadata
+      (:none values)
+      (:compression (values values physical-compressed))
+      (:full
+       (values values
+               (page-u32 bytes (+ start +heap-tuple-xmin-off+))
+               (page-u32 bytes (+ start +heap-tuple-xmax-off+))
+               (page-u32 bytes (+ start +heap-tuple-cid-off+))
+               infomask
+               (page-u32 bytes (+ start +heap-tuple-ctid-block-off+))
+               (page-u16 bytes (+ start +heap-tuple-ctid-offnum-off+))
+               physical-compressed)))))
 
 (defun heapam-deform-page-item (page block offnum off len columns &optional toast-visibility-p)
   "Deform a live line pointer in an already acquired page."

@@ -223,7 +223,14 @@
       (rove:ok (= (length tuple) (heap-tuple-layout physical columns)))
       (multiple-value-bind (values xmin) (deform-heap-tuple tuple columns)
         (rove:ok (= xmin 42))
-        (rove:ok (equalp values logical)))))
+        (rove:ok (equalp values logical))
+        (rove:ok (equalp logical (deform-heap-tuple tuple columns :metadata :none))
+                 "values-only deformation still decompresses inline datums")
+        (multiple-value-bind (row compressed)
+            (deform-heap-tuple tuple columns :metadata :compression)
+          (rove:ok (equalp logical row))
+          (rove:ok (heap-compressed-varlena-p (aref compressed 1)))
+          (rove:ok (equalp compressed (nth-value 7 (deform-heap-tuple tuple columns))))))))
 
 (rove:deftest test-inline-compression-externalization-choice
     (let* ((columns (vector (make-pg-column :type :bytea)

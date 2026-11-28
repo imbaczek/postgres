@@ -41,6 +41,26 @@
   initially-deferred-p
   validated-p)
 
+(defstruct sql-relation-name schema name)
+
+(defstruct sql-derived-relation query)
+
+(defstruct view-relation-reference
+  "A relation OID and the qualifier visible when the view was defined."
+  (oid nil :read-only t)
+  (name nil :read-only t)
+  (attributes nil :read-only t))
+
+(defstruct pg-view-definition
+  "Definition-time query bindings and their dependency identities.
+The owning PG-CLASS stores the output descriptor in attnum order."
+  (query nil :read-only t)
+  (source nil :read-only t)
+  (owner "postgres" :read-only t)
+  (dependencies nil :read-only t)
+  (attribute-dependencies nil :read-only t)
+  (sequence-dependencies nil :read-only t))
+
 (defstruct pg-class
   oid
   name
@@ -48,10 +68,11 @@
   (relfrozenxid +first-normal-xid+)
   columns           ; simple-vector of pg-column, attnum order
   indexes           ; list of index OIDs
-  statistics
   checks
   foreign-keys
-  toast)       ; derived ANALYZE estimates; raw samples remain transient
+  toast
+  view-definition
+  statistics)       ; derived ANALYZE estimates; raw samples remain transient
 
 (defstruct pg-index
   oid
@@ -225,7 +246,17 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
 (defun catalog-expression-to-sexp (expression)
   ;; Encode decimals explicitly so persisted expression trees round-trip without
   ;; relying on a Lisp structure reader or losing their display scale.
-  (cond ((sql-array-p expression)
+  (cond ((view-relation-reference-p expression)
+         (list :pg-catalog-view-relation (view-relation-reference-oid expression)
+               (view-relation-reference-name expression)
+               (view-relation-reference-attributes expression)))
+        ((sql-relation-name-p expression)
+         (list :pg-catalog-relation-name (sql-relation-name-schema expression)
+               (sql-relation-name-name expression)))
+        ((sql-derived-relation-p expression)
+         (list :pg-catalog-derived-relation
+               (catalog-expression-to-sexp (sql-derived-relation-query expression))))
+        ((sql-array-p expression)
          (list :pg-catalog-array (sql-array-element-type-id expression)
                (copy-list (sql-array-dimensions expression)) (copy-list (sql-array-lower-bounds expression))
                (map 'list #'catalog-expression-to-sexp (sql-array-elements expression))))
@@ -253,7 +284,14 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
         (t expression)))
 
 (defun catalog-expression-from-sexp (expression)
-  (cond ((and (consp expression) (eq (first expression) :pg-catalog-array))
+  (cond ((and (consp expression) (eq (first expression) :pg-catalog-view-relation))
+         (make-view-relation-reference :oid (second expression) :name (third expression)
+                                       :attributes (fourth expression)))
+        ((and (consp expression) (eq (first expression) :pg-catalog-relation-name))
+         (make-sql-relation-name :schema (second expression) :name (third expression)))
+        ((and (consp expression) (eq (first expression) :pg-catalog-derived-relation))
+         (make-sql-derived-relation :query (catalog-expression-from-sexp (second expression))))
+        ((and (consp expression) (eq (first expression) :pg-catalog-array))
          (make-sql-array :element-type-id (second expression)
                          :dimensions (third expression) :lower-bounds (fourth expression)
                          :elements (map 'vector #'catalog-expression-from-sexp (fifth expression))))
@@ -369,10 +407,34 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:index-relfilenode pg-toast-index-relfilenode :index-relfilenode)
   (:relfrozenxid pg-toast-relfrozenxid :relfrozenxid))
 
+(defun view-definition-to-sexp (definition)
+  (when definition
+    (list :version 1
+          :query (catalog-expression-to-sexp (pg-view-definition-query definition))
+          :source (pg-view-definition-source definition)
+          :owner (pg-view-definition-owner definition)
+          :dependencies (pg-view-definition-dependencies definition)
+          :attribute-dependencies (pg-view-definition-attribute-dependencies definition)
+          :sequence-dependencies (pg-view-definition-sequence-dependencies definition))))
+
+(defun view-definition-from-sexp (encoded)
+  (when encoded
+    (unless (eql (getf encoded :version) 1)
+      (error "Unsupported view definition version ~S" (getf encoded :version)))
+    (make-pg-view-definition
+     :query (catalog-expression-from-sexp (getf encoded :query))
+     :source (getf encoded :source)
+     :owner (getf encoded :owner "postgres")
+     :dependencies (getf encoded :dependencies)
+     :attribute-dependencies (getf encoded :attribute-dependencies)
+     :sequence-dependencies (getf encoded :sequence-dependencies))))
+
 (define-catalog-codec (class copy-pg-class) make-pg-class
   (:oid pg-class-oid :oid)
   (:name pg-class-name :name)
   (:relfilenode pg-class-relfilenode :relfilenode)
+  (:view-definition pg-class-view-definition :view-definition :omit-default t
+                                                              :encode #'view-definition-to-sexp :decode #'view-definition-from-sexp)
   (:relfrozenxid pg-class-relfrozenxid :relfrozenxid
                  :decode (lambda (xid)
                            (or xid (xid-epoch-start *next-xid*))))
@@ -721,7 +783,8 @@ cluster-wide minimum directly and skips missing horizons."
          (maphash
           (lambda (table-name table)
             (declare (ignore table-name))
-            (dolist (relfrozenxid (list (pg-class-relfrozenxid table)
+            (dolist (relfrozenxid (list (and (pg-class-relfilenode table)
+                                             (pg-class-relfrozenxid table))
                                         (and (pg-class-toast table)
                                              (pg-toast-relfrozenxid (pg-class-toast table)))))
               (when (and relfrozenxid
@@ -1019,7 +1082,15 @@ from advancing the shared WAL generation between a failed save and rollback."
   (with-write-catalog-locks
     (call-with-catalog-durability-rollback-under-lock rollback function)))
 
-(defun sequence-nextval (name)
+(defun lookup-executed-sequence (name expected-oid)
+  "Check the admitted sequence identity before a primitive reads or changes it."
+  (let ((sequence (lookup-sequence name)))
+    (when (and expected-oid
+               (not (and sequence (eql expected-oid (pg-sequence-oid sequence)))))
+      (ereport "42P01" "view references missing sequence with OID ~d" expected-oid))
+    sequence))
+
+(defun sequence-nextval (name &optional expected-oid)
   "Advance and durably save NAME before returning its next value."
   (prevent-recovery-write "nextval")
   (when (and *backend* (backend-read-only *backend*))
@@ -1027,7 +1098,7 @@ from advancing the shared WAL generation between a failed save and rollback."
   (when (and *backend* (eq (backend-state *backend*) :in-progress))
     (logical-note-xid-mutation-needs-capture-p (get-current-xid)))
   (with-write-lock
-    (let* ((sequence (lookup-sequence name))
+    (let* ((sequence (lookup-executed-sequence name expected-oid))
            (old-value (and sequence (pg-sequence-last-value sequence)))
            (old-called (and sequence (pg-sequence-called-p sequence))))
       (unless sequence
@@ -1053,8 +1124,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                        (backend-sequence-currvals *backend*)) value)
         value))))
 
-(defun sequence-currval (name)
-  (let* ((sequence (lookup-sequence name))
+(defun sequence-currval (name &optional expected-oid)
+  (let* ((sequence (lookup-executed-sequence name expected-oid))
          (value (and sequence
                      (gethash (pg-sequence-oid sequence)
                               (backend-sequence-currvals *backend*)))))
@@ -1066,7 +1137,7 @@ from advancing the shared WAL generation between a failed save and rollback."
                name))
     value))
 
-(defun sequence-setval (name value &optional (called-p t))
+(defun sequence-setval (name value &optional (called-p t) expected-oid)
   "Set and durably save a sequence value; this operation is not transactional."
   (prevent-recovery-write "setval")
   (when (and *backend* (backend-read-only *backend*))
@@ -1076,7 +1147,7 @@ from advancing the shared WAL generation between a failed save and rollback."
   (when (and *backend* (eq (backend-state *backend*) :in-progress))
     (logical-note-xid-mutation-needs-capture-p (get-current-xid)))
   (with-write-lock
-    (let* ((sequence (lookup-sequence name))
+    (let* ((sequence (lookup-executed-sequence name expected-oid))
            (old-value (and sequence (pg-sequence-last-value sequence)))
            (old-called (and sequence (pg-sequence-called-p sequence))))
       (unless sequence
@@ -1125,8 +1196,8 @@ from advancing the shared WAL generation between a failed save and rollback."
 
 (defun publication-selected-table-names (publication db)
   (if (pg-publication-all-tables-p publication)
-      (sort (loop for name being the hash-keys of (database-tables db)
-                  collect name)
+      (sort (loop for name being the hash-keys of (database-tables db) using (hash-value relation)
+                  unless (pg-class-view-definition relation) collect name)
             #'string<)
       (mapcar (lambda (entry) (getf entry :name))
               (remove-if-not
@@ -1134,7 +1205,8 @@ from advancing the shared WAL generation between a failed save and rollback."
                  (let* ((table (gethash (getf entry :name)
                                         (database-tables db)))
                         (oid (getf entry :table-oid)))
-                   (and table (or (null oid) (= oid (pg-class-oid table))))))
+                   (and table (not (pg-class-view-definition table))
+                        (or (null oid) (= oid (pg-class-oid table))))))
                (pg-publication-tables publication)))))
 
 (defun catalog-expression-sequence-names (expression &key validate-p)
@@ -1232,7 +1304,9 @@ from advancing the shared WAL generation between a failed save and rollback."
                     (format nil "numeric(~d,~d)" precision scale))))
     (:varchar (let ((length (sql-varchar-typmod-length typmod)))
                 (if length (format nil "varchar(~d)" length) "varchar")))
-    (:varchar-array (concatenate 'string (catalog-expression-type-sql :varchar typmod) "[]"))
+    ((:varchar-array :date-array :time-array :timetz-array :timestamp-array
+                     :timestamptz-array :interval-array)
+     (concatenate 'string (catalog-expression-type-sql (sql-array-element-type type) typmod) "[]"))
     (:bit (if (minusp typmod) "\"bit\"" (format nil "bit(~d)" typmod)))
     ((:int2 :int4 :int8 :float4 :float8 :bool :uuid :text :json :jsonb :bytea :name
       :oid :oid8 :pg-lsn :char :int2vector :text-array :bytea-array :json-array :jsonb-array
@@ -1252,16 +1326,22 @@ from advancing the shared WAL generation between a failed save and rollback."
   "Render a cooked constant without consulting session format settings."
   (let* ((value (second expression)) (type (getf (cddr expression) :type))
                                      (typmod (or (getf (cddr expression) :typmod) -1))
-                                     (type-sql (unless (eq type :pg-node-tree) (catalog-expression-type-sql type typmod))))
+                                     (type-sql (unless (or (eq type :pg-node-tree)
+                                                           (and (eq type :record) (eq value +null+)))
+                                                 (catalog-expression-type-sql type typmod))))
     (when (eq type :pg-node-tree)
       (unless (eq value +null+) (ereport "0A000" "cannot serialize pg_node_tree constant"))
       (return-from catalog-canonical-constant-sql "NULL"))
-    (if (eq value +null+) (format nil "CAST(NULL AS ~a)" type-sql)
+    (if (eq value +null+)
+        (if type-sql (format nil "CAST(NULL AS ~a)" type-sql) "NULL")
         (let ((text (case type
                       (:date (sql-date-output value)) (:time (sql-time-output value))
                       (:timetz (sql-timetz-output value)) (:timestamp (sql-timestamp-output value nil))
                       (:timestamptz (sql-timestamp-output value t))
                       (:interval (sql-interval-output value))
+                      ((:date-array :time-array :timetz-array :timestamp-array
+                        :timestamptz-array :interval-array)
+                       (sql-array-output value #'catalog-temporal-value-text))
                       ((:float4 :float8) (sql-float-output value type 3))
                       (:numeric (sql-numeric-output value))
                       (:bool (if value "true" "false"))
@@ -1270,22 +1350,42 @@ from advancing the shared WAL generation between a failed save and rollback."
                       (otherwise (value->text value type)))))
           (format nil "CAST(~a AS ~a)" (catalog-sql-literal text) type-sql)))))
 
-(defun catalog-canonical-expression-sql (expression &optional table)
-  "Deparse a cooked stored expression without re-evaluating it."
+(defun catalog-canonical-expression-sql (expression &optional table column-renderer outer-renderer subquery-renderer row-renderer)
+  "Deparse a cooked expression, using COLUMN-RENDERER for query-scope slots when supplied."
   (labels ((render (node)
              (unless (consp node) (ereport "0A000" "cannot serialize stored expression ~s" node))
              (case (first node)
                (:assignment (render (second node)))
-               (:const (catalog-canonical-constant-sql node))
+               (:outer-ref
+                (unless outer-renderer
+                  (ereport "0A000" "cannot serialize an outer reference without its query scope"))
+                (funcall outer-renderer (second node) (third node)))
+               (:subplan
+                (unless subquery-renderer
+                  (ereport "0A000" "cannot serialize a subquery without its query scope"))
+                (funcall subquery-renderer (second node)))
+               (:whole-row
+                (unless row-renderer
+                  (ereport "0A000" "cannot serialize a whole row without its query scope"))
+                (funcall row-renderer (getf (cdddr node) :source-index)))
+               (:const
+                (if (or (getf (cddr node) :view-sequence-oid)
+                        (getf (cddr node) :view-nonsequence-oid)
+                        (getf (cddr node) :view-missing-regclass-oid))
+                    (catalog-sql-literal (or (getf (cddr node) :view-regclass-literal)
+                                             (second node)))
+                    (catalog-canonical-constant-sql node)))
                (:bool (if (second node) "TRUE" "FALSE"))
-               (:col (let* ((index (1- (second node)))
-                            (columns (and table (pg-class-columns table))))
-                       (unless (and columns (<= 0 index) (< index (length columns)))
-                         (ereport "0A000" "cannot serialize stored expression column"))
-                       (catalog-sql-quote-ident (pg-column-name (aref columns index)))))
-               (:cast (format nil "CAST(~a AS ~a)" (render (second node))
-                              (catalog-expression-type-sql (getf (cddr node) :type)
-                                                           (or (getf (cddr node) :typmod) -1))))
+               (:col (if column-renderer
+                         (funcall column-renderer (second node))
+                         (let* ((index (1- (second node)))
+                                (columns (and table (pg-class-columns table))))
+                           (unless (and columns (<= 0 index) (< index (length columns)))
+                             (ereport "0A000" "cannot serialize stored expression column"))
+                           (catalog-sql-quote-ident (pg-column-name (aref columns index))))))
+               ((:cast :join-relabel) (format nil "CAST(~a AS ~a)" (render (second node))
+                                              (catalog-expression-type-sql (getf (cddr node) :type)
+                                                                           (or (getf (cddr node) :typmod) -1))))
                (:unary (format nil "(~a ~a)" (second node) (render (third node))))
                (:binop (format nil "(~a ~a ~a)" (render (third node)) (second node) (render (fourth node))))
                (:concat (format nil "(~a || ~a)" (render (second node)) (render (third node))))
@@ -1322,8 +1422,11 @@ from advancing the shared WAL generation between a failed save and rollback."
                            (format nil "ARRAY[~{~a~^, ~}]" (mapcar #'render (second node)))
                            "CAST('{}' AS text[])"))
                (:record-field
-                (let* ((record (second node)) (fields (getf (cdddr record) :fields))
-                                              (field (nth (third node) fields)))
+                (let* ((record (second node))
+                       (call (and (eq (first record) :col)
+                                  (getf (cddr record) :set-function-expression)))
+                       (fields (getf (cdddr (or call record)) :fields))
+                       (field (nth (third node) fields)))
                   (unless field (ereport "0A000" "cannot serialize stored record field"))
                   (format nil "(~a).~a" (render record) (catalog-sql-quote-ident (first field)))))
                (:array-slice
@@ -1334,11 +1437,15 @@ from advancing the shared WAL generation between a failed save and rollback."
                (:array-subscript (format nil "(~a)~{[~a]~}" (render (second node))
                                          (mapcar #'render (third node))))
                (:array-length (format nil "array_length(~a, ~a)" (render (second node)) (render (third node))))
-               ((:func :single-record)
+               ((:func :single-record :set-func)
+                (when (and (eq (first node) :set-func) (null column-renderer))
+                  (ereport "0A000" "cannot serialize a set-returning call outside a query"))
                 (let ((arguments (mapcar #'render (third node))))
                   (when (and arguments (getf (cdddr node) :variadic))
                     (setf (car (last arguments)) (concatenate 'string "VARIADIC " (car (last arguments)))))
                   (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node)) arguments)))
+               (:join-coalesce
+                (format nil "COALESCE(~a, ~a)" (render (second node)) (render (third node))))
                (:coalesce (format nil "COALESCE(~{~a~^, ~})" (mapcar #'render (second node))))
                (:case (format nil "(CASE~{ WHEN ~a THEN ~a~} ELSE ~a END)"
                               (loop for (condition result) in (second node)
@@ -1476,7 +1583,8 @@ the feature boundary in pg_dump.c's schema/data phases. Standalone index entries
 carry their owning table, as pg_index.indrelid does in PostgreSQL's catalog."
   (let ((tables (sort (loop for table being the hash-values of
                                                             (database-tables db)
-                            collect table)
+                            unless (pg-class-view-definition table)
+                              collect table)
                       #'string< :key #'pg-class-name))
         (sequences
           (if (and snapshot

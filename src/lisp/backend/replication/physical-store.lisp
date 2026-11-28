@@ -102,18 +102,22 @@ the archive outside the receive spool; otherwise it is stored beneath the spool.
 Per-record CRCs alone cannot detect a missing whole record before a rotation.
 This FNV-1a-64 checksum detects accidental prefix damage, not malicious tampering.
 For a nonempty simple octet vector and unsigned 64-bit DIGEST, join the
-kernel's two halves here, which may allocate a full-width integer.  Other
-inputs use the historical generic calculation.  BYTES is read without mutation."
-  (if (and (typep digest '(unsigned-byte 64))
-           (typep bytes '(simple-array (unsigned-byte 8) (*)))
-           (plusp (length bytes)))
+kernel's two halves here, which may allocate a full-width integer. A displaced
+octet slice with simple backing uses the same kernel over its bounds.
+BYTES is read without mutation."
+  (when (and (typep digest '(unsigned-byte 64)) (typep bytes '(vector (unsigned-byte 8)))
+             (plusp (length bytes)))
+    (when (typep bytes '(simple-array (unsigned-byte 8) (*)))
       (multiple-value-bind (low high) (%physical-store-fnv1a64-parts digest bytes)
-        (logior low (ash high 32)))
-      (progn
-        (loop for octet across bytes
-              do (setf digest (logand #xffffffffffffffff
-                                      (* (logxor digest octet) #x100000001B3))))
-        digest)))
+        (return-from physical-store-update-digest (logior low (ash high 32)))))
+    (multiple-value-bind (backing start) (array-displacement bytes)
+      (when (typep backing '(simple-array (unsigned-byte 8) (*)))
+        (return-from physical-store-update-digest
+          (physical-store-update-digest-span digest backing start (+ start (length bytes)))))))
+  (loop for octet across bytes
+        do (setf digest (logand #xffffffffffffffff
+                                (* (logxor digest octet) #x100000001B3))))
+  digest)
 
 (defconstant +wal-archive-segment-proof-size+ 52)
 

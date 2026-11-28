@@ -102,8 +102,8 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
 (defun select-order-value (expression row)
   ;; Reuse selected projection slots across ordinary, top-N and external sorts.
   (if (eq (first expression) :sort-output)
-      (aref (car row) (1- (second expression)))
-      (eval-expr expression (cdr row))))
+      (aref (if (consp row) (car row) row) (1- (second expression)))
+      (eval-expr expression (if (consp row) (cdr row) row))))
 
 (defun row-less-p (a b order)
   (loop for (expr . direction) in order
@@ -121,20 +121,28 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
   presence
   (bytes 0))
 
+(defstruct top-n-key-cutoff
+  slot descending-p value item-size-bound)
+
 (defstruct (select-top-n-collector (:constructor %make-select-top-n-collector))
   limit
   order
+  item-order
   heap
+  candidate
   next-sequence
   item-size-function
+  last-replacement-at-leaf-p
   (bytes 0))
 
 (defun make-select-top-n-collector (limit order &optional item-size-function)
   (%make-select-top-n-collector
    :limit limit
    :order order
+   :item-order (make-select-top-n-item-order order)
    :item-size-function item-size-function
    :heap (make-array (min limit 32) :adjustable t :fill-pointer 0)
+   :candidate (make-select-top-n-item :keys (make-array (length order)))
    :next-sequence 0))
 
 (defun select-top-n-push (heap item limit)
@@ -157,61 +165,138 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
              (return (< (select-top-n-item-sequence a)
                         (select-top-n-item-sequence b)))))
 
-(defun select-top-n-sift-up (heap order index)
+(defun make-select-top-n-item-order (order)
+  "Resolve direction and NULL placement for the common single-key bounded sort."
+  (if (and order (null (cdr order)))
+      (let* ((direction (cdar order))
+             (descending-p (order-descending-p direction))
+             (reverse-nulls-p (keywordp direction))
+             (compare (case (expr-type (caar order))
+                        ((:text :varchar :name) #'sql-string-compare)
+                        (:uuid #'sql-uuid-compare))))
+        (lambda (a b)
+          (let ((left (svref (select-top-n-item-keys a) 0))
+                (right (svref (select-top-n-item-keys b) 0)))
+            (if (and (typep left 'fixnum) (typep right 'fixnum))
+                (cond ((= left right)
+                       (< (select-top-n-item-sequence a) (select-top-n-item-sequence b)))
+                      (descending-p (> left right))
+                      (t (< left right)))
+                (let* ((null-key-p (or (eq left +null+) (eq right +null+)))
+                       (comparison (if (and compare (not null-key-p))
+                                       (funcall compare left right)
+                                       (order-compare left right))))
+                  (if (zerop comparison)
+                      (< (select-top-n-item-sequence a) (select-top-n-item-sequence b))
+                      (let ((reverse-p (and reverse-nulls-p null-key-p)))
+                        (if (eq descending-p reverse-p)
+                            (minusp comparison)
+                            (plusp comparison)))))))))
+      (lambda (a b) (select-top-n-item-less-p a b order))))
+
+(defun select-top-n-sift-up (heap less-p index)
   (when (plusp index)
     (let ((parent (floor (1- index) 2)))
-      (when (select-top-n-item-less-p (aref heap parent) (aref heap index)
-                                      order)
+      (when (funcall less-p (aref heap parent) (aref heap index))
         (rotatef (aref heap index) (aref heap parent))
-        (select-top-n-sift-up heap order parent)))))
+        (select-top-n-sift-up heap less-p parent)))))
 
-(defun select-top-n-sift-down (heap order index)
-  (let* ((left (+ (* 2 index) 1))
-         (right (1+ left))
-         (heap-length (length heap)))
-    (when (< left heap-length)
-      (let* ((worse-child
-               (if (and (< right heap-length)
-                        (select-top-n-item-less-p (aref heap left)
-                                                  (aref heap right) order))
-                   right
-                   left)))
-        (when (select-top-n-item-less-p (aref heap index)
-                                        (aref heap worse-child) order)
-          (rotatef (aref heap index) (aref heap worse-child))
-          (select-top-n-sift-down heap order worse-child))))))
+(defun select-top-n-replace-root (heap less-p item last-at-leaf-p)
+  "Replace the heap root with ITEM and report whether a leaf placement favors a full descent next."
+  ;; The collector creates a non-displaced vector and never grows it here.
+  (let* ((data (sb-ext:array-storage-vector heap))
+         (index 0)
+         (heap-length (length heap))
+         (parents (floor heap-length 2)))
+    (declare (simple-vector data)
+             (type fixnum index heap-length parents))
+    (loop while (< index parents)
+          for left of-type fixnum = (the fixnum (1+ (* 2 index)))
+          for right of-type fixnum = (the fixnum (1+ left))
+          for child of-type fixnum = (if (and (< right heap-length)
+                                              (funcall less-p (svref data left) (svref data right)))
+                                         right
+                                         left)
+          ;; A previous leaf placement predicts deep replacements in
+          ;; partially ordered input. Keep the root check for abrupt changes.
+          while (or (and last-at-leaf-p (plusp index))
+                    (funcall less-p item (svref data child)))
+          do (setf (svref data index) (svref data child)
+                   index child))
+    (when last-at-leaf-p
+      ;; The path above the hole is ordered. A candidate near the leaves
+      ;; needs only one comparison against its new parent.
+      (loop while (plusp index)
+            for parent of-type fixnum = (ash (1- index) -1)
+            for value = (svref data parent)
+            while (funcall less-p value item)
+            do (setf (svref data index) value
+                     index parent)))
+    (setf (svref data index) item)
+    ;; A path of at most two edges needs no more candidate comparisons
+    ;; than checking both ends, so use ordinary descent in small heaps.
+    (and (>= heap-length 8) (>= index parents))))
 
-(defun offer-select-top-n-row (collector row)
+(defun offer-select-top-n-row (collector row &optional scratch)
+  "Reuse the candidate outside the sort heap so only admitted items retain rows."
   (let* ((order (select-top-n-collector-order collector))
          (heap (select-top-n-collector-heap collector))
+         (less-p (select-top-n-collector-item-order collector))
          (limit (select-top-n-collector-limit collector))
-         (sequence (select-top-n-collector-next-sequence collector))
-         (item (make-select-top-n-item
-                :row row
-                :presence (copy-seq *query-row-presence*)
-                :origins (and *datum-origin-capture* *query-row-origins*)
-                :keys (map 'vector
-                           (lambda (entry)
-                             (select-order-value (car entry) row))
-                           order)
-                :sequence sequence)))
+         (item (select-top-n-collector-candidate collector))
+         (keys (select-top-n-item-keys item)))
+    (declare (simple-vector keys))
+    (if (and order (null (cdr order)))
+        (setf (svref keys 0) (select-order-value (caar order) row))
+        (loop for entry in order for position from 0
+              do (setf (svref keys position) (select-order-value (car entry) row))))
+    (setf (select-top-n-item-sequence item)
+          (select-top-n-collector-next-sequence collector))
     (incf (select-top-n-collector-next-sequence collector))
-    (when (and (plusp limit)
-               (or (< (length heap) limit)
-                   (select-top-n-item-less-p item (aref heap 0) order)))
-      (let ((size-function (select-top-n-collector-item-size-function collector)))
-        (when size-function
-          (setf (select-top-n-item-bytes item) (funcall size-function item))
-          (incf (select-top-n-collector-bytes collector) (select-top-n-item-bytes item))))
-      (if (< (length heap) limit)
-          (let ((expanded (select-top-n-push heap item limit)))
-            (setf (select-top-n-collector-heap collector) expanded)
-            (select-top-n-sift-up expanded order (1- (length expanded))))
-          (progn
-            (decf (select-top-n-collector-bytes collector)
-                  (select-top-n-item-bytes (aref heap 0)))
-            (setf (aref heap 0) item)
-            (select-top-n-sift-down heap order 0))))))
+    (cond
+      ((and (plusp limit)
+            (or (< (length heap) limit)
+                (funcall less-p item (aref heap 0))))
+       (setf (select-top-n-item-row item) row
+             (select-top-n-item-presence item)
+             ;; A bare row comes from a scan with immutable source presence.
+             (if (consp row) (copy-seq *query-row-presence*) *query-row-presence*)
+             (select-top-n-item-origins item) (and *datum-origin-capture* *query-row-origins*))
+       (let ((size-function (select-top-n-collector-item-size-function collector)))
+         (when size-function
+           (setf (select-top-n-item-bytes item) (funcall size-function item))
+           (incf (select-top-n-collector-bytes collector) (select-top-n-item-bytes item))))
+       (if (< (length heap) limit)
+           (let ((expanded (select-top-n-push heap item limit)))
+             (when (and scratch (eq row (car scratch)))
+               (setf (car scratch) (make-array (length row))))
+             (setf (select-top-n-collector-heap collector) expanded
+                   (select-top-n-collector-candidate collector)
+                   (make-select-top-n-item :keys (make-array (length keys))))
+             (select-top-n-sift-up expanded less-p (1- (length expanded))))
+           (let ((evicted (aref heap 0)))
+             ;; A borrowing iterator yields only its current scratch vector.
+             ;; Transfer the accepted vector and reuse the evicted one.
+             (when (and scratch (eq row (car scratch)))
+               (setf (car scratch) (select-top-n-item-row evicted)))
+             (decf (select-top-n-collector-bytes collector) (select-top-n-item-bytes evicted))
+             (setf (select-top-n-collector-last-replacement-at-leaf-p collector)
+                   (select-top-n-replace-root
+                    heap less-p item
+                    (select-top-n-collector-last-replacement-at-leaf-p collector)))
+             (setf (select-top-n-collector-candidate collector) evicted
+                   (select-top-n-item-row evicted) nil
+                   (select-top-n-item-origins evicted) nil
+                   (select-top-n-item-presence evicted) nil
+                   (select-top-n-item-bytes evicted) 0)
+             (fill (select-top-n-item-keys evicted) nil)
+             nil))
+       (when (and (cdr scratch)
+                  (= (length (select-top-n-collector-heap collector)) limit))
+         (setf (top-n-key-cutoff-value (cdr scratch))
+               (svref (select-top-n-item-keys
+                       (aref (select-top-n-collector-heap collector) 0)) 0))))
+      (t (fill keys nil) nil))))
 
 (defun select-top-n-collector-rows (collector &optional with-origins with-presence)
   (mapcar (cond
@@ -223,9 +308,7 @@ MODE is the literal :READ or :WRITE. Registration remains until the XID ends."
                 (lambda (item) (cons (select-top-n-item-row item) (select-top-n-item-origins item))))
             (t #'select-top-n-item-row))
           (stable-sort (coerce (select-top-n-collector-heap collector) 'list)
-                       (lambda (a b)
-                         (select-top-n-item-less-p
-                          a b (select-top-n-collector-order collector))))))
+                       (select-top-n-collector-item-order collector))))
 
 (defun check-select-limit (count)
   "Validate the bigint row count when its LIMIT begins execution.
@@ -1137,17 +1220,17 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
                 (when (<= candidate-cost cost)
                   (setf best path cost candidate-cost))))))))))
 
-(defun select-relation-columns (relation)
+(defun select-relation-columns (relation &optional (table (select-relation-table relation)))
   (when (and (select-relation-origins relation)
              (/= (length (select-relation-origins relation))
-                 (length (pg-class-columns (select-relation-table relation)))))
+                 (length (pg-class-columns table))))
     (error "Derived column origins do not match projected columns"))
-  (loop for column across (pg-class-columns (select-relation-table relation))
+  (loop for column across (pg-class-columns table)
         for origin in (or (select-relation-origins relation)
                           (make-list (select-relation-width relation)))
         for slot = (pg-column-attnum column)
         for table-oid = (if origin (getf origin :table-oid)
-                            (pg-class-oid (select-relation-table relation)))
+                            (pg-class-oid table))
         for attnum = (if origin (getf origin :attnum) slot)
         for expr = (list :col (+ (select-relation-offset relation) slot)
                          :type (pg-column-type column) :typmod (pg-column-typmod column)
@@ -1330,6 +1413,424 @@ COLUMN-OFFSET maps the query-wide Var numbers back to this relation's attnums."
    prepared)
   nil)
 
+(defvar *view-source-bindings* nil)
+
+(defun map-view-query-syntax (function node)
+  "Copy mutable query syntax while applying FUNCTION before descending."
+  (let ((mapped (funcall function node)))
+    (cond ((not (eq node mapped)) mapped)
+          ((sql-derived-relation-p node)
+           (make-sql-derived-relation
+            :query (map-view-query-syntax function (sql-derived-relation-query node))))
+          ((consp node)
+           (cons (map-view-query-syntax function (car node))
+                 (map-view-query-syntax function (cdr node))))
+          (t node))))
+
+(defun view-query-attribute-dependencies (prepared)
+  "Collect relation and attribute identities from resolved Vars in the definition."
+  (let ((references (make-hash-table :test #'equal)))
+    (visit-prepared-query-expressions
+     (lambda (node depth)
+       (declare (ignore depth))
+       (let ((var (if (eq (first node) :outer-ref) (third node) node)))
+         (when (eq (first var) :col)
+           (let ((oid (getf (cddr var) :table-oid))
+                 (attnum (getf (cddr var) :attnum)))
+             (when (and oid (plusp oid) attnum (plusp attnum))
+               (setf (gethash (list oid attnum) references) t))))))
+     prepared 0 nil (lambda (query) (not (getf query :stored-view-expansion-p)))
+     ;; A named whole row depends on its relation, not on each current field.
+     (lambda (node) (eq (first node) :whole-row)))
+    (sort (loop for reference being the hash-keys of references collect reference)
+          (lambda (left right)
+            (or (< (first left) (first right))
+                (and (= (first left) (first right))
+                     (< (second left) (second right))))))))
+
+(defun analyze-view-query (query)
+  "Return prepared query, bound syntax and relation OIDs under the catalog view lock."
+  (let* ((*view-source-bindings* (make-hash-table :test #'eq))
+         (*view-literal-bindings* (make-hash-table :test #'eq))
+         (*view-constant-sources* (make-hash-table :test #'eq))
+         ;; Give each source name its own identity, even when a caller has
+         ;; shared a string between lexical scopes with different CTEs.
+         (syntax (map-view-query-syntax
+                  (lambda (node)
+                    (typecase node
+                      (string (copy-seq node))
+                      (sql-relation-name (copy-sql-relation-name node))
+                      (t node)))
+                  query))
+         (prepared (clear-query-analysis-contexts (prepare-select-internal syntax))))
+    (values prepared
+            (map-view-query-syntax
+             (lambda (node)
+               (or (gethash node *view-source-bindings*)
+                   (gethash node *view-literal-bindings*)
+                   node))
+             syntax)
+            (sort (remove-duplicates
+                   (nconc
+                    (loop for reference being the hash-values of *view-source-bindings*
+                          collect (view-relation-reference-oid reference))
+                    (loop for binding being the hash-values of *view-literal-bindings*
+                          when (eq (first binding) :view-bound-nonsequence)
+                            collect (third binding)))
+                   :test #'eql)
+                  #'<)
+            (view-query-attribute-dependencies prepared)
+            (sort (remove-duplicates
+                   (loop for binding being the hash-values of *view-literal-bindings*
+                         when (eq (first binding) :view-bound-sequence)
+                           collect (cons (second binding) (third binding)))
+                   :test #'equal)
+                  #'string< :key #'car))))
+
+(defvar *expanding-view-oids* nil)
+
+(defvar *view-definition-outer-scopes* nil
+  "Input expression renderers for enclosing LATERAL query scopes.")
+
+(defun view-definition-derived-field-names (source)
+  "Return usable field names for a derived source with an unambiguous descriptor."
+  (let ((names (map 'list #'pg-column-name (getf source :columns))))
+    (when (= (length names) (length (remove-duplicates names :test #'string=)))
+      names)))
+
+(defun view-definition-column-sql (slot relations depth)
+  (loop for source in relations for alias from 1
+        for offset = (getf source :offset)
+        when (< offset slot (+ offset (getf source :width) 1))
+          return (if (and (not (getf source :cte))
+                          (zerop (pg-class-oid (getf source :table))))
+                     (let ((name (nth (- slot offset 1) (view-definition-derived-field-names source))))
+                       (if name
+                           (format nil "r~d_~d.~a" depth alias (catalog-sql-quote-ident name))
+                           (format nil "r~d_~d.c~d" depth alias (- slot offset))))
+                     (format nil "r~d_~d.~a" depth alias
+                             (catalog-sql-quote-ident
+                              (pg-column-name (aref (getf source :columns) (- slot offset 1))))))
+        finally (ereport "0A000" "cannot serialize view column slot ~d" slot)))
+
+(defun write-view-definition-relation (stream source alias render-input)
+  (let ((table (getf source :table))
+        (depth (length *view-definition-outer-scopes*)))
+    (cond ((getf source :cte)
+           (format stream "~a" (catalog-sql-quote-ident (getf source :name))))
+          ((plusp (pg-class-oid table))
+           (format stream "~a.~a"
+                   (if (sql-system-relation-p table) "pg_catalog" "public")
+                   (catalog-sql-quote-ident (pg-class-name table))))
+          (t
+           (let* ((query (getf source :subquery-prepared))
+                  (names (or (view-definition-derived-field-names source)
+                             (loop for slot from 1 to (getf source :width)
+                                   collect (format nil "c~d" slot))))
+                  (*view-definition-outer-scopes*
+                    (cons render-input *view-definition-outer-scopes*))
+                  (sql (and query (render-view-query-body query names))))
+             (unless sql (ereport "0A000" "cannot serialize view subquery source"))
+             (format stream "~a(~a)" (if (getf source :lateral-reference) "LATERAL " "") sql))))
+    (format stream " AS r~d_~d" depth alias)))
+
+(defun view-definition-order-direction-sql (direction)
+  (ecase direction
+    ((nil) "") ((t) " DESC")
+    (:asc-nulls-first " NULLS FIRST")
+    (:desc-nulls-last " DESC NULLS LAST")))
+
+(defun write-view-definition-order (stream prepared render)
+  (when (getf prepared :order)
+    (write-string " ORDER BY " stream)
+    (loop for (expression . direction) in (getf prepared :order)
+          for first-p = t then nil
+          for position = (position expression (getf prepared :targets)
+                                   :key (lambda (target) (getf target :expr)))
+          do (unless first-p (write-string ", " stream))
+             (cond ((or (eq (first expression) :sort-output)
+                        (and (getf prepared :distinct) (eq (first expression) :col)))
+                    (format stream "~d" (second expression)))
+                   (position (format stream "~d" (1+ position)))
+                   (t (write-string (funcall render expression) stream)))
+             (write-string (view-definition-order-direction-sql direction) stream))))
+
+(defun view-definition-aggregate-call-sql (kind input render)
+  (if (eq kind :count)
+      "count(*)"
+      (format nil "~a(~a)"
+              (ecase kind
+                (:count-expr "count") (:array-agg "array_agg") (:json-agg "json_agg")
+                ((:sum :avg :min :max) (string-downcase (symbol-name kind))))
+              (funcall render input))))
+
+(defun render-view-window-call (descriptor render)
+  (let ((kind (getf descriptor :kind))
+        (partition (getf descriptor :partition))
+        (order (getf descriptor :order))
+        (frame (getf descriptor :frame)))
+    (with-output-to-string (stream)
+      (write-string (case kind
+                      (:row-number "row_number()")
+                      (:rank "rank()")
+                      (:dense-rank "dense_rank()")
+                      (otherwise
+                       (view-definition-aggregate-call-sql kind (getf descriptor :input) render)))
+                    stream)
+      (write-string " OVER (" stream)
+      (when partition
+        (format stream "PARTITION BY ~{~a~^, ~} " (mapcar render partition)))
+      (when order
+        (format stream "ORDER BY ~{~a~^, ~} "
+                (mapcar (lambda (item)
+                          (concatenate 'string (funcall render (car item))
+                                       (view-definition-order-direction-sql (cdr item))))
+                        order)))
+      (format stream "~a BETWEEN UNBOUNDED PRECEDING AND ~a)"
+              (symbol-name (first frame))
+              (ecase (second frame)
+                (:current "CURRENT ROW")
+                (:unbounded-following "UNBOUNDED FOLLOWING"))))))
+
+(defun view-definition-grouped-slot-sql (slot prepared render-input)
+  "Render a slot in the grouped row as its grouping expression or aggregate."
+  (let* ((groups (getf prepared :group-keys))
+         (count (length groups)))
+    (if (<= slot count)
+        (funcall render-input (nth (1- slot) groups))
+        (let ((aggregate (nth (- slot count 1) (getf prepared :aggregates))))
+          (view-definition-aggregate-call-sql
+           (getf aggregate :kind) (getf aggregate :input) render-input)))))
+
+(defun render-view-sublink (descriptor render-parent)
+  (let* ((query (sql-subplan-prepared descriptor))
+         (names (loop for target in (getf query :targets) for slot from 1
+                      collect (format nil "c~d" slot)))
+         (sql (let ((*view-definition-outer-scopes*
+                      (cons render-parent *view-definition-outer-scopes*)))
+                (render-view-query-body query names))))
+    (unless sql (ereport "0A000" "cannot serialize view expression subquery"))
+    (ecase (sql-subplan-kind descriptor)
+      (:scalar (format nil "(~a)" sql))
+      (:exists (format nil "EXISTS (~a)" sql))
+      (:array (format nil "ARRAY(~a)" sql))
+      ((:any :all)
+       (let ((comparison (sql-subplan-test descriptor)))
+         (format nil "(~a ~a ~a (~a))"
+                 (funcall render-parent (third comparison))
+                 (second comparison)
+                 (symbol-name (sql-subplan-kind descriptor)) sql))))))
+
+(defun view-definition-whole-row-sql (index relations depth)
+  "Render a whole-row value without expanding it into result columns."
+  (let ((source (and (typep index '(integer 0 *)) (nth index relations))))
+    (unless source (ereport "0A000" "cannot serialize a whole row without its source"))
+    (let ((source-alias (format nil "r~d_~d" depth (1+ index))))
+      (if (or (getf source :cte)
+              (plusp (pg-class-oid (getf source :table)))
+              (view-definition-derived-field-names source))
+          ;; A qualified star in expression context retains one record value.
+          (format nil "(CASE WHEN TRUE THEN ~a.* END)" source-alias)
+          (let* ((names (map 'list #'pg-column-name (getf source :columns)))
+                 (record-alias (loop for alias = "whole_row" then (concatenate 'string alias "_")
+                                     unless (member alias names :test #'string=) return alias))
+                 (fields (loop for name in names for slot from 1
+                               collect (format nil "~a.c~d AS ~a" source-alias slot
+                                               (catalog-sql-quote-ident name)))))
+            ;; Synthetic names keep positional references unambiguous. Rebuild
+            ;; the record's original labels and retain NULL for an absent row.
+            (format nil
+                    "(CASE WHEN pg_catalog.row_to_json(~a.*) IS NULL THEN NULL ELSE (SELECT ~a FROM (SELECT ~{~a~^, ~}) AS ~a) END)"
+                    source-alias record-alias fields record-alias))))))
+
+(defun render-view-select-body (prepared output-names union-arm-p)
+  "Render a bound SELECT body using live catalog identifiers."
+  (let* ((relations (getf prepared :relations))
+         (qualifications (getf prepared :qualification-identity))
+         (where (if qualifications (car qualifications) (getf prepared :where)))
+         (having (cdr qualifications))
+         (outer-scopes *view-definition-outer-scopes*)
+         (depth (length outer-scopes))
+         (windows (getf prepared :windows))
+         (window-keys (getf prepared :window-keys))
+         (window-start (getf prepared :window-input-width))
+         (input-width (- window-start (length window-keys)))
+         (set-start (+ window-start (length windows))))
+    (labels ((render-row (index)
+               (view-definition-whole-row-sql index relations depth))
+             (render-outer (level expression)
+               (let ((renderer (nth (1- level) outer-scopes)))
+                 (unless renderer
+                   (ereport "0A000" "cannot serialize outer reference at level ~d" level))
+                 (funcall renderer expression)))
+             (render-input (expression)
+               (catalog-canonical-expression-sql
+                expression nil (lambda (slot) (view-definition-column-sql slot relations depth))
+                #'render-outer
+                (lambda (descriptor) (render-view-sublink descriptor #'render-input)) #'render-row))
+             (render-output-slot (slot)
+               (cond ((> slot set-start)
+                      (render (nth (- slot set-start 1) (getf prepared :set-functions))))
+                     ((> slot window-start)
+                      (render-view-window-call
+                       (nth (- slot window-start 1) windows) #'render))
+                     ((> slot input-width)
+                      (render (nth (- slot input-width 1) window-keys)))
+                     ((getf prepared :aggregate-p)
+                      (view-definition-grouped-slot-sql slot prepared #'render-input))
+                     (t (view-definition-column-sql slot relations depth))))
+             (render (expression)
+               (catalog-canonical-expression-sql
+                expression nil #'render-output-slot #'render-outer
+                (lambda (descriptor) (render-view-sublink descriptor #'render)) #'render-row)))
+      (handler-case
+          (with-output-to-string (stream)
+            (write-string (if (getf prepared :distinct) "SELECT DISTINCT " "SELECT ") stream)
+            (loop for target in (getf prepared :targets)
+                  for name in output-names
+                  for expression = (getf target :expr)
+                  for first-p = t then nil
+                  do (unless first-p (write-string ", " stream))
+                     (format stream "~a AS ~a"
+                             (if (and union-arm-p (in-unknown-constant-p expression))
+                                 (if (eq (second expression) +null+) "NULL"
+                                     (catalog-sql-literal (second expression)))
+                                 (render expression))
+                             (catalog-sql-quote-ident name)))
+            (when relations
+              (write-string " FROM " stream)
+              (write-view-definition-relation stream (first relations) 1 #'render-input))
+            (loop for join in (getf prepared :joins)
+                  for source in (rest relations) for alias from 2
+                  for kind = (getf join :type)
+                  do (format stream " ~a JOIN " (symbol-name kind))
+                     (write-view-definition-relation stream source alias #'render-input)
+                     (unless (eq kind :cross)
+                       (format stream " ON ~a" (render-input (getf join :qual)))))
+            (when where (format stream " WHERE ~a" (render-input where)))
+            (when (getf prepared :group-keys)
+              (format stream " GROUP BY ~{~a~^, ~}"
+                      (mapcar #'render-input (getf prepared :group-keys))))
+            (when having
+              (format stream " HAVING ~a"
+                      (render (rewrite-aggregate-columns
+                               having (getf prepared :group-keys) (getf prepared :scope)))))
+            (write-view-definition-order stream prepared #'render)
+            (when (getf prepared :limit)
+              (format stream " LIMIT ~d" (getf prepared :limit))))
+        (pg-error () nil)))))
+
+(defun render-view-query-core (prepared output-names &optional union-arm-p)
+  (let ((operation (getf prepared :set-operation)))
+    (if operation
+        (let ((left (render-view-query-body (getf prepared :left) output-names t))
+              (right (render-view-query-body (getf prepared :right) output-names t)))
+          (when (and left right)
+            (with-output-to-string (stream)
+              (format stream "(~a) UNION~a (~a)" left
+                      (if (eq operation :union-all) " ALL" "") right)
+              (write-view-definition-order stream prepared nil)
+              (when (getf prepared :limit)
+                (format stream " LIMIT ~d" (getf prepared :limit))))))
+        (render-view-select-body prepared output-names union-arm-p))))
+
+(defun render-view-query-body (prepared output-names &optional union-arm-p)
+  (let ((body (render-view-query-core prepared output-names union-arm-p))
+        (definitions (getf prepared :ctes)))
+    (when (and body definitions)
+      (let ((bindings
+              (loop for definition in definitions
+                    for query = (sql-cte-prepared definition)
+                    for names = (mapcar (lambda (target) (getf target :name))
+                                        (getf query :targets))
+                    for sql = (render-view-query-body query names)
+                    unless sql do (return-from render-view-query-body nil)
+                      collect (format nil "~a AS ~a(~a)"
+                                      (catalog-sql-quote-ident (sql-cte-name definition))
+                                      (ecase (sql-cte-materialized definition)
+                                        ((nil) "") (:always "MATERIALIZED ") (:never "NOT MATERIALIZED "))
+                                      sql))))
+        (setf body (format nil "WITH ~:[~;RECURSIVE ~]~{~a~^, ~} ~a"
+                           (some (lambda (definition)
+                                   (getf (sql-cte-prepared definition) :recursive-cte))
+                                 definitions)
+                           bindings body))))
+    body))
+
+(defun render-bound-view-definition (view definition)
+  "Reconstruct supported bound query trees under the catalog view lock."
+  (let* ((*view-definition-outer-scopes* nil)
+         (*view-source-bindings* nil)
+         (*select-cte-environment* nil)
+         (*select-outer-scope* nil)
+         (syntax (pg-view-definition-query definition))
+         (prepared (prepare-select-internal syntax))
+         (output-names (map 'list #'pg-column-name (pg-class-columns view)))
+         (sql (render-view-query-body prepared output-names)))
+    (when sql (concatenate 'string sql ";"))))
+
+(defun view-definition-display-sql (view)
+  "Return SQL for a stored view while the caller holds the catalog view lock."
+  (let ((definition (pg-class-view-definition view)))
+    (or (render-bound-view-definition view definition)
+        (pg-view-definition-source definition))))
+
+(defun prepare-view-select-source (table name alias offset)
+  "Expand a stored query in its own namespace through the derived-query planner."
+  (let ((oid (pg-class-oid table)))
+    (when (member oid *expanding-view-oids*)
+      (ereport "42P17" "infinite recursion detected in view \"~a\"" (pg-class-name table)))
+    (let* ((*expanding-view-oids* (cons oid *expanding-view-oids*))
+           (*view-source-bindings* nil)
+           (*select-cte-environment* nil)
+           (*select-outer-scope* nil)
+           (definition (pg-class-view-definition table))
+           (source (prepare-select-source
+                    (make-sql-derived-relation :query (pg-view-definition-query definition))
+                    alias offset))
+           (columns (pg-class-columns table)))
+      (unless (= (getf source :width) (length columns))
+        (error "Stored query width differs from the descriptor of view ~a" name))
+      (setf (getf source :name) name
+            (getf source :table) table
+            (getf source :columns) columns
+            (getf source :origins) nil)
+      (setf (getf (getf source :subquery-prepared) :stored-view-expansion-p) t)
+      source)))
+
+(defun prepare-catalog-select-source (name alias table offset)
+  (if (pg-class-view-definition table)
+      (prepare-view-select-source table (sql-relation-base-name name) alias offset)
+      (make-select-relation-spec name alias table offset)))
+
+(defun prepare-named-select-source (source alias offset)
+  (let ((table (select-table-or-error source)))
+    (when *view-source-bindings*
+      (setf (gethash source *view-source-bindings*)
+            (make-view-relation-reference :oid (pg-class-oid table)
+                                          :name (sql-relation-base-name source)
+                                          :attributes
+                                          (loop for column across (pg-class-columns table)
+                                                unless (pg-column-dropped-p column)
+                                                  collect (list (pg-column-attnum column)
+                                                                (pg-column-name column))))))
+    (prepare-catalog-select-source source alias table offset)))
+
+(defun view-relation-scope-table (reference table)
+  "Expose definition-time names for surviving attributes at their physical slots."
+  (let ((scope-table (copy-pg-class table))
+        (columns (pg-class-columns table)))
+    (setf (pg-class-columns scope-table)
+          (coerce (loop for (attnum name) in (view-relation-reference-attributes reference)
+                        for column = (and (<= 1 attnum (length columns))
+                                          (aref columns (1- attnum)))
+                        when (and column (not (pg-column-dropped-p column)))
+                          collect (let ((copy (copy-pg-column column)))
+                                    (setf (pg-column-name copy) name)
+                                    copy))
+                  'vector))
+    scope-table))
+
 (defun prepare-select-source (source alias offset &optional preceding-scope)
   "Prepare a FROM namespace entry; callers hold the catalog view lock.
 Mark direct scalar function sources through their aliases."
@@ -1390,11 +1891,21 @@ Mark direct scalar function sources through their aliases."
               :lateral-dependent (and (getf query :lateral)
                                       (member 1 (prepared-query-outer-depths prepared)))
               :subquery-plan nil :subquery-logical nil :subquery-physical nil))
-      (make-select-relation-spec source alias (select-table-or-error source) offset)))
+      (if (view-relation-reference-p source)
+          (let* ((oid (view-relation-reference-oid source))
+                 (table (or (find-table-by-oid oid) (lookup-sql-system-relation oid))))
+            (unless table
+              (ereport "42P01" "view references missing relation with OID ~d"
+                       (view-relation-reference-oid source)))
+            (list* :scope-table (view-relation-scope-table source table)
+                   (prepare-catalog-select-source (view-relation-reference-name source) alias table offset)))
+          (prepare-named-select-source source alias offset))))
 
 (defun select-source-scope-relation (source)
   (make-select-relation :name (getf source :name) :alias (getf source :alias)
-                        :table (getf source :table) :origins (getf source :origins)
+                        :table (or (getf source :scope-table) (getf source :table))
+                        :whole-row-table (and (getf source :scope-table) (getf source :table))
+                        :origins (getf source :origins)
                         :scalar-function-p (getf source :scalar-function-p)
                         :identity (ensure-select-source-identity source)
                         :offset (getf source :offset) :width (getf source :width)))
@@ -1755,6 +2266,12 @@ reader registration."
 Signal an error if a table, its columns, or its captured TOAST identity changed.
 Replace stale index paths in the copied relation specifications with SeqScans."
   (dolist (spec relations)
+    (let ((table (getf spec :table)))
+      ;; The admitted relation list retains the immutable descriptor for the
+      ;; portal lifetime. Check its identity at admission without a heap lock.
+      (when (and (pg-class-view-definition table)
+                 (not (eq table (lookup-table-by-name (pg-class-name table)))))
+        (ereport "42P01" "view \"~a\" changed during query planning" (pg-class-name table))))
     (unless (getf spec :virtual-p)
       (let* ((table (getf spec :table))
              (path (getf spec :path))
@@ -2121,25 +2638,24 @@ scopes to clean up."
 (defvar *select-toast-slice-plan* nil
   "A recognized expression, owning table, and bytea slot for this scan.")
 
-(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader) demand retain-external-p)
-  "Replace external attributes with SQL values, omitting proven unused slots.
-The parent is visible and SNAPSHOT remains active throughout the fetch. TOAST
-chunk visibility follows the parent and is not independently filtered."
-  (let ((values (htup-values tuple))
-        (columns (pg-class-columns table)))
+(defun materialize-select-row (table values snapshot physical-compressed
+                               &key (index-reader #'select-toast-index-reader)
+                                 demand retain-external-p origins)
+  "Resolve TOAST values and return row values and optional datum origins."
+  (let ((columns (pg-class-columns table)))
     (when *datum-origin-capture*
-      (let ((compressed (htup-physical-compressed tuple)))
-        (when compressed
-          (setf (htup-origins tuple)
-                (map 'vector (lambda (value) (when value (make-datum-origin :compressed value))) compressed)))))
+      (when physical-compressed
+        (setf origins
+              (map 'vector (lambda (value) (when value (make-datum-origin :compressed value)))
+                   physical-compressed))))
     (loop for i below (length values)
           for value = (aref values i)
           when (pg-column-dropped-p (aref columns i))
             do (setf (aref values i) +null+)
-               (when (htup-origins tuple)
-                 (setf (aref (htup-origins tuple) i) nil))
-               (when (htup-physical-compressed tuple)
-                 (setf (aref (htup-physical-compressed tuple) i) nil))
+               (when origins
+                 (setf (aref origins i) nil))
+               (when physical-compressed
+                 (setf (aref physical-compressed i) nil))
           else when (heap-external-varlena-p value)
                  do (if (and demand
                              (eq table (car demand))
@@ -2151,15 +2667,26 @@ chunk visibility follows the parent and is not independently filtered."
                             (ereport "XX001" "external value has no owning TOAST relation"))
                           (when *datum-origin-capture*
                             (let ((compressed (toast-fetch-compressed-value toast value snapshot :index-reader index-reader)))
-                              (unless (htup-origins tuple)
-                                (setf (htup-origins tuple) (make-array (length values) :initial-element nil)))
-                              (setf (aref (htup-origins tuple) i)
+                              (unless origins
+                                (setf origins (make-array (length values) :initial-element nil)))
+                              (setf (aref origins i)
                                     (make-datum-origin :compressed compressed :external-p t
                                                        :descriptor (heap-encode-external-varlena value)))))
                           (let ((bytes (toast-fetch-value toast value snapshot :index-reader index-reader)))
                             (setf (aref values i)
                                   (heap-decode-varlena-payload bytes type))))))
-    tuple))
+    (values values origins)))
+
+(defun materialize-select-tuple (table tuple snapshot &key (index-reader #'select-toast-index-reader)
+                                                        demand retain-external-p)
+  "Materialize SQL values for callers that retain the heap tuple's identity."
+  (multiple-value-bind (row origins)
+      (materialize-select-row table (htup-values tuple) snapshot (htup-physical-compressed tuple)
+                              :index-reader index-reader :demand demand
+                              :retain-external-p retain-external-p :origins (htup-origins tuple))
+    (declare (ignore row))
+    (setf (htup-origins tuple) origins))
+  tuple)
 
 (defun unchanged-tuple-toast-pointers (tuple assignments &optional table new-values snapshot)
   "Return reusable external pointers from the physical version actually claimed.
@@ -2305,19 +2832,19 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
         (scan-select-path table (pg-class-relfilenode table) path snapshot
                           callback environment))))
 
-(defun project-select-scan-row (relations relation row origins)
-  "Return ROW and ORIGINS in source order, borrowing both when no placement is needed."
-  (if (getf relation :join-order-base)
-      (let* ((width (or (getf relation :environment-width)
-                        (reduce #'+ relations :key (lambda (spec) (getf spec :width))
-                                              :initial-value 0)))
-             (offset (getf relation :offset))
-             (environment (make-array width :initial-element +null+))
-             (placed-origins (when origins (make-array width :initial-element nil))))
-        (replace environment row :start1 offset)
-        (when placed-origins (replace placed-origins origins :start1 offset))
-        (values environment placed-origins))
-      (values row origins)))
+(defun make-select-scan-row-placement (relations relation)
+  "Return a row and origin placer for a scan with reordered join inputs."
+  (when (getf relation :join-order-base)
+    (let ((width (or (getf relation :environment-width)
+                     (reduce #'+ relations :key (lambda (spec) (getf spec :width))
+                                           :initial-value 0)))
+          (offset (getf relation :offset)))
+      (lambda (row origins)
+        (let ((environment (make-array width :initial-element +null+))
+              (placed-origins (when origins (make-array width :initial-element nil))))
+          (replace environment row :start1 offset)
+          (when placed-origins (replace placed-origins origins :start1 offset))
+          (values environment placed-origins))))))
 
 (defun make-select-result-row (environment where targets)
   "Apply WHERE before projecting ENVIRONMENT, retaining it for ORDER BY."
@@ -2355,14 +2882,15 @@ can itself park.  A new cursor restores coverage if an earlier park released it.
     (values values padded-origins)))
 
 (defun qualify-select-join-pair (join qual left right left-origins right-origins
-                                 left-presence right-presence capture-p presence-cache)
+                                 left-presence right-presence capture-p presence-cache
+                                 &optional qual-proven-p)
   "Return a matching joined row with its origins and source presence."
   (let* ((joined (combine-select-join-environment left right join))
          (origins (and capture-p (combine-select-join-origins left left-origins right right-origins join)))
          (presence (cached-query-row-presence left-presence right-presence presence-cache))
          (*query-row-origins* origins)
          (*query-row-presence* presence))
-    (when (true-p (eval-expr qual joined))
+    (when (or qual-proven-p (true-p (eval-expr qual joined)))
       (values joined origins presence))))
 
 (defun nested-loop-spool-memory (track-right-p)

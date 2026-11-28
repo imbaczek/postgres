@@ -452,26 +452,27 @@ each publishes its own horizon after its heap pass."
      (maphash
       (lambda (table-name table)
         (declare (ignore table-name))
-        (let ((index-provider
-                (lambda ()
-                  (mapcar #'pg-index-relfilenode (table-indexes table database))))
-              (verify-function
-                (lambda ()
-                  (unless (eq table
-                              (gethash (pg-class-name table)
-                                       (database-tables database)))
-                    (ereport "42P01" "relation \"~a\" does not exist"
-                             (pg-class-name table))))))
-          (vacuum-catalog-relation
-           table index-provider verify-function
-           :forced-oldest-xmin boundary
-           :forced-freeze-cutoff boundary
-           :after-page-function after-page-function
-           :fsync-function fsync-function)
-          (vacuum-toast-relation
-           table verify-function :forced-oldest-xmin boundary
-           :forced-freeze-cutoff boundary :after-page-function after-page-function
-           :fsync-function fsync-function)))
+        (when (pg-class-relfilenode table)
+          (let ((index-provider
+                  (lambda ()
+                    (mapcar #'pg-index-relfilenode (table-indexes table database))))
+                (verify-function
+                  (lambda ()
+                    (unless (eq table
+                                (gethash (pg-class-name table)
+                                         (database-tables database)))
+                      (ereport "42P01" "relation \"~a\" does not exist"
+                               (pg-class-name table))))))
+            (vacuum-catalog-relation
+             table index-provider verify-function
+             :forced-oldest-xmin boundary
+             :forced-freeze-cutoff boundary
+             :after-page-function after-page-function
+             :fsync-function fsync-function)
+            (vacuum-toast-relation
+             table verify-function :forced-oldest-xmin boundary
+             :forced-freeze-cutoff boundary :after-page-function after-page-function
+             :fsync-function fsync-function))))
       (database-tables database)))
    (catalog-databases *catalog*))
   (values))

@@ -621,6 +621,29 @@
                             "skipped candidates keep their positions across replay and spill"))
               (close-sql-iterator iterator)))))))
 
+(rove:deftest view-catalog-roundtrip-preserves-storage-free-class
+    (let* ((reference (make-view-relation-reference
+                       :oid 70 :name "base" :attributes '(("id" . 3))))
+           (source "CREATE VIEW persisted AS SELECT id FROM base")
+           (definition (make-pg-view-definition
+                        :query (list :from reference) :source source
+                        :dependencies '(70) :attribute-dependencies '((70 . 3))))
+           (class (make-pg-class
+                   :oid 71 :name "persisted"
+                   :columns (vector (make-pg-column :name "id"))
+                   :view-definition definition))
+           (encoded (class-to-sexp class))
+           (decoded (class-from-sexp encoded))
+           (recovered (pg-class-view-definition decoded)))
+      (rove:ok (eql 1 (getf (view-definition-to-sexp definition) :version)))
+      (rove:ok (equal encoded (class-to-sexp decoded)))
+      (rove:ok (null (pg-class-relfilenode decoded)))
+      (rove:ok (string= "id" (pg-column-name (aref (pg-class-columns decoded) 0))))
+      (rove:ok (string= source (pg-view-definition-source recovered)))
+      (rove:ok (equal '(70) (pg-view-definition-dependencies recovered)))
+      (rove:ok (equal '((70 . 3)) (pg-view-definition-attribute-dependencies recovered)))
+      (rove:ok (equalp reference (getf (pg-view-definition-query recovered) :from)))))
+
 (rove:deftest test-toast-catalog-ownership-roundtrip
     (let* ((toast (make-pg-toast :oid 100 :relfilenode 101 :index-oid 102
                                  :index-relfilenode 103 :relfrozenxid 20))
@@ -1254,3 +1277,21 @@
                "ANALYZE shrink updates the reservoir fill pointer")
       (rove:ok (and (null (aref sample 2)) (null (aref sample 3)))
                "ANALYZE shrink clears references beyond the fill pointer")))
+
+(rove:deftest test-analyze-physical-reservoir-owns-selected-tuples
+    (let* ((draws '((2 . 1) (3 . 0)))
+           (*analyze-random-function* (lambda (limit)
+                                        (destructuring-bind (expected . slot) (pop draws)
+                                          (rove:ok (= limit expected))
+                                          slot)))
+           (sample (make-array 1 :adjustable t :fill-pointer 0))
+           (page (make-array 4 :element-type '(unsigned-byte 8)
+                               :initial-contents '(99 1 2 99))))
+      (analyze-add-reservoir-tuple page 1 2 1 sample 1)
+      (setf (aref page 1) 3)
+      (analyze-add-reservoir-tuple page 1 2 2 sample 1)
+      (rove:ok (equalp #(1 2) (aref sample 0)) "A rejected tuple leaves the owned copy intact")
+      (analyze-add-reservoir-tuple page 1 2 3 sample 1)
+      (fill page 0)
+      (rove:ok (equalp #(3 2) (aref sample 0)) "A replacement owns exactly its selected page slice")
+      (rove:ok (null draws))))

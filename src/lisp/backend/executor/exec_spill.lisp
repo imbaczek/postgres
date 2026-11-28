@@ -1127,33 +1127,42 @@ Normal close errors propagate; abnormal cleanup preserves the original exit."
           ,@body)
         (lambda (,normal) (finish-query-temp-stream ,stream ,normal))))))
 
+(defconstant +query-spill-cons-overhead+ 48)
+
+(defconstant +query-spill-vector-overhead+ 64)
+
 (defun query-spill-value-size (value)
   "Estimate retained row memory without building its printed representation."
   (cond
     ((integerp value)
-     (+ 16 (ceiling (integer-length value) 8)))
+     ;; Round the bit length up to a whole byte.
+     (+ 16 (ash (+ (integer-length value) 7) -3)))
     ((stringp value)
      (+ 40 (* 4 (length value))))
     ((simple-vector-p value)
-     (+ 64 (loop for index below (length value)
-                 sum (query-spill-value-size (svref value index)))))
+     (+ +query-spill-vector-overhead+
+        (loop for index below (length value)
+              sum (query-spill-value-size (svref value index)))))
     ((and (vectorp value) (typep value '(vector (unsigned-byte 8))))
-     (+ 64 (length value)))
+     (+ +query-spill-vector-overhead+ (length value)))
     ((vectorp value)
-     (+ 64 (loop for element across value
-                 sum (query-spill-value-size element))))
+     (+ +query-spill-vector-overhead+
+        (loop for element across value
+              sum (query-spill-value-size element))))
     ((consp value)
      (let ((tail value) (size 0) (count 0))
        (loop while (consp tail)
              do (when (zerop (mod count 4096)) (check-for-interrupts))
-                (incf size (+ 48 (query-spill-value-size (car tail))))
+                (incf size (+ +query-spill-cons-overhead+ (query-spill-value-size (car tail))))
                 (incf count)
                 (setf tail (cdr tail)))
        (+ size (query-spill-value-size tail))))
     ((symbolp value)
      (+ 32 (* 2 (length (symbol-name value)))))
     ((sql-jsonb-p value) (+ 32 (query-spill-value-size (sql-jsonb-value value))))
-    ((sql-uuid-p value) (+ 32 (query-spill-value-size (sql-uuid-bytes value))))
+    ((sql-uuid-p value)
+     ;; A UUID always owns a sixteen-octet vector.
+     (+ 32 +query-spill-vector-overhead+ +sql-uuid-size+))
     ((sql-decimal-p value) (+ 32 (query-spill-value-size (sql-decimal-coefficient value))))
     ((sql-array-p value)
      (+ 64 (query-spill-value-size (sql-array-element-type-id value))
