@@ -281,7 +281,8 @@
 
 (defun cte-volatile-call-p (form)
   (and (member (first form) '(:func :set-func :single-record))
-       (analyzed-function-volatile-p (second form))))
+       (or (getf (cdddr form) :routine-oid)
+           (analyzed-function-volatile-p (second form)))))
 
 (defun cte-expression-volatile-p (form &key skip-outer-references)
   "Check executable operands and explicitly visit nested subquery scopes."

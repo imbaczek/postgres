@@ -826,6 +826,24 @@ Send its row description before execution and close it before reporting completi
                      (result-column-format column) format))
       result)))
 
+(defun extended-initial-parameter-types (ast oids)
+  "Allocate slots for supplied OIDs and parameters whose OIDs were omitted."
+  (let ((count (length oids)))
+    (labels ((visit (node)
+               (when (consp node)
+                 (if (eq (first node) :parameter)
+                     (let ((index (second node)))
+                       (unless (<= 1 index #xffff)
+                         (ereport "42P02" "there is no parameter $~a" index))
+                       (setf count (max count index)))
+                     (loop for tail = node then (cdr tail)
+                           while (consp tail) do (visit (car tail)))))))
+      (visit ast))
+    (let ((types (make-array count :initial-element nil)))
+      (loop for oid in oids for slot from 0
+            unless (zerop oid) do (setf (svref types slot) (extended-type-from-oid oid)))
+      types)))
+
 (defun extended-apply-parse (stream state operation)
   (destructuring-bind (kind name sql oids) operation
     (declare (ignore kind))
@@ -839,7 +857,7 @@ Send its row description before execution and close it before reporting completi
            (concurrent (concurrent-index-ddl-p ast))
            (slot-query-p (and (= (length statements) 1)
                               (patroni-slot-query-shape-p (first statements))))
-           (types (map 'vector (lambda (oid) (unless (zerop oid) (extended-type-from-oid oid))) oids)))
+           (types (extended-initial-parameter-types ast oids)))
       (check-rewind-sql-statements statements)
       (unless (and (= (length statements) 1)
                    (or concurrent (member (getf ast :type) '(:insert :update :delete :select :do :copy-from))))

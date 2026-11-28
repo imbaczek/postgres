@@ -128,7 +128,7 @@ Range and negative checks occur when the LIMIT executes."
 
 (defun clause-keyword-p (word)
   (member word
-          '("with" "from" "where" "order" "limit" "group" "having" "union"
+          '("with" "from" "into" "where" "order" "limit" "group" "having" "union"
             "intersect" "except" "offset" "fetch" "for" "join" "inner"
             "left" "right" "full" "outer" "cross" "on" "using"
             "natural" "asc" "desc" "window" "lateral" "returning" "conflict"
@@ -251,25 +251,77 @@ Range and negative checks occur when the LIMIT executes."
         collect (prog1 (parse-do-procedural-statement p)
                   (expect-punct p #\;))))
 
-(defun parse-do-if-found (p)
-  (let* ((condition (parse-expr p))
-         (negated-p (equal condition '(:not (:column "found")))))
+(defun match-plpgsql-assignment (p)
+  (or (match-op p ":=") (match-op p "=")))
+
+(defun parse-do-declarations (p)
+  (when (match-kw p "declare")
+    (loop until (kw-p p "begin")
+          collect (let ((name (pident p)))
+                    (multiple-value-bind (type typmod) (parse-type p)
+                      (let ((default (when (or (match-kw p "default")
+                                               (match-plpgsql-assignment p))
+                                       (parse-expr p))))
+                        (expect-punct p #\;)
+                        (list name type typmod default)))))))
+
+(defun parse-do-if-branch (p)
+  (let ((condition (parse-expr p)))
     (expect-kw p "then")
-    (unless (or negated-p (equal condition '(:column "found")))
-      (ereport "0A000" "inline PL/pgSQL IF requires FOUND or NOT FOUND"))
-    (let* ((then (parse-do-statements p '("else" "end")))
-           (else (when (match-kw p "else")
-                   (parse-do-statements p '("end")))))
-      (expect-kw p "end")
-      (expect-kw p "if")
-      (list :type :do-if-found :negated-p negated-p :then then :else else))))
+    (list :type :do-if :condition condition
+          :then (parse-do-statements p '("elsif" "else" "end"))
+          :else (cond ((match-kw p "elsif") (list (parse-do-if-branch p)))
+                      ((match-kw p "else") (parse-do-statements p '("end")))))))
+
+(defun parse-do-if (p)
+  (prog1 (parse-do-if-branch p)
+    (expect-kw p "end")
+    (expect-kw p "if")))
+
+(defparameter *plpgsql-condition-sqlstates*
+  '(("division_by_zero" . "22012") ("data_exception" . "22000")
+    ("invalid_text_representation" . "22P02") ("numeric_value_out_of_range" . "22003")
+    ("integrity_constraint_violation" . "23000") ("unique_violation" . "23505")
+    ("foreign_key_violation" . "23503") ("not_null_violation" . "23502")
+    ("check_violation" . "23514") ("raise_exception" . "P0001")
+    ("no_data_found" . "P0002") ("too_many_rows" . "P0003")
+    ("assert_failure" . "P0004") ("query_canceled" . "57014")
+    ("undefined_table" . "42P01") ("undefined_column" . "42703")))
+
+(defun parse-plpgsql-sqlstate (p)
+  (let ((state (parse-string-literal p)))
+    (unless (and (= 5 (length state))
+                 (every (lambda (character)
+                          (or (char<= #\0 character #\9) (char<= #\A character #\Z)))
+                        state)
+                 (not (string= state "00000")))
+      (ereport "42601" "invalid SQLSTATE code ~s" state))
+    state))
+
+(defun parse-plpgsql-exception-condition (p)
+  (cond ((match-kw p "others") :others)
+        ((match-kw p "sqlstate") (parse-plpgsql-sqlstate p))
+        (t (let ((name (pident p)))
+             (or (cdr (assoc name *plpgsql-condition-sqlstates* :test #'string=))
+                 (ereport "42704" "unrecognized exception condition ~s" name))))))
+
+(defun parse-plpgsql-exception-handlers (p)
+  (when (match-kw p "exception")
+    (loop do (expect-kw p "when")
+          collect (let ((conditions (loop collect (parse-plpgsql-exception-condition p)
+                                          while (match-kw p "or"))))
+                    (expect-kw p "then")
+                    (list conditions (parse-do-statements p '("when" "end"))))
+          while (kw-p p "when"))))
 
 (defun parse-do-block (p)
   "Parse a BEGIN/END block of supported procedural statements."
-  (expect-kw p "begin")
-  (let ((statements (parse-do-statements p '("end"))))
-    (expect-kw p "end")
-    (list :type :do-block :statements statements)))
+  (let ((declarations (parse-do-declarations p)))
+    (expect-kw p "begin")
+    (let* ((statements (parse-do-statements p '("exception" "end")))
+           (handlers (parse-plpgsql-exception-handlers p)))
+      (expect-kw p "end")
+      (list :type :do-block :declarations declarations :statements statements :handlers handlers))))
 
 (defun parse-rewind-function-grant (p)
   (expect-kw p "execute")
@@ -288,12 +340,86 @@ Range and negative checks occur when the LIMIT executes."
     (list :type :grant-role-function :name (pident p)
           :options (list (cons :grant-function grant)))))
 
+(defun parse-do-raise (p)
+  (when (punct-p p #\;)
+    (return-from parse-do-raise (list :type :do-reraise)))
+  (match-kw p "exception")
+  (cond
+    ((eq (pkind p) :string)
+     (list :type :do-raise :state "P0001" :format (parse-string-literal p)
+           :arguments (loop while (match-punct p #\,) collect (parse-expr p))))
+    (t
+     (let* ((explicit-p (match-kw p "sqlstate"))
+            (name (unless explicit-p (pident p)))
+            (state (if explicit-p (parse-plpgsql-sqlstate p)
+                       (or (cdr (assoc name *plpgsql-condition-sqlstates* :test #'string=))
+                           (ereport "42704" "unrecognized exception condition ~s" name)))))
+       (list :type :do-raise :state state :condition-name name
+             :message (when (match-kw p "using")
+                        (expect-kw p "message")
+                        (expect-op p "=")
+                        (parse-expr p)))))))
+
+(defun parse-do-assignment (p)
+  (let ((name (pident p)))
+    (unless (match-plpgsql-assignment p)
+      (ereport "0A000" "unsupported statement in PL/pgSQL block: ~a" name))
+    (list :type :do-assign :name name :expression (parse-expr p))))
+
+(defun parse-do-select-into (p)
+  (let* ((core (parse-select-core p t))
+         (into (getf core :plpgsql-into)))
+    (unless into (ereport "42601" "query has no destination for result data"))
+    (remf core :plpgsql-into)
+    (list :type :do-select-into :query (parse-select-tail p core)
+          :strict (car into) :names (cdr into))))
+
+(defun parse-do-loop (p condition)
+  (expect-kw p "loop")
+  (let ((statements (parse-do-statements p '("end"))))
+    (expect-kw p "end")
+    (expect-kw p "loop")
+    (list :type :do-loop :condition condition :statements statements)))
+
+(defun parse-do-execute (p)
+  (let ((query (parse-expr p)) (into nil) (using nil) (strict-p nil))
+    (loop
+      (cond
+        ((match-kw p "into")
+         (when into (syntax-error p "INTO specified more than once"))
+         (setf strict-p (match-kw p "strict") into (parse-ident-list p)))
+        ((match-kw p "using")
+         (when using (syntax-error p "USING specified more than once"))
+         (setf using (parse-expr-list p)))
+        (t (return))))
+    (list :type :do-execute :expression query :names into :strict strict-p :using using)))
+
+(defun parse-plpgsql-stacked-diagnostics (p)
+  (expect-kw p "stacked")
+  (expect-kw p "diagnostics")
+  (list :type :do-stacked-diagnostics
+        :assignments (loop collect (let ((name (pident p)))
+                                     (unless (match-plpgsql-assignment p)
+                                       (syntax-error p "expected ="))
+                                     (list name (pident p)))
+                           while (match-punct p #\,))))
+
 (defun parse-do-procedural-statement (p)
   (cond
     ((match-kw p "grant") (parse-rewind-function-grant p))
     ((at-eof-p p) (syntax-error p "expected END"))
-    ((kw-p p "begin") (parse-do-block p))
-    ((match-kw p "if") (parse-do-if-found p))
+    ((or (kw-p p "begin") (kw-p p "declare")) (parse-do-block p))
+    ((match-kw p "if") (parse-do-if p))
+    ((match-kw p "raise") (parse-do-raise p))
+    ((match-kw p "get") (parse-plpgsql-stacked-diagnostics p))
+    ((match-kw p "return")
+     (list :type :do-return :expression (unless (punct-p p #\;) (parse-expr p))))
+    ((match-kw p "select") (parse-do-select-into p))
+    ((match-kw p "execute") (parse-do-execute p))
+    ((match-kw p "while") (parse-do-loop p (parse-expr p)))
+    ((kw-p p "loop") (parse-do-loop p nil))
+    ((match-kw p "exit")
+     (list :type :do-exit :condition (when (match-kw p "when") (parse-expr p))))
     ((match-kw p "null") (list :type :do-null))
     ((match-kw p "perform")
      (let* ((start (sql-parser-pos p))
@@ -316,7 +442,8 @@ Range and negative checks occur when the LIMIT executes."
      (parse-role-options p :alter-role))
     ((match-kw p "set") (parse-set p))
     ((match-kw p "reset") (parse-reset p))
-    (t (ereport "0A000" "unsupported statement in inline PL/pgSQL block: ~a" (pval p)))))
+    ((eq (pkind p) :ident) (parse-do-assignment p))
+    (t (ereport "0A000" "unsupported statement in PL/pgSQL block: ~a" (pval p)))))
 
 (defun compile-do-source (source)
   "Compile the inline source at execution and require a complete block."
@@ -460,13 +587,15 @@ Range and negative checks occur when the LIMIT executes."
 
 ;;; ---- SELECT ----
 
-(defun parse-select-core (p)
+(defun parse-select-core (p &optional plpgsql-into-p)
   (let ((distinct (match-kw p "distinct")))
     (when (and distinct (kw-p p "on"))
       (ereport "0A000" "SELECT DISTINCT ON is not supported"))
     (unless distinct (match-kw p "all"))
-    (let ((targets (parse-target-list p))
-          (from nil) (from-alias nil) (joins nil) (where nil) (group-by nil) (having nil))
+    (let* ((targets (parse-target-list p))
+           (into (when (and plpgsql-into-p (match-kw p "into"))
+                   (cons (match-kw p "strict") (parse-ident-list p))))
+           (from nil) (from-alias nil) (joins nil) (where nil) (group-by nil) (having nil))
       (when (match-kw p "from")
         (multiple-value-setq (from from-alias joins) (parse-from p)))
       (when (match-kw p "where") (setf where (parse-expr p)))
@@ -474,9 +603,12 @@ Range and negative checks occur when the LIMIT executes."
         (expect-kw p "by")
         (setf group-by (parse-expr-list p)))
       (when (match-kw p "having") (setf having (parse-expr p)))
-      (list :type :select :targets targets :from from :from-alias from-alias
-            :joins joins :where where :group-by group-by :having having :distinct distinct
-            :windows (when (match-kw p "window") (parse-window-clause p))))))
+      (when (and plpgsql-into-p (null into) (match-kw p "into"))
+        (setf into (cons (match-kw p "strict") (parse-ident-list p))))
+      (list* :type :select :targets targets :from from :from-alias from-alias
+             :joins joins :where where :group-by group-by :having having :distinct distinct
+             :windows (when (match-kw p "window") (parse-window-clause p))
+             (when into (list :plpgsql-into into))))))
 
 (defun parse-values-query (p)
   "Parse one VALUES row as a SELECT with PostgreSQL's default column names."
@@ -907,6 +1039,85 @@ Range and negative checks occur when the LIMIT executes."
     (unless cascade (match-kw p "restrict"))
     (list :type :drop-view :names names :if-exists if-exists :cascade cascade)))
 
+(defun parse-routine-parameter (p defaults-p)
+  "Read an input type, optionally preceded by its parameter name."
+  (match-kw p "in")
+  (when (or (kw-p p "out") (kw-p p "inout") (kw-p p "variadic"))
+    (ereport "0A000" "only IN function parameters are supported"))
+  (let* ((start (sql-parser-pos p))
+         (type (handler-case (parse-type p) (pg-error () nil)))
+         (name nil))
+    (unless (and type
+                 (or (punct-p p #\,) (punct-p p #\))
+                     (kw-p p "default") (op-p p "=")))
+      (setf (sql-parser-pos p) start
+            name (pident p)
+            type (parse-type p)))
+    (list name type (when (and defaults-p (or (match-kw p "default") (match-op p "=")))
+                      (parse-expr p)))))
+
+(defun parse-routine-parameters (p defaults-p)
+  (with-parens (p)
+    (unless (punct-p p #\))
+      (loop collect (parse-routine-parameter p defaults-p)
+            while (match-punct p #\,)))))
+
+(defun parse-routine-option (p)
+  (cond ((match-kw p "as") (values :source (parse-string-literal p)))
+        ((match-kw p "language")
+         (values :language (if (eq (pkind p) :string) (parse-string-literal p) (pident p))))
+        ((match-kw p "strict") (values :strict t))
+        ((match-kw p "returns")
+         (expect-kw p "null")
+         (expect-kw p "on")
+         (expect-kw p "null")
+         (expect-kw p "input")
+         (values :strict t))
+        ((match-kw p "called")
+         (expect-kw p "on")
+         (expect-kw p "null")
+         (expect-kw p "input")
+         (values :strict nil))
+        ((match-kw p "immutable") (values :volatility :immutable))
+        ((match-kw p "stable") (values :volatility :stable))
+        ((match-kw p "volatile") (values :volatility :volatile))
+        (t (syntax-error p "expected a function option"))))
+
+(defun parse-create-function (p replace-p)
+  (let* ((name (parse-view-name p))
+         (parameters (parse-routine-parameters p t))
+         (table-p (progn (expect-kw p "returns") (match-kw p "table")))
+         (returns-set-p (or table-p (match-kw p "setof")))
+         (fields (when table-p
+                   (with-parens (p)
+                     (loop collect (list (pident p) (parse-type p))
+                           while (match-punct p #\,)))))
+         (result-type (cond ((rest fields) :record)
+                            (fields (second (first fields)))
+                            (t (parse-type p))))
+         (options nil))
+    (loop until (or (at-eof-p p) (punct-p p #\;))
+          do (multiple-value-bind (option value) (parse-routine-option p)
+               (when (member option options :key #'car)
+                 (ereport "42601" "conflicting or redundant function option ~a" option))
+               (push (cons option value) options)))
+    (list :type :create-function :name name :parameters parameters
+          :result-type result-type :result-fields fields :returns-set-p returns-set-p
+          :replace replace-p :options (nreverse options))))
+
+(defun parse-drop-function (p)
+  (let* ((if-exists (when (match-kw p "if") (expect-kw p "exists") t))
+         (signatures (loop collect
+                           (let* ((name (parse-view-name p))
+                                  (specified-p (punct-p p #\()))
+                             (list name specified-p
+                                   (when specified-p
+                                     (mapcar #'second (parse-routine-parameters p nil)))))
+                           while (match-punct p #\,)))
+         (cascade (match-kw p "cascade")))
+    (unless cascade (match-kw p "restrict"))
+    (list :type :drop-function :signatures signatures :if-exists if-exists :cascade cascade)))
+
 (defun parse-create (p)
   (cond
     ((match-kw p "role") (parse-role-options p :create-role))
@@ -914,10 +1125,12 @@ Range and negative checks occur when the LIMIT executes."
     ((match-kw p "publication") (parse-create-publication p))
     ((match-kw p "table") (parse-create-table p))
     ((match-kw p "view") (parse-create-view p nil))
+    ((match-kw p "function") (parse-create-function p nil))
     ((match-kw p "or")
      (expect-kw p "replace")
-     (expect-kw p "view")
-     (parse-create-view p t))
+     (cond ((match-kw p "function") (parse-create-function p t))
+           ((match-kw p "view") (parse-create-view p t))
+           (t (syntax-error p "expected FUNCTION or VIEW"))))
     ((match-kw p "unique")
      (expect-kw p "index")
      (parse-create-index p t))
@@ -1432,6 +1645,7 @@ Range and negative checks occur when the LIMIT executes."
 (defun parse-drop (p)
   (cond
     ((match-kw p "view") (parse-drop-view p))
+    ((match-kw p "function") (parse-drop-function p))
     ((match-kw p "publication")
      (let ((if-exists (when (match-kw p "if")
                         (expect-kw p "exists")

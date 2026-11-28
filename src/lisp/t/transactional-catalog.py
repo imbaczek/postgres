@@ -2122,10 +2122,525 @@ def verify_logical_column_type_rewrite():
 
 
 
+def verify_scalar_sql_routine_transactions(port):
+    definition = (
+        "CREATE FUNCTION p12_sum(x integer, y integer DEFAULT 4) RETURNS integer "
+        "LANGUAGE sql IMMUTABLE STRICT AS $$SELECT 1; SELECT x + p12_sum.y$$"
+    )
+    with contextlib.closing(Connection(port)) as writer, contextlib.closing(Connection(port)) as reader:
+        writer.query("BEGIN")
+        writer.query(definition)
+        assert writer.query("SELECT p12_sum(3), public.p12_sum(5,6), p12_sum(NULL::integer)") == [
+            ["7", "11", None]
+        ]
+        assert writer.query("SELECT p12_sum(y => 6, x => 5), p12_sum(x => 3)") == [["11", "7"]]
+        try:
+            reader.query("SELECT p12_sum(3)")
+        except WireError as error:
+            assert error.sqlstate == "42883", error
+        else:
+            raise AssertionError("uncommitted routine was visible to another connection")
+        writer.query("COMMIT")
+        assert reader.query("SELECT p12_sum(3)") == [["7"]]
+
+        writer.query("BEGIN")
+        writer.query(definition.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
+                     .replace("x + p12_sum.y", "$1 * $2"))
+        assert writer.query("SELECT p12_sum(3)") == [["12"]]
+        assert reader.query("SELECT p12_sum(3)") == [["7"]]
+        writer.query("ROLLBACK")
+        assert writer.query("SELECT p12_sum(3)") == [["7"]]
+
+        prepared = b"p12_routine_generation"
+        assert cycle(reader, [parse("SELECT p12_sum($1)", (), name=prepared)]) == []
+
+        def prepared_result():
+            return cycle(reader, [bind((b"3",), statement=prepared), frame(b"E", bytes(5))])
+
+        assert prepared_result() == [(b"D", struct.pack("!Hi1s", 1, 1, b"7"))]
+        writer.query(definition.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
+                     .replace("x + p12_sum.y", "$1 * $2"))
+        assert prepared_result() == [(b"D", struct.pack("!Hi2s", 1, 2, b"12"))]
+        writer.query(definition.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"))
+
+        for body, sqlstate in (("SELECT NULL", "42P13"), ("SELECT missing_column", "42703")):
+            invalid = definition.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION").replace(
+                "SELECT 1; SELECT x + p12_sum.y", body
+            )
+            try:
+                writer.query(invalid)
+            except WireError as error:
+                assert error.sqlstate == sqlstate, error
+            else:
+                raise AssertionError("invalid SQL routine definition was accepted")
+            assert writer.query("SELECT p12_sum(3)") == [["7"]]
+
+        writer.query("SET check_function_bodies = off")
+        writer.query(
+            "CREATE FUNCTION p12_forward() RETURNS integer LANGUAGE sql "
+            "AS $$SELECT p12_later()$$"
+        )
+        writer.query("RESET check_function_bodies")
+        assert writer.query("SHOW check_function_bodies") == [["on"]]
+        writer.query("CREATE FUNCTION p12_later() RETURNS integer LANGUAGE sql AS $$SELECT 12$$")
+        assert writer.query("SELECT p12_forward()") == [["12"]]
+        writer.query("DROP FUNCTION p12_forward(), p12_later()")
+
+        writer.query(
+            "CREATE FUNCTION p12_overload(integer) RETURNS integer LANGUAGE sql AS $$SELECT 4$$; "
+            "CREATE FUNCTION p12_overload(bigint) RETURNS integer LANGUAGE sql AS $$SELECT 8$$"
+        )
+        assert writer.query("SELECT p12_overload(1), p12_overload(1::bigint)") == [["4", "8"]]
+        for sql in ("SELECT p12_overload(NULL)", "DROP FUNCTION p12_overload"):
+            try:
+                writer.query(sql)
+            except WireError as error:
+                assert error.sqlstate == "42725", error
+            else:
+                raise AssertionError("ambiguous routine signature was accepted")
+        writer.query("DROP FUNCTION p12_overload(integer)")
+        assert writer.query("SELECT p12_overload(1)") == [["8"]]
+        writer.query("DROP FUNCTION p12_overload(bigint)")
+
+
+def verify_recovered_scalar_sql_routine(port):
+    with contextlib.closing(Connection(port)) as connection:
+        assert connection.query("SELECT p12_sum(3)") == [["7"]]
+        connection.query("DROP FUNCTION public.p12_sum(integer, integer)")
+        try:
+            connection.query("SELECT p12_sum(3)")
+        except WireError as error:
+            assert error.sqlstate == "42883", error
+        else:
+            raise AssertionError("dropped routine remains callable")
+
+
+def create_durable_routine_expressions(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query(
+            "CREATE FUNCTION p12_expr_default() RETURNS integer LANGUAGE plpgsql "
+            "AS $$BEGIN RETURN 7; END$$"
+        )
+        connection.query(
+            "CREATE FUNCTION p12_expr_check(x integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE "
+            "AS $$BEGIN RETURN x > 0; END$$"
+        )
+        connection.query(
+            "CREATE TABLE p12_expressions (x integer DEFAULT p12_expr_default(), "
+            "CONSTRAINT p12_positive CHECK (p12_expr_check(x)))"
+        )
+        assert connection.query("INSERT INTO p12_expressions DEFAULT VALUES RETURNING x") == [["7"]]
+
+
+def verify_recovered_routine_expressions(port):
+    with contextlib.closing(Connection(port)) as connection:
+        assert connection.query("SELECT x FROM p12_expressions") == [["7"]]
+        for sql, sqlstate in (
+            ("DROP FUNCTION p12_expr_default()", "2BP01"),
+            ("DROP FUNCTION p12_expr_check(integer)", "2BP01"),
+            ("INSERT INTO p12_expressions VALUES (-1)", "23514"),
+        ):
+            try:
+                connection.query(sql)
+            except WireError as error:
+                assert error.sqlstate == sqlstate, error
+            else:
+                raise AssertionError(f"expected stored routine dependency to reject {sql}")
+        connection.query(
+            "CREATE OR REPLACE FUNCTION p12_expr_default() RETURNS integer LANGUAGE plpgsql "
+            "AS $$BEGIN RETURN 9; END$$"
+        )
+        assert connection.query("INSERT INTO p12_expressions DEFAULT VALUES RETURNING x") == [["9"]]
+
+        drop = "DROP FUNCTION p12_expr_default(), p12_expr_check(integer) CASCADE"
+        connection.query("BEGIN")
+        connection.query(drop)
+        assert connection.query("INSERT INTO p12_expressions DEFAULT VALUES RETURNING x") == [[None]]
+        connection.query("INSERT INTO p12_expressions VALUES (-1)")
+        connection.query("ROLLBACK")
+        assert connection.query("INSERT INTO p12_expressions DEFAULT VALUES RETURNING x") == [["9"]]
+
+        connection.query(drop)
+        assert connection.query("INSERT INTO p12_expressions DEFAULT VALUES RETURNING x") == [[None]]
+        connection.query("INSERT INTO p12_expressions VALUES (-1)")
+        assert connection.query("SELECT x FROM p12_expressions ORDER BY x") == [
+            ["-1"], ["7"], ["9"], ["9"], [None]
+        ]
+        connection.query("DROP TABLE p12_expressions")
+
+
+def create_durable_plpgsql_routine(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query(
+            "CREATE FUNCTION p12_durable_plpgsql(n integer) RETURNS integer LANGUAGE plpgsql STRICT "
+            "AS $$DECLARE doubled integer := n * 2; BEGIN RETURN doubled; END$$"
+        )
+
+
+def verify_recovered_plpgsql_routine(port):
+    with contextlib.closing(Connection(port)) as connection:
+        assert connection.query(
+            "SELECT p12_durable_plpgsql(3), p12_durable_plpgsql(NULL::integer)"
+        ) == [["6", None]]
+        connection.query("DROP FUNCTION p12_durable_plpgsql(integer)")
+
+
+def verify_sql_routine_dml(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query("CREATE TABLE p12_changes (id integer PRIMARY KEY, value integer)")
+        connection.query(
+            "CREATE FUNCTION p12_change(n integer) RETURNS integer LANGUAGE sql AS "
+            "$$INSERT INTO p12_changes VALUES (n, 1); "
+            "UPDATE p12_changes SET value = value + 1 WHERE id = n RETURNING value$$"
+        )
+        connection.query(
+            "CREATE FUNCTION p12_remove(n integer) RETURNS bigint LANGUAGE sql AS "
+            "$$DELETE FROM p12_changes WHERE id = n; SELECT count(*) FROM p12_changes$$"
+        )
+        assert connection.query("SELECT * FROM p12_changes") == []
+        connection.query("BEGIN")
+        assert connection.query("SELECT p12_change(7)") == [["2"]]
+        assert connection.query("SELECT * FROM p12_changes") == [["7", "2"]]
+        connection.query("ROLLBACK")
+        assert connection.query("SELECT * FROM p12_changes") == []
+        for key in (1, 2):
+            assert connection.query(f"SELECT p12_change({key})") == [["2"]]
+        assert connection.query("SELECT p12_remove(1)") == [["1"]]
+        assert connection.query("SELECT * FROM p12_changes") == [["2", "2"]]
+
+        connection.query("BEGIN READ ONLY")
+        try:
+            connection.query("SELECT p12_change(9)")
+        except WireError as error:
+            assert error.sqlstate == "25006", error
+        else:
+            raise AssertionError("routine bypassed transaction read-only mode")
+        connection.query("ROLLBACK")
+        assert connection.query("SELECT * FROM p12_changes") == [["2", "2"]]
+
+        connection.query(
+            "CREATE FUNCTION p12_fail() RETURNS integer LANGUAGE sql AS "
+            "$$INSERT INTO p12_changes VALUES (8, 1); "
+            "INSERT INTO p12_changes VALUES (8, 2); SELECT 1$$"
+        )
+        try:
+            connection.query("SELECT p12_fail()")
+        except WireError as error:
+            assert error.sqlstate == "23505", error
+        else:
+            raise AssertionError("expected unique violation from routine body")
+        assert connection.query("SELECT * FROM p12_changes") == [["2", "2"]]
+
+        connection.query(
+            "CREATE FUNCTION p12_stable_write() RETURNS integer LANGUAGE sql STABLE AS "
+            "$$INSERT INTO p12_changes VALUES (9, 1); SELECT 1$$"
+        )
+        try:
+            connection.query("SELECT p12_stable_write()")
+        except WireError as error:
+            assert error.sqlstate == "0A000", error
+        else:
+            raise AssertionError("STABLE routine performed a write")
+        assert connection.query("SELECT * FROM p12_changes") == [["2", "2"]]
+
+        connection.query(
+            "CREATE FUNCTION p12_drain() RETURNS integer LANGUAGE sql AS "
+            "$$DELETE FROM p12_changes RETURNING value$$"
+        )
+        assert connection.query("SELECT p12_change(3)") == [["2"]]
+        assert connection.query("SELECT p12_drain()") == [["2"]]
+        assert connection.query("SELECT * FROM p12_changes") == []
+        assert connection.query("SELECT p12_drain()") == [[None]]
+        connection.query(
+            "DROP FUNCTION p12_change(integer), p12_remove(integer), p12_fail(), "
+            "p12_stable_write(), p12_drain()"
+        )
+        connection.query("DROP TABLE p12_changes")
+
+
+def verify_sql_set_portal_snapshots(port, reader):
+    with contextlib.closing(Connection(port)) as writer:
+        for volatility in ("STABLE", "VOLATILE"):
+            writer.query(
+                f"CREATE FUNCTION p12_pinned() RETURNS SETOF integer LANGUAGE sql {volatility} "
+                "AS $$SELECT id FROM p12_set_input WHERE id >= 102 ORDER BY id$$"
+            )
+            reader.query("BEGIN")
+            execute_one = frame(b"E", b"\0" + struct.pack("!I", 1))
+            assert cycle(reader, [parse("SELECT p12_pinned()"), bind(), execute_one]) == [
+                (b"D", struct.pack("!Hi3s", 1, 3, b"102"))
+            ]
+            writer.query("INSERT INTO p12_set_input VALUES (999)")
+            assert cycle(reader, [frame(b"E", bytes(5))]) == [
+                (b"D", struct.pack("!Hi3s", 1, 3, b"103"))
+            ]
+            reader.query("COMMIT")
+            writer.query("DELETE FROM p12_set_input WHERE id = 999")
+            writer.query("DROP FUNCTION p12_pinned()")
+
+
+def verify_sql_set_routines(port, *, require_index=True):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query("CREATE TABLE p12_set_input (id integer PRIMARY KEY)")
+        connection.query("INSERT INTO p12_set_input VALUES (1),(2),(3)")
+        connection.query(
+            "CREATE FUNCTION p12_numbers(n integer) RETURNS SETOF bigint LANGUAGE sql STABLE STRICT "
+            "AS $$SELECT id FROM p12_set_input WHERE id >= n ORDER BY id$$"
+        )
+        connection.query(
+            "CREATE FUNCTION p12_records(n integer) RETURNS TABLE(output_id bigint, label text) "
+            "LANGUAGE sql STABLE AS $$SELECT id, id::text AS item FROM p12_set_input "
+            "WHERE id >= n ORDER BY id$$"
+        )
+        connection.query(
+            "CREATE FUNCTION p12_one() RETURNS TABLE(output_id integer) "
+            "LANGUAGE sql STABLE AS $$SELECT 7$$"
+        )
+        assert connection.query("SELECT p12_numbers(2)") == [["2"], ["3"]]
+        assert connection.query("SELECT * FROM p12_numbers(NULL::integer)") == []
+        assert connection.query("SELECT * FROM p12_records(2)") == [["2", "2"], ["3", "3"]]
+        assert connection.query("SELECT p12_records(2)") == [["(2,2)"], ["(3,3)"]]
+        assert connection.query("SELECT output_id FROM p12_one() AS renamed") == [["7"]]
+        connection.query(
+            "CREATE FUNCTION p12_set_subquery() RETURNS SETOF integer LANGUAGE sql STABLE "
+            "AS $$SELECT (SELECT id FROM p12_set_input WHERE id = 1); SELECT 11$$"
+        )
+        assert connection.query("SELECT p12_set_subquery()") == [["11"]]
+
+        connection.query("CREATE SEQUENCE p12_set_seq")
+        connection.query(
+            "CREATE FUNCTION p12_effects() RETURNS SETOF bigint LANGUAGE sql VOLATILE AS "
+            "$$SELECT nextval('p12_set_seq') FROM p12_set_input$$"
+        )
+        connection.query("BEGIN")
+        execute_one = frame(b"E", b"\0" + struct.pack("!I", 1))
+        assert cycle(connection, [parse("SELECT p12_effects()"), bind(), execute_one]) == [
+            (b"D", struct.pack("!Hi1s", 1, 1, b"1"))
+        ]
+        assert cycle(connection, [execute_one]) == [(b"D", struct.pack("!Hi1s", 1, 1, b"2"))]
+        assert cycle(connection, [frame(b"C", b"P\0")]) == []
+        assert connection.query("SELECT currval('p12_set_seq')") == [["2"]]
+        connection.query("ROLLBACK")
+        assert connection.query("SELECT p12_effects() LIMIT 1") == [["3"]]
+        assert connection.query("SELECT currval('p12_set_seq')") == [["3"]]
+        assert connection.query("SELECT * FROM p12_effects() LIMIT 1") == [["4"]]
+        assert connection.query("SELECT currval('p12_set_seq')") == [["6"]]
+
+        rows = ",".join(f"({value})" for value in range(4, 104))
+        connection.query("INSERT INTO p12_set_input VALUES " + rows)
+        suffix = "x" * 1024
+        connection.query(
+            "CREATE FUNCTION p12_wide_set() RETURNS SETOF text LANGUAGE sql VOLATILE "
+            f"AS $$SELECT id::text || '{suffix}' FROM p12_set_input$$"
+        )
+        connection.query("SET work_mem = '64kB'")
+        assert connection.query("SELECT count(*) FROM p12_wide_set()") == [["103"]]
+        connection.query("RESET work_mem")
+
+        sources = " CROSS JOIN ".join(f"p12_set_input AS {alias}" for alias in "abcde")
+        connection.query(
+            "CREATE FUNCTION p12_cancel_set() RETURNS SETOF bigint LANGUAGE sql STABLE "
+            f"AS $$SELECT sum(a.id::bigint + e.id) FROM {sources}$$"
+        )
+        connection.query("SET statement_timeout = '30ms'")
+        try:
+            connection.query("SELECT p12_cancel_set()")
+        except WireError as error:
+            assert error.sqlstate == "57014", error
+        else:
+            raise AssertionError("expected cancellation during a routine set pull")
+        connection.query("RESET statement_timeout")
+        assert connection.query("SELECT p12_numbers(103)") == [["103"]]
+
+        verify_sql_set_portal_snapshots(port, connection)
+        for start in range(-3000, 0, 300):
+            padding = ",".join(f"({value})" for value in range(start, start + 300))
+            connection.query("INSERT INTO p12_set_input VALUES " + padding)
+        connection.query("ANALYZE p12_set_input")
+        connection.query("CREATE TABLE p12_set_outer (id integer PRIMARY KEY)")
+        connection.query("INSERT INTO p12_set_outer SELECT id FROM p12_set_input")
+        connection.query("ANALYZE p12_set_outer")
+        connection.query("BEGIN")
+        indexed = "SELECT p12_numbers(o.id) FROM p12_set_outer AS o WHERE o.id = 2 LIMIT 1"
+        plan = connection.query("EXPLAIN (COSTS OFF) " + indexed)
+        if require_index:
+            assert any("Index" in line[0] for line in plan), plan
+        assert cycle(connection, [parse(indexed), bind(), execute_one]) == [
+            (b"D", struct.pack("!Hi1s", 1, 1, b"2"))
+        ]
+        assert cycle(connection, [execute_one]) == []
+        assert cycle(connection, [frame(b"C", b"P\0")]) == []
+        connection.query("TRUNCATE p12_set_input")
+        connection.query("ROLLBACK")
+        connection.query("DROP TABLE p12_set_outer")
+
+        connection.query(
+            "CREATE FUNCTION p12_index_error(n integer) RETURNS SETOF integer LANGUAGE sql STABLE "
+            "AS $$SELECT 10 / (id - n) FROM p12_set_input WHERE id = n$$"
+        )
+        plan = connection.query(
+            "EXPLAIN (COSTS OFF) SELECT 10 / (id - 2) FROM p12_set_input WHERE id = 2"
+        )
+        if require_index:
+            assert any("Index" in line[0] for line in plan), plan
+        try:
+            connection.query("SELECT p12_index_error(2)")
+        except WireError as error:
+            assert error.sqlstate == "22012", error
+        else:
+            raise AssertionError("expected the routine body division error")
+        assert connection.query("SELECT p12_numbers(103)") == [["103"]]
+
+        connection.query(
+            "DROP FUNCTION p12_numbers(integer), p12_records(integer), p12_one(), p12_effects(), "
+            "p12_cancel_set(), p12_set_subquery(), p12_index_error(integer), p12_wide_set()"
+        )
+        connection.query("DROP SEQUENCE p12_set_seq")
+        connection.query("DROP TABLE p12_set_input")
+
+
+def verify_plpgsql_scalar_routines(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query(
+            "DO $$DECLARE v integer := 1; BEGIN WHILE v < 3 LOOP "
+            "v := v + 1; END LOOP; IF v <> 3 THEN RAISE 'unexpected value %', v; END IF; END$$"
+        )
+        connection.query(
+            "CREATE FUNCTION p12_plpgsql(n integer) RETURNS integer LANGUAGE plpgsql AS "
+            "$$DECLARE x integer := n; BEGIN LOOP x := x + 1; EXIT WHEN x >= 3; END LOOP; "
+            "PERFORM 1 WHERE x = 3; IF FOUND THEN SELECT 4 INTO STRICT x; "
+            "ELSIF x > 3 THEN x := x + 5; ELSE RAISE 'not found'; END IF; RETURN x; END$$"
+        )
+        assert connection.query("SELECT p12_plpgsql(1), p12_plpgsql(7)") == [["4", "13"]]
+        connection.query(
+            "CREATE FUNCTION p12_plpgsql_dynamic(n integer) RETURNS integer LANGUAGE plpgsql AS "
+            "$$BEGIN PERFORM 1 WHERE false; EXECUTE 'SELECT $1 + 1' INTO n USING n; "
+            "IF FOUND THEN RAISE 'EXECUTE changed FOUND'; END IF; RETURN $1; END$$"
+        )
+        assert connection.query("SELECT p12_plpgsql_dynamic(7)") == [["8"]]
+        connection.query(
+            "CREATE FUNCTION p12_plpgsql_qualified(n integer) RETURNS integer LANGUAGE plpgsql AS "
+            "$$DECLARE n integer := 1; BEGIN RETURN n + p12_plpgsql_qualified.n; END$$"
+        )
+        assert connection.query("SELECT p12_plpgsql_qualified(7)") == [["8"]]
+        connection.query("CREATE TABLE p12_plpgsql_values (n integer)")
+        connection.query("INSERT INTO p12_plpgsql_values VALUES (1),(2),(3)")
+        connection.query(
+            "CREATE FUNCTION p12_plpgsql_subquery() RETURNS bigint LANGUAGE plpgsql STABLE AS "
+            "$$DECLARE result bigint := (SELECT count(*) FROM p12_plpgsql_values); "
+            "BEGIN RETURN result + (SELECT max(n) FROM p12_plpgsql_values); END$$"
+        )
+        assert connection.query("SELECT p12_plpgsql_subquery()") == [["6"]]
+        connection.query("CREATE SEQUENCE p12_plpgsql_seq")
+        connection.query(
+            "DO $$DECLARE first_value bigint; BEGIN EXECUTE "
+            "'SELECT nextval(''p12_plpgsql_seq'') FROM p12_plpgsql_values' INTO first_value; "
+            "IF first_value <> 1 THEN RAISE 'wrong first value'; END IF; END$$"
+        )
+        assert connection.query("SELECT currval('p12_plpgsql_seq')") == [["3"]]
+        for sql, sqlstate in (
+            ("DO $$DECLARE n integer; BEGIN n := true; END$$", "22P02"),
+            ("DO $$BEGIN EXECUTE 'SELEC' USING 1 / 0; END$$", "22012"),
+            (
+                "CREATE FUNCTION p12_invalid() RETURNS integer LANGUAGE plpgsql AS "
+                "$$BEGIN IF false THEN missing := 1; END IF; RETURN 2; END$$",
+                "42601",
+            ),
+            (
+                "CREATE FUNCTION p12_invalid() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN; END$$",
+                "42601",
+            ),
+        ):
+            try:
+                connection.query(sql)
+            except WireError as error:
+                assert error.sqlstate == sqlstate, error
+            else:
+                raise AssertionError(f"expected PL/pgSQL to reject {sql}")
+        connection.query(
+            "CREATE FUNCTION p12_plpgsql_raise(n integer) RETURNS integer LANGUAGE plpgsql AS "
+            "$$BEGIN RAISE SQLSTATE '22012' USING MESSAGE = 'value ' || n::text; END$$"
+        )
+        try:
+            connection.query("SELECT p12_plpgsql_raise(7)")
+        except WireError as error:
+            assert error.sqlstate == "22012" and "value 7" in str(error), error
+        else:
+            raise AssertionError("expected the PL/pgSQL error")
+        assert connection.query("SELECT p12_plpgsql_dynamic(8)") == [["9"]]
+        connection.query(
+            "DROP FUNCTION p12_plpgsql(integer), p12_plpgsql_dynamic(integer), "
+            "p12_plpgsql_raise(integer), p12_plpgsql_subquery(), p12_plpgsql_qualified(integer)"
+        )
+        connection.query("DROP SEQUENCE p12_plpgsql_seq")
+        connection.query("DROP TABLE p12_plpgsql_values")
+
+
+def verify_plpgsql_exception_routines(port):
+    with contextlib.closing(Connection(port)) as connection:
+        connection.query("CREATE TABLE p12_exc_rows (id integer PRIMARY KEY)")
+        connection.query(
+            "CREATE FUNCTION p12_exception() RETURNS text LANGUAGE plpgsql AS $$"
+            "DECLARE caught text; original text; BEGIN "
+            "BEGIN EXECUTE 'INSERT INTO p12_exc_rows VALUES ($1)' USING 1; "
+            "EXECUTE 'INSERT INTO p12_exc_rows VALUES ($1)' USING 1; "
+            "EXCEPTION WHEN integrity_constraint_violation THEN "
+            "GET STACKED DIAGNOSTICS caught = RETURNED_SQLSTATE, original = MESSAGE_TEXT; "
+            "IF caught <> SQLSTATE OR original <> SQLERRM THEN RAISE 'wrong diagnostics'; END IF; "
+            "END; EXECUTE 'INSERT INTO p12_exc_rows VALUES ($1)' USING 2; RETURN caught; END$$"
+        )
+        connection.query("BEGIN")
+        assert connection.query("SELECT p12_exception()") == [["23505"]]
+        assert connection.query("SELECT id FROM p12_exc_rows") == [["2"]]
+        connection.query("ROLLBACK")
+        assert connection.query("SELECT id FROM p12_exc_rows") == []
+
+        assert connection.query("SELECT p12_exception()") == [["23505"]]
+        connection.query(
+            "CREATE FUNCTION p12_nested_exception() RETURNS text LANGUAGE plpgsql AS $$"
+            "BEGIN BEGIN BEGIN EXECUTE 'INSERT INTO p12_exc_rows VALUES ($1)' USING 3; "
+            "RAISE SQLSTATE '22012' USING MESSAGE = 'inner'; "
+            "EXCEPTION WHEN division_by_zero THEN RAISE; END; "
+            "EXCEPTION WHEN SQLSTATE '22000' THEN RETURN SQLSTATE || ':' || SQLERRM; END; "
+            "RETURN 'missing'; END$$"
+        )
+        assert connection.query("SELECT p12_nested_exception()") == [["22012:inner"]]
+        assert connection.query("SELECT id FROM p12_exc_rows") == [["2"]]
+        connection.query(
+            "CREATE FUNCTION p12_found() RETURNS boolean LANGUAGE plpgsql AS $$"
+            "DECLARE result integer; BEGIN FOUND := true; "
+            "BEGIN SELECT 1 INTO STRICT result WHERE false; "
+            "EXCEPTION WHEN no_data_found THEN RETURN FOUND; END; RETURN true; END$$"
+        )
+        assert connection.query("SELECT p12_found()") == [["f"]]
+        try:
+            connection.query(
+                "DO $$BEGIN RAISE 'caught'; EXCEPTION WHEN OTHERS THEN SQLSTATE := '00000'; END$$"
+            )
+        except WireError as error:
+            assert error.sqlstate == "22005", error
+        else:
+            raise AssertionError("exception diagnostic variable was assignable")
+        connection.query("DROP FUNCTION p12_exception(), p12_nested_exception(), p12_found()")
+        connection.query("DROP TABLE p12_exc_rows")
+
+
 def main():
     server = OwnedLisp()
     try:
         server.start()
+        verify_scalar_sql_routine_transactions(server.port)
+        create_durable_plpgsql_routine(server.port)
+        create_durable_routine_expressions(server.port)
+        server.stop(immediate=True)
+        server.start()
+        verify_recovered_scalar_sql_routine(server.port)
+        verify_recovered_plpgsql_routine(server.port)
+        verify_recovered_routine_expressions(server.port)
+        verify_sql_routine_dml(server.port)
+        verify_sql_set_routines(server.port)
+        verify_plpgsql_scalar_routines(server.port)
+        verify_plpgsql_exception_routines(server.port)
         verify_create(server)
         verify_drop(server)
         verify_indexes(server)

@@ -2185,10 +2185,38 @@ returned overflow file and processes it after the in-memory groups."
                  (when origins (setf (aref origins i) origin))))
     (values values origins)))
 
+(declaim (ftype function make-stored-routine-set-iterator))
+
+(defun materialize-routine-set (source)
+  "Finish a FROM routine's body before exposing its first row."
+  (let ((spool nil) (store nil) (complete nil))
+    (unwind-protect
+         (progn
+           (setf spool (make-query-row-spool))
+           (map-sql-iterator source
+                             (lambda (value)
+                               (query-row-spool-append spool value)
+                               nil))
+           (query-row-spool-seal spool)
+           (setf store (adopt-sealed-query-row-spool spool))
+           (let ((reader (make-query-replay-reader store)))
+             (prog1
+                 (make-sql-iterator (lambda () (sql-iterator-next reader))
+                                    (lambda () (close-query-replay-store store)))
+               (setf complete t))))
+      (unwind-protect (close-sql-iterator source)
+        (unless complete
+          (cond (store (close-query-replay-store store))
+                (spool
+                 (unwind-protect (close-query-row-spool spool)
+                   (when (query-row-spool-pathname spool)
+                     (delete-query-temp-file (query-row-spool-pathname spool)))))))))))
+
 (defun make-sql-set-function-iterator (call environment)
   (let* ((arguments (mapcar (lambda (argument) (eval-expr argument environment)) (third call)))
          (iterator
-           (when (eq (first call) :set-func)
+           (when (and (eq (first call) :set-func)
+                      (not (getf (cdddr call) :routine-signature)))
              (scalar-builtin-iterator
               (scalar-builtin-for-call (second call) arguments (first (third call)))))))
     (cond ((eq (first call) :single-record)
@@ -2196,6 +2224,12 @@ returned overflow file and processes it after the in-memory groups."
              (lambda ()
                (if pending (progn (setf pending nil) (values value t))
                    (values nil nil)))))
+          ((getf (cdddr call) :routine-signature)
+           (let ((source (make-stored-routine-set-iterator
+                          (lookup-stored-routine-for-call call) arguments)))
+             (if (getf (cdddr call) :materialize-routine-set-p)
+                 (materialize-routine-set source)
+                 source)))
           (iterator (apply iterator arguments))
           (t (ereport "0A000" "unsupported set-returning function ~a" (second call))))))
 
@@ -2209,6 +2243,7 @@ returned overflow file and processes it after the in-memory groups."
 (defun project-set-next-values (environment sets &optional attempt-function)
   "Advance each set at most once, padding exhausted calls and suppressing an all-empty row.
 ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
+  (declare (notinline sql-iterator-p))
   (let* ((width (length sets))
          (values (make-array width :initial-element +null+))
          (visited (when attempt-function (make-array width :element-type 'bit :initial-element 0)))
@@ -2220,13 +2255,16 @@ ATTEMPT-FUNCTION lets fused projection advance sets in target-list order."
                (when (and (not (eq state t))
                           (or (null visited) (zerop (aref visited index))))
                  (when visited (setf (aref visited index) 1))
-                 (unless (functionp state)
+                 (unless (or (functionp state) (sql-iterator-p state))
                    (setf state (make-sql-set-function-iterator state environment)
                          (aref sets index) state))
-                 (multiple-value-bind (value present-p) (funcall state)
+                 (multiple-value-bind (value present-p)
+                     (if (sql-iterator-p state) (sql-iterator-next state) (funcall state))
                    (if present-p
                        (setf any-row-p t (aref values index) value)
-                       (setf (aref sets index) t)))))))
+                       (progn
+                         (when (sql-iterator-p state) (close-sql-iterator state))
+                         (setf (aref sets index) t))))))))
       (declare (dynamic-extent #'step-set))
       (when attempt-function (funcall attempt-function environment values #'step-set))
       (dotimes (index width) (step-set index)))
@@ -2322,7 +2360,8 @@ Expressions wrapping a set result must remain in a separate projection."
    (lambda (form walk)
      (declare (ignore walk))
      (and (eq (first form) :func)
-          (eq (scalar-builtin-family-volatility (second form)) :volatile)))
+          (or (getf (cdddr form) :routine-oid)
+              (eq (scalar-builtin-family-volatility (second form)) :volatile))))
    expression))
 
 (defun project-set-expression-dependent-p (expression width count targets)

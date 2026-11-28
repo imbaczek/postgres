@@ -32,13 +32,15 @@
 (defun catalog-transaction-name-map (database kind)
   (ecase kind
     (:table (database-tables database))
-    (:index (database-indexes database))))
+    (:index (database-indexes database))
+    (:routine (database-routines database))))
 
 (defun catalog-relation-definition-version (object)
   "Snapshot structural fields that legacy DDL can change in place.
 Statistics and freeze horizons can advance without changing the definition."
   (etypecase object
     (null nil)
+    (pg-routine (pg-routine-generation object))
     (pg-index (copy-tree (index-to-sexp object)))
     (pg-class
      (list (pg-class-relfilenode object)
@@ -61,7 +63,10 @@ Statistics and freeze horizons can advance without changing the definition."
                                                     kind)))))
 
 (defun catalog-transaction-find-by-oid (transaction kind oid)
-  (let ((oid-of (ecase kind (:table #'pg-class-oid) (:index #'pg-index-oid))))
+  (let ((oid-of (ecase kind
+                  (:table #'pg-class-oid)
+                  (:index #'pg-index-oid)
+                  (:routine #'pg-routine-oid))))
     (or (loop for key being the hash-keys of (catalog-transaction-names transaction)
                 using (hash-value entry)
               for object = (catalog-transaction-entry-object entry)
@@ -122,7 +127,7 @@ Statistics and freeze horizons can advance without changing the definition."
 
 (defun catalog-relation-storage-nodes (object)
   (etypecase object
-    (null nil)
+    ((or null pg-routine) nil)
     (pg-index (list (pg-index-relfilenode object)))
     (pg-class
      (let ((toast (pg-class-toast object)))
@@ -329,7 +334,8 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
                             (equal (catalog-relation-definition-version current)
                                    (catalog-transaction-entry-base-version entry)))
                  (ereport "40001" "catalog definition of relation ~a changed during transaction" name))
-               (when (and (catalog-transaction-entry-object entry)
+               (when (and (member (car key) '(:table :index))
+                          (catalog-transaction-entry-object entry)
                           (or (gethash name (database-sequences database))
                               (catalog-transaction-lookup
                                transaction (ecase (car key) (:table :index) (:index :table)) name)))
@@ -444,6 +450,7 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
   (let ((view (copy-database database)))
     (setf (database-tables view) (catalog-transaction-merged-name-map transaction :table)
           (database-indexes view) (catalog-transaction-merged-name-map transaction :index)
+          (database-routines view) (catalog-transaction-merged-name-map transaction :routine)
           (database-publications view) (catalog-transaction-publications transaction database))
     (catalog-transaction-adjust-index-membership view transaction)
     (validate-catalog-foreign-key-dependencies view)
@@ -543,6 +550,7 @@ Return OBJECT and its sequence dependency snapshot for logical capture."
                    (setf (pg-class-indexes (car update)) (cdr update)))
                  (setf (database-tables database) (database-tables view)
                        (database-indexes database) (database-indexes view)
+                       (database-routines database) (database-routines view)
                        (database-publications database) (database-publications view)
                        *catalog-oldest-relfrozenxid* oldest
                        *active-xids* (delete xid *active-xids* :test #'eql))

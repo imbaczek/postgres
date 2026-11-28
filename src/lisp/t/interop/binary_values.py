@@ -44,6 +44,15 @@ def bind(values=(), formats=(), results=(), statement=b''):
 def main(ports):
     peers = [RawConnection(port, 'binary-values') for port in ports]
     try:
+        execute = frame(b'E', bytes(5))
+        for oids in ((), (23,), (0, 0)):
+            frames = [parse('SELECT $1::integer, $2::bigint', oids),
+                      bind((b'7', b'42')), execute]
+            expected = [(b'D', struct.pack('!Hi1si2s', 2, 1, b'7', 2, b'42'))]
+            for peer in peers:
+                assert cycle(peer, frames) == expected, oids
+        for peer in peers:
+            assert cycle(peer, [parse('SELECT $1 IS NULL')]) == [(b'E', '42P18')]
         for p in peers:
             p.query('CREATE TABLE binary_values (t text, v varchar, b bytea, j json, k jsonb, n numeric)')
         oids = (25, 1043, 17, 114, 3802, 1700)

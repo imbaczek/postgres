@@ -30,7 +30,7 @@ precondition under the write and catalog locks, after acquiring the gates."
 (defun ddl-p (ast)
   (member (getf ast :type)
           '(:create-table :drop-table :create-view :drop-view :create-index :drop-index
-            :alter-index :alter-table :create-sequence :alter-sequence
+            :create-function :drop-function :alter-index :alter-table :create-sequence :alter-sequence
             :drop-sequence :apply-sequence-state
             :create-publication :alter-publication
             :drop-publication)))
@@ -2596,8 +2596,6 @@ old identity before publishing the event and replacement catalog object."
           (ereport "42704" "language ~a does not exist" language)))
     (compile-do-source source)))
 
-(defvar *inline-do-found-p* nil)
-
 (defun exec-role-change (stream ast)
   (when (backend-transaction-read-only-p)
     (ereport "25006" "cannot change roles in a read-only transaction"))
@@ -2611,53 +2609,411 @@ old identity before publishing the event and replacement catalog object."
                                   (:alter-role "ALTER ROLE")
                                   (:grant-role-function "GRANT"))))
 
+(defvar *plpgsql-routine* nil)
+
+(defvar *plpgsql-found-variable* nil)
+
+(defvar *plpgsql-return-tag* nil)
+
+(defvar *plpgsql-loop-tag* nil)
+
+(defun eval-plpgsql-expression (syntax &optional boolean-p)
+  (let* ((expression
+           (if (raw-query-sublinks-p syntax)
+               (call-with-plpgsql-statement-snapshot
+                (lambda ()
+                  (multiple-value-bind (row targets)
+                      (read-plpgsql-select-row
+                       (list :type :select :targets (list (list :expr syntax))) nil)
+                    (let ((target (first targets)))
+                      (list :const (aref row 0) :explicit-cast t
+                            :type (getf target :type) :typmod (getf target :typmod))))))
+               (analyze-expr syntax nil)))
+         (typed (if boolean-p (coerce-boolean-expression expression "PL/pgSQL condition") expression)))
+    (values (eval-expr typed #()) (expr-type typed))))
+
+(defun plpgsql-cast-value (value source target typmod)
+  (cond ((eq value +null+) +null+)
+        ((sql-assignment-coercion-p source target) (sql-cast-value value source target typmod))
+        (t (sql-cast-value (value->text value source) :text target typmod))))
+
+(defun plpgsql-target-variable (name)
+  (let ((variable (find name *plpgsql-variables* :key #'plpgsql-variable-name :test #'equal)))
+    (unless variable (ereport "42601" "\"~a\" is not a known variable" name))
+    (when (plpgsql-variable-constant-p variable)
+      (ereport "22005" "variable \"~a\" is declared CONSTANT" name))
+    variable))
+
+(defun assign-plpgsql-variable (variable value source)
+  (let ((coerced (plpgsql-cast-value (copy-subquery-value value) source
+                                     (plpgsql-variable-type variable)
+                                     (plpgsql-variable-typmod variable)))
+        (slot (plpgsql-variable-argument-slot variable)))
+    (setf (plpgsql-variable-value variable) coerced)
+    (when slot (setf (svref *query-parameter-values* slot) coerced))))
+
+(defun initialize-plpgsql-block-variables (declarations)
+  (let ((names nil))
+    (dolist (declaration declarations)
+      (destructuring-bind (name type typmod default) declaration
+        (when (member name names :test #'equal)
+          (ereport "42601" "duplicate declaration of variable \"~a\"" name))
+        (push name names)
+        (let ((variable (make-plpgsql-variable :name name :type type :typmod typmod :value +null+)))
+          (when default
+            (multiple-value-bind (value source) (eval-plpgsql-expression default)
+              (assign-plpgsql-variable variable value source)))
+          (push variable *plpgsql-variables*))))))
+
+(defun plpgsql-raise-message (ast)
+  (cond
+    ((getf ast :format)
+     (let ((format-text (getf ast :format))
+           (arguments (copy-list (getf ast :arguments))))
+       (with-output-to-string (output)
+         (loop for index from 0 below (length format-text)
+               for character = (char format-text index)
+               do (cond
+                    ((char/= character #\%) (write-char character output))
+                    ((and (< (1+ index) (length format-text))
+                          (char= #\% (char format-text (1+ index))))
+                     (incf index)
+                     (write-char #\% output))
+                    (arguments
+                     (multiple-value-bind (value type) (eval-plpgsql-expression (pop arguments))
+                       (write-string (if (eq value +null+) "<NULL>" (value->text value type)) output)))
+                    (t (ereport "42601" "too few parameters specified for RAISE"))))
+         (when arguments (ereport "42601" "too many parameters specified for RAISE")))))
+    ((getf ast :message)
+     (multiple-value-bind (value type) (eval-plpgsql-expression (getf ast :message))
+       (when (eq value +null+) (ereport "22004" "RAISE statement option cannot be null"))
+       (value->text value type)))
+    (t (or (getf ast :condition-name) (getf ast :state)))))
+
+(defun read-plpgsql-select-row (query strict-p &key drain-p found-variable)
+  "Copy the first result and check cardinality; dynamic EXECUTE drains all rows."
+  (let* ((plan (plan-select-query query))
+         (targets (getf (query-plan-prepared plan) :targets))
+         (row nil)
+         (additional-row-p nil))
+    (call-with-admitted-select-plan
+     plan (lambda (relations)
+            (map-query-plan-rows
+             plan relations
+             (lambda (result)
+               (cond (row
+                      (setf additional-row-p t)
+                      (unless drain-p :stop))
+                     (t
+                      (setf row (copy-subquery-value (car result)))
+                      (unless (or strict-p drain-p) :stop)))))))
+    (when found-variable
+      (setf (plpgsql-variable-value found-variable) (not (null row))))
+    (when strict-p
+      (cond ((null row) (ereport "P0002" "query returned no rows"))
+            (additional-row-p (ereport "P0003" "query returned more than one row"))))
+    (values row targets)))
+
+(defun assign-plpgsql-select-row (variables row targets)
+  (loop for variable in variables for column from 0
+        for target = (nth column targets)
+        for value = (if (and row target) (aref row column) +null+)
+        do (assign-plpgsql-variable variable value (getf target :type))))
+
+(defun execute-plpgsql-select-into (ast)
+  (let ((variables (mapcar #'plpgsql-target-variable (getf ast :names))))
+    (multiple-value-bind (row targets)
+        (read-plpgsql-select-row (getf ast :query) (getf ast :strict)
+                                 :found-variable *plpgsql-found-variable*)
+      (assign-plpgsql-select-row variables row targets))))
+
+(defun evaluate-plpgsql-execute-parameters (syntax)
+  "Evaluate USING expressions once before switching to the dynamic SQL scope."
+  (let ((types (make-array (length syntax)))
+        (values (make-array (length syntax))))
+    (loop for expression in syntax for slot from 0
+          do (multiple-value-bind (value type) (eval-plpgsql-expression expression)
+               (setf (svref values slot) value
+                     (svref types slot) type)))
+    (values types values)))
+
+(defun execute-plpgsql-dynamic-sql (ast)
+  (multiple-value-bind (value type) (eval-plpgsql-expression (getf ast :expression))
+    (when (eq value +null+) (ereport "22004" "query string argument of EXECUTE is null"))
+    (let ((query (value->text value type))
+          (variables (mapcar #'plpgsql-target-variable (getf ast :names))))
+      (multiple-value-bind (types values) (evaluate-plpgsql-execute-parameters (getf ast :using))
+        (let* ((statements (parse-statements query))
+               (statement (first statements)))
+          (unless (and statement (null (rest statements)))
+            (ereport "0A000" "EXECUTE requires exactly one SQL statement"))
+          (multiple-value-bind (row targets)
+              (let ((*query-parameter-types* types)
+                    (*query-parameter-values* values)
+                    (*sql-routine-parse-context* nil)
+                    (*plpgsql-execution-p* nil)
+                    (executor (scalar-routine-dml-executor statement)))
+                (recovery-check-statement statement)
+                (cond
+                  ((eq (getf statement :type) :select)
+                   (if variables
+                       (read-plpgsql-select-row statement (getf ast :strict) :drain-p t)
+                       (progn (exec-perform statement) (values nil nil))))
+                  ((and (not variables) executor)
+                   (when (and *plpgsql-routine*
+                              (not (eq (pg-routine-volatility *plpgsql-routine*) :volatile)))
+                     (ereport "0A000" "write commands are not allowed in a non-volatile function"))
+                   (execute-scalar-routine-dml executor statement nil)
+                   (values nil nil))
+                  (t (ereport "0A000" "unsupported statement for PL/pgSQL EXECUTE"))))
+            (when variables (assign-plpgsql-select-row variables row targets))))))))
+
+(defun call-with-fresh-routine-snapshot (function)
+  "Advance the command ID, run FUNCTION and restore the caller's snapshot."
+  (declare (dynamic-extent function))
+  (let ((saved-snapshot (backend-snapshot *backend*))
+        (*statement-snapshot-override* nil))
+    (unwind-protect
+         (with-statement-snapshot
+             (snapshot (lambda (registration) (statement-start registration t)))
+           (funcall function))
+      (setf (backend-snapshot *backend*) saved-snapshot))))
+
+(defun call-with-plpgsql-statement-snapshot (function)
+  (declare (dynamic-extent function))
+  (let ((*subquery-execution-active-p* nil))
+    (if *plpgsql-routine*
+        (call-with-sql-routine-statement *plpgsql-routine* function)
+        (call-with-fresh-routine-snapshot function))))
+
+(defun execute-plpgsql-return (ast)
+  (let ((expression (getf ast :expression)))
+    (cond
+      (*plpgsql-routine*
+       (unless expression (ereport "42601" "RETURN must specify a value"))
+       (multiple-value-bind (value source) (eval-plpgsql-expression expression)
+         (throw *plpgsql-return-tag*
+           (plpgsql-cast-value (copy-subquery-value value) source
+                               (pg-routine-result-type *plpgsql-routine*) -1))))
+      (expression (ereport "42804" "RETURN cannot have a parameter in a DO block"))
+      (t (throw *plpgsql-return-tag* nil)))))
+
+(defvar *plpgsql-exception* nil)
+
+(defvar *plpgsql-subtransaction-depth* 0)
+
+(defun call-with-plpgsql-subtransaction (function)
+  "Run a block under the heap and resource checkpoints used by SAVEPOINT."
+  (declare (dynamic-extent function))
+  (let* ((backend *backend*)
+         (outer (backend-savepoints backend))
+         (checkpoint (capture-backend-savepoint backend nil))
+         (*plpgsql-subtransaction-depth* (1+ *plpgsql-subtransaction-depth*)))
+    (unwind-protect
+         (progn
+           (push checkpoint (backend-savepoints backend))
+           (handler-case (progn (funcall function) nil)
+             (error (condition)
+               (when (or (fatal-error-p condition)
+                         (not (member checkpoint (backend-savepoints backend))))
+                 (error condition))
+               (rollback-backend-savepoint backend checkpoint)
+               condition)))
+      (sb-sys:without-interrupts
+        (when (member checkpoint (backend-savepoints backend))
+          (setf (backend-savepoints backend) outer)
+          (unless outer (setf (backend-heap-undo-log backend) nil)))))))
+
+(defun plpgsql-exception-matches-p (state condition)
+  (if (eq condition :others)
+      (not (member state '("57014" "P0004") :test #'equal))
+      (or (string= state condition)
+          (and (string= condition "000" :start1 2)
+               (string= state condition :end1 2 :end2 2)))))
+
+(defun execute-plpgsql-exception-handler (stream condition handlers)
+  (unless (typep condition 'pg-error) (error condition))
+  (let* ((state (pg-error-sqlstate condition))
+         (handler (find-if (lambda (entry)
+                             (some (lambda (name) (plpgsql-exception-matches-p state name))
+                                   (first entry)))
+                           handlers)))
+    (unless handler (error condition))
+    (let ((*plpgsql-exception* condition)
+          (*plpgsql-variables*
+            (list* (make-plpgsql-variable :name "sqlstate" :type :text :typmod -1
+                                          :value state :constant-p t)
+                   (make-plpgsql-variable :name "sqlerrm" :type :text :typmod -1
+                                          :value (pg-error-message condition) :constant-p t)
+                   *plpgsql-variables*)))
+      (dolist (statement (second handler))
+        (execute-do-statement stream statement)))))
+
+(defun execute-plpgsql-block-body (stream ast)
+  (let ((handlers (getf ast :handlers))
+        (statements (getf ast :statements)))
+    (flet ((body ()
+             (dolist (statement statements)
+               (execute-do-statement stream statement))))
+      (if handlers
+          (let ((condition (call-with-plpgsql-subtransaction #'body)))
+            (when condition (execute-plpgsql-exception-handler stream condition handlers)))
+          (body)))))
+
+(defun execute-plpgsql-stacked-diagnostics (assignments)
+  (let ((condition *plpgsql-exception*))
+    (unless condition
+      (ereport "0Z002" "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"))
+    (dolist (assignment assignments)
+      (destructuring-bind (name item) assignment
+        (let ((value (cond ((string= item "returned_sqlstate") (pg-error-sqlstate condition))
+                           ((string= item "message_text") (pg-error-message condition))
+                           ((string= item "pg_exception_detail") (pg-error-detail condition))
+                           ((string= item "pg_exception_hint") (pg-error-hint condition))
+                           (t (ereport "0A000" "unsupported stacked diagnostics item ~a" item)))))
+          (assign-plpgsql-variable (plpgsql-target-variable name) (or value "") :text))))))
+
 (defun execute-do-statement (stream ast)
-  "Run an inline statement without starting or ending a transaction.
-SQL children register a statement snapshot and advance the command ID; cleanup
-restores the caller's snapshot. Blocks and NULL need no snapshot of their own."
+  "Execute a PL/pgSQL statement in the surrounding transaction."
   (check-for-interrupts)
   (case (getf ast :type)
     (:do-null (values))
     (:do-block
-        (dolist (statement (getf ast :statements))
+        (let ((*plpgsql-variables* *plpgsql-variables*))
+          (initialize-plpgsql-block-variables (getf ast :declarations))
+          (execute-plpgsql-block-body stream ast)))
+    (:do-if
+        (dolist (statement (getf ast (if (true-p (eval-plpgsql-expression (getf ast :condition) t))
+                                         :then :else)))
           (execute-do-statement stream statement)))
-    (:do-if-found
-        (dolist (statement (getf ast (if (eq *inline-do-found-p* (getf ast :negated-p))
-                                         :else
-                                         :then)))
-          (execute-do-statement stream statement)))
+    (:do-loop
+        (let ((*plpgsql-loop-tag* (gensym "PLPGSQL-LOOP-"))
+              (condition (getf ast :condition)))
+          (catch *plpgsql-loop-tag*
+            (loop while (or (null condition) (true-p (eval-plpgsql-expression condition t)))
+                  do (check-for-interrupts)
+                     (dolist (statement (getf ast :statements))
+                       (execute-do-statement stream statement))))))
+    (:do-exit
+        (unless *plpgsql-loop-tag* (ereport "42601" "EXIT cannot be used outside a loop"))
+      (when (or (null (getf ast :condition))
+                (true-p (eval-plpgsql-expression (getf ast :condition) t)))
+        (throw *plpgsql-loop-tag* nil)))
+    (:do-assign
+        (let ((variable (plpgsql-target-variable (getf ast :name))))
+          (multiple-value-bind (value type) (eval-plpgsql-expression (getf ast :expression))
+            (assign-plpgsql-variable variable value type))))
+    (:do-return (execute-plpgsql-return ast))
+    (:do-raise (ereport (getf ast :state) "~a" (plpgsql-raise-message ast)))
+    (:do-reraise
+        (if *plpgsql-exception*
+            (error *plpgsql-exception*)
+            (ereport "0Z002" "RAISE without parameters cannot be used outside an exception handler")))
+    (:do-stacked-diagnostics (execute-plpgsql-stacked-diagnostics (getf ast :assignments)))
     (otherwise
-     (let ((saved-snapshot (backend-snapshot *backend*))
-           (*statement-snapshot-override* nil))
-       (unwind-protect
-            (with-statement-snapshot (snapshot
-                                      (lambda (registration) (statement-start registration t)))
-              (recovery-check-statement
-               (if (eq (getf ast :type) :perform) (getf ast :query) ast))
-              (case (getf ast :type)
-                (:perform (setf *inline-do-found-p* (exec-perform (getf ast :query))))
-                ((:create-role :alter-role :grant-role-function) (exec-role-change stream ast))
-                (:set (exec-set stream ast))
-                (:reset (exec-reset stream ast))
-                (t (ereport "0A000" "unsupported inline statement"))))
-         (setf (backend-snapshot *backend*) saved-snapshot))))))
+     (call-with-plpgsql-statement-snapshot
+      (lambda ()
+        (unless (eq (getf ast :type) :do-execute)
+          (recovery-check-statement (or (getf ast :query) ast)))
+        (case (getf ast :type)
+          (:perform
+           (setf (plpgsql-variable-value *plpgsql-found-variable*) (exec-perform (getf ast :query))))
+          (:do-select-into (execute-plpgsql-select-into ast))
+          (:do-execute (execute-plpgsql-dynamic-sql ast))
+          (otherwise
+           (when (or *plpgsql-routine* (plusp *plpgsql-subtransaction-depth*))
+             (ereport "0A000" "utility commands are not supported in this PL/pgSQL context"))
+           (case (getf ast :type)
+             ((:create-role :alter-role :grant-role-function) (exec-role-change stream ast))
+             (:set (exec-set stream ast))
+             (:reset (exec-reset stream ast))
+             (t (ereport "0A000" "unsupported PL/pgSQL statement"))))))))))
+
+(defun validate-plpgsql-block (block routine)
+  "Resolve procedural targets without evaluating expressions or executing SQL."
+  (labels ((require-target (name scope)
+             (let ((binding (assoc name scope :test #'equal)))
+               (unless binding (ereport "42601" "\"~a\" is not a known variable" name))
+               (when (cdr binding)
+                 (ereport "22005" "variable \"~a\" is declared CONSTANT" name))))
+           (visit-list (statements scope in-loop-p)
+             (dolist (statement statements) (visit statement scope in-loop-p)))
+           (visit (ast scope in-loop-p)
+             (case (getf ast :type)
+               (:do-block
+                   (let ((locals nil))
+                     (dolist (declaration (getf ast :declarations))
+                       (let ((name (first declaration)))
+                         (when (assoc name locals :test #'equal)
+                           (ereport "42601" "duplicate declaration of variable \"~a\"" name))
+                         (push (cons name nil) locals)))
+                     (let ((nested (append locals scope)))
+                       (visit-list (getf ast :statements) nested in-loop-p)
+                       (dolist (handler (getf ast :handlers))
+                         (visit-list (second handler)
+                                     (list* '("sqlstate" . t) '("sqlerrm" . t) nested)
+                                     in-loop-p)))))
+               (:do-if
+                   (visit-list (getf ast :then) scope in-loop-p)
+                 (visit-list (getf ast :else) scope in-loop-p))
+               (:do-loop (visit-list (getf ast :statements) scope t))
+               (:do-exit
+                   (unless in-loop-p (ereport "42601" "EXIT cannot be used outside a loop")))
+               (:do-assign (require-target (getf ast :name) scope))
+               ((:do-select-into :do-execute)
+                (dolist (name (getf ast :names)) (require-target name scope)))
+               (:do-stacked-diagnostics
+                   (dolist (assignment (getf ast :assignments))
+                     (require-target (first assignment) scope)))
+               (:do-return
+                   (cond ((and routine (null (getf ast :expression)))
+                          (ereport "42601" "RETURN must specify a value"))
+                         ((and (null routine) (getf ast :expression))
+                          (ereport "42804" "RETURN cannot have a parameter in a DO block")))))))
+    (visit block
+           (cons '("found") (when routine
+                              (loop for name in (pg-routine-argument-names routine)
+                                    when name collect (cons name nil))))
+           nil))
+  block)
+
+(defun run-plpgsql-block (stream block &optional routine arguments)
+  "Share the procedural frame between anonymous blocks and scalar routines."
+  (validate-plpgsql-block block routine)
+  (let* ((*plpgsql-routine* routine)
+         (*plpgsql-execution-p* t)
+         (*statement-nested-p* t)
+         (*plpgsql-found-variable*
+           (make-plpgsql-variable :name "found" :type :bool :typmod -1 :value nil))
+         (*plpgsql-exception* nil)
+         (*plpgsql-loop-tag* nil)
+         (*plpgsql-return-tag* (gensym "PLPGSQL-RETURN-"))
+         (*sql-routine-parse-context* routine)
+         (*query-parameter-types* (when routine (coerce (pg-routine-argument-types routine) 'vector)))
+         (*query-parameter-values* (when routine (coerce arguments 'vector)))
+         (*plpgsql-variables*
+           (cons *plpgsql-found-variable*
+                 (when routine
+                   (loop for name in (pg-routine-argument-names routine)
+                         for type in (pg-routine-argument-types routine)
+                         for slot from 0
+                         when name collect (make-plpgsql-variable :name name :type type :typmod -1
+                                                                  :argument-slot slot
+                                                                  :value (svref *query-parameter-values* slot)))))))
+
+    (catch *plpgsql-return-tag*
+      (execute-do-statement stream block)
+      (when routine (ereport "2F005" "control reached end of function without RETURN")))))
 
 (defun exec-do (stream ast)
-  "Compile and execute an inline block in the surrounding transaction.
-The caller owns commit and abort. Save settings for rollback and retain LOCAL
-bindings until transaction end. Discard child command tags and emit one DO
-completion after success; anonymous source cannot inherit Bind parameters."
+  "Execute an anonymous block and publish only the enclosing DO completion."
   (let ((block (do-statement-block ast))
         (*executing-do-p* t)
-        (*statement-nested-p* t)
-        (*inline-do-found-p* nil)
-        (*query-parameter-types* nil)
-        (*query-parameter-values* nil))
+        (*defer-command-complete-p* t)
+        (*deferred-command-completes* nil))
     (session-remember-settings)
-    (let ((*defer-command-complete-p* t)
-          (*deferred-command-completes* nil))
-      (execute-do-statement stream block))
-    (send-command-complete stream "DO")))
+    (run-plpgsql-block stream block))
+  (send-command-complete stream "DO"))
 
 (defun column-evolution-ddl-p (ast)
   (and (eq :alter-table (getf ast :type))
@@ -2686,12 +3042,13 @@ completion after success; anonymous source cannot inherit Bind parameters."
   (or (column-evolution-ddl-p ast)
       (foreign-key-add-ddl-p ast)
       (foreign-key-validation-ddl-p ast)
-      (and (member (getf ast :type) '(:create-table :drop-table :create-view :drop-view :create-index :drop-index))
+      (and (member (getf ast :type) '(:create-table :drop-table :create-view :drop-view :create-index :drop-index
+                                      :create-function :drop-function))
            (not (getf ast :concurrently)))))
 
 (defun staged-catalog-ddl-p (ast)
   (and (stageable-catalog-ddl-p ast)
-       (or (member (getf ast :type) '(:create-view :drop-view))
+       (or (member (getf ast :type) '(:create-view :drop-view :create-function :drop-function))
            (and (member (getf ast :type) '(:drop-table :drop-index)) (getf ast :cascade))
            (column-evolution-ddl-p ast) (foreign-key-create-ddl-p ast) (foreign-key-add-ddl-p ast) (foreign-key-validation-ddl-p ast) (backend-explicit *backend*) (backend-implicit-query-block *backend*))))
 
@@ -3049,6 +3406,494 @@ The first change chooses the capture mode. Earlier no-ops leave it undecided."
         (dolist (view roots)
           (catalog-transaction-stage transaction :table (pg-class-name view) nil))))
     (send-command-complete stream "DROP VIEW")))
+
+(defun routine-ddl-schema (reference)
+  "Resolve the creation namespace using the supported schema search path."
+  (if (sql-relation-name-p reference)
+      (let ((schema (sql-relation-name-schema reference)))
+        (unless (string= schema "public")
+          (ereport "0A000" "routine creation in schema \"~a\" is not supported" schema))
+        schema)
+      (progn (ensure-sql-creation-schema) "public")))
+
+(defun check-routine-owner (routine)
+  (unless (or (string= (current-user-name) (pg-routine-owner routine))
+              (string= (current-user-name) "postgres"))
+    (ereport "42501" "must be owner of function ~a" (pg-routine-name routine))))
+
+(defun check-routine-input-parameters (parameters)
+  (let ((names (make-hash-table :test #'equal))
+        (has-defaults-p nil))
+    (loop for parameter in parameters
+          for name = (first parameter)
+          for default = (third parameter)
+          do (when name
+               (when (gethash name names)
+                 (ereport "42P13" "parameter name \"~a\" used more than once" name))
+               (setf (gethash name names) t))
+             (cond (default
+                    (setf has-defaults-p t)
+                    (let ((*query-parameter-types* nil)
+                          (*sql-routine-parse-context* nil)
+                          (*defining-persistent-expression-p* t))
+                      (validate-stored-expression default :default)
+                      (coerce-common-expression (analyze-expr default nil) (second parameter))))
+                   (has-defaults-p
+                    (ereport "42P13" "input parameters after one with a default value must also have defaults"))))))
+
+(defun check-scalar-routine-replacement (prior ast)
+  (unless (getf ast :replace)
+    (ereport "42723" "function \"~a\" already exists with same argument types" (pg-routine-name prior)))
+  (check-routine-owner prior)
+  (unless (and (eq (pg-routine-result-type prior) (getf ast :result-type))
+               (eq (pg-routine-returns-set-p prior) (getf ast :returns-set-p))
+               (or (not (eq :record (pg-routine-result-type prior)))
+                   (equal (pg-routine-result-fields prior) (getf ast :result-fields))))
+    (ereport "42P13" "cannot change return type of existing function"))
+  (loop for old in (pg-routine-argument-names prior)
+        for (new) in (getf ast :parameters)
+        when (and old (not (equal old new)))
+          do (ereport "42P13" "cannot change name of input parameter \"~a\"" old))
+  (when (loop for old in (pg-routine-argument-defaults prior)
+              for parameter in (getf ast :parameters)
+                thereis (and old (null (third parameter))))
+    (ereport "42P13" "cannot remove parameter defaults from existing function")))
+
+(defun parse-scalar-sql-routine-statements (source)
+  "Check admitted statement kinds and the presence of a result-producing final statement."
+  (let ((statements (parse-statements source)))
+    (unless statements (ereport "42P13" "empty function body"))
+    (dolist (statement statements)
+      (unless (member (getf statement :type) '(:select :insert :update :delete))
+        (ereport "0A000" "statement type ~a is not supported in a SQL function"
+                 (getf statement :type))))
+    (let ((last (car (last statements))))
+      (unless (or (eq (getf last :type) :select) (getf last :returning))
+        (ereport "42P13" "function's final statement must be SELECT or have RETURNING")))
+    statements))
+
+(defun prepare-scalar-sql-routine-ddl (transaction ast &optional (check-body-p t))
+  "Build a detached routine descriptor and parse its body when requested."
+  (let* ((reference (getf ast :name))
+         (schema (routine-ddl-schema reference))
+         (name (sql-relation-base-name reference))
+         (parameters (getf ast :parameters))
+         (types (mapcar #'second parameters))
+         (signature (list schema name types))
+         (prior (catalog-transaction-lookup transaction :routine signature))
+         (options (getf ast :options))
+         (source (cdr (assoc :source options)))
+         (language-name (cdr (assoc :language options)))
+         (language (cond ((equal language-name "sql") :sql)
+                         ((equal language-name "plpgsql") :plpgsql))))
+    (unless language-name (ereport "42P13" "no language specified"))
+    (unless language (ereport "0A000" "routine language \"~a\" is not supported" language-name))
+    (when (and (eq language :plpgsql) (getf ast :returns-set-p))
+      (ereport "0A000" "set-returning stored PL/pgSQL routines are not supported"))
+    (unless source (ereport "42P13" "no function body specified"))
+    (check-routine-input-parameters parameters)
+    (let* ((fields (getf ast :result-fields))
+           (duplicate (loop for (field) in fields
+                            for tail on (cdr fields)
+                            when (member field tail :key #'first :test #'equal)
+                              return field)))
+      (when duplicate
+        (ereport "42P13" "parameter name \"~a\" used more than once" duplicate)))
+    (when prior (check-scalar-routine-replacement prior ast))
+    (let ((statements (when check-body-p
+                        (ecase language
+                          (:sql (parse-scalar-sql-routine-statements source))
+                          (:plpgsql (compile-do-source source))))))
+      (values (make-pg-routine :oid (if prior (pg-routine-oid prior) (allocate-oid))
+                               :schema schema :name name :argument-types types
+                               :argument-names (mapcar #'first parameters)
+                               :argument-defaults (mapcar #'third parameters)
+                               :result-type (getf ast :result-type)
+                               :result-fields (getf ast :result-fields)
+                               :returns-set-p (getf ast :returns-set-p)
+                               :language language :source source
+                               :owner (if prior (pg-routine-owner prior) (current-user-name))
+                               :generation (if prior (1+ (pg-routine-generation prior)) 0)
+                               :volatility (or (cdr (assoc :volatility options)) :volatile)
+                               :strict-p (cdr (assoc :strict options)))
+              statements))))
+
+(defun find-routine-to-drop (transaction reference specified-p types)
+  "Resolve a DROP target by signature or require a unique visible overload."
+  (let* ((name (sql-relation-base-name reference))
+         (schemas (if (sql-relation-name-p reference)
+                      (list (sql-relation-name-schema reference))
+                      (effective-sql-search-path))))
+    (if specified-p
+        (loop for schema in schemas
+                thereis (catalog-transaction-lookup transaction :routine (list schema name types)))
+        (let ((map (catalog-transaction-merged-name-map transaction :routine))
+              (visible (make-hash-table :test #'equal))
+              (result nil))
+          (dolist (schema schemas result)
+            (maphash (lambda (key routine)
+                       (when (and (equal schema (first key)) (equal name (second key))
+                                  (not (gethash (third key) visible)))
+                         (when result (ereport "42725" "function name \"~a\" is not unique" name))
+                         (setf (gethash (third key) visible) t result routine)))
+                     map))))))
+
+(defun collect-sql-routines-to-drop (transaction ast missing)
+  "Resolve and check ownership of each DROP FUNCTION target."
+  (declare (dynamic-extent missing))
+  (let (routines)
+    (dolist (signature (getf ast :signatures))
+      (destructuring-bind (reference specified-p types) signature
+        (let ((routine (find-routine-to-drop transaction reference specified-p types))
+              (name (sql-relation-base-name reference)))
+          (cond (routine (pushnew routine routines))
+                ((getf ast :if-exists) (funcall missing name))
+                (t (ereport "42883" "function \"~a\" does not exist" name))))))
+    (mapc #'check-routine-owner routines)
+    routines))
+
+(defvar *sql-routine-call-depth* 0)
+
+(defun scalar-routine-source-type (targets result-type)
+  "Validate a scalar SQL result descriptor and return its input type."
+  (let ((source-type (getf (first targets) :type)))
+    (unless (and targets (null (rest targets))
+                 (sql-assignment-coercion-p source-type result-type))
+      (ereport "42P13" "return type mismatch in function declared to return ~a" result-type))
+    source-type))
+
+(defun evaluate-scalar-routine-select (statement result-type)
+  "Read the first result row and close the plan, including on an early return."
+  (let* ((plan (plan-select-query statement))
+         (targets (getf (query-plan-prepared plan) :targets))
+         (source-type (scalar-routine-source-type targets result-type)))
+    (call-with-admitted-select-plan
+     plan (lambda (relations)
+            (map-query-plan-rows
+             plan relations
+             (lambda (row)
+               (return-from evaluate-scalar-routine-select
+                 (sql-cast-value (copy-subquery-value (aref (car row) 0))
+                                 source-type result-type -1))))))
+    +null+))
+
+(defun scalar-routine-dml-executor (statement)
+  (case (getf statement :type)
+    (:insert #'exec-insert)
+    (:update #'exec-update)
+    (:delete #'exec-delete)))
+
+(defun call-with-sql-routine-statement (routine function)
+  "Stable routines retain the caller snapshot; volatile statements get a fresh command ID."
+  (declare (dynamic-extent function))
+  (if (and *backend* (eq (pg-routine-volatility routine) :volatile))
+      (call-with-fresh-routine-snapshot function)
+      (funcall function)))
+
+(defun execute-scalar-routine-dml (executor statement result-type)
+  "Execute mutations completely and keep at most the first returned value."
+  (when (backend-transaction-read-only-p)
+    (ereport "25006" "cannot execute write statement in a read-only transaction"))
+  (let* ((returning (getf statement :returning))
+         (result +null+)
+         (*defer-command-complete-p* t)
+         (*deferred-command-completes* nil)
+         (*select-suppress-description* nil)
+         (*wal-row-page-write-p* t)
+         (*dml-returning-spool* (when returning (make-query-row-spool)))
+         (*dml-returning-receiver*
+           (when returning
+             (lambda (spool targets tag)
+               (declare (ignore tag))
+               (when result-type
+                 (let ((source-type (scalar-routine-source-type targets result-type)))
+                   (block first-row
+                     (map-query-row-spool
+                      spool (lambda (row index)
+                              (declare (ignore index))
+                              (setf result (sql-cast-value (copy-subquery-value (aref row 0))
+                                                           source-type result-type -1))
+                              (return-from first-row nil))))))))))
+    (unwind-protect
+         (progn
+           (note-backend-command-id-used)
+           (funcall executor nil statement)
+           result)
+      (when *dml-returning-spool* (close-query-row-spool *dml-returning-spool*)))))
+
+(defun execute-sql-routine-statement (routine statement result-type)
+  (call-with-sql-routine-statement
+   routine
+   (lambda ()
+     (let ((executor (scalar-routine-dml-executor statement)))
+       (cond
+         (executor
+          (unless (eq (pg-routine-volatility routine) :volatile)
+            (ereport "0A000" "~a is not allowed in a non-volatile function" (getf statement :type)))
+          (execute-scalar-routine-dml executor statement result-type))
+         (result-type (evaluate-scalar-routine-select statement result-type))
+         (t (exec-perform statement)))))))
+
+(defun evaluate-scalar-sql-routine (routine arguments)
+  "Execute a scalar SQL function in the caller's statement and transaction."
+  (when (and (pg-routine-strict-p routine) (find +null+ arguments))
+    (return-from evaluate-scalar-sql-routine +null+))
+  (when (>= *sql-routine-call-depth* 64)
+    (ereport "54001" "SQL routine stack depth limit exceeded"))
+  (detach-select-index-scans)
+  (let* ((*plpgsql-execution-p* nil)
+         (*select-index-scans* nil)
+         (*select-index-lease-domain* nil)
+         (*select-index-lease-groups* nil)
+         (*sql-routine-call-depth* (1+ *sql-routine-call-depth*))
+         (*sql-routine-parse-context* routine)
+         (*query-parameter-types* (coerce (pg-routine-argument-types routine) 'vector))
+         (*query-parameter-values* (coerce arguments 'vector))
+         (*subquery-execution-active-p* nil)
+         (statements (parse-scalar-sql-routine-statements (pg-routine-source routine))))
+    (loop for (statement . rest) on statements
+          for result-type = (unless rest (pg-routine-result-type routine))
+          for value = (execute-sql-routine-statement routine statement result-type)
+          unless rest return value)))
+
+(defun evaluate-stored-scalar-routine (routine arguments)
+  (ecase (pg-routine-language routine)
+    (:sql (evaluate-scalar-sql-routine routine arguments))
+    (:plpgsql
+     (when (and (pg-routine-strict-p routine) (find +null+ arguments))
+       (return-from evaluate-stored-scalar-routine +null+))
+     (when (>= *sql-routine-call-depth* 64)
+       (ereport "54001" "SQL routine stack depth limit exceeded"))
+     (detach-select-index-scans)
+     (let ((*select-index-scans* nil)
+           (*select-index-lease-domain* nil)
+           (*select-index-lease-groups* nil)
+           (*sql-routine-call-depth* (1+ *sql-routine-call-depth*)))
+       (run-plpgsql-block nil (compile-do-source (pg-routine-source routine)) routine arguments)))))
+
+(defun require-routine-set-select (statement)
+  (unless (eq (getf statement :type) :select)
+    (ereport "0A000" "set-returning SQL routines require a final SELECT")))
+
+(defun routine-set-source-types (targets routine)
+  (let ((fields (pg-routine-result-fields routine)))
+    (if (rest fields)
+        (progn
+          (unless (and (= (length targets) (length fields))
+                       (every (lambda (target field)
+                                (sql-assignment-coercion-p (getf target :type) (second field)))
+                              targets fields))
+            (ereport "42P13" "return type mismatch in function declared to return a table"))
+          (mapcar (lambda (target) (getf target :type)) targets))
+        (list (scalar-routine-source-type targets (pg-routine-result-type routine))))))
+
+(defun coerce-routine-set-row (row source-types routine)
+  (let ((fields (pg-routine-result-fields routine)))
+    (if (rest fields)
+        (make-sql-record :fields fields
+                         :values (map 'vector
+                                      (lambda (value source field)
+                                        (sql-cast-value (copy-subquery-value value) source (second field) -1))
+                                      row source-types fields))
+        (sql-cast-value (copy-subquery-value (aref row 0))
+                        (first source-types) (pg-routine-result-type routine) -1))))
+
+(defun prepare-routine-set-query (owner routine statements)
+  "Run preceding statements, then register the final SELECT for resumable pulls."
+  (call-with-query-execution-owner
+   owner
+   (lambda ()
+     (loop for (statement . rest) on statements while rest
+           do (let ((*subquery-execution-active-p* nil))
+                (execute-sql-routine-statement routine statement nil)))
+     (when (eq (pg-routine-volatility routine) :volatile)
+       (let ((outer-snapshot (backend-snapshot *backend*))
+             (*statement-snapshot-override* nil))
+         (unwind-protect
+              (query-execution-owner-acquire-snapshot
+               owner (lambda (registration) (statement-start registration t)))
+           (setf (backend-snapshot *backend*) outer-snapshot))))
+     (let* ((plan (plan-select-query (car (last statements))))
+            (targets (getf (query-plan-prepared plan) :targets))
+            (source-types (routine-set-source-types targets routine)))
+       (call-with-admitted-select-plan
+        plan (lambda (relations)
+               (setf (query-execution-owner-binding owner '*subquery-registered-relations*) relations)
+               (retain-query-plan-executor-tables plan relations)))
+       (values plan source-types)))))
+
+(defun pull-routine-set-row (owner plan iterator source-types routine)
+  (detach-select-index-scans)
+  (call-with-query-execution-owner
+   owner
+   (lambda ()
+     (let ((relations *subquery-registered-relations*))
+       (call-with-select-index-lease-domain
+        (query-plan-index-relfilenodes plan relations)
+        (lambda ()
+          (let ((*iterator-index-scan-domain-p* t)
+                (suspend-p nil))
+            (unwind-protect
+                 (progn
+                   (unless (car iterator)
+                     (setf (car iterator) (make-resumable-query-plan-iterator plan relations)))
+                   (multiple-value-bind (row present) (sql-iterator-next (car iterator))
+                     (when present
+                       (let ((value (coerce-routine-set-row (car row) source-types routine)))
+                         (detach-select-index-scans)
+                         (setf suspend-p t)
+                         (values value t)))))
+              (unless suspend-p
+                ;; An active borrowed cursor must close before the lease group unwinds.
+                (sb-sys:without-interrupts
+                  (unwind-protect
+                       (sb-sys:with-local-interrupts (close-query-execution-owner owner))
+                    (setf *select-index-scans*
+                          (delete-if #'select-index-scan-borrowed-lease-p
+                                     *select-index-scans*)))))))))))))
+
+(defun make-stored-routine-set-iterator (routine arguments)
+  "Own the body snapshot, plan and iterators across suspended outer pulls."
+  (when (and (pg-routine-strict-p routine) (find +null+ arguments))
+    (return-from make-stored-routine-set-iterator
+      (make-sql-iterator (lambda () (values nil nil)))))
+  (when (>= *sql-routine-call-depth* 64)
+    (ereport "54001" "SQL routine stack depth limit exceeded"))
+  (let* ((statements (parse-scalar-sql-routine-statements (pg-routine-source routine)))
+         (depth (1+ *sql-routine-call-depth*)))
+    (require-routine-set-select (car (last statements)))
+    (detach-select-index-scans)
+    (let ((owner nil) (complete nil))
+      (unwind-protect
+           (progn
+             (setf owner
+                   (make-query-execution-owner
+                    :bindings
+                    (list (cons '*query-parameter-types* (coerce (pg-routine-argument-types routine) 'vector))
+                          (cons '*query-parameter-values* (coerce arguments 'vector))
+                          (cons '*datum-origin-capture* nil))))
+             (unless (eq (pg-routine-volatility routine) :volatile)
+               (query-execution-owner-pin-snapshot owner *current-snapshot*))
+             (let ((*plpgsql-execution-p* nil)
+                   (*sql-routine-parse-context* routine)
+                   (*sql-routine-call-depth* depth))
+               (multiple-value-bind (plan source-types) (prepare-routine-set-query owner routine statements)
+                 (let ((iterator (list nil)))
+                   (prog1
+                       (make-sql-iterator
+                        (lambda ()
+                          (let ((*plpgsql-execution-p* nil)
+                                (*sql-routine-parse-context* routine)
+                                (*sql-routine-call-depth* depth))
+                            (pull-routine-set-row owner plan iterator source-types routine)))
+                        (lambda ()
+                          ;; A suspended body has detached its own scans. The
+                          ;; caller can hold unrelated leases when it closes it.
+                          (let ((*btree-read-leases* nil))
+                            (close-query-execution-owner owner))))
+                     (setf complete t))))))
+        (when (and owner (not complete)) (close-query-execution-owner owner))))))
+
+(defun admit-staged-routine-ddl (transaction)
+  (admit-staged-catalog-change transaction)
+  (when (or *applying-transaction-ddl* (catalog-transaction-capture-ddl-p transaction))
+    (ereport "0A000" "routine DDL is unsupported during logical capture")))
+
+(defun validate-scalar-sql-routine-body (routine statements)
+  "Analyze the body without running it, including a recursive reference."
+  (when (pg-routine-returns-set-p routine)
+    (require-routine-set-select (car (last statements))))
+  (let ((*validating-sql-routine* routine)
+        (*sql-routine-parse-context* routine)
+        (*query-parameter-types* (coerce (pg-routine-argument-types routine) 'vector)))
+    (loop for (statement . rest) on statements
+          for select-p = (eq (getf statement :type) :select)
+          for analyzed = (if select-p (prepare-select statement)
+                             (analyze-dml-subqueries statement))
+          unless rest
+            do (let ((targets (getf analyzed (if select-p :targets :returning))))
+                 (if (pg-routine-returns-set-p routine)
+                     (routine-set-source-types targets routine)
+                     (scalar-routine-source-type targets (pg-routine-result-type routine))))))
+  routine)
+
+(defun exec-stage-create-function (stream ast)
+  (let ((transaction (begin-catalog-ddl)))
+    (multiple-value-bind (routine statements)
+        (with-write-catalog-locks
+          (admit-staged-routine-ddl transaction)
+          (prepare-scalar-sql-routine-ddl
+           transaction ast (not (equal "off" (session-extra-setting-value "check_function_bodies")))))
+      (when statements
+        (ecase (pg-routine-language routine)
+          (:sql (validate-scalar-sql-routine-body routine statements))
+          (:plpgsql (validate-plpgsql-block statements routine))))
+      (with-write-catalog-locks
+        (catalog-transaction-stage transaction :routine (pg-routine-signature routine) routine))))
+  (send-command-complete stream "CREATE FUNCTION"))
+
+(defun routine-table-dependencies (transaction routines)
+  "Return affected live table descriptors and their bound defaults and checks."
+  (let ((oids (mapcar #'pg-routine-oid routines))
+        (dependencies nil))
+    (when oids
+      (catalog-map-visible-relations
+       (lambda (name table)
+         (declare (ignore name))
+         (let ((defaults (loop for column across (pg-class-columns table)
+                               when (and (not (pg-column-dropped-p column))
+                                         (catalog-expression-uses-routine-p
+                                          (pg-column-default-expression column) oids))
+                                 collect column))
+               (checks (remove-if-not
+                        (lambda (check)
+                          (catalog-expression-uses-routine-p (getf check :expression) oids))
+                        (pg-class-checks table))))
+           (when (or defaults checks) (push (list table defaults checks) dependencies))))
+       (catalog-transaction-database transaction) :table))
+    dependencies))
+
+(defun stage-routine-dependent-expression-drop (transaction dependency)
+  "Remove the cooked expressions while preserving the table and missing datums."
+  (destructuring-bind (table defaults checks) dependency
+    (ensure-current-table table)
+    (let* ((replacement (copy-pg-class table))
+           (columns (copy-seq (pg-class-columns table))))
+      (dolist (column defaults)
+        (let ((copy (copy-pg-column column)))
+          (setf (pg-column-default-expression copy) nil
+                (pg-column-default-sequence-name copy) nil
+                (pg-column-default-sql copy) nil
+                (aref columns (1- (pg-column-attnum column))) copy)))
+      (setf (pg-class-columns replacement) columns
+            (pg-class-checks replacement)
+            (remove-if (lambda (check) (member check checks)) (pg-class-checks table)))
+      (catalog-transaction-stage transaction :table (pg-class-name table) replacement))))
+
+(defun exec-stage-drop-function (stream ast)
+  (let* ((transaction (begin-catalog-ddl))
+         (routines
+           (with-write-catalog-locks
+             (collect-sql-routines-to-drop
+              transaction ast
+              (lambda (name)
+                (send-notice stream (format nil "function ~s does not exist, skipping" name)
+                             "NOTICE" "42883")))))
+         (dependencies (with-write-lock (routine-table-dependencies transaction routines))))
+    (when dependencies
+      (unless (getf ast :cascade)
+        (ereport "2BP01" "stored expressions on table ~s depend on the function"
+                 (pg-class-name (caar dependencies))))
+      (acquire-transaction-relation-locks
+       (mapcar (lambda (dependency) (pg-class-relfilenode (first dependency))) dependencies)))
+    (when routines
+      (with-write-catalog-locks
+        (admit-staged-routine-ddl transaction)
+        (dolist (dependency dependencies)
+          (stage-routine-dependent-expression-drop transaction dependency))
+        (dolist (routine routines)
+          (catalog-transaction-stage transaction :routine (pg-routine-signature routine) nil)))))
+  (send-command-complete stream "DROP FUNCTION"))
 
 (defun exec-stage-create-table (stream ast)
   "Create table metadata and storage without publishing either before COMMIT."
@@ -3587,6 +4432,8 @@ without a change; each actual publication captures its own schema precondition."
         (stage-ddl-p (staged-catalog-ddl-p ast))
         (logical-ddl-responses nil)
         (copy-row-count nil)
+        (*defining-persistent-expression-p*
+          (member (getf ast :type) '(:create-table :alter-table :create-view :create-index)))
         (*concurrent-index-snapshot-safe-p*
           (or (member (getf ast :type) '(:create-index :drop-index :alter-index
                                          :drop-table :alter-table))
@@ -3596,6 +4443,7 @@ without a change; each actual publication captures its own schema precondition."
                (member (getf ast :type)
                        '(:insert :update :delete :copy-from :truncate :create-table :drop-table
                          :create-view :drop-view :create-index :drop-index :alter-index :alter-table
+                         :create-function :drop-function
                          :apply-sequence-state :analyze)))
       (ereport "25006" "cannot execute write statement in a read-only transaction"))
     (when (find :add-foreign-key (getf ast :actions) :key (lambda (action) (getf action :action)))
@@ -3638,6 +4486,8 @@ without a change; each actual publication captures its own schema precondition."
                                       (exec-drop-table stream ast)))
                      (:create-view (exec-stage-create-view stream ast))
                      (:drop-view (exec-stage-drop-view stream ast))
+                     (:create-function (exec-stage-create-function stream ast))
+                     (:drop-function (exec-stage-drop-function stream ast))
                      (:create-sequence (exec-create-sequence stream ast))
                      (:alter-sequence (exec-alter-sequence stream ast))
                      (:apply-sequence-state
@@ -3731,6 +4581,23 @@ without a change; each actual publication captures its own schema precondition."
       (call-with-prepared-final-ddl (lambda () (execute-in-transaction-body stream ast)))
       (execute-in-transaction-body stream ast)))
 
+(defun rollback-backend-savepoint (backend checkpoint)
+  "Restore the heap, logical stream, locks and portals to CHECKPOINT."
+  (handler-case
+      (progn
+        (when (fboundp 'restore-savepoint-portals)
+          (funcall 'restore-savepoint-portals (backend-savepoint-portal-checkpoint checkpoint)))
+        (undo-heap-to-savepoint (backend-savepoint-heap-checkpoint checkpoint))
+        (restore-backend-savepoint-logical-state backend checkpoint)
+        (restore-on-conflict-row-locks
+         (backend-xid backend) (backend-savepoint-conflict-row-checkpoint checkpoint))
+        (restore-foreign-key-savepoint-state backend (backend-savepoint-foreign-key-state checkpoint))
+        (restore-savepoint-relation-access backend (backend-savepoint-relation-access-checkpoint checkpoint))
+        (set-backend-state backend :in-progress))
+    (error (condition)
+      (unless (fatal-error-p condition) (abort-transaction))
+      (error condition))))
+
 (defun exec-savepoint-command (stream ast)
   "Manage named savepoints for heap writes and deferred foreign-key state."
   (let* ((backend *backend*)
@@ -3750,21 +4617,8 @@ without a change; each actual publication captures its own schema precondition."
              (unless (backend-savepoints backend)
                (setf (backend-heap-undo-log backend) nil)))
             (:rollback-to-savepoint
-             (handler-case
-                 (progn
-                   (when (fboundp 'restore-savepoint-portals)
-                     (funcall 'restore-savepoint-portals (backend-savepoint-portal-checkpoint checkpoint)))
-                   (undo-heap-to-savepoint (backend-savepoint-heap-checkpoint checkpoint))
-                   (restore-backend-savepoint-logical-state backend checkpoint)
-                   (restore-on-conflict-row-locks
-                    (backend-xid backend) (backend-savepoint-conflict-row-checkpoint checkpoint))
-                   (restore-foreign-key-savepoint-state backend (backend-savepoint-foreign-key-state checkpoint))
-                   (restore-savepoint-relation-access backend (backend-savepoint-relation-access-checkpoint checkpoint))
-                   (setf (backend-savepoints backend) tail)
-                   (set-backend-state backend :in-progress))
-               (error (condition)
-                 (unless (fatal-error-p condition) (abort-transaction))
-                 (error condition))))))))
+             (rollback-backend-savepoint backend checkpoint)
+             (setf (backend-savepoints backend) tail))))))
   (send-command-complete stream (ecase (getf ast :type)
                                   (:savepoint "SAVEPOINT")
                                   (:release-savepoint "RELEASE")

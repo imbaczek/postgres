@@ -899,28 +899,37 @@
                             (policy (sql-implicit-coercion-p (expr-type argument) type))
                             (t (eq (expr-type argument) type)))))))
 
-(defun resolve-scalar-builtin (name candidates arguments)
-  "Rank by exact matches, then prefer text in an unknown first argument.
-The supported ambiguous bit and bytea overloads have no text candidate."
-  (let ((best nil)
-        (best-score -1)
-        (tied-p nil)
-        (unknown-first-p (and arguments (in-unknown-constant-p (first arguments)))))
+(declaim (inline resolve-callable-candidate))
+
+(defun resolve-callable-candidate (name candidates arguments score-candidate)
+  "Select the highest-ranked callable. A NIL score means the signature is inapplicable."
+  (declare (dynamic-extent score-candidate))
+  (let ((best nil) (best-score -1) (tied-p nil))
     (dolist (candidate candidates)
-      (when (scalar-builtin-match-p candidate arguments)
-        (let* ((types (scalar-builtin-argument-types candidate))
-               (exact-count (loop for argument in arguments for type in types
-                                  count (and (not (in-unknown-constant-p argument))
-                                             (eq (expr-type argument) type))))
-               (score (+ (* 2 exact-count)
-                         (if (and unknown-first-p (eq (first types) :text)) 1 0))))
-          (cond ((> score best-score) (setf best candidate best-score score tied-p nil))
+      (let ((score (funcall score-candidate candidate)))
+        (when score
+          (cond ((or (null best) (> score best-score)) (setf best candidate best-score score tied-p nil))
                 ((= score best-score) (setf tied-p t))))))
     (cond ((not best)
            (ereport "42883" "function ~a(~a) does not exist" name (call-signature arguments)))
           (tied-p
            (ereport "42725" "function ~a(~a) is not unique" name (call-signature arguments)))
           (t best))))
+
+(defun resolve-scalar-builtin (name candidates arguments)
+  "Rank by exact matches, then prefer text in an unknown first argument.
+The supported ambiguous bit and bytea overloads have no text candidate."
+  (let ((unknown-first-p (and arguments (in-unknown-constant-p (first arguments)))))
+    (resolve-callable-candidate
+     name candidates arguments
+     (lambda (candidate)
+       (when (scalar-builtin-match-p candidate arguments)
+         (let* ((types (scalar-builtin-argument-types candidate))
+                (exact-count (loop for argument in arguments for type in types
+                                   count (and (not (in-unknown-constant-p argument))
+                                              (eq (expr-type argument) type)))))
+           (+ (* 2 exact-count)
+              (if (and unknown-first-p (eq (first types) :text)) 1 0))))))))
 
 (defun coerce-scalar-builtin-argument (argument type)
   "Coerce a resolved input, retaining the concrete type for polymorphic arrays."
@@ -1701,8 +1710,112 @@ only when a non-NULL call executes; explicit text arguments arrive here then."
     (when (and (consp evaluator) (member (first evaluator) '(:call :iterator)))
       (third evaluator))))
 
+(defvar *validating-sql-routine* nil
+  "Detached routine visible to its own body validator before staging.")
+
+(defun stored-routine-candidates (name schema arity)
+  "Collect signature-visible stored overloads that admit ARITY arguments."
+  (when (and *catalog* *backend*)
+    (let ((schemas (if schema (list schema) (effective-sql-search-path)))
+          (validating-signature (when *validating-sql-routine*
+                                  (pg-routine-signature *validating-sql-routine*)))
+          (candidates nil))
+      (flet ((collect-candidate (routine)
+               (let ((count (length (pg-routine-argument-types routine))))
+                 (when (and (string= name (pg-routine-name routine))
+                            (member (pg-routine-schema routine) schemas :test #'equal)
+                            (<= arity count)
+                            (or (= arity count)
+                                (and (= count (length (pg-routine-argument-defaults routine)))
+                                     (every #'identity (nthcdr arity (pg-routine-argument-defaults routine))))))
+                   (push routine candidates)))))
+        (catalog-map-visible-relations
+         (lambda (signature routine)
+           (unless (equal signature validating-signature) (collect-candidate routine)))
+         (current-database) :routine)
+        (when *validating-sql-routine* (collect-candidate *validating-sql-routine*)))
+      candidates)))
+
+(defun stored-routine-argument-layout (routine raw)
+  "Return the formal slot for each supplied operand, or NIL for an incompatible call."
+  (let* ((count (length (pg-routine-argument-types routine)))
+         (assigned (make-array count :element-type 'bit :initial-element 0))
+         (layout (make-array (length raw))))
+    (loop for input in raw for position from 0
+          for slot = (if (eq (first input) :named-arg)
+                         (position (second input) (pg-routine-argument-names routine) :test #'equal)
+                         position)
+          do (unless (and slot (< slot count) (zerop (sbit assigned slot)))
+               (return-from stored-routine-argument-layout nil))
+             (setf (sbit assigned slot) 1
+                   (svref layout position) slot))
+    (dotimes (slot count layout)
+      (unless (or (plusp (sbit assigned slot))
+                  (nth slot (pg-routine-argument-defaults routine)))
+        (return-from stored-routine-argument-layout nil)))))
+
+(defun score-stored-routine (routine arguments layout)
+  (let ((types (pg-routine-argument-types routine)))
+    (when (loop for argument in arguments for slot across layout for type = (nth slot types)
+                always (or (in-unknown-constant-p argument)
+                           (sql-implicit-coercion-p (expr-type argument) type)))
+      (loop for argument in arguments for slot across layout for type = (nth slot types)
+            sum (cond ((in-unknown-constant-p argument) (if (eq type :text) 1 0))
+                      ((eq (expr-type argument) type) (1+ (length arguments)))
+                      (t 0))))))
+
+(defvar *defining-persistent-expression-p* nil
+  "Persistent definitions need dependency tracking before admitting stored calls.")
+
+(defun analyze-stored-routine-call (name raw table candidates decorations)
+  (when *defining-persistent-expression-p*
+    (ereport "0A000" "stored routine calls in persistent expressions require dependency tracking"))
+  (when (or (getf decorations :variadic)
+            (getf decorations :call-order) (getf decorations :call-distinct))
+    (ereport "0A000" "unsupported stored routine call syntax"))
+  (let ((layouts (loop for routine in candidates
+                       for layout = (stored-routine-argument-layout routine raw)
+                       when layout collect (cons routine layout))))
+    (when layouts
+      (flet ((input-type (entry position)
+               (nth (svref (cdr entry) position) (pg-routine-argument-types (car entry)))))
+        (loop for input in raw for position from 0
+              for type = (input-type (first layouts) position)
+              when (every (lambda (entry) (eq type (input-type entry position))) layouts)
+                do (infer-query-parameter-type (if (eq (first input) :named-arg) (third input) input)
+                                               type))))
+    (let* ((arguments (analyze-catalog-call-inputs raw table))
+           (selected (resolve-callable-candidate
+                      name layouts arguments
+                      (lambda (entry) (score-stored-routine (car entry) arguments (cdr entry)))))
+           (routine (car selected))
+           (types (pg-routine-argument-types routine))
+           (supplied (make-array (length types) :initial-element nil)))
+      (loop for argument in arguments for slot across (cdr selected)
+            do (setf (svref supplied slot) argument))
+      (let ((inputs (loop for type in types for slot from 0
+                          for argument = (or (svref supplied slot)
+                                             (analyze-expr (nth slot (pg-routine-argument-defaults routine)) nil))
+                          collect (coerce-common-expression argument type))))
+        (when (pg-routine-returns-set-p routine)
+          (check-record-set-call-context))
+        (list (if (pg-routine-returns-set-p routine) :set-func :func)
+              name inputs :type (pg-routine-result-type routine) :typmod -1
+              :routine-signature (pg-routine-signature routine) :routine-oid (pg-routine-oid routine)
+              :fields (pg-routine-result-fields routine))))))
+
 (defun analyze-function-expression (expr table)
   "Resolve a supported scalar or administrative function call."
+  (let* ((name (second expr))
+         (options (cdddr expr))
+         (schema (getf options :schema)))
+    (when (and (not (getf options :minmax-syntax-p))
+               (if schema (not (string= schema "pg_catalog"))
+                   (not (gethash name *scalar-builtin-descriptors*))))
+      (let ((candidates (stored-routine-candidates name schema (length (third expr)))))
+        (when candidates
+          (return-from analyze-function-expression
+            (analyze-stored-routine-call name (third expr) table candidates options))))))
   (check-qualified-numeric-function-call expr table)
   (when (and (getf (cdddr expr) :minmax-syntax-p)
              (or (null (third expr))
@@ -1922,6 +2035,7 @@ Visit present uppers before lowers and preserve omitted bounds."
   (let ((raw (second expression))
         (target (third expression))
         (typmod (fourth expression)))
+    (infer-query-parameter-type raw target)
     ;; Untyped strings and NULL have a known source type. They do not need
     ;; an intermediate analyzed constant before the cast can be folded.
     (when (and (eq (first raw) :const)
@@ -2738,6 +2852,41 @@ candidate selection."
       ((stringp v) (list :const v :type :text :typmod -1))
       (t (list :const v :type :text :typmod -1)))))
 
+(defvar *sql-routine-parse-context* nil
+  "Routine whose named arguments are in scope during SQL body analysis.")
+
+(defstruct plpgsql-variable name type typmod value argument-slot constant-p)
+
+(defvar *plpgsql-execution-p* nil)
+
+(defvar *plpgsql-variables* nil)
+
+(defun analyze-routine-column-fallback (expr table)
+  (let* ((routine *sql-routine-parse-context*)
+         (qualifier (and (third expr) (second expr)))
+         (name (or (third expr) (second expr)))
+         (slot (and routine (or (null qualifier) (equal qualifier (pg-routine-name routine)))
+                    (position name (pg-routine-argument-names routine) :test #'equal)))
+         (variable (when *plpgsql-execution-p*
+                     (if qualifier
+                         (when slot (find slot *plpgsql-variables* :key #'plpgsql-variable-argument-slot))
+                         (find name *plpgsql-variables* :key #'plpgsql-variable-name :test #'equal))))
+         (fallback
+           (cond (variable (list :const (plpgsql-variable-value variable) :explicit-cast t
+                                 :type (plpgsql-variable-type variable) :typmod (plpgsql-variable-typmod variable)))
+                 (slot (list :parameter (1+ slot) :type (nth slot (pg-routine-argument-types routine)) :typmod -1)))))
+    (if fallback
+        (handler-case
+            (let ((resolved (analyze-column-expression expr table)))
+              (when *plpgsql-execution-p*
+                (ereport "42702" "column reference \"~a\" is ambiguous" name))
+              resolved)
+          (pg-error (condition)
+            (unless (member (pg-error-sqlstate condition) '("42703" "42P01") :test #'equal)
+              (error condition))
+            fallback))
+        (analyze-column-expression expr table))))
+
 (defun analyze-column-expression (expr table)
   (let ((name (if (third expr) (third expr) (second expr)))
         (qualifier (and (third expr) (second expr))))
@@ -2761,6 +2910,13 @@ candidate selection."
 
 (defun report-unresolved-query-parameter (index)
   (ereport "42P18" "could not determine data type of parameter $~a" index))
+
+(declaim (inline analyze-column-in-context))
+
+(defun analyze-column-in-context (expr table)
+  (if (or *sql-routine-parse-context* *plpgsql-execution-p*)
+      (analyze-routine-column-fallback expr table)
+      (analyze-column-expression expr table)))
 
 (defun analyze-expr (expr table)
   "Resolve column references and annotate expression types."
@@ -2818,7 +2974,7 @@ candidate selection."
            (cons :single-record (cdr call)))))
     (:bool
      (list :bool (second expr) :type :bool :typmod -1))
-    (:column (analyze-column-expression expr table))
+    (:column (analyze-column-in-context expr table))
     (:whole-row (resolve-select-whole-row table (second expr)))
     (:binop (analyze-binop-expression expr table))
     (:unary
@@ -2969,6 +3125,8 @@ checks still apply."
               (some #'analyzed-expression-contains-set-p (third call))
               (analyzed-expression-contains-set-p call))
       (ereport "0A000" "set-returning functions must appear at top level of FROM"))
+    (when (and (eq (first call) :set-func) (getf (cdddr call) :routine-signature))
+      (setf (getf (cdddr call) :materialize-routine-set-p) t))
     (if (eq (expr-type call) :record)
         (let ((fields (getf (cdddr call) :fields))
               (record (if (eq (first call) :set-func) call (cons :single-record (cdr call)))))
@@ -2978,6 +3136,10 @@ checks still apply."
                 collect (list :expr (list :record-field record position :type type :typmod -1)
                               :name name :type type :typmod -1 :table-oid 0 :attnum 0)))
         (progn
+          (when (and (eq (first call) :set-func)
+                     (getf (cdddr call) :routine-signature)
+                     (getf (cdddr call) :fields))
+            (setf (getf analyzed :name) (caar (getf (cdddr call) :fields))))
           (setf (getf analyzed :scalar-function-p) t
                 (getf analyzed :table-oid) 0
                 (getf analyzed :attnum) 0)
@@ -4085,7 +4247,26 @@ the full 64-bit ID as a signed value."
         (scalar-builtin-for-evaluation candidates (length arguments) first-argument)
         (first candidates))))
 
+(declaim (ftype function evaluate-stored-scalar-routine))
+
+(defun lookup-stored-routine-for-call (call)
+  "Resolve the admitted signature without accepting a drop/recreate under the same name."
+  (let* ((signature (getf (cdddr call) :routine-signature))
+         (oid (getf (cdddr call) :routine-oid))
+         (transaction (backend-catalog-transaction *backend*))
+         (routine (if transaction
+                      (catalog-transaction-lookup transaction :routine signature)
+                      (gethash signature (database-routines (current-database))))))
+    (unless (and routine (= oid (pg-routine-oid routine)))
+      (ereport "42883" "function ~a no longer exists with the admitted signature" (second call)))
+    routine))
+
+(defun eval-stored-routine-call (call arguments)
+  (evaluate-stored-scalar-routine (lookup-stored-routine-for-call call) arguments))
+
 (defun eval-func (name args &optional first-argument call)
+  (when (and call (getf (cdddr call) :routine-signature))
+    (return-from eval-func (eval-stored-routine-call call args)))
   (let ((builtin (scalar-builtin-for-call name args first-argument)))
     (if builtin
         (eval-scalar-builtin builtin args first-argument call)

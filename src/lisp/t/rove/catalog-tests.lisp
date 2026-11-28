@@ -1,6 +1,99 @@
 ;;;; catalog-tests.lisp -- migrated unit regressions; run with pg-unit-tests.
 (in-package #:pg)
 
+(rove:deftest function-ddl-parses-overload-signatures-and-options
+    (destructuring-bind (create drop)
+        (parse-statements
+         "CREATE OR REPLACE FUNCTION public.f(IN x integer, text = 'a') RETURNS bigint AS $$SELECT 1$$ LANGUAGE sql RETURNS NULL ON NULL INPUT STABLE; DROP FUNCTION IF EXISTS public.f(integer, text), f() RESTRICT")
+      (let ((name (getf create :name)))
+        (rove:ok (string= "public" (sql-relation-name-schema name)))
+        (rove:ok (string= "f" (sql-relation-name-name name))))
+      (rove:ok (eq :create-function (getf create :type)))
+      (rove:ok (getf create :replace))
+      (rove:ok (eq :int8 (getf create :result-type)))
+      (rove:ok (equal '(("x" :int4) (nil :text))
+                      (mapcar (lambda (parameter) (subseq parameter 0 2))
+                              (getf create :parameters))))
+      (rove:ok (third (second (getf create :parameters))))
+      (rove:ok (equal '((:source . "SELECT 1") (:language . "sql") (:strict . t)
+                        (:volatility . :stable))
+                      (getf create :options)))
+      (rove:ok (eq :drop-function (getf drop :type)))
+      (rove:ok (getf drop :if-exists))
+      (rove:ok (equal '(t (:int4 :text)) (rest (first (getf drop :signatures)))))
+      (rove:ok (equal '("f" t nil) (second (getf drop :signatures))))))
+
+(rove:deftest routine-catalog-preserves-distinct-overload-signatures
+    (let* ((original '(:name "postgres" :oid 5 :tables nil :indexes nil
+                       :sequences nil :publications nil :applied-logical-event-ids nil))
+           (database (database-from-sexp original)))
+      (rove:ok (equal (database-to-sexp database) original))
+      (loop for type in '(:int4 :text) for oid from 10001
+            for routine = (make-pg-routine :oid oid :schema "public" :name "identity"
+                                           :argument-types (list type) :result-type type
+                                           :language :sql :source "SELECT $1" :owner "postgres"
+                                           :returns-set-p (eq type :text)
+                                           :result-fields (when (eq type :text) '(("output" :text)))
+                                           :generation 2 :volatility :immutable :strict-p t)
+            do (setf (gethash (pg-routine-signature routine) (database-routines database)) routine))
+      (let ((restored (database-routines
+                       (database-from-sexp (database-to-sexp database)))))
+        (rove:ok (= 2 (hash-table-count restored)))
+        (loop for type in '(:int4 :text)
+              for signature = (list "public" "identity" (list type))
+              do (rove:ok (equal (routine-to-sexp (gethash signature restored))
+                                 (routine-to-sexp (gethash signature (database-routines database)))))))))
+
+(rove:deftest routine-catalog-overlay-keeps-replacement-private
+    (let* ((database (make-database :name "postgres" :oid 5))
+           (routine (make-pg-routine :oid 10001 :schema "public" :name "answer"
+                                     :result-type :int4 :language :sql :source "SELECT 41"))
+           (replacement (copy-pg-routine routine))
+           (signature (pg-routine-signature routine))
+           (transaction (make-catalog-transaction database)))
+      (setf (gethash signature (database-routines database)) routine
+            (pg-routine-source replacement) "SELECT 42"
+            (pg-routine-generation replacement) 1)
+      (catalog-transaction-stage transaction :routine signature replacement)
+      (rove:ok (eq replacement (catalog-transaction-lookup transaction :routine signature)))
+      (rove:ok (eq replacement (catalog-transaction-find-by-oid transaction :routine 10001)))
+      (let ((prepared (catalog-transaction-prepare-database transaction database)))
+        (rove:ok (eq routine (gethash signature (database-routines database))))
+        (rove:ok (eq replacement (gethash signature (database-routines prepared))))
+        (rove:ok (null (catalog-transaction-deferred-deletes transaction prepared))))))
+
+(rove:deftest routine-ddl-staging-retains-oid-and-input-metadata
+    (let* ((*backend* nil)
+           (database (make-database :name "postgres" :oid 5))
+           (routine (make-pg-routine :oid 10001 :schema "public" :name "answer"
+                                     :argument-types '(:int4) :argument-names '("n")
+                                     :result-type :int4 :language :sql :owner "postgres"
+                                     :source "SELECT $1"))
+           (signature (pg-routine-signature routine))
+           (transaction (make-catalog-transaction database))
+           (create (first (parse-statements
+                           "CREATE OR REPLACE FUNCTION public.answer(n integer DEFAULT 42) RETURNS integer AS $$SELECT $1$$ LANGUAGE sql STRICT IMMUTABLE")))
+           (drop (first (parse-statements "DROP FUNCTION public.answer(integer)"))))
+      (setf (gethash signature (database-routines database)) routine)
+      (multiple-value-bind (replacement statements)
+          (prepare-scalar-sql-routine-ddl transaction create)
+        (validate-scalar-sql-routine-body replacement statements)
+        (catalog-transaction-stage transaction :routine signature replacement)
+        (rove:ok (= 10001 (pg-routine-oid replacement)))
+        (rove:ok (= 1 (pg-routine-generation replacement)))
+        (rove:ok (pg-routine-strict-p replacement))
+        (rove:ok (eq :immutable (pg-routine-volatility replacement)))
+        (rove:ok (equal '(("n") ((:const 42)))
+                        (list (pg-routine-argument-names replacement)
+                              (pg-routine-argument-defaults replacement))))
+        (rove:ok (= 23 (evaluate-scalar-sql-routine replacement '(23))))
+        (rove:ok (eq +null+ (evaluate-scalar-sql-routine replacement (list +null+))))
+        (rove:ok (eq replacement (catalog-transaction-lookup transaction :routine signature)))
+        (rove:ok (equal (list replacement) (collect-sql-routines-to-drop transaction drop #'identity)))
+        (catalog-transaction-stage transaction :routine signature nil))
+      (rove:ok (null (catalog-transaction-lookup transaction :routine signature)))
+      (rove:ok (eq routine (gethash signature (database-routines database))))))
+
 (rove:deftest expression-index-uses-typed-parameter-after-independent-predicate-proof
     (let* ((*query-parameter-types* #(:text :int4))
            (table (make-pg-class :oid 101 :name "events"

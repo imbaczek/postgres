@@ -220,14 +220,45 @@ invalidation. PL/pgSQL exception handlers also need P07 subtransactions.
 - [ ] Add transactional CREATE OR REPLACE FUNCTION and DROP FUNCTION for
   scalar SQL routines. Verify STRICT/NULL handling, coercion, volatility,
   rollback and restart against C PostgreSQL.
+  The transactional catalog wire fixture covers scalar SELECT bodies,
+  positional and named arguments, defaults, STRICT, private replacement,
+  crash restart and overload-specific DROP. The shared transaction scenario
+  also passes on the C reference.
+  CREATE validates the body by default and supports deferred validation
+  with `check_function_bodies = off`. The wire fixture also checks failed
+  replacement, overload ambiguity and rebind after committed replacement.
 - [ ] Run multi-statement SQL bodies in the caller's transaction. Add named
   and default arguments, fixed RETURNS TABLE/SETOF results and resumable
   execution. Verify close, cancel, recursion limits and error cleanup.
-- [ ] Share the existing DO runtime with a bounded PL/pgSQL subset covering
+  Scalar SQL bodies run SELECT, INSERT, UPDATE and DELETE in the caller's
+  transaction, with a final SELECT or DML RETURNING result. Shared C and Lisp
+  wire tests cover visibility between volatile statements, rollback after
+  an error, and rejection of writes in read-only transactions.
+  SQL routines with SETOF and fixed RETURNS TABLE now resume a final SELECT
+  across bounded Execute. Wire checks cover target-list laziness, FROM
+  materialization and spill, snapshot retention across a concurrent commit,
+  Close, LIMIT, cancellation, and returning records. Final DML RETURNING for
+  set results and PL/pgSQL set results remain open.
+- [x] Share the existing DO runtime with a bounded PL/pgSQL subset covering
   declarations, assignment, flow control, RETURN, PERFORM, SELECT INTO,
   FOUND, RAISE and parameterized dynamic EXECUTE.
+  Anonymous blocks and stored scalar functions share these paths. The
+  wire fixture compares control flow, STRICT SELECT INTO, FOUND and EXECUTE
+  USING with C PostgreSQL, and checks stored PL/pgSQL recovery after restart.
+  It verifies that dynamic SELECT INTO finishes all rows, checks variable
+  scopes and assignment coercion, and checks invalid statement targets
+  during CREATE when body validation is enabled.
 - [ ] Add EXCEPTION rollback, SQLSTATE matching and diagnostics using real
   subtransactions. Verify nested failures and routine-backed checks and defaults.
+  Exception blocks use the heap, logical change and resource checkpoints
+  behind SAVEPOINT. Shared wire tests cover rollback of writes before a
+  caught violation, nested rethrow, SQLSTATE classes and stacked diagnostics.
+  An injected rollback restoration failure preserves its original SQLSTATE
+  and bypasses outer handlers after the transaction has aborted.
+  Column defaults and CHECK constraints track stored routine references.
+  The paired wire fixture verifies replacement, DROP RESTRICT, DROP CASCADE,
+  rollback and crash restart. Logical schema export and dependencies from
+  other persistent expressions remain open.
 - [ ] Use P23's upstream workload to select record returns, RETURN QUERY,
   catalog helpers and bounded CALL support. Treat procedure transaction
   control as a separate capability.
@@ -240,6 +271,10 @@ invalidation. PL/pgSQL exception handlers also need P07 subtransactions.
 - [ ] Preserve analyzed literal coercions and contextual parameter types in
   prepared statements. Verify omitted or zero OIDs, ambiguous types, repeated
   Bind metadata and supported text and binary formats.
+  Parse now allocates inferred slots for OIDs omitted from the wire frame,
+  including a partially specified OID list. The binary-values wire fixture
+  compares omitted, partial and zero OIDs in cast contexts and untyped
+  parameters in an IS NULL test.
 - [ ] Qualify named and unnamed statements and portals, bounded Execute,
   Describe, Close, Flush and Sync. Check ReadyForQuery status, aborted
   pipelines, cancel, disconnect and resource cleanup.

@@ -780,8 +780,12 @@ releases it; closing an active scan discards its unread cursor without a copy."
                                nil input-presence))
                (setf sets nil)))))
      (lambda ()
-       (setf sets nil environment nil input-origins nil)
-       (close-sql-iterator input)))))
+       (unwind-protect
+            (when sets
+              (loop for state across sets
+                    when (sql-iterator-p state) do (close-sql-iterator state)))
+         (setf sets nil environment nil input-origins nil)
+         (close-sql-iterator input))))))
 
 (defun make-project-set-projection-iterator (input calls targets width)
   "Project targets in order on each attempt to expand an input row.

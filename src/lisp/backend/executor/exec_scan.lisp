@@ -2006,7 +2006,8 @@ Mark direct scalar function sources through their aliases."
                 (lambda (operand) (not (immutable-literal-expression-p operand)))
                 expression)))
          (:func
-          (and (having-immutable-function-p (second expression))
+          (and (not (getf (cdddr expression) :routine-oid))
+               (having-immutable-function-p (second expression))
                (every #'immutable-literal-expression-p (third expression))))
          (otherwise nil))))
 
@@ -2028,7 +2029,8 @@ Mark direct scalar function sources through their aliases."
      (map-analyzed-array-access-operands #'having-gate-skeleton expression))
     (:in (map-analyzed-in-operands #'having-gate-skeleton expression))
     (:func
-     (if (having-immutable-function-p (second expression))
+     (if (and (not (getf (cdddr expression) :routine-oid))
+              (having-immutable-function-p (second expression)))
          (let ((copy (copy-list expression)))
            (setf (third copy) (mapcar #'having-gate-skeleton (third expression)))
            copy)

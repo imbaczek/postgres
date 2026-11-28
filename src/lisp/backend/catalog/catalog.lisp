@@ -118,12 +118,18 @@ Older catalogs have no CONSTRAINT field, but did persist PRIMARY."
   (or (pg-index-constraint-p index)
       (pg-index-primary-p index)))
 
+(defstruct pg-routine
+  "Persistent callable descriptor. Argument types participate in identity."
+  oid schema name argument-types argument-names argument-defaults result-type result-fields language source owner
+  (generation 0) (volatility :volatile) strict-p returns-set-p)
+
 (defstruct database
   name
   oid
   (tables (make-hash-table :test #'equal))
   (indexes (make-hash-table :test #'equal))
   (sequences (make-hash-table :test #'equal))
+  (routines (make-hash-table :test #'equal))
   (publications (make-hash-table :test #'equal))
   (applied-logical-event-ids (make-hash-table :test #'equal)))
 
@@ -484,6 +490,29 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
   (:live pg-index-live-p :live-p :default t :omit-default t)
   (:logical-visible pg-index-logical-visible-p :logical-visible-p :default t :omit-default t))
 
+(define-catalog-codec (routine copy-pg-routine) make-pg-routine
+  (:oid pg-routine-oid :oid)
+  (:schema pg-routine-schema :schema)
+  (:name pg-routine-name :name)
+  (:argument-types pg-routine-argument-types :argument-types)
+  (:argument-names pg-routine-argument-names :argument-names :omit-default t)
+  (:argument-defaults pg-routine-argument-defaults :argument-defaults :omit-default t
+                                                                      :encode #'catalog-expression-to-sexp :decode #'catalog-expression-from-sexp)
+  (:result-type pg-routine-result-type :result-type)
+  (:result-fields pg-routine-result-fields :result-fields :omit-default t)
+  (:language pg-routine-language :language)
+  (:source pg-routine-source :source)
+  (:owner pg-routine-owner :owner)
+  (:generation pg-routine-generation :generation :default 0)
+  (:volatility pg-routine-volatility :volatility :default :volatile)
+  (:strict pg-routine-strict-p :strict-p)
+  (:returns-set pg-routine-returns-set-p :returns-set-p :omit-default t))
+
+(defun pg-routine-signature (routine)
+  "Return the catalog key for a routine overload."
+  (list (pg-routine-schema routine) (pg-routine-name routine)
+        (pg-routine-argument-types routine)))
+
 (defun database-to-sexp (db)
   `(:name ,(database-name db)
     :oid ,(database-oid db)
@@ -495,6 +524,9 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
                       collect (sequence-to-sexp s))
     :publications ,(loop for p being the hash-values of (database-publications db)
                          collect (publication-to-sexp p))
+    ,@(when (plusp (hash-table-count (database-routines db)))
+        (list :routines (loop for routine being the hash-values of (database-routines db)
+                              collect (routine-to-sexp routine))))
     :applied-logical-event-ids
     ,(loop for key being the hash-keys of
                                        (database-applied-logical-event-ids db)
@@ -528,6 +560,9 @@ SNAPSHOT-COPY supplies a function for a field that needs independent storage."
       (let ((publication (publication-from-sexp ps)))
         (setf (gethash (pg-publication-name publication)
                        (database-publications db)) publication)))
+    (dolist (encoded (getf s :routines))
+      (let ((routine (routine-from-sexp encoded)))
+        (setf (gethash (pg-routine-signature routine) (database-routines db)) routine)))
     (dolist (entry (getf s :applied-logical-event-ids))
       (if (consp entry)
           (setf (gethash (car entry) (database-applied-logical-event-ids db))
@@ -1220,8 +1255,10 @@ from advancing the shared WAL generation between a failed save and rollback."
     (some-local-plan-expression
      (lambda (node walk)
        (declare (ignore walk))
-       (when (and (eq (first node) :func) (let ((builtin (first (gethash (second node) *scalar-builtin-descriptors*))))
-                                            (and builtin (eq (scalar-builtin-implicit-arguments-p builtin) :sequence))))
+       (when (and (eq (first node) :func)
+                  (not (getf (cdddr node) :routine-oid))
+                  (let ((builtin (first (gethash (second node) *scalar-builtin-descriptors*))))
+                    (and builtin (eq (scalar-builtin-implicit-arguments-p builtin) :sequence))))
          (let* ((argument (first (third node)))
                 (value (and (eq (first argument) :const) (second argument))))
            (cond ((stringp value)
@@ -1234,6 +1271,17 @@ from advancing the shared WAL generation between a failed save and rollback."
        nil)
      expression)
     names))
+
+(defun catalog-expression-uses-routine-p (expression &optional oids)
+  "Find a bound routine identity, optionally restricted to OIDS."
+  (and expression
+       (some-local-plan-expression
+        (lambda (node walk)
+          (declare (ignore walk))
+          (when (eq (first node) :func)
+            (let ((oid (getf (cdddr node) :routine-oid)))
+              (and oid (or (null oids) (member oid oids :test #'eql))))))
+        expression)))
 
 (defun catalog-table-sequence-names (table)
   (remove-duplicates
@@ -1443,7 +1491,12 @@ from advancing the shared WAL generation between a failed save and rollback."
                 (let ((arguments (mapcar #'render (third node))))
                   (when (and arguments (getf (cdddr node) :variadic))
                     (setf (car (last arguments)) (concatenate 'string "VARIADIC " (car (last arguments)))))
-                  (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node)) arguments)))
+                  (let ((signature (getf (cdddr node) :routine-signature)))
+                    (if signature
+                        (format nil "~a.~a(~{~a~^, ~})"
+                                (catalog-sql-quote-ident (first signature))
+                                (catalog-sql-quote-ident (second signature)) arguments)
+                        (format nil "~a(~{~a~^, ~})" (catalog-sql-quote-ident (second node)) arguments)))))
                (:join-coalesce
                 (format nil "COALESCE(~a, ~a)" (render (second node)) (render (third node))))
                (:coalesce (format nil "COALESCE(~{~a~^, ~})" (mapcar #'render (second node))))

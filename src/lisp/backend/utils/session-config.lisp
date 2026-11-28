@@ -24,6 +24,7 @@
    (make-startup-setting-descriptor "log_statement" :user :disabled-logging "none")
    (make-startup-setting-descriptor "log_min_duration_statement" :user :disabled-logging "-1")
    (make-startup-setting-descriptor "log_min_error_statement" :user :disabled-logging "error")
+   (make-startup-setting-descriptor "check_function_bodies" :user :boolean "on")
    (make-startup-setting-descriptor "statement_timeout" :user :integer 0 0 2147483647 :milliseconds)
    (make-startup-setting-descriptor "work_mem" :user :integer 4096 64 2147483647 :kilobytes)
    (make-startup-setting-descriptor "pg_stat_statements.track" :superuser :statement-tracking "top")
